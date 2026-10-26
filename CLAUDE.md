@@ -19,9 +19,9 @@ A runtime for coding-agent sessions on Kubernetes. The design lives in the ADRs 
 - UI: `cd ui && npm ci`, then `npm run check` and `npm run test:e2e` (Playwright against the mock runtime).
 - End-to-end on a local cluster, where docker and kind are available:
   1. `dev/up.sh` creates a kind cluster with Cilium, agent-sandbox and Postgres.
-  2. Create the `sloppod-claude` and `sloppod-github` Secrets in namespace `sloppod` (see `docs/deploy.md`).
+  2. Create the `sloppod-claude` and `sloppod-github` Secrets in namespace `sloppod`, as in `docs/deploy.md` (`dev/values.yaml` expects those names, plus `sloppod-db`, which `up.sh` creates).
   3. `dev/deploy.sh` builds both images, loads them and installs the chart.
-  4. Port-forward `svc/sloppod` and drive it with `sloppodctl` (`SLOPPOD_URL`) or the UI.
+  4. Port-forward `svc/sloppod` (e.g. to 18080) and drive it with `sloppodctl` (`cargo build -p sloppod-cli`; set `SLOPPOD_URL`) or the UI. `dev/smoke.sh` runs the milestone checks; it pushes a `sloppod/<id>` branch to the repository and uses a few small model calls.
 - Inside a sloppod session there's no container runtime, so stick to `mise run check` and the UI tests there.
 - ADRs are MADR style. Numbers are permanent and append-only; add new ones to the README index under the right group.
 - Only comment code for intent a reader couldn't infer.

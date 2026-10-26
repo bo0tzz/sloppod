@@ -4,13 +4,13 @@ import { expect, test, type Page } from '@playwright/test';
 // One small live turn against a real runtime: prompt, permission, a steer, and a reload mid-turn.
 // It uses a real model, so it only runs with SLOPPOD_REAL_TURN=1. It never approves proposals.
 
-const SESSION = process.env.SLOPPOD_SESSION ?? '2677e6a5-833c-466c-8a94-41eee6a260e8';
+const SESSION = process.env.SLOPPOD_SESSION ?? '';
 // A write, so the default mode asks for permission and the turn blocks long enough to reload and steer.
 const PROMPT = 'Run touch /tmp/sloppod-ui-check, then reply with one word.';
 const STEER = 'Make that one word French.';
 const dir = '.screenshots/real';
 
-test.skip(!process.env.SLOPPOD_REAL_TURN, 'runs a real prompt; set SLOPPOD_REAL_TURN=1');
+test.skip(!process.env.SLOPPOD_REAL_TURN || !SESSION, 'runs a real prompt; set SLOPPOD_REAL_TURN=1 and SLOPPOD_SESSION=<id>');
 
 type Frame = { at: number; dir: 'in' | 'out'; message: unknown };
 

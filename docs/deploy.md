@@ -5,17 +5,17 @@ sloppod ships as an OCI Helm chart, `oci://ghcr.io/bo0tzz/charts/sloppod`, publi
 - `ghcr.io/bo0tzz/sloppod`: the runtime and UI
 - `ghcr.io/bo0tzz/sloppod-session`: the session image with the supervisor, the Claude Code adapter, mise and the memini plugin
 
-Chart versions are `0.1.0-main.<run>`. `appVersion` is the commit, and the images are tagged with it.
+Published chart versions are `0.1.0-main.<run>`, with `appVersion` set to the commit; the images are tagged with the commit and `latest`. Installing the chart from a checkout instead needs `image.tag` and `session.image.tag` set, because the in-repo `appVersion` (`0.1.0`) isn't an image tag.
 
 ## Cluster prerequisites
 
-- **Cilium with CiliumEnvoyConfig support:** Helm value `envoyConfig.enabled=true`. Nodes need `net.ipv4.conf.all.src_valid_mark=0`, or every L7 redirect is dropped ([ADR 11](adr/0011-enforcement-at-the-pod-boundary.md)).
+- **Cilium with CiliumEnvoyConfig support:** Cilium's own Helm value `envoyConfig.enabled=true` (not a sloppod value). `dev/cilium-values.yaml` is a known-good Cilium configuration. Nodes need `net.ipv4.conf.all.src_valid_mark=0`, or every L7 redirect is dropped ([ADR 11](adr/0011-enforcement-at-the-pod-boundary.md)).
 - **agent-sandbox v1.0.8:** `https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v1.0.8/sandbox.yaml`. Only the core `Sandbox` CRD and controller are needed.
 - **Postgres**, e.g. a CloudNativePG `Cluster`. The chart reads a connection URI from a Secret, such as CNPG's `<cluster>-app` Secret, key `uri`.
 - **A default StorageClass** with `ReadWriteOnce` volumes, or set `session.storage.storageClass`. Each session gets its own volume.
 - **Network policies:** if the namespace has default-deny policies, allow:
   - session pods → the runtime on port 8080
-  - Cilium's Envoy → the runtime on port 9001 (`ext_authz`; Envoy runs on the host network, so it shows up as `host`/`remote-node`)
+  - Cilium's Envoy → the runtime on port 9001 (`ext_authz`; Envoy runs on the host network, so it shows up as `host`/`remote-node`), and the kubelet → port 8080 for probes
   - the runtime → the Kubernetes API, GitHub and Postgres
 
   sloppod writes its own CiliumNetworkPolicy per session pod.
@@ -31,7 +31,16 @@ All are referenced by name from values; the chart creates none.
 | `database.existingSecret` | `uri` | Postgres URI. |
 | `memini.existingSecret` | `api-key` | Optional. A memini key for the runtime, e.g. `memini key add sloppod --home personal/bo0tzz`, so sessions read your personal memory. Set `memini.url` too. |
 
-The GitHub App is what sessions act through, and what opens approved pull requests. It needs **Contents: read & write**, **Pull requests: read & write** and **Metadata: read**, and must be installed on every repository sessions may work on. The repositories offered in the UI are the app's installations. `sl0pz` works for `bo0tzz/sloppod` as is.
+For example:
+
+```sh
+k="kubectl --context <cluster> -n sloppod"
+$k create secret generic sloppod-claude --from-literal=oauth-token=<token from claude setup-token>
+$k create secret generic sloppod-github --from-file=private-key=./app.private-key.pem
+$k create secret generic sloppod-memini --from-literal=api-key=<memini key>
+```
+
+The GitHub App is what sessions act through, and what opens approved pull requests. It needs **Contents: read & write**, **Pull requests: read & write** and **Metadata: read**, and must be installed on every repository sessions may work on. The repositories offered in the UI are the app's installations. (`sl0pz`, the app sloppod itself is developed with, already has these on `bo0tzz/sloppod`.)
 
 ## HelmRelease (Flux)
 
@@ -71,8 +80,9 @@ spec:
       memory: 8Gi
       # `auto` lets Claude Code's classifier handle permission prompts; the pod boundary is the hard limit.
       defaultMode: auto
-    instructions: |
-      # (your user-level CLAUDE.md, rendered into every session)
+    # Optional: your user-level CLAUDE.md, rendered into every session.
+    # instructions: |
+    #   ...
 ```
 
 The release name decides resource names. With release `sloppod`, the runtime Service is `sloppod`, port `http` (8080).

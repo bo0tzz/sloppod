@@ -99,3 +99,14 @@ Runtime → UI:
 | `_sloppod/permission_resolved` `{sessionId, toolCallId}` | Sent to every UI, including the one that answered, once a request is answered or cancelled. |
 | `_sloppod/session` `{session: Session}` | The session's phase or title changed. |
 | `_sloppod/proposal` `{proposal: Proposal}` | A proposal for a loaded session was created or changed. |
+
+## Session pods
+
+Session pods use two more endpoints on the same port. Neither is for UIs; keep them off public routes.
+
+- `/link/v1`: the supervisor link ([ADR 17](adr/0017-in-pod-supervisor.md)), a WebSocket authenticated with the pod's projected ServiceAccount token. Its types are in `crates/protocol`.
+- `/mcp`: an MCP server (streamable HTTP, JSON responses) registered with the agent at session start. It identifies the session by the pod's IP. Its tools:
+  - `propose_pull_request {title, body, base?, draft?}` creates a `github.pr.create` proposal from the session branch.
+  - `get_proposal {id}` returns a proposal's status and result. The agent isn't notified when a proposal is decided; it checks with this tool.
+
+In the pod, the repository is checked out at `/workspace/repo` on the session branch. `/workspace` is the session's own volume, kept across pod restarts.

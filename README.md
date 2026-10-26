@@ -10,7 +10,7 @@ A runtime for coding-agent sessions. Sessions run in sandbox pods on Kubernetes,
 
 ### Architecture decisions
 
-ADR numbers are permanent. This index groups them by topic, concepts first.
+ADR numbers are permanent. This index groups them by topic, concepts first. ADRs record decisions, not what's built: [docs/mvp.md](docs/mvp.md) says which parts the MVP covers.
 
 Concepts:
 

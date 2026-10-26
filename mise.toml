@@ -8,6 +8,23 @@ helm = "4.3.1"
 kubectl = "1.37.1"
 "github:kube-rs/kopium" = "0.24.1"
 
+[tasks."ui:check"]
+description = "UI type check and end-to-end tests against the mock runtime"
+dir = "ui"
+run = ["npm ci", "npm run check", "npm run test:e2e"]
+
+[tasks."dev:up"]
+description = "Create the kind dev cluster"
+run = "dev/up.sh"
+
+[tasks."dev:deploy"]
+description = "Build images and deploy them to the kind dev cluster"
+run = "dev/deploy.sh"
+
+[tasks."dev:smoke"]
+description = "End-to-end smoke test against a port-forwarded dev runtime"
+run = ["cargo build -p sloppod-cli", "dev/smoke.sh"]
+
 [tasks.check]
 description = "Format check, lints and tests"
 run = [
