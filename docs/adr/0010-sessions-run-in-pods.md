@@ -21,7 +21,9 @@ Chosen option: **pods only**. There is no local mode.
 - **Shutdown is mechanical.** Pods go away for many reasons: preemption, eviction, a move to another node, parking ([ADR 5](0005-park-and-wake.md)) or a restart ([ADR 6](0006-self-reference.md)). The agent can register **shutdown handlers** for background work it starts: a command, a timeout and a description. On termination the runtime:
   1. runs the handlers, without any model calls
   2. records their output, along with what was still running unregistered
-  3. pushes work in progress and syncs the transcript ([ADR 17](0017-in-pod-supervisor.md))
+  3. snapshots work in progress and syncs the transcript ([ADR 17](0017-in-pod-supervisor.md))
+
+  The working tree itself lives on a per-session **workdir volume** that outlives the pod, so preemption or a move doesn't lose uncommitted work.
 
   When the session next runs, the agent finds a summary of all this in its inbox.
 - **Resources** are requestable ([ADR 2](0002-capabilities.md)) and resized in place where possible. If a node can't fit the new size, the session is moved to another node: the transcript and session branch make it portable.

@@ -28,7 +28,7 @@ On termination (`SIGTERM`, whether from preemption, eviction, a move, parking or
 1. Interrupts the agent, so no new model calls are made.
 2. Runs the shutdown handlers in parallel, each with its own timeout, within a fixed share of the grace period.
 3. Records each handler's result, plus every still-running process it didn't know about (command line and tail of its output).
-4. Commits and pushes work in progress to the session branch, and syncs the transcript blob.
+4. Snapshots work in progress to the runtime ([ADR 19](0019-repositories-from-runtime-mirrors.md)), and syncs the transcript blob.
 5. Sends the runtime a shutdown report, which becomes an inbox item when the session next runs.
 
 The grace period is sized for handlers plus sync; the default is 90 s. A pod killed without a signal skips all of this, so the runtime records a lost pod and the next run starts from the last sync.
