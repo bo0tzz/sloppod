@@ -21,8 +21,7 @@ fi
 docker exec "$name-control-plane" sysctl -qw net.ipv4.conf.all.src_valid_mark=0
 
 helm upgrade --install cilium cilium --repo https://helm.cilium.io --version 1.20.4 \
-  --kube-context "$ctx" -n kube-system \
-  --set ipam.mode=kubernetes --set operator.replicas=1 --set envoyConfig.enabled=true \
+  --kube-context "$ctx" -n kube-system -f "$here/cilium-values.yaml" --set k8sServiceHost="$name-control-plane" \
   --wait --timeout 10m
 
 k apply --server-side -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v1.0.8/sandbox.yaml

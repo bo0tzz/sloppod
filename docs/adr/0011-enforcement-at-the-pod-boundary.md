@@ -86,3 +86,10 @@ Spike, 2026-10-26: claude-agent-acp 0.97.0 (Claude Code 2.1.310, the SDK's bundl
 With nonessential traffic off and everything except `/v1/messages` refused, a prompt with a tool call worked normally. The model request policy therefore starts as: allow `POST /v1/messages`, deny the rest.
 
 Prior art: Claude Code cloud environments (secrets injected by the egress proxy), Codex network secrets, Boundary's injected credentials, Zalando's agentic identity broker.
+
+Milestone 1, 2026-10-26, in kind with the real runtime:
+
+- `ext_authz`'s `CheckRequest` carries the session pod's IP as the source address, and the authorizer maps it to the session from a watch on session pods.
+- Cilium prefixes the names of resources in a CiliumEnvoyConfig with `<namespace>/<config>/`, and rewrites only the references it knows. `ext_authz`'s `envoy_grpc.cluster_name` needs the prefixed name. Envoy then uses that name as the HTTP/2 `:authority`, and Rust's HTTP/2 server rejects the slashes, so `envoy_grpc.authority` has to be set as well.
+- The authorizer trusts the source address in the request, and its answers carry credentials, so its port is restricted to Cilium's Envoy (the `host` and `remote-node` entities).
+- git shows only the status of a refused push, not the response body. The authorizer therefore refuses pushes to other refs with a `200` in git's receive-pack format, which git prints as `remote:` output and `! [remote rejected]` lines.

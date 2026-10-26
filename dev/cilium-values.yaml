@@ -1,0 +1,20 @@
+# Mirrors the parts of clusterfuck's Cilium setup that matter to sloppod: kube-proxy replacement with socket LB,
+# native routing with BPF masquerading, and Envoy embedded in the agent.
+ipam:
+  mode: kubernetes
+operator:
+  replicas: 1
+envoyConfig:
+  enabled: true
+envoy:
+  enabled: false
+kubeProxyReplacement: true
+k8sServicePort: 6443
+routingMode: native
+autoDirectNodeRoutes: true
+ipv4NativeRoutingCIDR: 10.244.0.0/16
+bpf:
+  masquerade: true
+  hostLegacyRouting: true
+socketLB:
+  enabled: true

@@ -34,3 +34,7 @@ Before accepting, check against the current release:
 - how claims and the warm pool behave with our flow of config pushed after start
 - that `Unmanaged` network policy really leaves no NetworkPolicy behind
 - how PVCs behave across suspend and resume on our storage
+
+## More Information
+
+Milestone 1, 2026-10-26, agent-sandbox v1.0.8 on kind: a plain `Sandbox` per session (no template, claim or warm pool) works with config pushed after start by the supervisor. Each `volumeClaimTemplates` entry is mounted as a pod volume named after the template, and its PVC (`<template>-<sandbox>`) outlives the pod. Deleting the pod makes the controller create a new one with the same PVC, and the session resumes from its working tree and transcript. Claims, warm pools, suspend and the `Unmanaged` network policy setting are still unchecked.

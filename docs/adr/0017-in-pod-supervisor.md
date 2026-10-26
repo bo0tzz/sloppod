@@ -39,3 +39,7 @@ Being outbound-only, the supervisor needs no ingress to session pods. That fits 
 
 - Good: the runtime never needs exec access into pods, and the pod lifecycle is owned by one component.
 - Bad: another binary to ship in the session image.
+
+## More Information
+
+Milestone 1, 2026-10-26: the session-scoped identity is the pod's projected ServiceAccount token (audience `sloppod`, from a ServiceAccount with no permissions). The runtime checks it with TokenReview, whose `authentication.kubernetes.io/pod-name` extra names the pod, and the pod's label names the session. No per-session secret is delivered, and the same works for pods from a warm pool. On termination the supervisor stops the agent and syncs the transcript; shutdown handlers and the shutdown report are not built yet.
