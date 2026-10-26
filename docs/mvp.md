@@ -22,7 +22,7 @@ A sloppod session can take a change to this repository from prompt to reviewed P
 | Async ([4](adr/0004-asynchronous-interaction.md)) | Prompts and steering through the adapter; proposals return a pending ID | Inbox urgency levels, delivery of grant changes |
 | Park/wake ([5](adr/0005-park-and-wake.md)) | Not in the MVP | Everything |
 | Self-reference ([6](adr/0006-self-reference.md)) | Not in the MVP | Everything |
-| Memory ([8](adr/0008-shared-memory-service.md)) | Claude Code's built-in auto memory, with `autoMemoryDirectory` pointed at a per-project directory that the runtime persists and restores like the transcript blob (merging per file when sessions overlap). Your user-level instructions are rendered into every session, and the repository carries its own `CLAUDE.md` | memini |
+| Memory ([8](adr/0008-shared-memory-service.md)) | memini through its Claude Code plugin (loaded via the adapter's SDK `plugins` option). The namespace comes from the session's project (`MEMINI_NAMESPACE`), the key is attached by the authorizer, and Claude Code's built-in auto memory is off. Your user-level instructions are rendered into every session, and the repository carries its own `CLAUDE.md` | Namespaces pinned by the authorizer, limits on memini's escape hatches, project links |
 | ACP ([9](adr/0009-acp.md)) | Runtime as ACP client to `claude-agent-acp`, and `/acp` over WebSocket for the UI | Other agents, several UIs per session |
 | Pods ([10](adr/0010-sessions-run-in-pods.md), [16](adr/0016-agent-sandbox.md), [17](adr/0017-in-pod-supervisor.md)) | One Sandbox per session, fixed resources, supervisor connects outward; work in progress pushed and transcript synced on shutdown | Warm pools, resize, suspend for parking, `exec@<host>`, agent shutdown handlers |
 | Enforcement ([11](adr/0011-enforcement-at-the-pod-boundary.md)) | Egress allowlist plus redirection to the Envoy listener; an authorizer with request policies for the model API and GitHub (reads, session-branch pushes, writes refused with a pointer to the propose tool) | Request policies for more services, grant-driven changes, short-lived SSH certs |
@@ -36,5 +36,5 @@ A sloppod session can take a change to this repository from prompt to reviewed P
 
 1. **Skeleton:** runtime binary, Postgres schema, the session image with supervisor and adapter, and the egress listener plus authorizer with the model-API request policy. A CLI test client creates a session and gets a reply from a prompt.
 2. **Chat:** the UI connects over `/acp`, with streaming, permission requests, steering, and resume after the pod is deleted.
-3. **Repository work:** checkout of the session branch, mise tools, the GitHub request policy, pushing to the session branch, and the `github.pr.create` proposal with a review screen and an executor.
+3. **Repository work:** checkout of the session branch, memini, mise tools, the GitHub request policy, pushing to the session branch, and the `github.pr.create` proposal with a review screen and an executor.
 4. **Switch:** develop sloppod in sloppod.
