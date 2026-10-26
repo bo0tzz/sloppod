@@ -20,7 +20,18 @@ Proposed option: **an in-pod supervisor**. It is part of the runtime codebase an
 2. Fetches the session config: instructions, settings, the transcript blob, the checkout spec and the tool set.
 3. Prepares the pod: restores the transcript, checks out the session branch, links the read-only tool store.
 4. Starts the agent adapter, bridges its stdio ACP to the runtime, and passes steering through.
-5. Syncs the transcript blob back at the end of each turn and before parking, and pushes work in progress to the session branch when parking.
+5. Syncs the transcript blob back at the end of each turn.
+6. Keeps the session's shutdown handlers ([ADR 10](0010-sessions-run-in-pods.md)), registered by the agent through a runtime tool.
+
+On termination (`SIGTERM`, whether from preemption, eviction, a move, parking or a restart), within the pod's grace period, the supervisor:
+
+1. Interrupts the agent, so no new model calls are made.
+2. Runs the shutdown handlers in parallel, each with its own timeout, within a fixed share of the grace period.
+3. Records each handler's result, plus every still-running process it didn't know about (command line and tail of its output).
+4. Commits and pushes work in progress to the session branch, and syncs the transcript blob.
+5. Sends the runtime a shutdown report, which becomes an inbox item when the session next runs.
+
+The grace period is sized for handlers plus sync; the default is 90 s. A pod killed without a signal skips all of this, so the runtime records a lost pod and the next run starts from the last sync.
 
 Being outbound-only, the supervisor needs no ingress to session pods. That fits default-deny policies and doesn't need the agent-sandbox router.
 
