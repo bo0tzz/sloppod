@@ -17,6 +17,7 @@ Capabilities ([ADR 2](0002-capabilities.md)) need enforcement that works for any
 
 Chosen option: **a per-request authorizer at egress**.
 
+- **Default-deny egress.** A session with no grants reaches nothing but its channel to the runtime ([ADR 2](0002-capabilities.md)). All allowed egress, including `web:read`, goes through the authorizer. For `web:read` the authorizer allows only `GET`/`HEAD`, attaches no credentials and strips any the agent supplies. DNS is allowlisted to match.
 - **Credentials never enter the pod.** Session traffic to authenticated services is redirected (`toPorts[].listener` → a CiliumEnvoyConfig) to an Envoy listener that:
   1. terminates TLS with a certificate from the runtime's CA, which the pod trusts
   2. calls sloppod's **authorizer** through `ext_authz`
@@ -40,6 +41,14 @@ Chosen option: **a per-request authorizer at egress**.
 - Bad: every authenticated request costs one round trip to the authorizer, and the authorizer is critical: if it's down, no authenticated egress.
 - Bad: we write raw Envoy configuration in CiliumEnvoyConfig, which Cilium barely validates. A listener redirect can't be combined with Cilium's own L7 rules on the same port.
 - Bad: TLS interception requires pods to trust the runtime CA. Clients that pin certificates break.
+
+### Limits
+
+- **What a request does doesn't always match its method or path.** Kubernetes `exec`/`attach`/`port-forward` and service `proxy` are subresources, and `exec` over WebSocket starts as a `GET`. GitHub has POSTs that only read (`/markdown`, GraphQL queries), writes that bypass git (`PUT …/contents/{path}`), and `repository_dispatch`/`workflow_dispatch`. Request policies are therefore per-service allowlists written with that service's semantics, and the credential's own scope (RBAC, GitHub App permissions) is the outer bound. GraphQL needs real parsing.
+- **Read-only web still leaks.** `web:read` prevents writes to the open web, but data can leave through query strings or DNS names. Prefer narrow variants (docs sites, package registries) over the open web, or reads through a runtime-side fetch tool.
+- **Credentials found in content** (`.env` files, CI logs, git history) are stripped from requests to policed services. Elsewhere, default-deny egress is the only defense.
+- **The agent's own tooling** can talk to its provider beyond inference (e.g. publishing Artifacts). The model policy allows only the inference endpoints unless a grant says otherwise.
+- **SSH and other raw TCP** sit outside request-level control: `exec@<host>` is broad by nature, so it gets short TTLs, approval and forced commands where possible.
 
 ## More Information
 
