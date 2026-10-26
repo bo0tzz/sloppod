@@ -50,8 +50,8 @@ A **grant** is a capability given to a session for a duration.
   The human approves as-is, narrows it, swaps the target, or rejects it. When the agent suggests no target, the human picks one. The reason is recorded for audit but doesn't affect the decision. Requests have a pending TTL separate from the grant's maximum duration, and support delayed start. A session can never approve a request. This follows Teleport access requests and Sandstorm's Powerbox.
 - **Only humans approve.** There is no session-facing surface for approving anything. Approvals come from a human, or from a standing approval or policy a human configured.
 - **Standing approvals:** a human can pre-approve a request pattern (capability, target, which sessions, TTL) so matching requests are granted automatically.
-- **Profiles** are named default sets of capabilities.
-- **Starting set:** a new session gets a suggested starting set (capabilities, resources, model) from a cheap model reading the first message. The human confirms; anything under an `auto` policy just applies.
+- **Profiles** are named default sets of capabilities. A project can name one as its default ([ADR 1](0001-sessions-decoupled-from-directories.md)).
+- **Starting set:** a new session gets a suggested starting set (project, capabilities, resources, model) from a cheap model reading the first message. The human confirms; anything under an `auto` policy just applies.
 - **Revocation:** a grant can be revoked at any time. Revocation takes effect at the enforcement layer ([ADR 11](0011-enforcement-at-the-pod-boundary.md)), not by asking the agent.
 
 ### Consequences

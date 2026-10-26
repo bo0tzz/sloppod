@@ -15,6 +15,7 @@ The runtime's API is exposed to sessions as a capability.
 - **Propose (gated):** changes to runtime config are a proposal kind ([ADR 3](0003-proposals-and-trusted-executor.md)). This covers:
   - new or changed capability definitions
   - profiles
+  - projects: creating them, and re-filing sessions
   - instruction snippets
   - standing approvals
   - proposal kinds
