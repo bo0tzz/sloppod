@@ -29,7 +29,10 @@ An agent never performs an outward action itself. It submits a **proposal**: a s
   - A **standing approval** auto-approves proposals that match a pattern (kind, target, scope and TTL), e.g. "PRs on `bo0tzz/sloppod` until Friday". The executor still performs them, so there is only ever one path for outward actions.
   - An optional reviewer model in the style of auto mode can auto-approve proposals that clearly match the session's stated intent, and escalate the rest.
 - **Submission:** agents submit proposals with an explicit tool from the runtime. The per-request authorizer ([ADR 11](0011-enforcement-at-the-pod-boundary.md)) rejects direct attempts at an outward action, such as `POST /repos/{owner}/{repo}/pulls` from `gh pr create`, with a 403. The 403 says to use the propose tool, so CLI habits redirect themselves.
-- **Repositories:** credentials attached to a session's requests are read-only, except pushes to the session's own branches. The authorizer enforces this by inspecting the ref updates in git's `receive-pack` request body, which an HTTP path rule can't see. GitHub rulesets add defense in depth. Creating PRs, merging, tagging and pushing to other branches are proposals.
+- **Repositories:** credentials attached to a session's requests are read-only, except pushes to the session's own branches. The authorizer enforces this by inspecting the ref updates in git's `receive-pack` request body, which an HTTP path rule can't see. Opening a PR, merging, tagging and pushing to other branches are proposals.
+  - PRs are opened from the session branch, so the agent can keep iterating on review feedback.
+  - Merging stays a human decision, so later pushes never reach the default branch unreviewed.
+- **CI on session branches:** pushes trigger workflows like any collaborator's push, including workflow files the agent changed. We treat that as collaborator-level trust rather than adding machinery such as forks or blocking workflow edits. High-value secrets belong in GitHub environments restricted to protected branches. If needed later, the authorizer can ask before accepting a push that touches workflow files.
 
 ### Consequences
 

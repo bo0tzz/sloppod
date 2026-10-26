@@ -29,6 +29,10 @@ Examples:
 - `exec@<host>`
 - `namespace` (a per-session namespace for extra workloads)
 - `resources` (CPU and memory for the session pod)
+- `model:<provider>` (inference access for the session's agent)
+- `web:read` (`GET`/`HEAD` to the open web with no credentials attached), plus narrower variants such as docs sites or package registries
+
+**Default deny:** a session with no grants can reach nothing except its own channel to the runtime. Everything else is a capability, including model access and read-only web access.
 
 A **grant** is a capability given to a session for a duration.
 
