@@ -24,9 +24,10 @@ A sloppod session can take a change to this repository from prompt to reviewed P
 | Self-reference ([6](adr/0006-self-reference.md)) | Not in the MVP | Everything |
 | Memory ([8](adr/0008-shared-memory-service.md)) | Not in the MVP. Claude Code's built-in auto memory off, with no replacement yet | memini |
 | ACP ([9](adr/0009-acp.md)) | Runtime as ACP client to `claude-agent-acp`, and `/acp` over WebSocket for the UI | Other agents, several UIs per session |
-| Pods ([10](adr/0010-sessions-run-in-pods.md), [16](adr/0016-agent-sandbox.md), [17](adr/0017-in-pod-supervisor.md)) | One Sandbox per session, fixed resources, supervisor connects outward | Warm pools, resize, suspend for parking, `exec@<host>` |
+| Pods ([10](adr/0010-sessions-run-in-pods.md), [16](adr/0016-agent-sandbox.md), [17](adr/0017-in-pod-supervisor.md)) | One Sandbox per session, fixed resources, supervisor connects outward; work in progress pushed and transcript synced on shutdown | Warm pools, resize, suspend for parking, `exec@<host>`, agent shutdown handlers |
 | Enforcement ([11](adr/0011-enforcement-at-the-pod-boundary.md)) | Egress allowlist plus redirection to the Envoy listener; an authorizer with request policies for the model API and GitHub (reads, session-branch pushes, writes refused with a pointer to the propose tool) | Request policies for more services, grant-driven changes, short-lived SSH certs |
-| Tools ([12](adr/0012-tooling-via-mise.md)) | `mise install` from the repository's locked `mise.toml` at session start, into the session's own volume | Trusted installer, read-only store, capability tool fragments, pull-through caches |
+| Tools ([12](adr/0012-tooling-via-mise.md)) | `mise install` from the repository's locked `mise.toml` at session start, into the session's own volume | Trusted installer, read-only store, base dev tool set, tool requests from the agent, dependency caching |
+| Repositories | Fresh clone into the session's volume, through the authorizer | Runtime-managed mirrors that sessions clone from |
 | Containers ([13](adr/0013-container-workloads.md)) | Not in the MVP | Everything |
 | UI ([18](adr/0018-ui.md)) | Session list, chat (streaming, tool calls, permission requests, steering), PR proposal review | Board, approval queue, grants, config |
 | Storage ([15](adr/0015-postgres.md)) | Postgres with migrations | — |
