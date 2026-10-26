@@ -1,0 +1,165 @@
+{{- $required := list .Values.database.existingSecret .Values.claude.existingSecret .Values.github.appId .Values.github.existingSecret -}}
+{{- if has "" $required }}
+{{- fail "database.existingSecret, claude.existingSecret, github.appId and github.existingSecret are required" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sloppod.fullname" . }}
+  labels:
+    {{- include "sloppod.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  # Live session state is in memory; one runtime at a time.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "sloppod.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "sloppod.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "sloppod.fullname" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: runtime
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+            - name: SLOPPOD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SLOPPOD_SERVICE
+              value: {{ include "sloppod.fullname" . }}
+            - name: SLOPPOD_RUNTIME_SELECTOR
+              value: app.kubernetes.io/name=sloppod,app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=runtime
+            - name: SLOPPOD_SESSION_IMAGE
+              value: "{{ .Values.session.image.repository }}:{{ .Values.session.image.tag | default .Chart.AppVersion }}"
+            - name: SLOPPOD_SESSION_IMAGE_PULL_POLICY
+              value: {{ .Values.session.image.pullPolicy }}
+            - name: SLOPPOD_SESSION_SERVICE_ACCOUNT
+              value: {{ include "sloppod.sessionServiceAccount" . }}
+            - name: SLOPPOD_SESSION_STORAGE_SIZE
+              value: {{ .Values.session.storage.size | quote }}
+            {{- with .Values.session.storage.storageClass }}
+            - name: SLOPPOD_SESSION_STORAGE_CLASS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.session.cpu }}
+            - name: SLOPPOD_SESSION_CPU
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.session.memory }}
+            - name: SLOPPOD_SESSION_MEMORY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.session.defaultMode }}
+            - name: SLOPPOD_DEFAULT_MODE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.session.model }}
+            - name: SLOPPOD_AGENT_MODEL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.session.directHosts }}
+            - name: SLOPPOD_DIRECT_HOSTS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret }}
+                  key: {{ .Values.database.secretKey }}
+            - name: SLOPPOD_CLAUDE_OAUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.claude.existingSecret }}
+                  key: {{ .Values.claude.secretKey }}
+            - name: SLOPPOD_GITHUB_APP_ID
+              value: {{ .Values.github.appId | quote }}
+            - name: SLOPPOD_GITHUB_APP_PRIVATE_KEY_FILE
+              value: /etc/sloppod/github/private-key
+            {{- if .Values.memini.url }}
+            - name: SLOPPOD_MEMINI_URL
+              value: {{ .Values.memini.url | quote }}
+            - name: SLOPPOD_MEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "memini.existingSecret is required with memini.url" .Values.memini.existingSecret }}
+                  key: {{ .Values.memini.secretKey }}
+            {{- end }}
+            - name: SLOPPOD_GIT_NAME
+              value: {{ .Values.git.name | quote }}
+            - name: SLOPPOD_GIT_EMAIL
+              value: {{ .Values.git.email | quote }}
+            {{- if .Values.instructions }}
+            - name: SLOPPOD_INSTRUCTIONS_FILE
+              value: /etc/sloppod/config/instructions.md
+            {{- end }}
+            - name: SLOPPOD_ENVOY_TRUSTED_CA
+              value: {{ .Values.envoyTrustedCA | quote }}
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: authz
+              containerPort: 9001
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 30
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: github
+              mountPath: /etc/sloppod/github
+              readOnly: true
+            - name: config
+              mountPath: /etc/sloppod/config
+              readOnly: true
+      volumes:
+        - name: github
+          secret:
+            secretName: {{ .Values.github.existingSecret }}
+            items:
+              - key: {{ .Values.github.secretKey }}
+                path: private-key
+        - name: config
+          configMap:
+            name: {{ include "sloppod.fullname" . }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

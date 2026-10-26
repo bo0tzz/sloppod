@@ -1,0 +1,69 @@
+image:
+  repository: ghcr.io/bo0tzz/sloppod
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+session:
+  image:
+    repository: ghcr.io/bo0tzz/sloppod-session
+    # Defaults to the chart's appVersion.
+    tag: ""
+    pullPolicy: IfNotPresent
+  storage:
+    size: 20Gi
+    storageClass: ""
+  cpu: ""
+  memory: 4Gi
+  # ACP mode new sessions start in: default, acceptEdits, plan, bypassPermissions...
+  defaultMode: ""
+  # Model for the agent, e.g. claude-opus-5-5. Empty uses the agent's default.
+  model: ""
+  # Hosts sessions may reach without the authorizer, e.g. package registries. Empty keeps the built-in list.
+  directHosts: []
+
+# Postgres connection URI, from an existing Secret (e.g. CloudNativePG's `<cluster>-app`, key `uri`).
+database:
+  existingSecret: ""
+  secretKey: uri
+
+# Long-lived Claude OAuth token from `claude setup-token`. It stays in the runtime; sessions only get a placeholder.
+claude:
+  existingSecret: ""
+  secretKey: oauth-token
+
+# GitHub App that sessions act through. Install it on the repositories sessions may work on.
+github:
+  appId: ""
+  existingSecret: ""
+  secretKey: private-key
+
+# Optional memory service (ADR 8).
+memini:
+  url: ""
+  existingSecret: ""
+  secretKey: api-key
+
+git:
+  name: sloppod
+  email: sloppod@users.noreply.github.com
+
+# Rendered into every session as the agent's user-level instructions (CLAUDE.md).
+instructions: ""
+
+# CA bundle inside Cilium's Envoy for verifying real upstreams.
+envoyTrustedCA: /etc/ssl/certs/ca-certificates.crt
+
+logLevel: info,sloppod=debug
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

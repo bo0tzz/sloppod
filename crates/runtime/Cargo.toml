@@ -12,12 +12,36 @@ name = "sloppod"
 path = "src/main.rs"
 
 [dependencies]
+sloppod-contracts.workspace = true
 sloppod-protocol.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
 clap.workspace = true
+envoy-types.workspace = true
+futures.workspace = true
+graphql-parser.workspace = true
+jsonwebtoken.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
+prost.workspace = true
+rand.workspace = true
+rcgen.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
+tonic.workspace = true
+tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

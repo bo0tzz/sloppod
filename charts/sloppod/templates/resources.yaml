@@ -1,0 +1,92 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sloppod.fullname" . }}
+  labels:
+    {{- include "sloppod.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "sloppod.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+    # Envoy's ext_authz calls the authorizer here (ADR 11).
+    - name: authz
+      port: 9001
+      targetPort: authz
+      appProtocol: kubernetes.io/h2c
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "sloppod.fullname" . }}
+  labels:
+    {{- include "sloppod.labels" . | nindent 4 }}
+---
+# Session pods run as this account. It has no permissions; its projected token only identifies the pod to the runtime.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "sloppod.sessionServiceAccount" . }}
+  labels:
+    {{- include "sloppod.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "sloppod.fullname" . }}
+  labels:
+    {{- include "sloppod.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [agents.x-k8s.io]
+    resources: [sandboxes]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [cilium.io]
+    resources: [ciliumnetworkpolicies, ciliumenvoyconfigs]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [sloppod-ca]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "sloppod.fullname" . }}
+  labels:
+    {{- include "sloppod.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "sloppod.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "sloppod.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# Supervisors authenticate with their pod's projected token, checked through TokenReview (ADR 17).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "sloppod.fullname" . }}-{{ .Release.Namespace }}-auth-delegator
+  labels:
+    {{- include "sloppod.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "sloppod.fullname" . }}
+    namespace: {{ .Release.Namespace }}

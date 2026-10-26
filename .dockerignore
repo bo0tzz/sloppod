@@ -1,0 +1,9 @@
+target
+.git
+dev/.state
+ui/node_modules
+ui/build
+ui/.svelte-kit
+ui/.playwright
+ui/.screenshots
+ui/test-results

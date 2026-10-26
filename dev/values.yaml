@@ -1,0 +1,20 @@
+image:
+  repository: ghcr.io/bo0tzz/sloppod
+  tag: dev
+  pullPolicy: Never
+session:
+  image:
+    repository: ghcr.io/bo0tzz/sloppod-session
+    tag: dev
+    pullPolicy: Never
+  storage:
+    size: 5Gi
+  memory: 3Gi
+  model: claude-haiku-5-5
+database:
+  existingSecret: sloppod-db
+claude:
+  existingSecret: sloppod-claude
+github:
+  appId: "5484236"
+  existingSecret: sloppod-github
