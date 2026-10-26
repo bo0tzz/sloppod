@@ -42,4 +42,4 @@ Spike, 2026-10-26, `claude-agent-acp` 0.97.0 with Haiku:
 - **During a tool call:** a steer sent 5.5 s into a 40 s foreground command moved the command to the background, and the steer was answered at 8.5 s.
 - **During generation:** a steer sent mid-essay cut it off and was answered about 1 s later.
 
-For comparison, in Claude Code's own terminal UI, 93% of 441 messages queued while the agent worked were taken up after 0–1 tool rounds.
+For comparison, in Claude Code's own terminal UI, 93% of 441 messages queued while the agent worked were taken up after 0–1 tool rounds. That is a tendency, not a guarantee: runs of five or more tool calls and a message without the queued message being picked up have been seen since.
