@@ -38,3 +38,7 @@ Implementation:
 - [16. Session pods are agent-sandbox Sandboxes](docs/adr/0016-agent-sandbox.md)
 - [17. An in-pod supervisor bridges the agent to the runtime](docs/adr/0017-in-pod-supervisor.md)
 - [18. The UI is Svelte with @immich/ui](docs/adr/0018-ui.md)
+
+## License
+
+[AGPL-3.0](LICENSE)
