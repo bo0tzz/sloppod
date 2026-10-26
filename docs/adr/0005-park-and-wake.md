@@ -11,7 +11,7 @@ Some work has to wait for something outside the session, such as next week's ver
 
 A session moves through the states `active → parked → woken → active` (or `done`).
 
-- **Parking** pushes any work in progress to the session branch, keeps the transcript, frees the pod, and hides the session from the active board. The agent can propose parking itself, e.g. "park until the Renovate PRs for X land".
+- **Parking** keeps the session's workdir volume and transcript, snapshots work in progress to the runtime ([ADR 19](0019-repositories-from-runtime-mirrors.md)), frees the pod, and hides the session from the active board. The agent can propose parking itself, e.g. "park until the Renovate PRs for X land".
 - **Wake conditions** can be:
   - a time
   - an event (a webhook, e.g. a PR opened or a release published)
