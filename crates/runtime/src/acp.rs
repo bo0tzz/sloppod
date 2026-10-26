@@ -87,7 +87,8 @@ impl Conn {
         }
     }
 
-    async fn load(self: &Arc<Self>, session: Uuid) -> Result<Value, RpcError> {
+    /// Replays a session; returns the load response and the permission requests still open, which go out after it.
+    async fn load(self: &Arc<Self>, session: Uuid) -> Result<(Value, Vec<(u64, Value)>), RpcError> {
         if db::get_session(&self.state.db, session)
             .await
             .map_err(internal)?
@@ -102,14 +103,11 @@ impl Conn {
         for (_, update) in &replay.events {
             self.send(session_update(session, update));
         }
-        for (pid, params) in replay.permissions {
-            self.send_permission(session, pid, params).await;
-        }
         let task = tokio::spawn(self.clone().forward(session, events, after));
         if let Some(old) = self.loaded.lock().await.insert(session, task) {
             old.abort();
         }
-        Ok(replay.agent_state)
+        Ok((replay.agent_state, replay.permissions))
     }
 
     async fn handle_request(self: Arc<Self>, id: Value, method: String, params: Value) {
@@ -117,6 +115,18 @@ impl Conn {
             .as_str()
             .and_then(|s| s.parse::<Uuid>().ok());
         let hub = &self.state.hub;
+        if let ("session/load" | "session/resume", Some(session)) = (method.as_str(), session) {
+            match self.load(session).await {
+                Ok((state, permissions)) => {
+                    self.reply(id, Ok(state));
+                    for (pid, params) in permissions {
+                        self.send_permission(session, pid, params).await;
+                    }
+                }
+                Err(e) => self.reply(id, Err(e)),
+            }
+            return;
+        }
         let result = match (method.as_str(), session) {
             ("initialize", _) => Ok(self.initialize()),
             ("authenticate", _) => Ok(json!({})),
@@ -125,7 +135,6 @@ impl Conn {
                 -32601,
                 "create sessions with POST /api/v1/sessions",
             )),
-            ("session/load" | "session/resume", Some(session)) => self.load(session).await,
             ("session/prompt", Some(session)) => hub.prompt(session, params).await,
             ("_session/steering", Some(session)) => hub.steer(session, params).await,
             ("session/set_mode", Some(session)) => hub.set_mode(session, params).await,

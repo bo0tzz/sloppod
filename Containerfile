@@ -7,7 +7,9 @@ COPY . .
 ARG CARGO_BUILD_JOBS=4
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p sloppod-runtime -p sloppod-supervisor \
+    # COPY doesn't give changed sources newer mtimes than the cached target dir, so cargo would skip them.
+    find crates -type f -exec touch {} + \
+    && cargo build --release --locked -p sloppod-runtime -p sloppod-supervisor \
     && mkdir /out && cp target/release/sloppod target/release/sloppod-supervisor /out/
 
 FROM node:24.22.1-trixie-slim AS ui

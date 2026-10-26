@@ -1,0 +1,756 @@
+#!/usr/bin/env node
+// A mock sloppod runtime implementing docs/api.md (REST and ACP over /acp) with a scripted fake agent.
+//
+//   node mock/server.mjs [--port 8080] [--static build] [--delay 40] [--no-seed]
+//
+// --static serves a built UI with SPA fallback, like the runtime does. --delay is the pause between
+// streamed chunks in milliseconds; turn steps are multiples of it.
+
+import { randomBytes, randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import http from 'node:http';
+import path from 'node:path';
+import { parseArgs } from 'node:util';
+import { formatPatch, structuredPatch } from 'diff';
+import { WebSocketServer } from 'ws';
+
+const { values: args } = parseArgs({
+  options: {
+    port: { type: 'string', default: process.env.PORT ?? '8080' },
+    static: { type: 'string' },
+    delay: { type: 'string', default: process.env.MOCK_DELAY ?? '40' },
+    'no-seed': { type: 'boolean', default: false },
+  },
+});
+
+const DELAY = Number(args.delay);
+const REPOS = ['bo0tzz/sloppod', 'bo0tzz/memini', 'immich-app/static-pages'];
+const MODES = [
+  { id: 'default', name: 'Default', description: 'Ask before edits and commands' },
+  { id: 'acceptEdits', name: 'Accept edits', description: 'Edit files without asking' },
+  { id: 'plan', name: 'Plan', description: 'Read-only planning' },
+  { id: 'bypassPermissions', name: 'Bypass permissions', description: 'Never ask' },
+];
+const CANCELLED = Symbol('cancelled');
+
+/** @type {Map<string, MockSession>} */
+const sessions = new Map();
+const proposals = new Map();
+const connections = new Set();
+
+const now = () => new Date().toISOString();
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const sha = () => randomBytes(20).toString('hex');
+
+class MockSession {
+  constructor(data) {
+    this.data = data;
+    /** Every `session/update` params object, replayed by `session/load`. */
+    this.log = [];
+    /** @type {Set<Connection>} */
+    this.subscribers = new Set();
+    /** Open permission requests by toolCallId. */
+    this.pending = new Map();
+    this.turn = null;
+    this.modeId = 'default';
+  }
+
+  emit(update) {
+    const params = { sessionId: this.data.id, update };
+    this.log.push(params);
+    for (const conn of this.subscribers) conn.notify('session/update', params);
+  }
+
+  setPhase(phase) {
+    this.data.phase = phase;
+    this.data.updated_at = now();
+    for (const conn of this.subscribers) conn.notify('_sloppod/session', { session: this.data });
+  }
+
+  modeState() {
+    return { currentModeId: this.modeId, availableModes: MODES };
+  }
+}
+
+class Connection {
+  constructor(ws) {
+    this.ws = ws;
+    this.loaded = new Set();
+    this.nextId = 1;
+    this.awaiting = new Map();
+  }
+
+  send(message) {
+    if (this.ws.readyState === this.ws.OPEN) this.ws.send(JSON.stringify(message));
+  }
+
+  notify(method, params) {
+    this.send({ jsonrpc: '2.0', method, params });
+  }
+
+  request(method, params, onResponse) {
+    const id = this.nextId++;
+    this.awaiting.set(id, onResponse);
+    this.send({ jsonrpc: '2.0', id, method, params });
+    return id;
+  }
+
+  respond(id, result) {
+    this.send({ jsonrpc: '2.0', id, result });
+  }
+
+  error(id, code, message) {
+    this.send({ jsonrpc: '2.0', id, error: { code, message } });
+  }
+}
+
+// --- the fake agent -------------------------------------------------------------------------
+
+const FILE = 'ui/src/lib/acp/connection.ts';
+const OLD_SNIPPET = `  #scheduleReconnect() {
+    this.#timer = setTimeout(() => this.connect(), 1000);
+  }`;
+const NEW_SNIPPET = `  #scheduleReconnect() {
+    const delay = Math.min(500 * 2 ** this.#attempt, MAX_BACKOFF_MS);
+    this.#attempt++;
+    this.#timer = setTimeout(() => this.connect(), delay);
+  }`;
+const TEST_OUTPUT = `> sloppod-ui@0.0.0 test
+> playwright test reconnect
+
+Running 3 tests using 1 worker
+
+  ✓  1 reconnect.spec.ts:5:1 › reconnects after the socket drops (1.2s)
+  ✓  2 reconnect.spec.ts:18:1 › backs off between attempts (2.4s)
+  ✓  3 reconnect.spec.ts:31:1 › replays history once after reconnecting (1.1s)
+
+  3 passed (5.3s)`;
+
+function chunks(text) {
+  const words = text.match(/\S+\s*/g) ?? [text];
+  const out = [];
+  for (let i = 0; i < words.length; i += 3) out.push(words.slice(i, i + 3).join(''));
+  return out;
+}
+
+function promptText(prompt) {
+  return (Array.isArray(prompt) ? prompt : [])
+    .map((block) => (block?.type === 'text' ? block.text : ''))
+    .join('');
+}
+
+function echoUser(session, text) {
+  session.emit({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text }, messageId: randomUUID() });
+}
+
+function requestPermission(session, toolCall, options) {
+  return new Promise((resolve) => {
+    const pending = { toolCall, options, resolve, requests: new Map() };
+    session.pending.set(toolCall.toolCallId, pending);
+    session.setPhase('waiting');
+    for (const conn of session.subscribers) sendPermission(session, pending, conn);
+  });
+}
+
+function sendPermission(session, pending, conn) {
+  const toolCallId = pending.toolCall.toolCallId;
+  const rpcId = conn.request(
+    'session/request_permission',
+    { sessionId: session.data.id, toolCall: pending.toolCall, options: pending.options },
+    (message) => {
+      pending.requests.delete(conn);
+      if (session.pending.get(toolCallId) !== pending) return;
+      resolvePermission(session, pending, message.result?.outcome ?? { outcome: 'cancelled' }, conn);
+    },
+  );
+  pending.requests.set(conn, rpcId);
+}
+
+function resolvePermission(session, pending, outcome, answeredBy) {
+  const toolCallId = pending.toolCall.toolCallId;
+  session.pending.delete(toolCallId);
+  for (const conn of pending.requests.keys()) {
+    if (conn !== answeredBy) conn.notify('_sloppod/permission_resolved', { sessionId: session.data.id, toolCallId });
+  }
+  pending.requests.clear();
+  if (session.data.phase === 'waiting') session.setPhase('working');
+  pending.resolve(outcome);
+}
+
+async function runTurn(session, text, { echo = true } = {}) {
+  const turn = { cancelled: false, steers: [] };
+  session.turn = turn;
+  session.setPhase('working');
+  if (echo) echoUser(session, text);
+  try {
+    await agentScript(session, turn, text);
+    return 'end_turn';
+  } catch (error) {
+    if (error === CANCELLED) {
+      for (const params of [...session.log]) {
+        const update = params.update;
+        if (update.sessionUpdate === 'tool_call' && update.status !== 'completed' && !isFinished(session, update.toolCallId)) {
+          session.emit({ sessionUpdate: 'tool_call_update', toolCallId: update.toolCallId, status: 'failed' });
+        }
+      }
+      return 'cancelled';
+    }
+    throw error;
+  } finally {
+    session.turn = null;
+    if (sessions.has(session.data.id) && session.data.phase !== 'stopped') session.setPhase('idle');
+  }
+}
+
+function isFinished(session, toolCallId) {
+  return session.log.some(
+    ({ update }) =>
+      update.toolCallId === toolCallId &&
+      (update.status === 'completed' || update.status === 'failed'),
+  );
+}
+
+async function agentScript(session, turn, prompt) {
+  const delay = session.fast ? 0 : DELAY;
+  const checkCancel = () => {
+    if (turn.cancelled) throw CANCELLED;
+  };
+  const say = async (text, kind = 'agent_message_chunk') => {
+    const messageId = randomUUID();
+    for (const piece of chunks(text)) {
+      session.emit({ sessionUpdate: kind, content: { type: 'text', text: piece }, messageId });
+      await sleep(delay);
+      checkCancel();
+    }
+  };
+  // A step boundary: where a real agent would pick up steering messages.
+  const step = async (n = 1) => {
+    await sleep(delay * n);
+    checkCancel();
+    while (turn.steers.length > 0) {
+      const steer = turn.steers.shift();
+      await say(`Got your message mid-turn: “${steer}”. I'll take that into account for the rest of this turn.`);
+    }
+  };
+  const tool = (fields) => session.emit({ sessionUpdate: 'tool_call', ...fields });
+  const update = (toolCallId, fields) => session.emit({ sessionUpdate: 'tool_call_update', toolCallId, ...fields });
+  const plan = (statuses) =>
+    session.emit({
+      sessionUpdate: 'plan',
+      entries: [
+        { content: 'Read the reconnect code', priority: 'medium', status: statuses[0] },
+        { content: 'Add exponential backoff', priority: 'high', status: statuses[1] },
+        { content: 'Run the end-to-end tests', priority: 'medium', status: statuses[2] },
+        { content: 'Push and propose a pull request', priority: 'low', status: statuses[3] },
+      ],
+    });
+
+  await step(3);
+  await say(
+    `The request is: “${prompt.trim().slice(0, 200)}”. Before changing anything I should read how the socket reconnects today, then add backoff and run the tests.`,
+    'agent_thought_chunk',
+  );
+  plan(['in_progress', 'pending', 'pending', 'pending']);
+  await step(2);
+  await say("I'll start by reading the connection code to see how reconnects work today.");
+  await step(2);
+
+  const readId = randomUUID();
+  tool({
+    toolCallId: readId,
+    title: `Read ${FILE}`,
+    kind: 'read',
+    status: 'pending',
+    locations: [{ path: `/workspace/sloppod/${FILE}`, line: 40 }],
+    rawInput: { file_path: `/workspace/sloppod/${FILE}` },
+  });
+  await step(2);
+  update(readId, { status: 'in_progress' });
+  await step(2);
+  update(readId, {
+    status: 'completed',
+    content: [{ type: 'content', content: { type: 'text', text: '```ts\n' + OLD_SNIPPET + '\n```' } }],
+  });
+  plan(['completed', 'in_progress', 'pending', 'pending']);
+  await step(2);
+
+  await say(
+    'Reconnects use a **fixed one-second delay**, so a runtime restart gets hammered. I’ll switch to exponential backoff, capped at ten seconds:\n\n- start at 500 ms\n- double on every failed attempt\n- reset once a `session/load` succeeds',
+  );
+  await step(2);
+
+  const editId = randomUUID();
+  const editCall = {
+    toolCallId: editId,
+    title: `Edit ${FILE}`,
+    kind: 'edit',
+    status: 'pending',
+    content: [{ type: 'diff', path: `/workspace/sloppod/${FILE}`, oldText: OLD_SNIPPET, newText: NEW_SNIPPET }],
+    locations: [{ path: `/workspace/sloppod/${FILE}`, line: 40 }],
+  };
+  tool(editCall);
+  let allowed = true;
+  if (session.modeId === 'default' || session.modeId === 'plan') {
+    const outcome = await requestPermission(session, editCall, [
+      { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
+      { optionId: 'allow_always', name: 'Always allow edits', kind: 'allow_always' },
+      { optionId: 'reject', name: 'Reject', kind: 'reject_once' },
+    ]);
+    checkCancel();
+    if (outcome.outcome !== 'selected') throw CANCELLED;
+    allowed = outcome.optionId !== 'reject';
+    if (outcome.optionId === 'allow_always') {
+      session.modeId = 'acceptEdits';
+      session.emit({ sessionUpdate: 'current_mode_update', currentModeId: 'acceptEdits' });
+    }
+  }
+  if (!allowed) {
+    update(editId, { status: 'failed' });
+    await step(1);
+    await say("Understood, I won't make that edit. Let me know how you'd like to approach it instead.");
+    plan(['completed', 'pending', 'pending', 'pending']);
+    return;
+  }
+  update(editId, { status: 'in_progress' });
+  await step(2);
+  update(editId, { status: 'completed' });
+  plan(['completed', 'completed', 'in_progress', 'pending']);
+  await step(2);
+
+  const testId = randomUUID();
+  tool({
+    toolCallId: testId,
+    title: 'npm test -- reconnect',
+    kind: 'execute',
+    status: 'in_progress',
+    rawInput: { command: 'npm test -- reconnect', description: 'Run the reconnect tests' },
+  });
+  await step(8);
+  update(testId, {
+    status: 'completed',
+    content: [{ type: 'content', content: { type: 'text', text: '```console\n' + TEST_OUTPUT + '\n```' } }],
+  });
+  plan(['completed', 'completed', 'completed', 'in_progress']);
+  await step(2);
+
+  const pushId = randomUUID();
+  tool({
+    toolCallId: pushId,
+    title: `git push origin ${session.data.branch}`,
+    kind: 'execute',
+    status: 'in_progress',
+    content: [{ type: 'terminal', terminalId: pushId }],
+    _meta: { terminal_info: { terminal_id: pushId } },
+  });
+  await step(3);
+  update(pushId, {
+    status: 'completed',
+    _meta: {
+      terminal_output: {
+        terminal_id: pushId,
+        data: `To https://github.com/${session.data.repo}.git\n * [new branch]      ${session.data.branch} -> ${session.data.branch}\n`,
+      },
+      terminal_exit: { terminal_id: pushId, exit_code: 0, signal: null },
+    },
+  });
+  await step(2);
+
+  const proposeId = randomUUID();
+  tool({ toolCallId: proposeId, title: 'Propose pull request', kind: 'other', status: 'in_progress' });
+  await step(2);
+  const proposal = createProposal(session);
+  update(proposeId, {
+    status: 'completed',
+    content: [{ type: 'content', content: { type: 'text', text: `Proposal ${proposal.id} is pending review.` } }],
+  });
+  plan(['completed', 'completed', 'completed', 'completed']);
+  await step(2);
+  await say(
+    `Done. The tests pass and I've proposed a pull request, **${proposal.payload.title}**, from \`${session.data.branch}\`. It opens once you approve it.`,
+  );
+}
+
+function createProposal(session) {
+  const oldFile = `export class AcpConnection {\n  #timer: ReturnType<typeof setTimeout> | undefined;\n\n  connect() {\n    // …\n  }\n\n${OLD_SNIPPET}\n}\n`;
+  const newFile = `const MAX_BACKOFF_MS = 10_000;\n\nexport class AcpConnection {\n  #timer: ReturnType<typeof setTimeout> | undefined;\n  #attempt = 0;\n\n  connect() {\n    // …\n  }\n\n${NEW_SNIPPET}\n}\n`;
+  const testFile = `import { expect, test } from '@playwright/test';\n\ntest('reconnects after the socket drops', async ({ page }) => {\n  await page.goto('/');\n  await expect(page.getByTestId('reconnecting')).toBeHidden();\n});\n`;
+  const diff = [
+    formatPatch({ ...structuredPatch(`a/${FILE}`, `b/${FILE}`, oldFile, newFile, '', '', { context: 3 }), isGit: true }),
+    formatPatch({
+      ...structuredPatch('/dev/null', 'b/ui/tests/reconnect.spec.ts', '', testFile, '', '', { context: 3 }),
+      isGit: true,
+      isCreate: true,
+    }),
+  ].join('');
+
+  const id = randomUUID();
+  const proposal = {
+    id,
+    session_id: session.data.id,
+    kind: 'github.pr.create',
+    status: 'pending',
+    payload: {
+      repo: session.data.repo,
+      base: 'main',
+      head: session.data.branch,
+      title: 'Reconnect the ACP socket with exponential backoff',
+      body: 'Reconnects used a fixed one-second delay, which hammers a restarting runtime.\n\n## Changes\n\n- Back off exponentially from 500 ms, capped at 10 s\n- Reset the backoff after a successful `session/load`\n- Add an end-to-end test for reconnecting',
+      draft: false,
+    },
+    created_at: now(),
+    diff,
+    commits: [
+      { sha: sha(), message: 'Back off exponentially when reconnecting\n\nCapped at ten seconds.' },
+      { sha: sha(), message: 'Test reconnecting after the socket drops' },
+    ],
+  };
+  proposals.set(id, proposal);
+  broadcastProposal(proposal);
+  return proposal;
+}
+
+function publicProposal(proposal) {
+  const { diff: _diff, commits: _commits, ...rest } = proposal;
+  return rest;
+}
+
+function broadcastProposal(proposal) {
+  const session = sessions.get(proposal.session_id);
+  for (const conn of session?.subscribers ?? []) conn.notify('_sloppod/proposal', { proposal: publicProposal(proposal) });
+}
+
+function createSession({ repo, title, prompt }) {
+  const id = randomUUID();
+  const created = now();
+  const session = new MockSession({
+    id,
+    title: title || prompt?.split('\n')[0].slice(0, 60) || 'Untitled session',
+    repo,
+    branch: `sloppod/${id.slice(0, 8)}`,
+    phase: 'starting',
+    created_at: created,
+    updated_at: created,
+  });
+  sessions.set(id, session);
+  return session;
+}
+
+function cancelTurn(session) {
+  if (session.turn) session.turn.cancelled = true;
+  for (const pending of [...session.pending.values()]) {
+    resolvePermission(session, pending, { outcome: 'cancelled' }, null);
+  }
+}
+
+// --- ACP over WebSocket ---------------------------------------------------------------------
+
+function handleCall(conn, message) {
+  const { id, method, params = {} } = message;
+  const session = params.sessionId ? sessions.get(params.sessionId) : undefined;
+  const needLoaded = () => {
+    if (!session || !conn.loaded.has(session.data.id)) {
+      if (id !== undefined) conn.error(id, -32602, 'Session not loaded');
+      return false;
+    }
+    return true;
+  };
+
+  switch (method) {
+    case 'initialize':
+      conn.respond(id, {
+        protocolVersion: 1,
+        agentCapabilities: { loadSession: true, promptCapabilities: { image: false, audio: false, embeddedContext: false } },
+        agentInfo: { name: 'sloppod-mock', version: '0.0.0' },
+        authMethods: [],
+        _meta: { steering: { supported: true } },
+      });
+      return;
+
+    case 'session/load': {
+      if (!session) {
+        conn.error(id, -32602, `Unknown session ${params.sessionId}`);
+        return;
+      }
+      for (const entry of session.log) conn.notify('session/update', entry);
+      session.subscribers.add(conn);
+      conn.loaded.add(session.data.id);
+      conn.respond(id, { modes: session.modeState() });
+      for (const pending of session.pending.values()) sendPermission(session, pending, conn);
+      return;
+    }
+
+    case 'session/prompt': {
+      if (!needLoaded()) return;
+      if (session.turn) {
+        conn.error(id, -32000, 'A turn is already running; use _session/steering');
+        return;
+      }
+      if (session.data.phase !== 'idle') {
+        conn.error(id, -32000, `The session is ${session.data.phase}`);
+        return;
+      }
+      runTurn(session, promptText(params.prompt)).then(
+        (stopReason) => conn.respond(id, { stopReason }),
+        (error) => conn.error(id, -32603, String(error)),
+      );
+      return;
+    }
+
+    case 'session/cancel':
+      if (session) cancelTurn(session);
+      return;
+
+    case '_session/steering': {
+      if (!needLoaded()) return;
+      const text = promptText(params.prompt);
+      if (!session.turn) {
+        if (session.data.phase !== 'idle') {
+          conn.error(id, -32000, `The session is ${session.data.phase}`);
+          return;
+        }
+        void runTurn(session, text);
+        conn.respond(id, { outcome: 'startedNewTurn' });
+        return;
+      }
+      echoUser(session, text);
+      session.turn.steers.push(text);
+      conn.respond(id, { outcome: 'injected' });
+      return;
+    }
+
+    case 'session/set_mode': {
+      if (!needLoaded()) return;
+      if (!MODES.some((mode) => mode.id === params.modeId)) {
+        conn.error(id, -32602, `Unknown mode ${params.modeId}`);
+        return;
+      }
+      session.modeId = params.modeId;
+      session.emit({ sessionUpdate: 'current_mode_update', currentModeId: params.modeId });
+      conn.respond(id, {});
+      return;
+    }
+
+    default:
+      if (id !== undefined) conn.error(id, -32601, `Method not found: ${method}`);
+  }
+}
+
+// --- REST -----------------------------------------------------------------------------------
+
+function json(res, status, body) {
+  res.writeHead(status, { 'content-type': 'application/json' });
+  res.end(body === undefined ? '' : JSON.stringify(body));
+}
+
+async function readBody(req) {
+  let data = '';
+  for await (const chunk of req) data += chunk;
+  if (!data) return {};
+  return JSON.parse(data);
+}
+
+const sortedSessions = () =>
+  [...sessions.values()].map((s) => s.data).sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
+
+async function handleApi(req, res, url) {
+  const parts = url.pathname.replace(/^\/api\/v1\/?/, '').split('/').filter(Boolean);
+  const method = req.method;
+
+  if (parts[0] === 'repos' && parts.length === 1 && method === 'GET') return json(res, 200, REPOS);
+
+  if (parts[0] === 'sessions') {
+    if (parts.length === 1 && method === 'GET') return json(res, 200, sortedSessions());
+    if (parts.length === 1 && method === 'POST') {
+      const body = await readBody(req);
+      if (!REPOS.includes(body.repo)) return json(res, 400, { error: `unknown repository ${body.repo}` });
+      const session = createSession(body);
+      setTimeout(() => {
+        if (!sessions.has(session.data.id)) return;
+        session.setPhase('idle');
+        if (body.prompt) void runTurn(session, body.prompt);
+      }, DELAY * 8);
+      return json(res, 201, session.data);
+    }
+    const session = sessions.get(parts[1]);
+    if (!session) return json(res, 404, { error: 'session not found' });
+    if (parts.length === 2 && method === 'GET') return json(res, 200, session.data);
+    if (parts.length === 2 && method === 'DELETE') {
+      cancelTurn(session);
+      session.setPhase('stopped');
+      sessions.delete(session.data.id);
+      res.writeHead(204).end();
+      return;
+    }
+  }
+
+  if (parts[0] === 'proposals') {
+    if (parts.length === 1 && method === 'GET') {
+      const sessionId = url.searchParams.get('session');
+      const status = url.searchParams.get('status');
+      const list = [...proposals.values()]
+        .filter((p) => (!sessionId || p.session_id === sessionId) && (!status || p.status === status))
+        .map(publicProposal);
+      return json(res, 200, list);
+    }
+    const proposal = proposals.get(parts[1]);
+    if (!proposal) return json(res, 404, { error: 'proposal not found' });
+    if (parts.length === 2 && method === 'GET') return json(res, 200, proposal);
+    if (parts.length === 3 && method === 'POST' && (parts[2] === 'approve' || parts[2] === 'reject')) {
+      if (proposal.status !== 'pending') return json(res, 409, { error: `proposal is already ${proposal.status}` });
+      const body = await readBody(req);
+      proposal.decided_at = now();
+      if (parts[2] === 'approve') {
+        if (typeof body.title === 'string') proposal.payload.title = body.title;
+        if (typeof body.body === 'string') proposal.payload.body = body.body;
+        const number = 100 + proposals.size;
+        proposal.status = 'executed';
+        proposal.result = { url: `https://github.com/${proposal.payload.repo}/pull/${number}`, number };
+      } else {
+        proposal.status = 'rejected';
+        if (body.reason) proposal.reason = body.reason;
+      }
+      broadcastProposal(proposal);
+      return json(res, 200, publicProposal(proposal));
+    }
+  }
+
+  return json(res, 404, { error: 'not found' });
+}
+
+// --- static files ---------------------------------------------------------------------------
+
+const TYPES = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript',
+  '.css': 'text/css',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.json': 'application/json',
+  '.webmanifest': 'application/manifest+json',
+};
+
+function serveStatic(res, url) {
+  const root = path.resolve(args.static);
+  let file = path.join(root, decodeURIComponent(url.pathname));
+  if (!file.startsWith(root) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
+    file = path.join(root, 'index.html');
+  }
+  res.writeHead(200, { 'content-type': TYPES[path.extname(file)] ?? 'application/octet-stream' });
+  fs.createReadStream(file).pipe(res);
+}
+
+// --- seed data ------------------------------------------------------------------------------
+
+async function seed() {
+  const ago = (minutes) => new Date(Date.now() - minutes * 60_000).toISOString();
+
+  const first = createSession({
+    repo: 'bo0tzz/sloppod',
+    prompt: 'Reconnects hammer the runtime when it restarts. Add backoff to the ACP socket.',
+  });
+  first.fast = true;
+  first.modeId = 'acceptEdits';
+  await runTurn(first, 'Reconnects hammer the runtime when it restarts. Add backoff to the ACP socket.');
+  first.fast = false;
+  first.modeId = 'default';
+  first.data.created_at = ago(95);
+  first.data.updated_at = ago(12);
+  for (const proposal of proposals.values()) proposal.created_at = ago(13);
+
+  const second = createSession({ repo: 'bo0tzz/memini', title: 'Summarise the namespace resolution rules' });
+  echoUser(second, 'How does memini decide which namespace to read from?');
+  second.emit({ sessionUpdate: 'compaction_update', compactionId: 'c1', status: 'in_progress' });
+  second.emit({
+    sessionUpdate: 'compaction_update',
+    compactionId: 'c1',
+    status: 'completed',
+    summary: [
+      {
+        type: 'text',
+        text: 'Explored `resolve.rs` and the namespace tests. The resolution order is: explicit pin, `MEMINI_NAMESPACE`, then the git remote.',
+      },
+    ],
+  });
+  second.emit({
+    sessionUpdate: 'agent_message_chunk',
+    messageId: randomUUID(),
+    content: {
+      type: 'text',
+      text: 'It checks three things, in order:\n\n1. An explicit **pin** in the project config\n2. The `MEMINI_NAMESPACE` environment variable\n3. The `owner/repo` of the git remote\n\n| Source | Wins over |\n|---|---|\n| pin | everything |\n| env | git remote |',
+    },
+  });
+  second.data.phase = 'stopped';
+  second.data.created_at = ago(60 * 26);
+  second.data.updated_at = ago(60 * 24);
+
+  const third = createSession({ repo: 'bo0tzz/sloppod', title: 'Bump kopium to 0.24' });
+  echoUser(third, 'Bump kopium to 0.24 and regenerate the CRDs.');
+  third.emit({
+    sessionUpdate: 'agent_message_chunk',
+    messageId: randomUUID(),
+    content: { type: 'text', text: 'On it. Updating `mise.toml` first.' },
+  });
+  third.data.phase = 'disconnected';
+  third.data.created_at = ago(40);
+  third.data.updated_at = ago(3);
+}
+
+// --- server ---------------------------------------------------------------------------------
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url ?? '/', 'http://localhost');
+  try {
+    if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
+    if (url.pathname === '/_mock/drop' && req.method === 'POST') {
+      for (const conn of connections) conn.ws.terminate();
+      return json(res, 200, { dropped: connections.size });
+    }
+    if (args.static) return serveStatic(res, url);
+    json(res, 404, { error: 'not found' });
+  } catch (error) {
+    console.error(error);
+    json(res, 500, { error: String(error) });
+  }
+});
+
+const wss = new WebSocketServer({ noServer: true });
+server.on('upgrade', (req, socket, head) => {
+  if (new URL(req.url ?? '/', 'http://localhost').pathname !== '/acp') {
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    const conn = new Connection(ws);
+    connections.add(conn);
+    ws.on('message', (raw) => {
+      let message;
+      try {
+        message = JSON.parse(String(raw));
+      } catch {
+        conn.error(null, -32700, 'Parse error');
+        return;
+      }
+      if (message.method) {
+        handleCall(conn, message);
+      } else if (message.id !== undefined) {
+        const callback = conn.awaiting.get(message.id);
+        conn.awaiting.delete(message.id);
+        callback?.(message);
+      }
+    });
+    ws.on('close', () => {
+      connections.delete(conn);
+      for (const id of conn.loaded) {
+        const session = sessions.get(id);
+        if (!session) continue;
+        session.subscribers.delete(conn);
+        for (const pending of session.pending.values()) pending.requests.delete(conn);
+      }
+    });
+  });
+});
+
+if (!args['no-seed']) await seed();
+server.listen(Number(args.port), () => {
+  console.log(`mock sloppod runtime on http://localhost:${args.port}${args.static ? ` serving ${args.static}` : ''}`);
+});

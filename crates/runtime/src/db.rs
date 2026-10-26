@@ -133,9 +133,10 @@ pub async fn set_agent_session(
 }
 
 pub async fn take_pending_prompt(db: &PgPool, id: Uuid) -> sqlx::Result<Option<String>> {
+    // `old` reads the row from the statement's snapshot, so it still holds the prompt being cleared.
     let row = sqlx::query(
-        "with old as (select pending_prompt from sessions where id = $1 for update) \
-         update sessions set pending_prompt = null where id = $1 returning (select pending_prompt from old)",
+        "update sessions s set pending_prompt = null from sessions old \
+         where s.id = $1 and old.id = s.id and old.pending_prompt is not null returning old.pending_prompt",
     )
     .bind(id)
     .fetch_optional(db)

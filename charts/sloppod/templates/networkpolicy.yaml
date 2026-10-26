@@ -1,0 +1,27 @@
+{{- if .Values.networkPolicy.enabled }}
+# The authorizer trusts the source address Envoy reports, and its answers carry credentials, so only Cilium's
+# Envoy (on the host network) may reach it.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: {{ include "sloppod.fullname" . }}-runtime
+  labels:
+    {{- include "sloppod.labels" . | nindent 4 }}
+spec:
+  endpointSelector:
+    matchLabels:
+      {{- include "sloppod.selectorLabels" . | nindent 6 }}
+  ingress:
+    - fromEntities: [host, remote-node]
+      toPorts:
+        - ports:
+            - port: "9001"
+              protocol: TCP
+            - port: "8080"
+              protocol: TCP
+    - fromEntities: {{ toJson .Values.networkPolicy.httpFrom }}
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+{{- end }}

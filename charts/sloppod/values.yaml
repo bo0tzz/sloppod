@@ -67,3 +67,8 @@ podAnnotations: {}
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+networkPolicy:
+  # Restrict the runtime's ingress: the authorizer port only from Cilium's Envoy, the API from these entities.
+  enabled: true
+  httpFrom: [cluster, ingress]

@@ -340,8 +340,9 @@ impl Hub {
     }
 
     async fn record_user_message(&self, id: Uuid, prompt: &Value, steering: bool) {
+        let message_id = Uuid::new_v4();
         for block in prompt.as_array().into_iter().flatten() {
-            let mut update = json!({"sessionUpdate": "user_message_chunk", "content": block});
+            let mut update = json!({"sessionUpdate": "user_message_chunk", "messageId": message_id, "content": block});
             if steering {
                 update["_meta"] = json!({"sloppod": {"steering": true}});
             }
@@ -388,6 +389,20 @@ impl Hub {
     pub async fn cancel(&self, id: Uuid) {
         if let Ok((agent, agent_session_id)) = self.agent_for(id).await {
             agent.notify("session/cancel", json!({"sessionId": agent_session_id}));
+        }
+        // ACP: a client that cancels a turn answers its outstanding permission requests with `cancelled`.
+        let pending: Vec<u64> = self
+            .live(id)
+            .state
+            .lock()
+            .await
+            .permissions
+            .keys()
+            .copied()
+            .collect();
+        for pid in pending {
+            self.answer_permission(id, pid, Ok(json!({"outcome": {"outcome": "cancelled"}})))
+                .await;
         }
     }
 

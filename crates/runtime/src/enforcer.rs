@@ -15,6 +15,7 @@ use crate::tls::Ca;
 const LISTENER: &str = "sloppod-egress";
 
 pub struct Cilium {
+    namespace: String,
     policies: Api<DynamicObject>,
     envoy_configs: Api<DynamicObject>,
     runtime_labels: Vec<(String, String)>,
@@ -42,6 +43,7 @@ impl Cilium {
         runtime_port: u16,
     ) -> Self {
         Self {
+            namespace: namespace.to_owned(),
             policies: api(
                 client,
                 namespace,
@@ -64,7 +66,7 @@ impl Cilium {
         trusted_ca: &str,
     ) -> anyhow::Result<()> {
         let (cert, key) = ca.issue(hosts)?;
-        let config = envoy_config(&cert, &key, authz, trusted_ca);
+        let config = envoy_config(&self.namespace, &cert, &key, authz, trusted_ca);
         self.envoy_configs
             .patch(
                 LISTENER,
@@ -76,7 +78,13 @@ impl Cilium {
     }
 }
 
-fn envoy_config(cert: &str, key: &str, authz: SocketAddr, trusted_ca: &str) -> Value {
+fn envoy_config(
+    namespace: &str,
+    cert: &str,
+    key: &str,
+    authz: SocketAddr,
+    trusted_ca: &str,
+) -> Value {
     json!({
         "apiVersion": "cilium.io/v2",
         "kind": "CiliumEnvoyConfig",
@@ -135,7 +143,13 @@ fn envoy_config(cert: &str, key: &str, authz: SocketAddr, trusted_ca: &str) -> V
                                             "pack_as_bytes": true,
                                         },
                                         "grpc_service": {
-                                            "envoy_grpc": {"cluster_name": "sloppod-authz"},
+                                            // Cilium prefixes resource names with `<namespace>/<config>/`, but only
+                                            // rewrites the references it knows about. The authority must not
+                                            // contain those slashes: HTTP/2 servers reject it.
+                                            "envoy_grpc": {
+                                                "cluster_name": format!("{namespace}/{LISTENER}/sloppod-authz"),
+                                                "authority": "sloppod-authz",
+                                            },
                                             "timeout": "10s",
                                         },
                                     },

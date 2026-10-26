@@ -1,0 +1,100 @@
+@import '@immich/ui/theme/default.css';
+@source '../node_modules/@immich/ui';
+
+@layer base {
+  html,
+  body {
+    @apply bg-light text-dark;
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+
+/* Rendered Markdown from the agent, the user, or a proposal body. */
+.markdown {
+  overflow-wrap: anywhere;
+  line-height: 1.6;
+
+  & > * + * {
+    margin-top: 0.75em;
+  }
+  & h1,
+  & h2,
+  & h3,
+  & h4 {
+    font-weight: 600;
+    line-height: 1.3;
+    margin-top: 1.1em;
+  }
+  & h1 {
+    font-size: 1.35em;
+  }
+  & h2 {
+    font-size: 1.2em;
+  }
+  & h3 {
+    font-size: 1.05em;
+  }
+  & a {
+    @apply text-primary underline;
+  }
+  & ul {
+    list-style: disc;
+    padding-inline-start: 1.4em;
+  }
+  & ol {
+    list-style: decimal;
+    padding-inline-start: 1.4em;
+  }
+  & li + li {
+    margin-top: 0.2em;
+  }
+  & blockquote {
+    @apply border-light-300 text-dark/80 border-s-4 ps-3;
+  }
+  & code {
+    @apply bg-light-200 rounded px-1 py-0.5 font-mono;
+    font-size: 0.875em;
+  }
+  & pre {
+    @apply bg-light-100 border-light-200 rounded-lg border p-3;
+    overflow-x: auto;
+    font-size: 0.8125rem;
+    line-height: 1.5;
+  }
+  & pre code {
+    background: none;
+    padding: 0;
+    font-size: inherit;
+  }
+  & table {
+    display: block;
+    overflow-x: auto;
+    border-collapse: collapse;
+    font-size: 0.875em;
+  }
+  & th,
+  & td {
+    @apply border-light-300 border px-2 py-1;
+  }
+  & th {
+    @apply bg-light-100 font-semibold;
+  }
+  & hr {
+    @apply border-light-300;
+  }
+  & img {
+    max-width: 100%;
+  }
+}
+
+.safe-bottom {
+  padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+}
+
+/* iOS zooms into inputs with text under 16px when they get focus. */
+@media (pointer: coarse) {
+  input,
+  textarea {
+    font-size: max(16px, 1em);
+  }
+}
