@@ -16,7 +16,7 @@ A sloppod session can take a change to this repository from prompt to reviewed P
 
 | Area | MVP version | Later |
 |---|---|---|
-| Sessions ([1](adr/0001-sessions-decoupled-from-directories.md)) | Runtime-owned session object, event log and transcript blob. Resume after pod loss. Scope `repo` only | Scope `none`/`group`, sub-sessions, messaging |
+| Sessions ([1](adr/0001-sessions-decoupled-from-directories.md)) | Runtime-owned session object, event log and transcript blob. Resume after pod loss. One repository grant per session | Sessions with no or several repository grants, sub-sessions, messaging |
 | Capabilities ([2](adr/0002-capabilities.md)) | A fixed set per session: `repo:<remote>:rw` (session branches only), GitHub read, model access | Requests, approvals with TTL, standing approvals, profiles, starting-set suggestion |
 | Proposals ([3](adr/0003-proposals-and-trusted-executor.md)) | One kind, `github.pr.create`: review title, body and diff; approve or reject | Editing fields, more kinds, a reviewer model |
 | Async ([4](adr/0004-asynchronous-interaction.md)) | Prompts and steering through the adapter; proposals return a pending ID | Inbox urgency levels, delivery of grant changes |
