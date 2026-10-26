@@ -147,3 +147,6 @@ url = "https://dl.k8s.io/v1.37.1/bin/windows/amd64/kubectl.exe"
 version = "1.99.1"
 backend = "core:rust"
 specifiers = ["1.99.1"]
+
+[tools.rust.options]
+components = "clippy,rustfmt"
