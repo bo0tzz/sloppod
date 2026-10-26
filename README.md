@@ -21,3 +21,11 @@ Concepts and approach:
 11. [Enforcement happens at the pod boundary](docs/adr/0011-enforcement-at-the-pod-boundary.md)
 12. [Tools come from mise via a trusted installer](docs/adr/0012-tooling-via-mise.md)
 13. [Container workloads run inside or beside the session pod](docs/adr/0013-container-workloads.md)
+
+Implementation:
+
+14. [The runtime is written in Rust](docs/adr/0014-rust.md)
+15. [Postgres is the source of truth](docs/adr/0015-postgres.md)
+16. [Session pods are agent-sandbox Sandboxes](docs/adr/0016-agent-sandbox.md)
+17. [An in-pod supervisor bridges the agent to the runtime](docs/adr/0017-in-pod-supervisor.md)
+18. [The UI is Svelte with @immich/ui](docs/adr/0018-ui.md)
