@@ -56,16 +56,18 @@ pub async fn insert_session(
     title: &str,
     repo: &str,
     branch: &str,
+    custom_title: bool,
     pending_prompt: Option<&str>,
 ) -> sqlx::Result<SessionRow> {
     sqlx::query_as(AssertSqlSafe(format!(
-        "insert into sessions (id, title, repo, branch, pending_prompt) values ($1, $2, $3, $4, $5) returning {SESSION_COLUMNS}"
+        "insert into sessions (id, title, repo, branch, pending_prompt, custom_title) values ($1, $2, $3, $4, $5, $6) returning {SESSION_COLUMNS}"
     )))
     .bind(id)
     .bind(title)
     .bind(repo)
     .bind(branch)
     .bind(pending_prompt)
+    .bind(custom_title)
     .fetch_one(db)
     .await
 }
@@ -108,13 +110,16 @@ pub async fn set_phase(db: &PgPool, id: Uuid, phase: Phase) -> sqlx::Result<Opti
     .await
 }
 
-pub async fn set_title(db: &PgPool, id: Uuid, title: &str) -> sqlx::Result<()> {
-    sqlx::query("update sessions set title = $2, updated_at = now() where id = $1")
-        .bind(id)
-        .bind(title)
-        .execute(db)
-        .await
-        .map(|_| ())
+/// Sets the agent's automatic title, unless the person chose one; returns whether it changed.
+pub async fn set_auto_title(db: &PgPool, id: Uuid, title: &str) -> sqlx::Result<bool> {
+    let result = sqlx::query(
+        "update sessions set title = $2, updated_at = now() where id = $1 and not custom_title and title <> $2",
+    )
+    .bind(id)
+    .bind(title)
+    .execute(db)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn set_agent_session(

@@ -61,3 +61,15 @@ export const proposalStatuses: Record<ProposalStatus, { label: string; color: Co
   executed: { label: 'Opened', color: 'success' },
   failed: { label: 'Failed', color: 'danger' },
 };
+
+/** MCP tools arrive titled `mcp__<server>__<tool>`; show the tool name and say which server it's from. */
+export function toolTitle(title: string): { title: string; server?: string } {
+  const match = /^mcp__(.+?)__(.+)$/.exec(title);
+  return match ? { title: match[2].replaceAll('_', ' '), server: match[1] } : { title };
+}
+
+/** Tool calls often start with `rawInput: {}` before the input streams in; that isn't worth showing. */
+export function hasInput(rawInput: unknown): boolean {
+  if (rawInput === undefined || rawInput === null) return false;
+  return typeof rawInput !== 'object' || Object.keys(rawInput).length > 0;
+}

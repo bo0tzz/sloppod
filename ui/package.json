@@ -15,7 +15,8 @@
     "mock": "node mock/server.mjs",
     "test:e2e": "vite build && playwright test --project=e2e",
     "screenshots": "vite build && playwright test --project=screenshots",
-    "icons": "node scripts/icons.mjs"
+    "icons": "node scripts/icons.mjs",
+    "test:real": "vite build && playwright test -c playwright.real.config.ts"
   },
   "dependencies": {
     "@immich/ui": "^0.91.0",

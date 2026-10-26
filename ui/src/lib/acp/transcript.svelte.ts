@@ -20,6 +20,8 @@ export type MessageItem = {
   type: 'user' | 'agent' | 'thought';
   key: string;
   messageId: string | null;
+  /** A user message delivered into a running turn (the runtime marks the echo with `_meta.sloppod.steering`). */
+  steering: boolean;
   parts: MessagePart[];
 };
 
@@ -145,24 +147,22 @@ export class Transcript {
     const messageId = chunk.messageId ?? null;
     const last = this.items.at(-1);
 
-    if (
-      last?.type === type &&
-      (messageId === null || last.messageId === null || last.messageId === messageId)
-    ) {
+    // Without message IDs, consecutive chunks of the same kind are one message.
+    if (last?.type === type && last.messageId === messageId) {
       const lastPart = last.parts.at(-1);
       if (part.type === 'text' && lastPart?.type === 'text') {
         lastPart.text += part.text;
       } else {
         last.parts.push(part);
       }
-      last.messageId ??= messageId;
       return;
     }
 
     if (type === 'user') {
       this.#plan = null;
     }
-    this.#push({ type, key: this.#key(), messageId, parts: [part] });
+    const sloppodMeta = chunk._meta?.sloppod as { steering?: boolean } | undefined;
+    this.#push({ type, key: this.#key(), messageId, steering: sloppodMeta?.steering === true, parts: [part] });
   }
 
   #toolCall(call: ToolCall) {

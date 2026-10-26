@@ -104,6 +104,7 @@ test('steers the agent during a turn', async ({ page }) => {
   await page.getByRole('button', { name: 'Steer' }).click();
   await expect(box).toHaveValue('');
   await expect(userMessages(page).filter({ hasText: steer })).toHaveCount(1);
+  await expect(userMessages(page).filter({ hasText: steer })).toHaveAttribute('data-steering', 'true');
 
   await permissionCard(page).getByRole('button', { name: 'Allow', exact: true }).click();
   await expect(agentMessages(page).filter({ hasText: `Got your message mid-turn: “${steer}”` })).toBeVisible();

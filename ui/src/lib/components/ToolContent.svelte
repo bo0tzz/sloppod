@@ -3,6 +3,7 @@
   import { mdiFileOutline } from '@mdi/js';
   import type { ToolCallContent, ToolCallLocation } from '#lib/acp/types.ts';
   import { diffTexts } from '#lib/diff.ts';
+  import { hasInput } from '#lib/presentation.ts';
   import DiffView from './DiffView.svelte';
 
   let {
@@ -17,13 +18,13 @@
     rawInput?: unknown;
   } = $props();
 
-  // Adapters fence command output (```console … ```); the box is already preformatted.
-  function unfence(text: string): string {
+  // Adapters fence command output (```console … ```), but send descriptions and short results as plain text.
+  function unfence(text: string): string | null {
     const match = /^\s*```[\w-]*\n([\s\S]*?)\n?```\s*$/.exec(text);
-    return match ? match[1] : text;
+    return match ? match[1] : null;
   }
 
-  const showInput = $derived(content.length === 0 && rawInput !== undefined && rawInput !== null);
+  const showInput = $derived(content.length === 0 && hasInput(rawInput));
 </script>
 
 <div class="flex flex-col gap-2">
@@ -44,7 +45,12 @@
     {:else if block.type === 'terminal'}
       <pre class="tool-output" data-testid="tool-output">{terminals[block.terminalId] ?? '(no output yet)'}</pre>
     {:else if block.content.type === 'text'}
-      <pre class="tool-output" data-testid="tool-output">{unfence(block.content.text)}</pre>
+      {@const output = unfence(block.content.text)}
+      {#if output === null}
+        <p class="text-sm break-words whitespace-pre-wrap" data-testid="tool-text">{block.content.text}</p>
+      {:else}
+        <pre class="tool-output" data-testid="tool-output">{output}</pre>
+      {/if}
     {:else if block.content.type === 'image'}
       <img src={block.content.uri ?? `data:${block.content.mimeType};base64,${block.content.data}`} alt="" class="max-h-80 rounded-lg" />
     {:else if block.content.type === 'resource_link'}

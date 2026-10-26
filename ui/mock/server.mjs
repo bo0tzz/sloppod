@@ -139,8 +139,13 @@ function promptText(prompt) {
     .join('');
 }
 
-function echoUser(session, text) {
-  session.emit({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text }, messageId: randomUUID() });
+function echoUser(session, text, { steering = false } = {}) {
+  session.emit({
+    sessionUpdate: 'user_message_chunk',
+    content: { type: 'text', text },
+    messageId: randomUUID(),
+    ...(steering ? { _meta: { sloppod: { steering: true } } } : {}),
+  });
 }
 
 function requestPermission(session, toolCall, options) {
@@ -512,7 +517,7 @@ function handleCall(conn, message) {
         conn.respond(id, { outcome: 'startedNewTurn' });
         return;
       }
-      echoUser(session, text);
+      echoUser(session, text, { steering: true });
       session.turn.steers.push(text);
       conn.respond(id, { outcome: 'injected' });
       return;

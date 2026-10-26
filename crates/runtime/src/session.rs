@@ -248,10 +248,11 @@ impl Hub {
         if update["sessionUpdate"] == "session_info_update"
             && let Some(title) = update["title"].as_str()
         {
-            if let Err(e) = db::set_title(&self.db, id, title).await {
-                tracing::warn!(session = %id, error = %e, "setting title");
+            match db::set_auto_title(&self.db, id, title).await {
+                Ok(true) => self.broadcast_session(id).await,
+                Ok(false) => {}
+                Err(e) => tracing::warn!(session = %id, error = %e, "setting title"),
             }
-            self.broadcast_session(id).await;
         }
         self.record(id, update).await;
     }

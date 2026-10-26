@@ -105,13 +105,18 @@ async fn create_session(
     }
     let id = Uuid::new_v4();
     let branch = format!("sloppod/{}", &id.simple().to_string()[..8]);
-    let title = new
-        .title
-        .clone()
-        .filter(|t| !t.trim().is_empty())
-        .unwrap_or_else(|| default_title(&new));
-    let row =
-        db::insert_session(&state.db, id, &title, &repo, &branch, new.prompt.as_deref()).await?;
+    let custom = new.title.as_ref().filter(|t| !t.trim().is_empty());
+    let title = custom.cloned().unwrap_or_else(|| default_title(&new));
+    let row = db::insert_session(
+        &state.db,
+        id,
+        &title,
+        &repo,
+        &branch,
+        custom.is_some(),
+        new.prompt.as_deref(),
+    )
+    .await?;
     if let Err(e) = place(&state, &row).await {
         state.hub.set_phase(id, Phase::Stopped).await;
         return Err(ApiError(

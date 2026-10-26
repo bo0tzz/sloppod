@@ -19,7 +19,7 @@ GET    /api/v1/repos                -> string[]    repositories sessions can be 
 ```ts
 type NewSession = {
   repo: string;          // "owner/name"
-  title?: string;
+  title?: string;        // kept as given; without one, the agent's automatic title is used
   prompt?: string;       // sent as the first prompt once the agent is up
 };
 
@@ -94,8 +94,8 @@ Runtime → UI:
 
 | Method | Notes |
 |---|---|
-| `session/update` | Standard ACP updates: `user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `available_commands_update`, `current_mode_update`, and compaction reports. Prompts sent by any UI are echoed as `user_message_chunk` so every viewer sees them. |
-| `session/request_permission` (request) | Sent to every UI that has the session loaded. The first answer wins; the others get `_sloppod/permission_resolved`. |
-| `_sloppod/permission_resolved` `{sessionId, toolCallId}` | Another UI answered, or the request was cancelled. |
+| `session/update` | Standard ACP updates: `user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `available_commands_update`, `current_mode_update`, and compaction reports. Prompts sent by any UI are echoed as `user_message_chunk` with a `messageId` per prompt, so every viewer sees them; steers carry `_meta.sloppod.steering: true`. |
+| `session/request_permission` (request) | Sent to every UI that has the session loaded, including requests still open when a UI loads the session (after the `session/load` response). The first answer wins. |
+| `_sloppod/permission_resolved` `{sessionId, toolCallId}` | Sent to every UI, including the one that answered, once a request is answered or cancelled. |
 | `_sloppod/session` `{session: Session}` | The session's phase or title changed. |
 | `_sloppod/proposal` `{proposal: Proposal}` | A proposal for a loaded session was created or changed. |
