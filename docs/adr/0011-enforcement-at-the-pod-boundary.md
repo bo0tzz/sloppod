@@ -74,4 +74,15 @@ Gotcha: on hosts with `net.ipv4.conf.all.src_valid_mark=1` (common with Tailscal
 
 Separately, a local reverse proxy that swapped a dummy `sk-ant-oat01-` token for the real one worked for Claude Code via `ANTHROPIC_BASE_URL`. Only `/v1/messages` went through it.
 
+Spike, 2026-10-26: claude-agent-acp 0.97.0 (Claude Code 2.1.310, the SDK's bundled binary) behind a TLS-intercepting proxy, trusting its CA only through `NODE_EXTRA_CA_CERTS`, with a dummy `CLAUDE_CODE_OAUTH_TOKEN` swapped for the real one. Every request went to `api.anthropic.com`:
+
+| Path | Default | `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` |
+|---|---|---|
+| `POST /v1/messages` | yes | yes |
+| `GET /api/claude_code/settings`, `GET /api/claude_code/policy_limits` | yes | yes; a 403 is tolerated |
+| `GET /api/claude_cli/bootstrap`, `POST /api/eval/sdk-*`, `POST /api/event_logging/v2/batch` | yes | no |
+| `GET /mcp-registry/v0/servers` (no auth) | yes | no |
+
+With nonessential traffic off and everything except `/v1/messages` refused, a prompt with a tool call worked normally. The model request policy therefore starts as: allow `POST /v1/messages`, deny the rest.
+
 Prior art: Claude Code cloud environments (secrets injected by the egress proxy), Codex network secrets, Boundary's injected credentials, Zalando's agentic identity broker.
