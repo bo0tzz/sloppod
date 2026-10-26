@@ -1,0 +1,23 @@
+[package]
+name = "sloppod-supervisor"
+description = "In-pod supervisor for sloppod sessions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "sloppod-supervisor"
+path = "src/main.rs"
+
+[dependencies]
+sloppod-protocol.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
