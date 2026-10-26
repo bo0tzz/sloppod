@@ -18,6 +18,12 @@ Chosen option: **pods only**. There is no local mode.
 
 - **Placement:** every session runs in a sandbox pod on a Kubernetes cluster.
 - **Host access:** work that needs a specific host (hardware, desktop, local devices) gets an `exec@<host>` capability, which issues a short-lived SSH certificate from the runtime's CA, limited to a principal. Placement is about cost and latency; what a session can reach is a separate question, answered by its capabilities.
+- **Shutdown is mechanical.** Pods go away for many reasons: preemption, eviction, a move to another node, parking ([ADR 5](0005-park-and-wake.md)) or a restart ([ADR 6](0006-self-reference.md)). The agent can register **shutdown handlers** for background work it starts: a command, a timeout and a description. On termination the runtime:
+  1. runs the handlers, without any model calls
+  2. records their output, along with what was still running unregistered
+  3. pushes work in progress and syncs the transcript ([ADR 17](0017-in-pod-supervisor.md))
+
+  When the session next runs, the agent finds a summary of all this in its inbox.
 - **Resources** are requestable ([ADR 2](0002-capabilities.md)) and resized in place where possible. If a node can't fit the new size, the session is moved to another node: the transcript and session branch make it portable.
 
 ### Consequences

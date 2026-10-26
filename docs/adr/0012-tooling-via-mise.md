@@ -11,11 +11,18 @@ Sessions need CLI tools: some from the project, some from their capabilities, su
 
 Tools are first-class [mise](https://mise.jdx.dev) tools.
 
-- **Tool set:** a session's tool set is the project's `mise.toml` plus the mise fragments of its granted capabilities.
+- **Tools are not access.** A binary can't do anything without egress and credentials, so tools are not capabilities, and there's no capability per tool. A session's tool set is:
+  - a base set of dev tools
+  - the project's `mise.toml`
+  - the project's defaults ([ADR 1](0001-sessions-decoupled-from-directories.md))
+  - anything the agent asks for, auto-approved by default
+
+  A capability may *suggest* tools as a convenience (a cluster capability brings its CLI), but never gates on them.
 - **Image:** the base image is minimal: OS, mise, and the agent adapter.
 - **Installs:** a **trusted installer** in the runtime is the only writer to a **read-only tool store**. It installs only locked versions, verified against lockfile checksums and provenance (`MISE_LOCKED=1`, `MISE_LOCKED_VERIFY_PROVENANCE=1`; `mise.lock` records per-platform URLs, checksums and SLSA/cosign/attestations).
-- **In sessions:** sessions mount the store read-only. A missing tool or version is just another capability request.
-- **Package managers** (npm/pnpm, Go modules, PyPI, container images) use pull-through caches. Lockfile integrity hashes make a poisoned cache detectable.
+- **In sessions:** sessions mount the store read-only. When a session needs a missing tool or version, the installer installs it; the session never writes to the store.
+- **Downloads:** the installer keeps a private central download cache, so tools need no pull-through cache.
+- **Project dependencies** are a separate concern: npm/pnpm, Go modules, PyPI and container images are still installed per session and would otherwise be re-downloaded every time. They use pull-through caches for now. Later they could follow the same pattern: the runtime prefetches from lockfiles into a read-only store. Lockfile integrity hashes make a poisoned cache detectable either way.
 
 ### Consequences
 

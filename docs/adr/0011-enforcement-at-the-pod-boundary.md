@@ -17,7 +17,7 @@ Capabilities ([ADR 2](0002-capabilities.md)) need enforcement that works for any
 
 Chosen option: **a per-request authorizer at egress**.
 
-- **Default-deny egress.** A session with no grants reaches nothing but its channel to the runtime ([ADR 2](0002-capabilities.md)). All allowed egress, including `web:read`, goes through the authorizer. For `web:read` the authorizer allows only `GET`/`HEAD`, attaches no credentials and strips any the agent supplies. DNS is allowlisted to match.
+- **Default-deny egress.** A session with no grants reaches nothing but its channel to the runtime ([ADR 2](0002-capabilities.md)). All allowed egress, including `web:read`, goes through the authorizer. For `web:read` the authorizer allows only `GET`/`HEAD`, attaches no credentials and, by default, strips any the agent supplies. DNS is allowlisted to match.
 - **Credentials never enter the pod.** Session traffic to authenticated services is redirected (`toPorts[].listener` → a CiliumEnvoyConfig) to an Envoy listener that:
   1. terminates TLS with a certificate from the runtime's CA, which the pod trusts
   2. calls sloppod's **authorizer** through `ext_authz`
@@ -28,7 +28,12 @@ Chosen option: **a per-request authorizer at egress**.
   - rate limits, and an audit log of every authenticated call
 - **Denials explain themselves.** The 403 body tells the agent what to do instead, e.g. use the propose tool ([ADR 3](0003-proposals-and-trusted-executor.md)).
 - **Cilium's role** is the egress firewall (which hosts and ports a session may reach at all) and redirection to the listener. Cilium's own header injection is **not** used: with `REPLACE`, any request the rule allows gets the token, including an arbitrary `curl`, and keeping it alongside the authorizer would mean two ways to do the same thing.
-- **Failure and cost:** the authorizer is a small replicated component, separate from the main runtime process, and fails closed (`failure_mode_allow: false`). Body inspection is opt-in per service: on for GitHub, off for the model API so large prompts aren't buffered.
+- **Failure and cost:** the authorizer runs as part of the runtime. If the runtime is down, sessions can't do much anyway, so it gets no redundancy of its own. It fails closed (`failure_mode_allow: false`). Body inspection is opt-in per service: on for GitHub, off for the model API so large prompts aren't buffered.
+- **Credentials the agent does legitimately hold:**
+  - **Credentials for the session's own workloads,** such as a database or dev server in its pod, its namespace or its vCluster. That traffic never passes the authorizer.
+  - **Short-lived, runtime-minted credentials for protocols the authorizer can't mediate,** such as SSH certificates. These are in the pod by design, tightly scoped and short-lived.
+  - **Keys that are public by design,** such as search-only API keys or error-reporting DSNs. A request policy can allow specific credential headers or parameters to specific hosts.
+  - **Secrets a human wants a session to use** are added to the runtime as a secret bound to a grant, not pasted into the chat (which would also send them to the model provider). The authorizer then attaches them like any other credential.
 - **Model credential:** the agent's model credential goes through the same path, so the Claude OAuth token never enters the pod.
 - **SSH:** Envoy has no SSH support, so it can gate connections but can't attach credentials. SSH starts with short-lived certificates from the runtime's CA (one principal, minutes of validity, `source-address`, optionally a forced command). An SSH-aware proxy (e.g. built on `russh`) is a later option, if command-level control is wanted.
 - **Kubernetes:** API tokens come from TokenRequest bound to a grant object, so deleting the grant revokes them.

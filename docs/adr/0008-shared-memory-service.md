@@ -31,6 +31,6 @@ What memini offers:
 
 - Good: memory is shared across sessions and pods, and is independent of machines and paths.
 - Bad: memini records everything automatically through hooks and consolidates later. Existing memory is a few hundred hand-curated notes, so expect noisier context at session start. Trial it on one repository before migrating.
-- Bad: memini API keys establish identity, not isolation: any key can read every namespace. Memory therefore cannot be scoped per session and must never hold secrets.
+- Note: memini API keys establish identity, not isolation: any key can read every namespace. Sessions therefore never hold memini keys. Their memini traffic goes through the per-request authorizer ([ADR 11](0011-enforcement-at-the-pod-boundary.md)), which attaches the key and pins the namespaces a request may read or write to the session's project and grants, so isolation is enforced there. Memory still never holds secrets.
 - Bad: young project: created June 2026, mostly one author, AGPL-3.0.
 - Note: its import tool covers past transcripts. Existing curated memory files need a separate, one-off import.
