@@ -5,6 +5,8 @@ A runtime for coding-agent sessions. Sessions run in sandbox pods on Kubernetes,
 ## Docs
 
 - [MVP: dogfooding](docs/mvp.md)
+- [Deploying](docs/deploy.md)
+- [Runtime API](docs/api.md)
 
 ### Architecture decisions
 

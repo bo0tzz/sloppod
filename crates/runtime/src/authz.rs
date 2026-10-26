@@ -28,11 +28,12 @@ pub async fn serve(addr: SocketAddr, state: AppState) -> anyhow::Result<()> {
 }
 
 fn deny(message: &str) -> CheckResponse {
-    deny_with(403, message)
+    deny_with(403, message, None)
 }
 
-fn deny_with(status: u16, message: &str) -> CheckResponse {
+fn deny_with(status: u16, message: &str, content_type: Option<&str>) -> CheckResponse {
     let code = match status {
+        200 => HttpStatusCode::Ok,
         401 => HttpStatusCode::Unauthorized,
         404 => HttpStatusCode::NotFound,
         429 => HttpStatusCode::TooManyRequests,
@@ -42,7 +43,12 @@ fn deny_with(status: u16, message: &str) -> CheckResponse {
     let mut denied = DeniedHttpResponseBuilder::new();
     denied
         .set_http_status(code)
-        .add_header("content-type", "text/plain; charset=utf-8", None, false)
+        .add_header(
+            "content-type",
+            content_type.unwrap_or("text/plain; charset=utf-8"),
+            None,
+            false,
+        )
         .set_body(message);
     let mut response = CheckResponse::with_status(Status::permission_denied(message.trim()));
     response.set_http_response(denied);
@@ -105,7 +111,11 @@ impl Authorizer {
             Ok(decision) => decision,
             Err(e) => {
                 tracing::error!(session = %session_id, %host, error = %e, "request policy failed");
-                return deny_with(503, &format!("sloppod: the {host} policy failed: {e}\n"));
+                return deny_with(
+                    503,
+                    &format!("sloppod: the {host} policy failed: {e}\n"),
+                    None,
+                );
             }
         };
         match decision {
@@ -135,9 +145,13 @@ impl Authorizer {
                 response.set_http_response(ok);
                 response
             }
-            Decision::Deny { status, message } => {
+            Decision::Deny {
+                status,
+                message,
+                content_type,
+            } => {
                 tracing::info!(session = %session_id, method = %request.method, %host, path = %request.path_only(), status, "deny");
-                deny_with(status, &message)
+                deny_with(status, &message, content_type.as_deref())
             }
         }
     }

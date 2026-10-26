@@ -9,9 +9,19 @@ A runtime for coding-agent sessions on Kubernetes. The design lives in the ADRs 
 - `crates/runtime`: the `sloppod` binary. API, ACP proxy, authorizer, placement and enforcement.
 - `crates/supervisor`: `sloppod-supervisor`, the session pod's entrypoint ([ADR 17](docs/adr/0017-in-pod-supervisor.md)).
 - `crates/cli`: `sloppodctl`, a test client.
+- `ui`: the web UI (SvelteKit SPA with @immich/ui), served by the runtime. `ui/mock` is a mock runtime for UI tests.
+- `charts/sloppod`: the Helm chart. `Containerfile` builds both images (`--target runtime`, `--target session`).
+- `docs/api.md` is the contract between the runtime and UIs; `docs/deploy.md` covers deploying.
 
 ## Working here
 
 - Tools come from `mise.toml`. `mise run check` runs the format check, clippy and tests, the same as CI.
+- UI: `cd ui && npm ci`, then `npm run check` and `npm run test:e2e` (Playwright against the mock runtime).
+- End-to-end on a local cluster, where docker and kind are available:
+  1. `dev/up.sh` creates a kind cluster with Cilium, agent-sandbox and Postgres.
+  2. Create the `sloppod-claude` and `sloppod-github` Secrets in namespace `sloppod` (see `docs/deploy.md`).
+  3. `dev/deploy.sh` builds both images, loads them and installs the chart.
+  4. Port-forward `svc/sloppod` and drive it with `sloppodctl` (`SLOPPOD_URL`) or the UI.
+- Inside a sloppod session there's no container runtime, so stick to `mise run check` and the UI tests there.
 - ADRs are MADR style. Numbers are permanent and append-only; add new ones to the README index under the right group.
 - Only comment code for intent a reader couldn't infer.

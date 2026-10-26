@@ -56,18 +56,20 @@ impl GitHubPolicy {
                     ));
                 }
                 match pushed_refs(&request.body) {
-                    Some(refs) if !refs.is_empty() => {
+                    Some(push) if !push.refs.is_empty() => {
                         let allowed = format!("refs/heads/{}", session.branch);
-                        if let Some(bad) = refs
+                        if let Some(bad) = push
+                            .refs
                             .iter()
                             .find(|r| **r != allowed && !r.starts_with(&format!("{allowed}/")))
                         {
-                            return Ok(Decision::deny(format!(
-                                "sloppod: pushes may only update your session branch `{}`; `{bad}` was refused. \
+                            let message = format!(
+                                "sloppod: pushes may only update your session branch `{}`, so `{bad}` was refused. \
                                  Push with `git push origin HEAD:{}`. To get changes into another branch, \
-                                 propose a pull request with the propose_pull_request tool.\n",
+                                 propose a pull request with the propose_pull_request tool.",
                                 session.branch, session.branch
-                            )));
+                            );
+                            return Ok(push.reject(&message));
                         }
                         let token = self.token(&session.repo).await?;
                         Ok(Decision::allow_with(
@@ -228,9 +230,52 @@ impl GitRequest {
     }
 }
 
-/// Refs updated by a `git-receive-pack` request, read from its leading pkt-lines.
-fn pushed_refs(body: &[u8]) -> Option<Vec<String>> {
-    let mut refs = Vec::new();
+/// A `git-receive-pack` request's ref updates and the capabilities the client asked for.
+struct Push {
+    refs: Vec<String>,
+    capabilities: Vec<String>,
+}
+
+fn pkt(line: &str) -> String {
+    format!("{:04x}{line}", line.len() + 4)
+}
+
+impl Push {
+    /// Refuses the whole push in git's own response format, so git shows the reason as `remote:` output and
+    /// `! [remote rejected]` lines instead of a bare HTTP error.
+    fn reject(&self, message: &str) -> Decision {
+        let mut report = pkt("unpack ok\n");
+        for name in &self.refs {
+            report.push_str(&pkt(&format!("ng {name} refused by sloppod, see above\n")));
+        }
+        report.push_str("0000");
+        let sideband = self
+            .capabilities
+            .iter()
+            .any(|c| c == "side-band-64k" || c == "side-band");
+        let body = if sideband {
+            let mut body = pkt(&format!("\u{2}{message}\n"));
+            // Band 1 carries the report; it would need splitting past 64k, which a ref list never reaches.
+            body.push_str(&pkt(&format!("\u{1}{report}")));
+            body.push_str("0000");
+            body
+        } else {
+            report
+        };
+        Decision::Deny {
+            status: 200,
+            message: body,
+            content_type: Some("application/x-git-receive-pack-result".into()),
+        }
+    }
+}
+
+/// Reads the leading pkt-lines of a `git-receive-pack` request.
+fn pushed_refs(body: &[u8]) -> Option<Push> {
+    let mut push = Push {
+        refs: Vec::new(),
+        capabilities: Vec::new(),
+    };
     let mut rest = body;
     loop {
         if rest.len() < 4 {
@@ -238,25 +283,34 @@ fn pushed_refs(body: &[u8]) -> Option<Vec<String>> {
         }
         let len = usize::from_str_radix(std::str::from_utf8(&rest[..4]).ok()?, 16).ok()?;
         if len == 0 {
-            return Some(refs);
+            return Some(push);
         }
         if len < 4 || rest.len() < len {
             return None;
         }
         let line = &rest[4..len];
         rest = &rest[len..];
-        let line = line.split(|b| *b == 0).next()?;
-        let line = std::str::from_utf8(line).ok()?.trim_end_matches('\n');
-        if line.starts_with("shallow ") {
+        let mut parts = line.splitn(2, |b| *b == 0);
+        let command = std::str::from_utf8(parts.next()?)
+            .ok()?
+            .trim_end_matches('\n');
+        if let Some(capabilities) = parts.next() {
+            push.capabilities = std::str::from_utf8(capabilities)
+                .ok()?
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect();
+        }
+        if command.starts_with("shallow ") {
             continue;
         }
         // A signed push starts with a push certificate; not supported.
-        if line.starts_with("push-cert") {
+        if command.starts_with("push-cert") {
             return None;
         }
-        let mut fields = line.split(' ');
+        let mut fields = command.split(' ');
         let (_old, _new, name) = (fields.next()?, fields.next()?, fields.next()?);
-        refs.push(name.to_owned());
+        push.refs.push(name.to_owned());
     }
 }
 
@@ -300,14 +354,26 @@ mod tests {
         ));
         body.extend(pkt(&format!("{new} {zero} refs/heads/main\n")));
         body.extend(b"0000PACK....");
+        let push = pushed_refs(&body).unwrap();
         assert_eq!(
-            pushed_refs(&body).unwrap(),
+            push.refs,
             vec![
                 "refs/heads/sloppod/x".to_owned(),
                 "refs/heads/main".to_owned()
             ]
         );
-        assert_eq!(pushed_refs(b"00"), None);
+        assert_eq!(push.capabilities, vec!["report-status", "side-band-64k"]);
+        assert!(pushed_refs(b"00").is_none());
+        let Decision::Deny {
+            status, message, ..
+        } = push.reject("no")
+        else {
+            panic!("expected a rejection");
+        };
+        assert_eq!(status, 200);
+        assert!(message.starts_with("0008\u{2}no\n"));
+        assert!(message.contains("ng refs/heads/main refused by sloppod"));
+        assert!(message.ends_with("00000000"));
     }
 
     #[test]

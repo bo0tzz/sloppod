@@ -43,6 +43,8 @@ memini:
   url: ""
   existingSecret: ""
   secretKey: api-key
+  # Prepended to every memory namespace, e.g. `dev/` for a test install.
+  namespacePrefix: ""
 
 git:
   name: sloppod

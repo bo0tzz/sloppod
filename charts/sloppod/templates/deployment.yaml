@@ -102,6 +102,10 @@ spec:
                 secretKeyRef:
                   name: {{ required "memini.existingSecret is required with memini.url" .Values.memini.existingSecret }}
                   key: {{ .Values.memini.secretKey }}
+            {{- with .Values.memini.namespacePrefix }}
+            - name: SLOPPOD_MEMINI_NAMESPACE_PREFIX
+              value: {{ . | quote }}
+            {{- end }}
             {{- end }}
             - name: SLOPPOD_GIT_NAME
               value: {{ .Values.git.name | quote }}

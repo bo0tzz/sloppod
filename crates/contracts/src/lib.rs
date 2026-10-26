@@ -81,7 +81,11 @@ pub enum Decision {
     },
     Deny {
         status: u16,
+        /// The response body, written so the agent knows what to do instead.
         message: String,
+        /// Defaults to plain text; protocols like git need their own framing to show a message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_type: Option<String>,
     },
 }
 
@@ -104,6 +108,7 @@ impl Decision {
         Self::Deny {
             status: 403,
             message: message.into(),
+            content_type: None,
         }
     }
 }
