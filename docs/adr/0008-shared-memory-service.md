@@ -18,7 +18,11 @@ Chosen option: **memini**. Claude Code's built-in auto memory is turned off (`au
 
 What memini offers:
 
-- Namespaces are derived from the git remote, which lines up with repository identity ([ADR 1](0001-sessions-decoupled-from-directories.md)).
+- Namespaces follow the session's context ([ADR 1](0001-sessions-decoupled-from-directories.md)):
+  - writes go to the namespace of the session's project
+  - reads also cover the git-remote namespaces of repositories the session holds grants for (memini's own keying), and the user's personal namespace
+
+  memini's linked namespaces and read scopes can express this directly.
 - It stores data in Postgres with VectorChord.
 - It ships a Helm chart.
 - It needs an OpenAI-compatible embeddings endpoint. An LLM is optional; it does background consolidation.
