@@ -1,0 +1,45 @@
+# 4. Interaction is asynchronous
+
+- Status: Accepted
+- Date: 2026-10-26
+
+## Context and Problem Statement
+
+Waiting is common: for the user's next message, for an approval, for a long command, for another session's reply. If every one of these blocks the agent until the turn ends, we lose time and context. Messages sent while the agent is working should reach it without waiting for the turn to end.
+
+## Decision Outcome
+
+Each session has one **inbox**. Everything addressed to the session goes through it:
+
+- the user's messages
+- approval decisions
+- grant changes
+- wake events
+- messages from sub-sessions and peers
+
+Each item has an urgency:
+
+| Urgency | Delivery | Typical use |
+|---|---|---|
+| `interrupt` | Abort the current generation now | "stop, wrong cluster" |
+| `next-boundary` (default) | At the next tool result, within the same turn | the user's messages, approval decisions, sub-session replies |
+| `idle` | When the turn ends | low-priority information |
+
+- **Delivery mechanism:** mid-turn delivery uses the agent's steering support where it has it. `claude-agent-acp` supports this as an `_session/steering` ACP extension. Agents without steering fall back to queueing, or to cancel-then-prompt for `interrupt`.
+- **Requests and proposals never block.** They return a pending ID immediately.
+- **Long-running work goes to the background.** Long tool calls are moved to the background automatically (for Claude Code, `CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS`), so the next tool boundary is rarely more than a few seconds away.
+- **Instructions:** the runtime's instruction snippet tells agents to background long work, treat approvals as asynchronous, carry on with independent work while waiting, and park ([ADR 5](0005-park-and-wake.md)) when nothing is left to do.
+
+### Consequences
+
+- Good: corrections and decisions reach the agent within seconds, not at the end of a turn.
+- Bad: steering is not yet part of the ACP spec. Two competing proposals are open, RFD PRs [#2255](https://github.com/agentclientprotocol/agent-client-protocol/pull/2255) and [#1261](https://github.com/agentclientprotocol/agent-client-protocol/pull/1261), so we depend on a vendor extension for now.
+
+## More Information
+
+Spike, 2026-10-26, `claude-agent-acp` 0.97.0 with Haiku:
+
+- **During a tool call:** a steer sent 5.5 s into a 40 s foreground command moved the command to the background, and the steer was answered at 8.5 s.
+- **During generation:** a steer sent mid-essay cut it off and was answered about 1 s later.
+
+For comparison, in Claude Code's own terminal UI, 93% of 441 messages queued while the agent worked were taken up after 0–1 tool rounds.
