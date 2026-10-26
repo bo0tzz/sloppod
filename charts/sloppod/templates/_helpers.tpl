@@ -22,3 +22,11 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
 {{- define "sloppod.sessionServiceAccount" -}}
 {{ include "sloppod.fullname" . }}-session
 {{- end -}}
+
+{{- define "sloppod.serviceAccountName" -}}
+{{ .Values.serviceAccount.name | default (include "sloppod.fullname" .) }}
+{{- end -}}
+
+{{- define "sloppod.caSecret" -}}
+{{ include "sloppod.fullname" . }}-egress-ca
+{{- end -}}

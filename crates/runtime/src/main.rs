@@ -128,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
     let mut proposals = ProposalKinds::default();
     proposals.register(Arc::new(proposals::PullRequest::new(github.clone())));
 
-    let ca = tls::Ca::load_or_create(kube.clone(), &config.namespace, "sloppod-ca").await?;
+    let ca = tls::Ca::load_or_create(kube.clone(), &config.namespace, &config.ca_secret).await?;
     let service: Service = Api::namespaced(kube.clone(), &config.namespace)
         .get(&config.service)
         .await

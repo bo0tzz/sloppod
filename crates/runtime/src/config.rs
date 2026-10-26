@@ -37,6 +37,10 @@ pub struct Config {
     )]
     pub runtime_selector: String,
 
+    /// Secret holding the egress CA; created on first start.
+    #[arg(long, env = "SLOPPOD_CA_SECRET", default_value = "sloppod-egress-ca")]
+    pub ca_secret: String,
+
     #[arg(
         long,
         env = "SLOPPOD_SESSION_IMAGE",

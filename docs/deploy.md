@@ -85,7 +85,7 @@ Never expose `/link/v1`, `/mcp` or port 9001 publicly. They authenticate session
 
 ## Checking it works
 
-1. The runtime logs `sloppod runtime up`. It creates the `sloppod-ca` Secret and the `sloppod-egress` CiliumEnvoyConfig on first start.
+1. The runtime logs `sloppod runtime up`. It creates the `<release>-egress-ca` Secret and the `sloppod-egress` CiliumEnvoyConfig on first start.
 2. In the UI, start a session on a repository with a small prompt. Within a minute or two the session goes `starting` → `idle`/`working`. The first start of a repository with a `mise.toml` takes longer, while tools install into the session's volume.
 3. If it stays `starting`, the session pod's log (the `session` container) shows the supervisor: link errors, clone or mise failures, and the agent's stderr.
 4. Denied egress shows up in the runtime log as `deny` lines with the session, host and path.

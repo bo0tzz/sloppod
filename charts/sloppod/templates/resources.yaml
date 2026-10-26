@@ -20,7 +20,7 @@ spec:
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: {{ include "sloppod.fullname" . }}
+  name: {{ include "sloppod.serviceAccountName" . }}
   labels:
     {{- include "sloppod.labels" . | nindent 4 }}
 ---
@@ -57,7 +57,7 @@ rules:
     verbs: [create]
   - apiGroups: [""]
     resources: [secrets]
-    resourceNames: [sloppod-ca]
+    resourceNames: [{{ include "sloppod.caSecret" . }}]
     verbs: [get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -72,7 +72,7 @@ roleRef:
   name: {{ include "sloppod.fullname" . }}
 subjects:
   - kind: ServiceAccount
-    name: {{ include "sloppod.fullname" . }}
+    name: {{ include "sloppod.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
 ---
 # Supervisors authenticate with their pod's projected token, checked through TokenReview (ADR 17).
@@ -88,5 +88,5 @@ roleRef:
   name: system:auth-delegator
 subjects:
   - kind: ServiceAccount
-    name: {{ include "sloppod.fullname" . }}
+    name: {{ include "sloppod.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}

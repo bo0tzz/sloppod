@@ -56,6 +56,11 @@ instructions: ""
 # CA bundle inside Cilium's Envoy for verifying real upstreams.
 envoyTrustedCA: /etc/ssl/certs/ca-certificates.crt
 
+# The runtime's ServiceAccount; defaults to the release's full name. Override it when something else, like a
+# CloudNativePG cluster of the same name, already owns that ServiceAccount.
+serviceAccount:
+  name: ""
+
 logLevel: info,sloppod=debug
 
 resources:
