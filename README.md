@@ -29,6 +29,7 @@ Approach:
 - [12. Tools come from mise via a trusted installer](docs/adr/0012-tooling-via-mise.md)
 - [13. Container workloads run inside or beside the session pod](docs/adr/0013-container-workloads.md)
 - [19. Repositories come from runtime-managed mirrors](docs/adr/0019-repositories-from-runtime-mirrors.md)
+- [20. Inference accounts can be switched under a running session](docs/adr/0020-switchable-inference-accounts.md)
 
 Implementation:
 
