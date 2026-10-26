@@ -26,7 +26,7 @@ Each item has an urgency:
 | `idle` | When the turn ends | low-priority information |
 
 - **Delivery mechanism:** mid-turn delivery uses the agent's steering support where it has it. `claude-agent-acp` supports this as an `_session/steering` ACP extension. Agents without steering fall back to queueing, or to cancel-then-prompt for `interrupt`.
-- **Requests and proposals never block.** They return a pending ID immediately.
+- **Requests and proposals never block.** They are tools the runtime provides to the agent, e.g. over MCP, and they return a pending ID as their result straight away; the agent doesn't need any special support for this. The decision arrives later through the inbox: steered in mid-turn, or as a new prompt if the session is idle by then. This is separate from the agent's own permission prompts (ACP `session/request_permission`), which do hold the tool call they belong to until answered.
 - **Long-running work goes to the background.** Long tool calls are moved to the background automatically (for Claude Code, `CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS`), so the next tool boundary is rarely more than a few seconds away.
 - **Instructions:** the runtime's instruction snippet tells agents to background long work, treat approvals as asynchronous, carry on with independent work while waiting, and park ([ADR 5](0005-park-and-wake.md)) when nothing is left to do.
 

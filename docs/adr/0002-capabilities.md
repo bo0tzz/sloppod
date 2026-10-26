@@ -39,7 +39,7 @@ A **grant** is a capability given to a session for a duration.
 ### Rules
 
 - **Composition:** within a session, grants add up: tools, egress and credentials are combined.
-- **Attenuation:** across delegation, grants only narrow. A sub-session or spawned worker can hold at most a subset of its parent's grants. This follows AWS session policies, Devin's profiles and Paseo's sessions.
+- **Attenuation:** delegation only narrows. A sub-session or spawned worker *starts with* at most a subset of its parent's grants, so a parent can never hand out more than it holds. This follows AWS session policies, Devin's profiles and Paseo's sessions. Beyond that, a sub-session requests grants of its own like any other session.
 - **Requests:** the agent can request a capability mid-session. A request carries:
   - a capability type
   - optionally one or more suggested targets
@@ -47,10 +47,11 @@ A **grant** is a capability given to a session for a duration.
   - a duration
   - a reason
 
-  The human approves as-is, narrows it, swaps the target, or rejects it. When the agent suggests no target, the human picks one. The reason is recorded for audit but doesn't affect the decision. Requests have a pending TTL separate from the grant's maximum duration, and support delayed start. A session can never approve its own request. This follows Teleport access requests and Sandstorm's Powerbox.
-- **Standing approvals:** a human can pre-approve a request pattern (capability, target, scope and TTL) so matching requests are granted automatically.
+  The human approves as-is, narrows it, swaps the target, or rejects it. When the agent suggests no target, the human picks one. The reason is recorded for audit but doesn't affect the decision. Requests have a pending TTL separate from the grant's maximum duration, and support delayed start. A session can never approve a request. This follows Teleport access requests and Sandstorm's Powerbox.
+- **Only humans approve.** There is no session-facing surface for approving anything. Approvals come from a human, or from a standing approval or policy a human configured.
+- **Standing approvals:** a human can pre-approve a request pattern (capability, target, which sessions, TTL) so matching requests are granted automatically.
 - **Profiles** are named default sets of capabilities.
-- **Starting set:** a new session gets a suggested starting set (scope, capabilities, resources, model) from a cheap model reading the first message. The human confirms; anything under an `auto` policy just applies.
+- **Starting set:** a new session gets a suggested starting set (capabilities, resources, model) from a cheap model reading the first message. The human confirms; anything under an `auto` policy just applies.
 - **Revocation:** a grant can be revoked at any time. Revocation takes effect at the enforcement layer ([ADR 11](0011-enforcement-at-the-pod-boundary.md)), not by asking the agent.
 
 ### Consequences

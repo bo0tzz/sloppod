@@ -21,6 +21,7 @@ The runtime's API is exposed to sessions as a capability.
 
   The human reviews a diff of the config.
 - **Applied changes affect new sessions only.** Running sessions are never reconfigured underneath themselves, except for grant changes, which are explicit and delivered through the inbox.
+- **Restart picks up new config.** The runtime re-places the session in a fresh pod with config rendered from the current state, and resumes the same transcript ([ADR 1](0001-sessions-decoupled-from-directories.md)). The human can trigger this, or the agent can propose it, typically after its own config proposal is applied. Restarts are a clean break: background processes stop, the working tree survives on the session's volume and branch, and the next turn starts with a cold prompt cache.
 - **Storage:** config lives in the database ([ADR 15](0015-postgres.md)). Revisions can be kept as rows if we want history; branching isn't needed.
 
 ### Consequences
