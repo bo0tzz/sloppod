@@ -536,9 +536,11 @@ impl ProposalKind for Stack {
             // Auto-merge on the top pull request merges the whole stack, so only a linked stack gets it.
             let (top, top_layer) = (pulls.last(), layers.last());
             message.push_str(&match (&linked, top, top_layer) {
-                (Ok(_), Some(top), Some(layer)) => match app
-                    .enable_auto_merge(
+                (Ok(stack), Some(top), Some(layer)) => match app
+                    .auto_merge_stack(
                         repo,
+                        *stack,
+                        &numbers,
                         top["node_id"].as_str().unwrap_or_default(),
                         layer["head_sha"].as_str().unwrap_or_default(),
                     )

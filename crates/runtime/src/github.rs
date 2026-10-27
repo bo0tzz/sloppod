@@ -571,7 +571,7 @@ impl GitHubApp {
     /// Turns auto-merge off on open pull requests from `branch`, returning their numbers.
     pub async fn disable_auto_merge(&self, repo: &str, branch: &str) -> anyhow::Result<Vec<u64>> {
         let owner = repo.split('/').next().unwrap_or_default();
-        let pulls: Vec<Value> = self
+        let headed: Vec<Value> = self
             .repo_get(
                 repo,
                 &format!("/pulls?state=open&head={owner}:{branch}"),
@@ -581,8 +581,31 @@ impl GitHubApp {
             .error_for_status()?
             .json()
             .await?;
+        // A stack merges through auto-merge on its top pull request, so a push to any layer turns that off too.
+        let mut numbers: Vec<u64> = Vec::new();
+        for pull in headed.iter().filter_map(|p| p["number"].as_u64()) {
+            numbers.push(pull);
+            if let Some(stack) = self.stack_of(repo, pull).await? {
+                numbers.extend(self.stack_members(repo, stack).await?);
+            }
+        }
+        numbers.sort_unstable();
+        numbers.dedup();
         let mut disabled = Vec::new();
-        for pull in pulls.iter().filter(|pull| !pull["auto_merge"].is_null()) {
+        for number in numbers {
+            let pull: Value = self
+                .repo_get(
+                    repo,
+                    &format!("/pulls/{number}"),
+                    "application/vnd.github+json",
+                )
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            if pull["state"] != "open" || pull["auto_merge"].is_null() {
+                continue;
+            }
             let token = self.token_for(repo).await?;
             let response: Value = self
                 .http
@@ -600,7 +623,7 @@ impl GitHubApp {
             if let Some(error) = response["errors"].as_array().and_then(|e| e.first()) {
                 bail!("{}", error["message"].as_str().unwrap_or("unknown error"));
             }
-            disabled.extend(pull["number"].as_u64());
+            disabled.push(number);
         }
         Ok(disabled)
     }
@@ -699,18 +722,57 @@ impl GitHubApp {
     }
 
     /// The number of the stack a pull request is in, if any (GitHub's stacked pull requests).
+    /// None too when the repository doesn't have stacked pull requests, which GitHub answers with a 404.
     pub async fn stack_of(&self, repo: &str, pull: u64) -> anyhow::Result<Option<u64>> {
-        let stacks: Vec<Value> = self
+        let response = self
             .repo_get(
                 repo,
                 &format!("/stacks?pull_request={pull}"),
+                "application/vnd.github+json",
+            )
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let stacks: Vec<Value> = response.error_for_status()?.json().await?;
+        Ok(stacks.first().and_then(|stack| stack["number"].as_u64()))
+    }
+
+    /// Has a stack merge itself once its required checks pass, through auto-merge on its top pull request, at
+    /// `top_sha`. Refused unless the stack holds exactly `pulls`, bottom to top: others in it would merge unreviewed.
+    pub async fn auto_merge_stack(
+        &self,
+        repo: &str,
+        stack: u64,
+        pulls: &[u64],
+        top_node_id: &str,
+        top_sha: &str,
+    ) -> anyhow::Result<()> {
+        let members = self.stack_members(repo, stack).await?;
+        if members != pulls {
+            bail!("stack #{stack} holds other pull requests than these");
+        }
+        self.enable_auto_merge(repo, top_node_id, top_sha).await
+    }
+
+    /// A stack's pull requests, bottom to top.
+    pub async fn stack_members(&self, repo: &str, stack: u64) -> anyhow::Result<Vec<u64>> {
+        let stack: Value = self
+            .repo_get(
+                repo,
+                &format!("/stacks/{stack}"),
                 "application/vnd.github+json",
             )
             .await?
             .error_for_status()?
             .json()
             .await?;
-        Ok(stacks.first().and_then(|stack| stack["number"].as_u64()))
+        Ok(stack["pull_requests"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|pull| pull["number"].as_u64())
+            .collect())
     }
 
     /// Links pull requests, bottom to top, into a stack; returns its number.
@@ -821,6 +883,103 @@ mod tests {
         minted: Mutex<Vec<(u64, Value)>>,
         /// Holds each mint until this many are in flight at once.
         rendezvous: Option<tokio::sync::Barrier>,
+        /// Open pull requests of `o/r`: number, head branch, and whether auto-merge is on.
+        pulls: Mutex<Vec<(u64, &'static str, bool)>>,
+        /// Stacks of `o/r` by number, with their pull requests bottom to top; None for a repository without them.
+        stacks: Option<Vec<(u64, Vec<u64>)>>,
+    }
+
+    fn pull_json(&(number, head, auto_merge): &(u64, &str, bool)) -> Value {
+        json!({
+            "number": number,
+            "state": "open",
+            "node_id": format!("PR{number}"),
+            "head": {"ref": head},
+            "auto_merge": if auto_merge { json!({"merge_method": "squash"}) } else { Value::Null },
+        })
+    }
+
+    async fn pulls(
+        State(fake): State<Arc<Fake>>,
+        axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        let head = query
+            .get("head")
+            .and_then(|h| h.split_once(':'))
+            .map(|(_, b)| b.to_owned());
+        let pulls = fake.pulls.lock().unwrap();
+        Json(json!(
+            pulls
+                .iter()
+                .filter(|p| head.as_deref().is_none_or(|h| h == p.1))
+                .map(pull_json)
+                .collect::<Vec<_>>()
+        ))
+    }
+
+    async fn pull(
+        State(fake): State<Arc<Fake>>,
+        Path((_, _, number)): Path<(String, String, u64)>,
+    ) -> Result<Json<Value>, StatusCode> {
+        let pulls = fake.pulls.lock().unwrap();
+        pulls
+            .iter()
+            .find(|p| p.0 == number)
+            .map(|p| Json(pull_json(p)))
+            .ok_or(StatusCode::NOT_FOUND)
+    }
+
+    fn stack_json(number: u64, members: &[u64]) -> Value {
+        json!({"number": number, "pull_requests": members.iter().map(|n| json!({"number": n})).collect::<Vec<_>>()})
+    }
+
+    async fn stacks(
+        State(fake): State<Arc<Fake>>,
+        axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+    ) -> Result<Json<Value>, StatusCode> {
+        let stacks = fake.stacks.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+        let pull: Option<u64> = query.get("pull_request").and_then(|p| p.parse().ok());
+        Ok(Json(json!(
+            stacks
+                .iter()
+                .filter(|(_, members)| pull.is_none_or(|p| members.contains(&p)))
+                .map(|(number, members)| stack_json(*number, members))
+                .collect::<Vec<_>>()
+        )))
+    }
+
+    async fn stack(
+        State(fake): State<Arc<Fake>>,
+        Path((_, _, number)): Path<(String, String, u64)>,
+    ) -> Result<Json<Value>, StatusCode> {
+        let stacks = fake.stacks.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+        stacks
+            .iter()
+            .find(|(n, _)| *n == number)
+            .map(|(n, members)| Json(stack_json(*n, members)))
+            .ok_or(StatusCode::NOT_FOUND)
+    }
+
+    async fn repository() -> Json<Value> {
+        Json(json!({"allow_squash_merge": true}))
+    }
+
+    /// Turns auto-merge on or off for the pull request whose node id the mutation names.
+    async fn graphql(State(fake): State<Arc<Fake>>, Json(body): Json<Value>) -> Json<Value> {
+        let on = body["query"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("enablePullRequestAutoMerge");
+        let id = body["variables"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        for pull in fake.pulls.lock().unwrap().iter_mut() {
+            if format!("PR{}", pull.0) == id {
+                pull.2 = on;
+            }
+        }
+        Json(json!({"data": {}}))
     }
 
     async fn installation(
@@ -875,6 +1034,12 @@ mod tests {
         let router = Router::new()
             .route("/repos/{owner}/{name}/installation", get(installation))
             .route("/app/installations/{id}/access_tokens", post(mint))
+            .route("/repos/{owner}/{name}", get(repository))
+            .route("/repos/{owner}/{name}/pulls", get(pulls))
+            .route("/repos/{owner}/{name}/pulls/{number}", get(pull))
+            .route("/repos/{owner}/{name}/stacks", get(stacks))
+            .route("/repos/{owner}/{name}/stacks/{number}", get(stack))
+            .route("/graphql", post(graphql))
             .with_state(fake.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api = format!("http://{}", listener.local_addr().unwrap());
@@ -882,6 +1047,74 @@ mod tests {
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).unwrap();
         let app = GitHubApp::with_api(&api, "1".into(), key.serialize_pem().as_bytes()).unwrap();
         (fake, app)
+    }
+
+    /// The stack #7 of three layers, the top one set to merge the stack.
+    fn stacked() -> Fake {
+        Fake {
+            pulls: Mutex::new(vec![
+                (1, "s-1", false),
+                (2, "s-2", false),
+                (3, "s-3", true),
+                (4, "other", true),
+            ]),
+            stacks: Some(vec![(7, vec![1, 2, 3])]),
+            ..Fake::default()
+        }
+    }
+
+    fn auto_merging(fake: &Fake) -> Vec<u64> {
+        fake.pulls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.2)
+            .map(|p| p.0)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_push_to_any_layer_stops_the_stack_merging() {
+        let (fake, app) = serve(stacked()).await;
+        assert_eq!(app.disable_auto_merge("o/r", "s-1").await.unwrap(), [3]);
+        assert_eq!(auto_merging(&fake), [4]);
+    }
+
+    #[tokio::test]
+    async fn a_push_without_stacks_stops_its_own_pull_request() {
+        let fake = Fake {
+            pulls: Mutex::new(vec![(1, "s-1", true), (4, "other", true)]),
+            stacks: None,
+            ..Fake::default()
+        };
+        let (fake, app) = serve(fake).await;
+        assert_eq!(app.disable_auto_merge("o/r", "s-1").await.unwrap(), [1]);
+        assert_eq!(auto_merging(&fake), [4]);
+    }
+
+    #[tokio::test]
+    async fn a_stack_merges_only_with_exactly_its_proposed_layers() {
+        let fake = Fake {
+            pulls: Mutex::new(vec![
+                (1, "s-1", false),
+                (2, "s-2", false),
+                (3, "s-3", false),
+            ]),
+            stacks: Some(vec![(7, vec![1, 2, 3])]),
+            ..Fake::default()
+        };
+        let (fake, app) = serve(fake).await;
+        // The upper two of an existing three-layer stack.
+        assert!(
+            app.auto_merge_stack("o/r", 7, &[2, 3], "PR3", "sha")
+                .await
+                .is_err()
+        );
+        assert!(auto_merging(&fake).is_empty());
+        app.auto_merge_stack("o/r", 7, &[1, 2, 3], "PR3", "sha")
+            .await
+            .unwrap();
+        assert_eq!(auto_merging(&fake), [3]);
     }
 
     #[tokio::test]
