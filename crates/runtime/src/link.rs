@@ -176,7 +176,10 @@ pub async fn handler(
             return (StatusCode::FORBIDDEN, e.to_string()).into_response();
         }
     };
+    // A transcript sync is one message, whole and base64-encoded; axum's default 16 MiB frame limit silently broke
+    // the link once a session's transcript passed about 12 MB.
     ws.max_message_size(256 << 20)
+        .max_frame_size(256 << 20)
         .on_upgrade(move |socket| run(state, session, socket))
 }
 
@@ -396,7 +399,11 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
     loop {
         let message = match tokio::time::timeout(LINK_TIMEOUT, stream.next()).await {
             Ok(Some(Ok(message))) => message,
-            Ok(_) => break,
+            Ok(Some(Err(e))) => {
+                tracing::warn!(session = %session_id, error = %e, "the supervisor link failed");
+                break;
+            }
+            Ok(None) => break,
             Err(_) => {
                 tracing::warn!(session = %session_id, "no word from the supervisor; dropping the link");
                 break;
