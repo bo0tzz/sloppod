@@ -23,6 +23,7 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::adapter::{self, PLACEHOLDER};
+use crate::github::GitIdentity;
 use crate::placement::WORKDIR;
 use crate::pods::SESSION_LABEL;
 use crate::{AppState, db};
@@ -31,8 +32,11 @@ pub const REPO_DIR: &str = "/workspace/repo";
 /// Where sessions without a repository work.
 pub const WORK_DIR: &str = "/workspace/work";
 
+/// Where other repositories the session was given are cloned.
+pub const REPOS_DIR: &str = "/workspace/repos";
+
 fn work_dir(session: &db::SessionRow) -> &'static str {
-    if session.context().writable_repo().is_some() {
+    if session.repo.is_some() {
         REPO_DIR
     } else {
         WORK_DIR
@@ -206,6 +210,21 @@ async fn authenticate(state: &AppState, token: &str) -> anyhow::Result<Uuid> {
         .context("pod is not a session pod")
 }
 
+/// Commits are by whoever pushes them: the owner's GitHub App.
+async fn git_identity(state: &AppState, owner: &str) -> GitIdentity {
+    let identity = match state.credentials.github(owner).await {
+        Ok(app) => app.identity().await,
+        Err(e) => Err(e),
+    };
+    identity.unwrap_or_else(|e| {
+        tracing::warn!(%owner, error = %e, "no git identity from a GitHub App");
+        GitIdentity {
+            name: "sloppod".to_owned(),
+            email: "sloppod@localhost".to_owned(),
+        }
+    })
+}
+
 async fn launch_for(
     state: &AppState,
     session: &db::SessionRow,
@@ -220,23 +239,15 @@ async fn launch_for(
             content_b64: base64::engine::general_purpose::STANDARD.encode(content),
         })
         .collect();
+    let identity = git_identity(state, &session.owner).await;
     let mut env = agent.env.clone();
     env.extend([
         ("GH_TOKEN".to_owned(), PLACEHOLDER.to_owned()),
         ("GITHUB_TOKEN".to_owned(), PLACEHOLDER.to_owned()),
-        ("GIT_AUTHOR_NAME".to_owned(), state.config.git_name.clone()),
-        (
-            "GIT_AUTHOR_EMAIL".to_owned(),
-            state.config.git_email.clone(),
-        ),
-        (
-            "GIT_COMMITTER_NAME".to_owned(),
-            state.config.git_name.clone(),
-        ),
-        (
-            "GIT_COMMITTER_EMAIL".to_owned(),
-            state.config.git_email.clone(),
-        ),
+        ("GIT_AUTHOR_NAME".to_owned(), identity.name.clone()),
+        ("GIT_AUTHOR_EMAIL".to_owned(), identity.email.clone()),
+        ("GIT_COMMITTER_NAME".to_owned(), identity.name),
+        ("GIT_COMMITTER_EMAIL".to_owned(), identity.email),
     ]);
     let launch = Launch {
         session_id: session.id,
@@ -252,12 +263,16 @@ async fn launch_for(
         transcript_dir: agent.transcript_dir.clone(),
         transcript,
         ca_pem: Some(state.ca.cert_pem.clone()),
-        repo: context.session.writable_repo().map(|grant| Repo {
-            clone_url: format!("https://github.com/{}.git", grant.repo),
-            branch: grant.branch.to_owned(),
-            path: REPO_DIR.to_owned(),
-        }),
-        install_tools: context.session.writable_repo().is_some(),
+        repo: session
+            .repo
+            .as_deref()
+            .and_then(|repo| context.session.writable_repo_for(repo))
+            .map(|grant| Repo {
+                clone_url: format!("https://github.com/{}.git", grant.repo),
+                branch: grant.branch.to_owned(),
+                path: REPO_DIR.to_owned(),
+            }),
+        install_tools: session.repo.is_some(),
         command: agent.command.clone(),
         env,
         cwd: work_dir(session).to_owned(),
@@ -284,7 +299,9 @@ pub async fn agent_context(state: &AppState, session: &db::SessionRow) -> AgentC
     AgentContext {
         session: context,
         workdir: WORKDIR.to_owned(),
+        repo: session.repo.clone(),
         repo_dir: work_dir(session).to_owned(),
+        repos_dir: REPOS_DIR.to_owned(),
         tools_url: format!("{}/mcp", state.config.runtime_url()),
         instructions: state.instructions.clone(),
         model: session.model.clone(),

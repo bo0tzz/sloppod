@@ -1,12 +1,15 @@
-//! Proposal kinds (ADR 3). The only one so far opens a pull request from the session branch.
+//! Proposal kinds (ADR 3): opening a pull request from the session branch, and write access to another repository.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use sloppod_contracts::{Error, Manifest, ProposalKind, Result, SessionContext, ToolSpec};
+use sloppod_contracts::{
+    Error, Grant, Manifest, ProposalKind, RepoGrant, Result, SessionContext, ToolSpec,
+};
 use sloppod_protocol::api::Proposal;
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::credentials::Credentials;
@@ -57,6 +60,36 @@ fn err(e: impl std::fmt::Display) -> Error {
     Error::new(e.to_string())
 }
 
+/// The branch a session pushes to; the same in every repository it can write to.
+pub fn session_branch(session: Uuid) -> String {
+    format!("sloppod/{}", &session.simple().to_string()[..8])
+}
+
+/// Lets a session push its branch to `repo`, unless it already can; returns whether the grant is new.
+pub async fn grant_repo(db: &PgPool, session: &SessionContext, repo: &str) -> anyhow::Result<bool> {
+    if session.writable_repo_for(repo).is_some() {
+        return Ok(false);
+    }
+    let branch = session_branch(session.session_id.parse()?);
+    let grant = Grant::new(
+        "repo",
+        json!({"repo": repo, "access": "rw", "branch": branch}),
+    );
+    db::add_grant(db, session.session_id.parse()?, &grant).await?;
+    Ok(true)
+}
+
+/// What the agent needs to know to use a repository it was just given.
+pub fn repo_granted(repo: &str, session: Uuid) -> String {
+    let branch = session_branch(session);
+    format!(
+        "You can now push to {repo}. Clone it with `git clone https://github.com/{repo} {}/{repo}` if you haven't, \
+         work on your session branch (`git switch -c {branch}`) and push with `git push origin HEAD:{branch}`; \
+         that's the only ref you can push there.",
+        crate::link::REPOS_DIR
+    )
+}
+
 #[async_trait]
 impl ProposalKind for PullRequest {
     fn manifest(&self) -> Manifest {
@@ -79,6 +112,7 @@ impl ProposalKind for PullRequest {
                 "properties": {
                     "title": {"type": "string", "description": "Pull request title"},
                     "body": {"type": "string", "description": "Pull request description (Markdown)"},
+                    "repo": {"type": "string", "description": "Repository as owner/name; needed when the session can push to more than one"},
                     "base": {"type": "string", "description": "Branch to merge into; defaults to the repository's default branch"},
                     "draft": {"type": "boolean", "description": "Open as a draft", "default": false},
                 },
@@ -87,13 +121,16 @@ impl ProposalKind for PullRequest {
         }
     }
 
+    fn summary(&self, payload: &Value) -> String {
+        format!(
+            "pull request \"{}\" on {}",
+            payload["title"].as_str().unwrap_or_default(),
+            payload["repo"].as_str().unwrap_or_default()
+        )
+    }
+
     async fn prepare(&self, session: &SessionContext, arguments: Value) -> Result<Value> {
-        let Some(grant) = session.writable_repo() else {
-            return Err(Error::new(
-                "this session has no repository, so there's nothing to open a pull request from",
-            ));
-        };
-        let (repo, branch) = (grant.repo, grant.branch);
+        let RepoGrant { repo, branch } = pull_request_repo(session, arguments["repo"].as_str())?;
         let app = self.app(session).await?;
         let title = arguments["title"].as_str().filter(|t| !t.trim().is_empty());
         let Some(title) = title else {
@@ -148,6 +185,124 @@ impl ProposalKind for PullRequest {
             .create_pull(payload["repo"].as_str().unwrap_or_default(), &request)
             .await
             .map_err(err)
+    }
+}
+
+/// The repository a pull request is from: the one named, or the only one the session can push to.
+fn pull_request_repo<'a>(
+    session: &'a SessionContext,
+    named: Option<&str>,
+) -> Result<RepoGrant<'a>> {
+    if let Some(repo) = named {
+        return session.writable_repo_for(repo).ok_or_else(|| {
+            Error::new(format!(
+                "this session can't push to {repo}; ask for write access with request_repository first"
+            ))
+        });
+    }
+    let writable: Vec<RepoGrant> = session.writable_repos().collect();
+    match writable.as_slice() {
+        [] => Err(Error::new(
+            "this session can't push to any repository; ask for write access with request_repository first",
+        )),
+        [only] => Ok(only.clone()),
+        several => Err(Error::new(format!(
+            "this session can push to {}; say which one with `repo`",
+            several
+                .iter()
+                .map(|g| g.repo)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+pub struct RepoAccess {
+    db: PgPool,
+    credentials: Arc<Credentials>,
+}
+
+impl RepoAccess {
+    pub fn new(db: PgPool, credentials: Arc<Credentials>) -> Self {
+        Self { db, credentials }
+    }
+}
+
+#[async_trait]
+impl ProposalKind for RepoAccess {
+    fn manifest(&self) -> Manifest {
+        Manifest::builtin("github")
+    }
+
+    fn kind(&self) -> String {
+        "sloppod.repo.grant".into()
+    }
+
+    fn summary(&self, payload: &Value) -> String {
+        format!(
+            "write access to {}",
+            payload["repo"].as_str().unwrap_or_default()
+        )
+    }
+
+    fn tool(&self) -> ToolSpec {
+        ToolSpec {
+            name: "request_repository".into(),
+            description: "Ask for write access to a GitHub repository, so you can push your session branch to it \
+                          and propose pull requests from it. A human reviews the request; you're told when it's \
+                          decided. Reading and cloning repositories doesn't need this."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository as owner/name"},
+                    "reason": {"type": "string", "description": "What you need it for, shown to the reviewer"},
+                },
+                "required": ["repo", "reason"],
+            }),
+        }
+    }
+
+    async fn prepare(&self, session: &SessionContext, arguments: Value) -> Result<Value> {
+        let wanted = arguments["repo"].as_str().unwrap_or_default().trim();
+        if wanted.split('/').count() != 2 {
+            return Err(Error::new("give the repository as owner/name"));
+        }
+        if session.writable_repo_for(wanted).is_some() {
+            return Err(Error::new(format!(
+                "this session can already push to {wanted}"
+            )));
+        }
+        let repos = self
+            .credentials
+            .github(&session.owner)
+            .await
+            .map_err(err)?
+            .repos()
+            .await
+            .map_err(err)?;
+        let Some(repo) = repos.into_iter().find(|r| r.eq_ignore_ascii_case(wanted)) else {
+            return Err(Error::new(format!(
+                "sloppod's GitHub App isn't installed on {wanted}, so it can't be granted"
+            )));
+        };
+        let session_id: Uuid = session.session_id.parse().map_err(err)?;
+        Ok(json!({
+            "repo": repo,
+            "reason": arguments["reason"].as_str().unwrap_or_default(),
+            "branch": session_branch(session_id),
+        }))
+    }
+
+    async fn detail(&self, _session: &SessionContext, _payload: &Value) -> Result<Value> {
+        Ok(json!({}))
+    }
+
+    async fn execute(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
+        let repo = payload["repo"].as_str().unwrap_or_default();
+        grant_repo(&self.db, session, repo).await.map_err(err)?;
+        let session_id: Uuid = session.session_id.parse().map_err(err)?;
+        Ok(json!({"message": repo_granted(repo, session_id)}))
     }
 }
 
@@ -229,13 +384,26 @@ pub async fn decide(
         anyhow::bail!("proposal {id} was already decided");
     };
     state.hub.broadcast_proposal(&row.to_api());
-    if status == "rejected" {
-        return Ok(Some(row.to_api()));
-    }
     let kind = state
         .proposals
         .get(&row.kind)
         .ok_or_else(|| anyhow::anyhow!("no executor for {}", row.kind))?;
+    let summary = kind.summary(&payload);
+    if status == "rejected" {
+        let reason = row
+            .reason
+            .as_deref()
+            .map(|r| format!(" Their reason: {r}"))
+            .unwrap_or_default();
+        state
+            .hub
+            .notify(
+                row.session_id,
+                format!("sloppod: the user rejected your proposal ({summary}).{reason}"),
+            )
+            .await;
+        return Ok(Some(row.to_api()));
+    }
     let session = db::get_session(&state.db, row.session_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("session gone"))?;
@@ -245,6 +413,23 @@ pub async fn decide(
     };
     let proposal = finished.to_api();
     state.hub.broadcast_proposal(&proposal);
+    state.hub.broadcast_session(row.session_id).await;
+    let outcome = match (&proposal.result, &proposal.error) {
+        (Some(result), _) => match (result["message"].as_str(), result["url"].as_str()) {
+            (Some(message), _) => format!("approved and done. {message}"),
+            (None, Some(url)) => format!("approved and done: {url}"),
+            (None, None) => "approved and done.".to_owned(),
+        },
+        (None, Some(error)) => format!("approved, but carrying it out failed: {error}"),
+        (None, None) => "approved.".to_owned(),
+    };
+    state
+        .hub
+        .notify(
+            row.session_id,
+            format!("sloppod: your proposal ({summary}) was {outcome}"),
+        )
+        .await;
     Ok(Some(proposal))
 }
 
@@ -274,4 +459,48 @@ pub async fn detail(state: &AppState, id: Uuid, owner: &str) -> anyhow::Result<O
         }
     }
     Ok(Some(proposal))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(repos: &[&str]) -> SessionContext {
+        SessionContext {
+            session_id: Uuid::nil().to_string(),
+            owner: "dev".into(),
+            grants: repos
+                .iter()
+                .map(|r| {
+                    Grant::new(
+                        "repo",
+                        json!({"repo": r, "access": "rw", "branch": "sloppod/00000000"}),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn picks_the_pull_request_repository() {
+        let one = session(&["a/one"]);
+        assert_eq!(pull_request_repo(&one, None).unwrap().repo, "a/one");
+        assert_eq!(
+            pull_request_repo(&one, Some("A/One")).unwrap().repo,
+            "a/one"
+        );
+        assert!(pull_request_repo(&one, Some("a/two")).is_err());
+        assert!(pull_request_repo(&session(&[]), None).is_err());
+        let two = session(&["a/one", "a/two"]);
+        assert!(
+            pull_request_repo(&two, None)
+                .unwrap_err()
+                .0
+                .contains("a/one, a/two")
+        );
+        assert_eq!(
+            pull_request_repo(&two, Some("a/two")).unwrap().repo,
+            "a/two"
+        );
+    }
 }

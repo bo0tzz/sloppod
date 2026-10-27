@@ -29,6 +29,7 @@ pub fn routes() -> Router<AppState> {
         .route("/settings", get(get_settings).put(put_settings))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}", get(get_session).delete(delete_session))
+        .route("/sessions/{id}/repos", post(add_repo))
         .route("/repos", get(repos))
         .route(
             "/credentials",
@@ -152,6 +153,46 @@ async fn get_session(
 }
 
 /// Repositories the user's GitHub App can act on; none without one.
+#[derive(Deserialize)]
+struct AddRepo {
+    repo: String,
+}
+
+/// Gives a session write access to another repository and tells its agent.
+async fn add_repo(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+    Json(body): Json<AddRepo>,
+) -> ApiResult<impl IntoResponse> {
+    let session = db::owned_session(&state.db, id, &user)
+        .await?
+        .ok_or_else(not_found)?;
+    let wanted = body.repo.trim();
+    let repo = accessible_repos(&state, &user)
+        .await
+        .into_iter()
+        .find(|r| r.eq_ignore_ascii_case(wanted))
+        .ok_or_else(|| bad_request(format!("{wanted} isn't accessible to your GitHub App")))?;
+    if proposals::grant_repo(&state.db, &session.context(), &repo).await? {
+        state.hub.broadcast_session(id).await;
+        state
+            .hub
+            .notify(
+                id,
+                format!(
+                    "sloppod: the user gave this session write access to {repo}. {}",
+                    proposals::repo_granted(&repo, id)
+                ),
+            )
+            .await;
+    }
+    let session = db::get_session(&state.db, id)
+        .await?
+        .ok_or_else(not_found)?;
+    Ok(Json(session.to_api()))
+}
+
 async fn accessible_repos(state: &AppState, user: &str) -> Vec<String> {
     let Ok(app) = state.credentials.github(user).await else {
         return Vec::new();
@@ -248,7 +289,7 @@ async fn create_session(
         Grant::new("packages", json!({})),
     ];
     if let Some(repo) = &repo {
-        let branch = format!("sloppod/{}", &id.simple().to_string()[..8]);
+        let branch = proposals::session_branch(id);
         grants.push(Grant::new(
             "repo",
             json!({"repo": repo, "access": "rw", "branch": branch}),
@@ -272,13 +313,18 @@ async fn create_session(
             custom_title: custom.is_some(),
             pending_prompt: prompt,
             model: model.as_deref(),
+            repo: repo.as_deref(),
             grants: &grants,
         },
     )
     .await?;
 
     if let Some((admin, memini)) = state.credentials.memini(&user).await? {
-        let namespace = state.memory_namespace(repo.as_deref());
+        let home = memini
+            .config("home")
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("personal/{user}"));
+        let namespace = state.memory_namespace(repo.as_deref(), &home);
         match admin
             .create_session_key(&id.to_string(), memini.config("home"), &namespace, false)
             .await

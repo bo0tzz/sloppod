@@ -14,20 +14,27 @@
     Text,
     Textarea,
   } from '@immich/ui';
-  import { mdiOpenInNew, mdiSourceCommit, mdiSourcePull } from '@mdi/js';
+  import { mdiOpenInNew, mdiSourceCommit } from '@mdi/js';
   import { onMount } from 'svelte';
-  import { api, type Proposal, type ProposalDetail } from '#lib/api.ts';
+  import { api, type Proposal, type ProposalDetail, type PullRequestPayload, type RepoGrantPayload } from '#lib/api.ts';
   import { parseUnifiedDiff } from '#lib/diff.ts';
   import { absoluteTime } from '#lib/format.ts';
-  import { proposalStatuses } from '#lib/presentation.ts';
+  import { proposalStatus, proposalSummary } from '#lib/presentation.ts';
   import DiffView from './DiffView.svelte';
   import Markdown from './Markdown.svelte';
 
   let {
-    id,
+    proposal,
     onChange,
     onClose,
-  }: { id: string; onChange: (proposal: Proposal) => void; onClose: () => void } = $props();
+  }: { proposal: Proposal; onChange: (proposal: Proposal) => void; onClose: () => void } = $props();
+
+  const kindTitles: Record<string, string> = {
+    'github.pr.create': 'Pull request proposal',
+    'sloppod.repo.grant': 'Repository access',
+  };
+  // svelte-ignore state_referenced_locally
+  const kind = proposal.kind;
 
   let detail = $state<ProposalDetail | null>(null);
   let loadError = $state<string | null>(null);
@@ -40,16 +47,17 @@
   let rejecting = $state(false);
   let reason = $state('');
 
-  const parsed = $derived(detail ? parseUnifiedDiff(detail.diff) : []);
+  const pr = $derived(detail?.kind === 'github.pr.create' ? (detail.payload as PullRequestPayload) : null);
+  const grant = $derived(detail?.kind === 'sloppod.repo.grant' ? (detail.payload as RepoGrantPayload) : null);
+  const summary = $derived(proposalSummary(detail ?? proposal));
+  const parsed = $derived(pr && detail ? parseUnifiedDiff(detail.diff ?? '') : []);
   const files = $derived(parsed ?? []);
   const totalLines = $derived(files.reduce((sum, file) => sum + file.lines.length, 0));
   const pending = $derived(detail?.status === 'pending');
 
   onMount(async () => {
     try {
-      detail = await api.getProposal(id);
-      title = detail.payload.title;
-      body = detail.payload.body;
+      detail = await api.getProposal(proposal.id);
     } catch (error) {
       loadError = error instanceof Error ? error.message : String(error);
     }
@@ -65,8 +73,8 @@
     busy = 'approve';
     actionError = null;
     const edits: { title?: string; body?: string } = {};
-    if (editing && title !== detail.payload.title) edits.title = title;
-    if (editing && body !== detail.payload.body) edits.body = body;
+    if (editing && pr && title !== pr.title) edits.title = title;
+    if (editing && pr && body !== pr.body) edits.body = body;
     try {
       applyResult(await api.approveProposal(detail.id, edits));
       editing = false;
@@ -92,14 +100,14 @@
   }
 
   function startEditing() {
-    if (!detail) return;
-    title = detail.payload.title;
-    body = detail.payload.body;
+    if (!pr) return;
+    title = pr.title;
+    body = pr.body;
     editing = true;
   }
 </script>
 
-<Modal title="Pull request proposal" icon={mdiSourcePull} size="giant" {onClose}>
+<Modal title={kindTitles[kind] ?? `Proposal: ${kind}`} icon={summary.icon} size={pr ? 'giant' : 'medium'} {onClose}>
   <ModalBody>
     <div class="flex flex-col gap-5 pb-4" data-testid="proposal-detail">
       {#if loadError}
@@ -107,23 +115,27 @@
       {:else if !detail}
         <div class="flex justify-center py-10"><LoadingSpinner size="large" /></div>
       {:else}
-        {@const status = proposalStatuses[detail.status]}
+        {@const status = proposalStatus(detail)}
         <div class="flex flex-wrap items-center gap-2 text-sm">
           <Badge color={status.color} shape="round" size="small" data-testid="proposal-status">{status.label}</Badge>
-          {#if detail.payload.draft}
+          {#if pr?.draft}
             <Badge color="secondary" shape="round" size="small">Draft</Badge>
           {/if}
-          <span class="text-muted min-w-0 font-mono text-xs break-all">
-            {detail.payload.repo}: {detail.payload.head} → {detail.payload.base}
-          </span>
+          {#if pr}
+            <span class="text-muted min-w-0 font-mono text-xs break-all">{pr.repo}: {pr.head} → {pr.base}</span>
+          {/if}
         </div>
 
-        {#if detail.status === 'executed' && detail.result}
+        {#if detail.status === 'executed' && pr && detail.result}
           <Alert color="success" size="small" title="Pull request opened">
             <a href={detail.result.url} target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-1 underline" data-testid="proposal-result">
               #{detail.result.number}
               <Icon icon={mdiOpenInNew} aria-hidden />
             </a>
+          </Alert>
+        {:else if detail.status === 'executed' && grant}
+          <Alert color="success" size="small" title="Access granted">
+            The session can now push to <span class="font-mono">{grant.branch}</span> on {grant.repo}.
           </Alert>
         {:else if detail.status === 'failed'}
           <Alert color="danger" size="small" title="Execution failed">{detail.error ?? 'Unknown error'}</Alert>
@@ -131,64 +143,29 @@
           <Alert color="secondary" size="small" title="Rejected">{detail.reason || 'No reason given.'}</Alert>
         {/if}
 
-        {#if editing}
+        {#if pr}
+          {@render pullRequest(detail, pr)}
+        {:else if grant}
           <div class="flex flex-col gap-3">
-            <Field label="Title">
-              <Input bind:value={title} name="title" />
-            </Field>
-            <Field label="Description">
-              <Textarea bind:value={body} rows={10} name="body" class="font-mono" />
-            </Field>
+            <Heading tag="h2" size="tiny" data-testid="proposal-title">{summary.title}</Heading>
+            <div class="flex flex-col gap-1">
+              <Text size="small" fontWeight="semi-bold">The agent's reason</Text>
+              <p class="bg-light-100 rounded-xl p-3 text-sm whitespace-pre-wrap" data-testid="proposal-reason">
+                {grant.reason || 'No reason given.'}
+              </p>
+            </div>
+            <Text color="muted" size="small">
+              Approving lets the session push to <span class="font-mono">{grant.branch}</span> on {grant.repo} and propose
+              pull requests from it. Merging stays with you.
+            </Text>
           </div>
         {:else}
           <div class="flex flex-col gap-2">
-            <Heading tag="h2" size="tiny" data-testid="proposal-title">{detail.payload.title}</Heading>
-            {#if detail.payload.body.trim()}
-              <div class="bg-light-100 rounded-xl p-3 text-sm">
-                <Markdown text={detail.payload.body} />
-              </div>
-            {:else}
-              <Text color="muted" size="small">No description.</Text>
-            {/if}
+            <Heading tag="h2" size="tiny" data-testid="proposal-title">{detail.kind}</Heading>
+            <Text color="muted" size="small">This UI doesn't know this kind of proposal yet. Its payload:</Text>
+            <pre class="bg-light-100 max-h-[50dvh] overflow-auto rounded-lg p-3 font-mono text-xs" data-testid="proposal-payload">{JSON.stringify(detail.payload, null, 2)}</pre>
           </div>
         {/if}
-
-        <section class="flex flex-col gap-2">
-          <Heading tag="h3" size="tiny">Commits ({detail.commits.length})</Heading>
-          <ul class="border-light-200 divide-light-200 divide-y rounded-xl border text-sm">
-            {#each detail.commits as commit (commit.sha)}
-              <li class="flex items-start gap-2 px-3 py-2">
-                <Icon icon={mdiSourceCommit} class="text-muted mt-0.5 shrink-0" aria-hidden />
-                <span class="min-w-0 grow break-words">{commit.message.split('\n')[0]}</span>
-                <code class="text-muted shrink-0 font-mono text-xs">{commit.sha.slice(0, 7)}</code>
-              </li>
-            {:else}
-              <li class="text-muted px-3 py-2">No commits.</li>
-            {/each}
-          </ul>
-        </section>
-
-        <section class="flex flex-col gap-2">
-          <Heading tag="h3" size="tiny">
-            Changes
-            {#if parsed}
-              <span class="text-muted font-normal">
-                ({files.length} {files.length === 1 ? 'file' : 'files'},
-                <span class="text-success-600">+{files.reduce((sum, file) => sum + file.additions, 0)}</span>
-                <span class="text-danger-600">−{files.reduce((sum, file) => sum + file.deletions, 0)}</span>)
-              </span>
-            {/if}
-          </Heading>
-          {#if parsed === null}
-            <pre class="bg-light-100 max-h-[60dvh] overflow-auto rounded-lg p-3 font-mono text-xs">{detail.diff}</pre>
-          {:else}
-            {#each files as file, index (index)}
-              <DiffView diff={file} open={totalLines < 1500} />
-            {:else}
-              <Text color="muted" size="small">Empty diff.</Text>
-            {/each}
-          {/if}
-        </section>
 
         <Text color="muted" size="tiny">
           Proposed {absoluteTime(detail.created_at)}{#if detail.decided_at}, decided {absoluteTime(detail.decided_at)}{/if}
@@ -222,7 +199,7 @@
           </Button>
           {#if editing}
             <Button color="secondary" variant="ghost" shape="round" onclick={() => (editing = false)}>Discard edits</Button>
-          {:else}
+          {:else if pr}
             <Button color="secondary" variant="outline" shape="round" onclick={startEditing}>Edit</Button>
           {/if}
           <Button color="success" shape="round" loading={busy === 'approve'} disabled={busy === 'reject'} onclick={approve}>
@@ -233,3 +210,64 @@
     </div>
   </ModalFooter>
 </Modal>
+
+{#snippet pullRequest(detail: ProposalDetail, pr: PullRequestPayload)}
+  {#if editing}
+    <div class="flex flex-col gap-3">
+      <Field label="Title">
+        <Input bind:value={title} name="title" />
+      </Field>
+      <Field label="Description">
+        <Textarea bind:value={body} rows={10} name="body" class="font-mono" />
+      </Field>
+    </div>
+  {:else}
+    <div class="flex flex-col gap-2">
+      <Heading tag="h2" size="tiny" data-testid="proposal-title">{pr.title}</Heading>
+      {#if pr.body.trim()}
+        <div class="bg-light-100 rounded-xl p-3 text-sm">
+          <Markdown text={pr.body} />
+        </div>
+      {:else}
+        <Text color="muted" size="small">No description.</Text>
+      {/if}
+    </div>
+  {/if}
+
+  <section class="flex flex-col gap-2">
+    <Heading tag="h3" size="tiny">Commits ({detail.commits?.length ?? 0})</Heading>
+    <ul class="border-light-200 divide-light-200 divide-y rounded-xl border text-sm">
+      {#each detail.commits ?? [] as commit (commit.sha)}
+        <li class="flex items-start gap-2 px-3 py-2">
+          <Icon icon={mdiSourceCommit} class="text-muted mt-0.5 shrink-0" aria-hidden />
+          <span class="min-w-0 grow break-words">{commit.message.split('\n')[0]}</span>
+          <code class="text-muted shrink-0 font-mono text-xs">{commit.sha.slice(0, 7)}</code>
+        </li>
+      {:else}
+        <li class="text-muted px-3 py-2">No commits.</li>
+      {/each}
+    </ul>
+  </section>
+
+  <section class="flex flex-col gap-2">
+    <Heading tag="h3" size="tiny">
+      Changes
+      {#if parsed}
+        <span class="text-muted font-normal">
+          ({files.length} {files.length === 1 ? 'file' : 'files'},
+          <span class="text-success-600">+{files.reduce((sum, file) => sum + file.additions, 0)}</span>
+          <span class="text-danger-600">−{files.reduce((sum, file) => sum + file.deletions, 0)}</span>)
+        </span>
+      {/if}
+    </Heading>
+    {#if parsed === null}
+      <pre class="bg-light-100 max-h-[60dvh] overflow-auto rounded-lg p-3 font-mono text-xs">{detail.diff}</pre>
+    {:else}
+      {#each files as file, index (index)}
+        <DiffView diff={file} open={totalLines < 1500} />
+      {:else}
+        <Text color="muted" size="small">Empty diff.</Text>
+      {/each}
+    {/if}
+  </section>
+{/snippet}

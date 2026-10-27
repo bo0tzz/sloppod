@@ -62,6 +62,8 @@ A **grant** is a capability given to a session for a duration.
 
 ## More Information
 
+MVP, 2026-10-27: the first request is the agent's `request_repository` tool: `repo` with `rw` on the session branch, one suggested target and a reason. It is carried as a `sloppod.repo.grant` proposal ([ADR 3](0003-proposals-and-trusted-executor.md)), so it shares the review queue and executor; the human approves or rejects it as-is. Durations, pending TTLs, narrowing and swapping the target aren't built. The user can also add a repository from the session directly. Either way the agent is told.
+
 Prior art:
 
 - [Teleport access requests](https://goteleport.com/docs/identity-governance/access-requests/access-request-configuration.md)

@@ -83,17 +83,27 @@ impl SessionContext {
         self.grant(capability).is_some()
     }
 
-    /// The repository the session may push to, if it has one.
-    pub fn writable_repo(&self) -> Option<RepoGrant<'_>> {
+    /// Repositories the session may push to, each with its session branch.
+    pub fn writable_repos(&self) -> impl Iterator<Item = RepoGrant<'_>> {
         self.grants
             .iter()
             .filter(|g| g.capability == "repo" && g.param("access") == Some("rw"))
-            .find_map(|g| {
+            .filter_map(|g| {
                 Some(RepoGrant {
                     repo: g.param("repo")?,
                     branch: g.param("branch")?,
                 })
             })
+    }
+
+    /// The first repository the session may push to, if any.
+    pub fn writable_repo(&self) -> Option<RepoGrant<'_>> {
+        self.writable_repos().next()
+    }
+
+    pub fn writable_repo_for(&self, repo: &str) -> Option<RepoGrant<'_>> {
+        self.writable_repos()
+            .find(|g| g.repo.eq_ignore_ascii_case(repo))
     }
 }
 
@@ -243,8 +253,12 @@ pub struct AgentFile {
 pub struct AgentContext {
     pub session: SessionContext,
     pub workdir: String,
+    /// The repository the session is about, checked out at `repo_dir`.
+    pub repo: Option<String>,
     /// Where the agent works: the checkout, or an empty directory for sessions without a repository.
     pub repo_dir: String,
+    /// Where other repositories the session can push to are cloned, as `<repos_dir>/<owner>/<name>`.
+    pub repos_dir: String,
     /// The runtime's MCP endpoint for this session's tools.
     pub tools_url: String,
     pub instructions: Option<String>,
@@ -292,6 +306,8 @@ pub struct ToolSpec {
 pub trait ProposalKind: Send + Sync {
     fn manifest(&self) -> Manifest;
     fn kind(&self) -> String;
+    /// A short description of a proposal for notices, e.g. `pull request "Fix the build"`.
+    fn summary(&self, payload: &Value) -> String;
     fn tool(&self) -> ToolSpec;
     /// Validates the agent's arguments and returns the payload a human reviews.
     async fn prepare(&self, session: &SessionContext, arguments: Value) -> Result<Value>;

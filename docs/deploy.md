@@ -32,8 +32,8 @@ The chart needs two existing Secrets; it creates none.
 Everything else is added in the UI, under Settings, after the first login:
 
 - **A Claude account:** a long-lived token from `claude setup-token`. It stays in the runtime; session pods only see a placeholder.
-- **A GitHub App:** its app ID and private key (PEM). Sessions act through it and it opens approved pull requests, so it needs **Contents: read & write**, **Pull requests: read & write** and **Metadata: read**, installed on every repository sessions may work on. The repositories a first message can pick from are its installations. (`sl0pz`, the app sloppod itself is developed with, has these on `bo0tzz/sloppod`.)
-- **memini, optionally:** its URL, an admin key, and your personal namespace (e.g. `personal/bo0tzz`). The runtime uses the admin key only to mint one key per session ([ADR 22](adr/0022-memini-keys-per-session.md)).
+- **A GitHub App:** its app ID and private key (PEM). Sessions act through it, commit as its bot user (`<slug>[bot]`), and it opens approved pull requests, so it needs **Contents: read & write**, **Pull requests: read & write** and **Metadata: read**, installed on every repository sessions may work on. The repositories a first message can pick from are its installations. (`sl0pz`, the app sloppod itself is developed with, has these on `bo0tzz/sloppod`.)
+- **memini, optionally:** its URL, an admin key, and your personal namespace (e.g. `personal/bo0tzz`; sessions read it, and those without a repository write under it). The runtime uses the admin key only to mint one key per session ([ADR 22](adr/0022-memini-keys-per-session.md)).
 
 ## HelmRelease (Flux)
 

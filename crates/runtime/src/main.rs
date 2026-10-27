@@ -72,12 +72,13 @@ impl Deref for AppState {
 
 impl Inner {
     /// The memory namespace for a session about `repo`; sessions without a project get a holding namespace (ADR 8).
-    pub fn memory_namespace(&self, repo: Option<&str>) -> String {
-        format!(
-            "{}{}",
-            self.config.memini_namespace_prefix,
-            repo.unwrap_or("unsorted")
-        )
+    /// A repository's namespace is shared by everyone working on it; other sessions stay under their owner's home.
+    pub fn memory_namespace(&self, repo: Option<&str>, home: &str) -> String {
+        let prefix = &self.config.memini_namespace_prefix;
+        match repo {
+            Some(repo) => format!("{prefix}{repo}"),
+            None => format!("{prefix}{home}/unsorted"),
+        }
     }
 
     /// (Re)writes the egress listener; its certificate has to cover every intercepted host.
@@ -124,6 +125,10 @@ async fn main() -> anyhow::Result<()> {
 
     let mut proposals = ProposalKinds::default();
     proposals.register(Arc::new(proposals::PullRequest::new(credentials.clone())));
+    proposals.register(Arc::new(proposals::RepoAccess::new(
+        db.clone(),
+        credentials.clone(),
+    )));
 
     let ca = tls::Ca::load_or_create(kube.clone(), &config.namespace, &config.ca_secret).await?;
     let service: Service = Api::namespaced(kube.clone(), &config.namespace)

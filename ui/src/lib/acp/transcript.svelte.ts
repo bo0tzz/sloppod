@@ -22,6 +22,8 @@ export type MessageItem = {
   messageId: string | null;
   /** A user message delivered into a running turn (the runtime marks the echo with `_meta.sloppod.steering`). */
   steering: boolean;
+  /** A message from sloppod itself (`_meta.sloppod.notice`), e.g. that a proposal was decided. */
+  notice: boolean;
   parts: MessagePart[];
 };
 
@@ -161,8 +163,15 @@ export class Transcript {
     if (type === 'user') {
       this.#plan = null;
     }
-    const sloppodMeta = chunk._meta?.sloppod as { steering?: boolean } | undefined;
-    this.#push({ type, key: this.#key(), messageId, steering: sloppodMeta?.steering === true, parts: [part] });
+    const sloppodMeta = chunk._meta?.sloppod as { steering?: boolean; notice?: boolean } | undefined;
+    this.#push({
+      type,
+      key: this.#key(),
+      messageId,
+      steering: sloppodMeta?.steering === true,
+      notice: sloppodMeta?.notice === true,
+      parts: [part],
+    });
   }
 
   #toolCall(call: ToolCall) {

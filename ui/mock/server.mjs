@@ -26,12 +26,15 @@ const { values: args } = parseArgs({
 
 const DELAY = Number(args.delay);
 const REPOS = ['bo0tzz/sloppod', 'bo0tzz/memini', 'immich-app/static-pages'];
-const MODES = [
-  { id: 'default', name: 'Default', description: 'Ask before edits and commands' },
-  { id: 'acceptEdits', name: 'Accept edits', description: 'Edit files without asking' },
-  { id: 'plan', name: 'Plan', description: 'Read-only planning' },
-  { id: 'bypassPermissions', name: 'Bypass permissions', description: 'Never ask' },
+// The adapter's model picker, as it appears in `configOptions`.
+const MODELS = [
+  { value: 'default', name: 'Default (recommended)', description: 'Sonnet' },
+  { value: 'sonnet', name: 'Sonnet' },
+  { value: 'opus', name: 'Opus' },
+  { value: 'haiku', name: 'Haiku' },
 ];
+/** The user's defaults for new sessions. `models` fills in once a session has offered them. */
+const settings = { model: null, models: [] };
 const CANCELLED = Symbol('cancelled');
 
 /** @type {Map<string, MockSession>} */
@@ -54,7 +57,9 @@ class MockSession {
     /** Open permission requests by toolCallId. */
     this.pending = new Map();
     this.turn = null;
-    this.modeId = 'default';
+    /** Set by an "always allow" answer: later edits in this session don't ask. */
+    this.alwaysAllow = false;
+    this.model = settings.model ?? 'default';
     /** Prompts sent before the agent was up: {text, done(stopReason), fail(error)}. */
     this.queue = [];
     this.startTimer = null;
@@ -76,8 +81,18 @@ class MockSession {
     for (const conn of this.subscribers) conn.notify('_sloppod/session', { session: this.data });
   }
 
-  modeState() {
-    return { currentModeId: this.modeId, availableModes: MODES };
+  configOptions() {
+    return [
+      {
+        id: 'model',
+        name: 'Model',
+        description: 'AI model to use',
+        category: 'model',
+        type: 'select',
+        currentValue: this.model,
+        options: MODELS,
+      },
+    ];
   }
 }
 
@@ -148,13 +163,56 @@ function promptText(prompt) {
     .join('');
 }
 
-function echoUser(session, text, { steering = false } = {}) {
+function echoUser(session, text, { steering = false, notice = false } = {}) {
+  const sloppod = { ...(steering ? { steering: true } : {}), ...(notice ? { notice: true } : {}) };
   session.emit({
     sessionUpdate: 'user_message_chunk',
     content: { type: 'text', text },
     messageId: randomUUID(),
-    ...(steering ? { _meta: { sloppod: { steering: true } } } : {}),
+    ...(steering || notice ? { _meta: { sloppod } } : {}),
   });
+}
+
+/**
+ * Tells the agent about something sloppod did, like deciding a proposal: recorded as a notice, steered
+ * into a running turn, or answered with a short turn of its own when the agent is idle.
+ */
+async function notifyAgent(session, text, ack) {
+  echoUser(session, text, { notice: true });
+  if (session.turn) {
+    session.turn.steers.push(text);
+    return;
+  }
+  if (session.data.phase !== 'idle') return;
+  session.turn = { cancelled: false, steers: [] };
+  session.setPhase('working');
+  try {
+    await sleep(DELAY * 2);
+    const messageId = randomUUID();
+    for (const piece of chunks(ack)) {
+      session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: piece }, messageId });
+      await sleep(DELAY);
+    }
+  } finally {
+    session.turn = null;
+    if (sessions.has(session.data.id) && session.data.phase !== 'stopped') session.setPhase('idle');
+  }
+}
+
+const sessionBranch = (session) => `sloppod/${session.data.id.slice(0, 8)}`;
+const hasRepoGrant = (session, repo) =>
+  session.data.grants.some((grant) => grant.capability === 'repo' && grant.params.repo === repo);
+
+/** Gives the session write access to another repository; the first one also becomes its `repo`. */
+function grantRepo(session, repo) {
+  if (!hasRepoGrant(session, repo)) {
+    session.data.grants.push({ capability: 'repo', params: { repo, access: 'rw', branch: sessionBranch(session) } });
+  }
+  if (!session.data.repo) {
+    session.data.repo = repo;
+    session.data.branch = sessionBranch(session);
+  }
+  session.broadcast();
 }
 
 function requestPermission(session, toolCall, options) {
@@ -265,6 +323,29 @@ async function agentScript(session, turn, prompt) {
       ],
     });
 
+  if (!session.data.repo && /request a repository/i.test(prompt)) {
+    const repo = availableRepos().at(-1) ?? REPOS.at(-1);
+    const reason = 'The change you asked for lives in that repository, and this session has none yet.';
+    await step(2);
+    await say("This session has no repository yet, so I'll ask for write access to one.");
+    const requestId = randomUUID();
+    tool({
+      toolCallId: requestId,
+      title: 'mcp__sloppod__request_repository',
+      kind: 'other',
+      status: 'pending',
+      rawInput: { repo, reason },
+    });
+    await step(2);
+    const proposal = createRepoGrant(session, repo, reason);
+    update(requestId, {
+      status: 'completed',
+      content: [{ type: 'content', content: { type: 'text', text: `Proposal ${proposal.id} created and waiting for human review.` } }],
+    });
+    await say(`I've asked for write access to **${repo}**. I'll carry on once you approve it.`);
+    return;
+  }
+
   await step(3);
   await say(
     `The request is: “${prompt.trim().slice(0, 200)}”. Before changing anything I should read how the socket reconnects today, then add backoff and run the tests.`,
@@ -310,19 +391,16 @@ async function agentScript(session, turn, prompt) {
   };
   tool(editCall);
   let allowed = true;
-  if (session.modeId === 'default' || session.modeId === 'plan') {
+  if (!session.alwaysAllow) {
     const outcome = await requestPermission(session, editCall, [
       { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
-      { optionId: 'allow_always', name: 'Always allow edits', kind: 'allow_always' },
+      { optionId: 'allow_always', name: 'Always allow', kind: 'allow_always' },
       { optionId: 'reject', name: 'Reject', kind: 'reject_once' },
     ]);
     checkCancel();
     if (outcome.outcome !== 'selected') throw CANCELLED;
     allowed = outcome.optionId !== 'reject';
-    if (outcome.optionId === 'allow_always') {
-      session.modeId = 'acceptEdits';
-      session.emit({ sessionUpdate: 'current_mode_update', currentModeId: 'acceptEdits' });
-    }
+    if (outcome.optionId === 'allow_always') session.alwaysAllow = true;
   }
   if (!allowed) {
     update(editId, { status: 'failed' });
@@ -435,6 +513,20 @@ function createProposal(session) {
   return proposal;
 }
 
+function createRepoGrant(session, repo, reason) {
+  const proposal = {
+    id: randomUUID(),
+    session_id: session.data.id,
+    kind: 'sloppod.repo.grant',
+    status: 'pending',
+    payload: { repo, reason, branch: sessionBranch(session) },
+    created_at: now(),
+  };
+  proposals.set(proposal.id, proposal);
+  broadcastProposal(proposal);
+  return proposal;
+}
+
 function publicProposal(proposal) {
   const { diff: _diff, commits: _commits, ...rest } = proposal;
   return rest;
@@ -494,6 +586,7 @@ function startAgent(session, ms) {
   session.startTimer = setTimeout(() => {
     session.startTimer = null;
     if (!sessions.has(session.data.id)) return;
+    rememberModels();
     session.setPhase('idle');
     const items = session.queue.splice(0);
     if (items.length === 0) return;
@@ -507,6 +600,9 @@ function startAgent(session, ms) {
     );
   }, ms);
 }
+
+/** The runtime remembers the models the agent offered, for the settings page. */
+const rememberModels = () => (settings.models = MODELS.map(({ value, name }) => ({ value, name })));
 
 const startupDelay = (prompt) => (/slow start/i.test(prompt) ? 3000 : DELAY * 8);
 
@@ -549,7 +645,7 @@ function handleCall(conn, message) {
       for (const entry of session.log) conn.notify('session/update', entry);
       session.subscribers.add(conn);
       conn.loaded.add(session.data.id);
-      conn.respond(id, { modes: session.modeState() });
+      conn.respond(id, { configOptions: session.configOptions() });
       for (const pending of session.pending.values()) sendPermission(session, pending, conn);
       return;
     }
@@ -591,7 +687,7 @@ function handleCall(conn, message) {
       if (session.data.phase === 'starting' || session.data.phase === 'disconnected') {
         queuePrompt(session, text);
         startAgent(session, DELAY * 8);
-        conn.respond(id, { outcome: 'startedNewTurn' });
+        conn.respond(id, { outcome: 'queued' });
         return;
       }
       if (!session.turn) {
@@ -609,15 +705,24 @@ function handleCall(conn, message) {
       return;
     }
 
-    case 'session/set_mode': {
+    case 'session/set_config_option': {
       if (!needLoaded()) return;
-      if (!MODES.some((mode) => mode.id === params.modeId)) {
-        conn.error(id, -32602, `Unknown mode ${params.modeId}`);
+      if (params.configId !== 'model' || !MODELS.some((model) => model.value === params.value)) {
+        conn.error(id, -32602, `Invalid value ${params.value} for ${params.configId}`);
         return;
       }
-      session.modeId = params.modeId;
-      session.emit({ sessionUpdate: 'current_mode_update', currentModeId: params.modeId });
-      conn.respond(id, {});
+      session.model = params.value;
+      const configOptions = session.configOptions();
+      // Other viewers hear about it the way the adapter reports it; the load response carries the state.
+      for (const other of session.subscribers) {
+        if (other !== conn) {
+          other.notify('session/update', {
+            sessionId: session.data.id,
+            update: { sessionUpdate: 'config_option_update', configOptions },
+          });
+        }
+      }
+      conn.respond(id, { configOptions });
       return;
     }
 
@@ -654,6 +759,18 @@ async function handleApi(req, res, url) {
 
   if (parts[0] === 'credentials') return handleCredentials(req, res, parts);
 
+  if (parts[0] === 'settings' && parts.length === 1) {
+    if (method === 'GET') return json(res, 200, settings);
+    if (method === 'PUT') {
+      const body = await readBody(req);
+      if ('model' in body) {
+        if (body.model !== null && typeof body.model !== 'string') return json(res, 400, { error: 'model must be a string or null' });
+        settings.model = body.model || null;
+      }
+      return json(res, 200, settings);
+    }
+  }
+
   if (parts[0] === 'sessions') {
     if (parts.length === 1 && method === 'GET') return json(res, 200, sortedSessions());
     if (parts.length === 1 && method === 'POST') {
@@ -672,6 +789,20 @@ async function handleApi(req, res, url) {
     const session = sessions.get(parts[1]);
     if (!session) return json(res, 404, { error: 'session not found' });
     if (parts.length === 2 && method === 'GET') return json(res, 200, session.data);
+    if (parts.length === 3 && parts[2] === 'repos' && method === 'POST') {
+      const body = await readBody(req);
+      if (!availableRepos().includes(body.repo)) return json(res, 400, { error: `unknown repository ${body.repo}` });
+      const granted = hasRepoGrant(session, body.repo);
+      grantRepo(session, body.repo);
+      if (!granted) {
+        void notifyAgent(
+          session,
+          `sloppod: the user gave this session write access to ${body.repo}.`,
+          `Thanks, I can push to ${body.repo} now.`,
+        );
+      }
+      return json(res, 200, session.data);
+    }
     if (parts.length === 2 && method === 'DELETE') {
       cancelTurn(session);
       session.setPhase('stopped');
@@ -696,18 +827,35 @@ async function handleApi(req, res, url) {
     if (parts.length === 3 && method === 'POST' && (parts[2] === 'approve' || parts[2] === 'reject')) {
       if (proposal.status !== 'pending') return json(res, 409, { error: `proposal is already ${proposal.status}` });
       const body = await readBody(req);
+      const session = sessions.get(proposal.session_id);
       proposal.decided_at = now();
-      if (parts[2] === 'approve') {
+      let notice;
+      let ack;
+      if (parts[2] === 'reject') {
+        proposal.status = 'rejected';
+        if (body.reason) proposal.reason = body.reason;
+        notice = `Your proposal was rejected${body.reason ? `: ${body.reason}` : '.'}`;
+        ack = "Understood, I'll leave that be.";
+      } else if (proposal.kind === 'github.pr.create') {
         if (typeof body.title === 'string') proposal.payload.title = body.title;
         if (typeof body.body === 'string') proposal.payload.body = body.body;
         const number = 100 + proposals.size;
         proposal.status = 'executed';
         proposal.result = { url: `https://github.com/${proposal.payload.repo}/pull/${number}`, number };
+        notice = `Your pull request was approved and opened: ${proposal.result.url}`;
+        ack = 'Great, the pull request is open.';
+      } else if (proposal.kind === 'sloppod.repo.grant') {
+        proposal.status = 'executed';
+        if (session) grantRepo(session, proposal.payload.repo);
+        notice = `You now have write access to ${proposal.payload.repo} on ${proposal.payload.branch}.`;
+        ack = `Thanks, I can push to ${proposal.payload.repo} now.`;
       } else {
-        proposal.status = 'rejected';
-        if (body.reason) proposal.reason = body.reason;
+        proposal.status = 'executed';
+        notice = `Your ${proposal.kind} proposal was approved.`;
+        ack = 'Thanks.';
       }
       broadcastProposal(proposal);
+      if (session) void notifyAgent(session, notice, ack);
       return json(res, 200, publicProposal(proposal));
     }
   }
@@ -788,6 +936,7 @@ async function seed() {
   const ago = (minutes) => new Date(Date.now() - minutes * 60_000).toISOString();
   addCredential({ kind: 'claude', name: 'Personal', config: {} });
   addCredential({ kind: 'github-app', name: 'sloppod-dev', config: { app_id: '1234567' } });
+  rememberModels();
 
   // Seeded sessions skip the startup queue: their history is written directly.
   const seeded = (fields) => {
@@ -802,10 +951,10 @@ async function seed() {
   const first = createSession({ prompt });
   first.queue = [];
   first.fast = true;
-  first.modeId = 'acceptEdits';
+  first.alwaysAllow = true;
   await runTurn(first, prompt, { echo: false });
   first.fast = false;
-  first.modeId = 'default';
+  first.alwaysAllow = false;
   first.data.created_at = ago(95);
   first.data.updated_at = ago(12);
   for (const proposal of proposals.values()) proposal.created_at = ago(13);
@@ -847,6 +996,15 @@ async function seed() {
     'A **parked** session has no pod: its state lives in the runtime until something wakes it, like a reply, a schedule or a webhook.',
   );
   fourth.data.phase = 'idle';
+  const unknown = {
+    id: randomUUID(),
+    session_id: fourth.data.id,
+    kind: 'kube.apply',
+    status: 'pending',
+    payload: { cluster: 'home', namespace: 'sloppod', manifests: ['deployment.yaml'] },
+    created_at: ago(60 * 2),
+  };
+  proposals.set(unknown.id, unknown);
   fourth.data.created_at = ago(60 * 3);
   fourth.data.updated_at = ago(60 * 2);
 }

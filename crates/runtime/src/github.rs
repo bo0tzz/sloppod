@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 
 const API: &str = "https://api.github.com";
 
@@ -18,6 +18,14 @@ pub struct GitHubApp {
     http: reqwest::Client,
     installations: Mutex<HashMap<String, u64>>,
     tokens: Mutex<HashMap<u64, (String, DateTime<Utc>)>>,
+    identity: OnceCell<GitIdentity>,
+}
+
+/// Who commits made with an app's access are by: its bot user.
+#[derive(Clone, Debug)]
+pub struct GitIdentity {
+    pub name: String,
+    pub email: String,
 }
 
 #[derive(Deserialize)]
@@ -44,7 +52,40 @@ impl GitHubApp {
                 .build()?,
             installations: Mutex::default(),
             tokens: Mutex::default(),
+            identity: OnceCell::new(),
         })
+    }
+
+    /// The app's bot user as a git identity, so commits are attributed to it on GitHub.
+    pub async fn identity(&self) -> anyhow::Result<GitIdentity> {
+        self.identity
+            .get_or_try_init(|| async {
+                let app: Value = self
+                    .app_get("/app")
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                let slug = app["slug"].as_str().context("app without slug")?;
+                let login = format!("{slug}[bot]");
+                let user: Value = self
+                    .http
+                    .get(format!("{API}/users/{login}"))
+                    .bearer_auth(self.any_token().await?)
+                    .header("accept", "application/vnd.github+json")
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                let id = user["id"].as_u64().context("bot user without id")?;
+                Ok(GitIdentity {
+                    email: format!("{id}+{login}@users.noreply.github.com"),
+                    name: login,
+                })
+            })
+            .await
+            .cloned()
     }
 
     fn jwt(&self) -> anyhow::Result<String> {

@@ -40,10 +40,6 @@ memory:
   # Prepended to every memory namespace, e.g. `dev/` for a test install.
   namespacePrefix: ""
 
-git:
-  name: sloppod
-  email: sloppod@users.noreply.github.com
-
 # Rendered into every session as the agent's user-level instructions (CLAUDE.md).
 instructions: ""
 

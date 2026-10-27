@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Button, Select, toastManager } from '@immich/ui';
   import { mdiSend, mdiSteering, mdiStop } from '@mdi/js';
+  import { configSelectOptions } from '#lib/presentation.ts';
   import type { SessionView } from '#lib/session.svelte.ts';
   import Composer from './Composer.svelte';
 
@@ -30,9 +31,8 @@
   );
   const canSend = $derived(!blockedReason && text.trim().length > 0 && !sending);
 
-  const modeOptions = $derived(
-    phase === 'stopped' ? [] : view.modes.map((mode) => ({ value: mode.id, label: mode.name })),
-  );
+  const model = $derived(phase === 'stopped' ? undefined : view.model);
+  const modelOptions = $derived(model?.type === 'select' ? configSelectOptions(model.options) : []);
 
   const unusualStops: Record<string, string> = {
     max_tokens: 'The agent hit its token limit.',
@@ -76,12 +76,12 @@
     }
   }
 
-  async function setMode(modeId: string) {
-    if (modeId === view.currentModeId) return;
+  async function setModel(value: string) {
+    if (model?.type !== 'select' || value === model.currentValue) return;
     try {
-      await view.setMode(modeId);
+      await view.setConfigOption('model', value);
     } catch (error) {
-      toastManager.danger({ title: "Couldn't switch mode", description: errorMessage(error) });
+      toastManager.danger({ title: "Couldn't switch the model", description: errorMessage(error) });
     }
   }
 </script>
@@ -101,9 +101,9 @@
   notice={blockedReason || queuedHint ? notice : undefined}
 >
   {#snippet leading()}
-    {#if modeOptions.length > 0}
-      <div class="w-36 shrink-0 sm:w-44" data-testid="mode-select">
-        <Select size="tiny" options={modeOptions} value={view.currentModeId ?? undefined} onChange={setMode} title="Permission mode" />
+    {#if model?.type === 'select' && modelOptions.length > 0}
+      <div class="w-32 shrink-0 sm:w-48" data-testid="model-select">
+        <Select size="tiny" options={modelOptions} value={model.currentValue} onChange={setModel} title={model.name} />
       </div>
     {/if}
   {/snippet}

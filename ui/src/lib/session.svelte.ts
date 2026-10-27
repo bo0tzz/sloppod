@@ -5,7 +5,7 @@ import type {
   InitializeResponse,
   LoadSessionResponse,
   RequestPermissionRequest,
-  SessionMode,
+  SessionConfigOption,
   SessionNotification,
   SessionUpdate,
   StopReason,
@@ -29,8 +29,9 @@ export class SessionView {
   connection = $state<ConnectionState>('connecting');
   connectionError = $state<string | null>(null);
 
-  modes = $state<SessionMode[]>([]);
-  currentModeId = $state<string | null>(null);
+  configOptions = $state<SessionConfigOption[]>([]);
+  /** The agent's model picker, if it offers one. */
+  model = $derived(this.configOptions.find((option) => option.id === 'model' && option.type === 'select'));
   steeringSupported = $state(false);
 
   permissions = $state<PendingPermission[]>([]);
@@ -88,7 +89,7 @@ export class SessionView {
         api.getSession(this.id),
         api.listProposals({ session: this.id }),
       ]);
-      this.#setSession(session);
+      this.setSession(session);
       for (const proposal of proposals) this.upsertProposal(proposal);
     } catch (error) {
       if (error instanceof ApiError && error.status === 404) {
@@ -115,10 +116,7 @@ export class SessionView {
         mcpServers: [],
       });
       this.transcript = this.#replay;
-      if (response?.modes) {
-        this.modes = response.modes.availableModes;
-        this.currentModeId = response.modes.currentModeId;
-      }
+      this.configOptions = response?.configOptions ?? [];
     } finally {
       this.#replay = null;
     }
@@ -135,7 +133,7 @@ export class SessionView {
       }
       case '_sloppod/session': {
         const { session } = params as { session: Session };
-        if (session.id === this.id) this.#setSession(session);
+        if (session.id === this.id) this.setSession(session);
         break;
       }
       case '_sloppod/proposal': {
@@ -166,19 +164,19 @@ export class SessionView {
 
   #applyUpdate(update: SessionUpdate) {
     switch (update.sessionUpdate) {
-      case 'current_mode_update':
-        this.currentModeId = update.currentModeId;
+      case 'config_option_update':
+        this.configOptions = update.configOptions;
         return;
       case 'available_commands_update':
         return;
       case 'session_info_update':
-        if (update.title && this.session) this.#setSession({ ...this.session, title: update.title });
+        if (update.title && this.session) this.setSession({ ...this.session, title: update.title });
         return;
     }
     (this.#replay ?? this.transcript).apply(update);
   }
 
-  #setSession(session: Session) {
+  setSession(session: Session) {
     this.session = newerSession(this.session, session);
     sessions.upsert(session);
   }
@@ -219,13 +217,21 @@ export class SessionView {
     this.permissions = [];
   }
 
-  async setMode(modeId: string) {
-    const previous = this.currentModeId;
-    this.currentModeId = modeId;
+  async setConfigOption(configId: string, value: string) {
+    const previous = this.configOptions;
+    // Show the choice right away; the response carries the authoritative options.
+    this.configOptions = previous.map((option) =>
+      option.id === configId && option.type === 'select' ? { ...option, currentValue: value } : option,
+    );
     try {
-      await this.#conn.request('session/set_mode', { sessionId: this.id, modeId });
+      const response = await this.#conn.request<{ configOptions?: SessionConfigOption[] }>('session/set_config_option', {
+        sessionId: this.id,
+        configId,
+        value,
+      });
+      if (response?.configOptions) this.configOptions = response.configOptions;
     } catch (error) {
-      this.currentModeId = previous;
+      this.configOptions = previous;
       throw error;
     }
   }

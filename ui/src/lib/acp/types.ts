@@ -49,8 +49,19 @@ export type PlanEntry = {
   status: 'pending' | 'in_progress' | 'completed';
 };
 
-export type SessionMode = { id: string; name: string; description?: string | null };
-export type SessionModeState = { currentModeId: string; availableModes: SessionMode[] };
+export type ConfigSelectOption = { value: string; name: string; description?: string | null };
+export type ConfigSelectGroup = { group: string; name: string; options: ConfigSelectOption[] };
+
+/** A session config option such as `model`. Select options may come flat or grouped. */
+export type SessionConfigOption = {
+  id: string;
+  name: string;
+  description?: string | null;
+  category?: string | null;
+} & (
+  | { type: 'select'; currentValue: string; options: ConfigSelectOption[] | ConfigSelectGroup[] }
+  | { type: 'boolean'; currentValue: boolean }
+);
 
 export type AvailableCommand = { name: string; description: string };
 
@@ -62,7 +73,6 @@ export type SessionUpdate =
   | ({ sessionUpdate: 'tool_call_update' } & ToolCallUpdate)
   | ({ sessionUpdate: 'plan'; entries: PlanEntry[] } & Meta)
   | ({ sessionUpdate: 'available_commands_update'; availableCommands: AvailableCommand[] } & Meta)
-  | ({ sessionUpdate: 'current_mode_update'; currentModeId: string } & Meta)
   | ({ sessionUpdate: 'session_info_update'; title?: string | null; updatedAt?: string | null } & Meta)
   | ({ sessionUpdate: 'notice'; severity: string; title: string; description?: string | null } & Meta)
   | ({
@@ -73,7 +83,8 @@ export type SessionUpdate =
       error?: string | null;
     } & Meta)
   | ({ sessionUpdate: 'compaction_summary_chunk'; compactionId: string; content: ContentBlock } & Meta)
-  | ({ sessionUpdate: 'usage_update' | 'config_option_update' } & Meta);
+  | ({ sessionUpdate: 'config_option_update'; configOptions: SessionConfigOption[] } & Meta)
+  | ({ sessionUpdate: 'usage_update' } & Meta);
 
 export type SessionNotification = { sessionId: string; update: SessionUpdate };
 
@@ -97,7 +108,7 @@ export type InitializeResponse = {
 };
 
 export type LoadSessionResponse = {
-  modes?: SessionModeState | null;
+  configOptions?: SessionConfigOption[] | null;
 } & Meta;
 
 export type StopReason = 'end_turn' | 'max_tokens' | 'max_turn_requests' | 'refusal' | 'cancelled';

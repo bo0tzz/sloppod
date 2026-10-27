@@ -18,10 +18,11 @@ A runtime for coding-agent sessions on Kubernetes. The design lives in the ADRs 
 - Tools come from `mise.toml`. `mise run check` runs the format check, clippy and tests, the same as CI.
 - UI: `cd ui && npm ci`, then `npm run check` and `npm run test:e2e` (Playwright against the mock runtime).
 - End-to-end on a local cluster, where docker and kind are available:
-  1. `dev/up.sh` creates a kind cluster with Cilium, agent-sandbox and Postgres.
-  2. Create the `sloppod-claude` and `sloppod-github` Secrets in namespace `sloppod`, as in `docs/deploy.md` (`dev/values.yaml` expects those names, plus `sloppod-db`, which `up.sh` creates).
-  3. `dev/deploy.sh` builds both images, loads them and installs the chart.
-  4. Port-forward `svc/sloppod` (e.g. to 18080) and drive it with `sloppodctl` (`cargo build -p sloppod-cli`; set `SLOPPOD_URL`) or the UI. `dev/smoke.sh` runs the milestone checks; it pushes a `sloppod/<id>` branch to the repository and uses a few small model calls.
+  1. `dev/up.sh` creates a kind cluster with Cilium, agent-sandbox and Postgres, plus the `sloppod-db` and `sloppod-master-key` Secrets.
+  2. `dev/deploy.sh` builds both images, loads them and installs the chart.
+  3. Port-forward `svc/sloppod` (e.g. to 18080) and drive it with `sloppodctl` (`cargo build -p sloppod-cli`; set `SLOPPOD_URL`) or the UI. Requests act as the user `dev`.
+  4. Add a Claude account and a GitHub App under Settings, or with `sloppodctl add-credential` (see `docs/deploy.md`); they're stored in the database, not in Secrets.
+  5. `dev/smoke.sh` runs the milestone checks; it pushes a `sloppod/<id>` branch to the repository and uses a few small model calls. Set the model to Haiku in Settings first to keep them cheap.
 - Inside a sloppod session there's no container runtime, so stick to `mise run check` and the UI tests there.
 - ADRs are MADR style. Numbers are permanent and append-only; add new ones to the README index under the right group.
 - Only comment code for intent a reader couldn't infer.

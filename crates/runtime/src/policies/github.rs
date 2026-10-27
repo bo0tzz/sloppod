@@ -49,18 +49,20 @@ impl GitHubPolicy {
                 Ok(Decision::allow_with(headers, vec!["authorization".into()]))
             }
             Service::ReceivePack => {
-                let Some(grant) = session.writable_repo() else {
-                    return Ok(Decision::deny(
-                        "sloppod: this session has no repository to push to.\n",
-                    ));
-                };
-                let (repo, branch) = (grant.repo, grant.branch);
-                if !git.repo.eq_ignore_ascii_case(repo) {
+                let Some(grant) = session.writable_repo_for(&git.repo) else {
+                    let writable: Vec<&str> = session.writable_repos().map(|g| g.repo).collect();
+                    let can = if writable.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (it can push to {})", writable.join(", "))
+                    };
                     return Ok(Decision::deny(format!(
-                        "sloppod: this session can only push to {repo}, not {}.\n",
+                        "sloppod: this session can't push to {}{can}. Ask for write access with the \
+                         request_repository tool.\n",
                         git.repo
                     )));
-                }
+                };
+                let (repo, branch) = (grant.repo, grant.branch);
                 let Some(app) = self.app(session).await else {
                     return Ok(Decision::deny(format!(
                         "sloppod: {} has no GitHub App configured.\n",
@@ -198,7 +200,9 @@ fn proposal_hint(what: &str, session: &SessionContext) -> String {
             "to open a pull request, push to your session branch `{}` and call the propose_pull_request tool",
             grant.branch
         ),
-        None => "this session has no repository, so it can't propose pull requests".to_owned(),
+        None => "to change a repository, ask for write access with the request_repository tool, then push to your \
+                 session branch and call propose_pull_request"
+            .to_owned(),
     };
     format!(
         "sloppod: {what}. Outward actions go through human review: {pull_request}. Other GitHub writes \

@@ -22,12 +22,16 @@ export type Grant = { capability: string; params: Record<string, unknown> };
 
 export type ProposalStatus = 'pending' | 'approved' | 'rejected' | 'executed' | 'failed';
 
+export type PullRequestPayload = { repo: string; base: string; head: string; title: string; body: string; draft: boolean };
+export type RepoGrantPayload = { repo: string; reason: string; branch: string };
+
 export type Proposal = {
   id: string;
   session_id: string;
-  kind: 'github.pr.create';
+  /** `github.pr.create` and `sloppod.repo.grant` so far; others render generically. */
+  kind: string;
   status: ProposalStatus;
-  payload: { repo: string; base: string; head: string; title: string; body: string; draft: boolean };
+  payload: Record<string, unknown>;
   result?: { url: string; number: number };
   error?: string;
   reason?: string;
@@ -35,9 +39,10 @@ export type Proposal = {
   decided_at?: string;
 };
 
+/** Pull requests add their diff and commits; other kinds add nothing. */
 export type ProposalDetail = Proposal & {
-  diff: string;
-  commits: { sha: string; message: string }[];
+  diff?: string;
+  commits?: { sha: string; message: string }[];
 };
 
 export type CredentialKind = 'claude' | 'github-app' | 'memini';
@@ -56,6 +61,12 @@ export type NewCredential = {
   name: string;
   config: Record<string, string>;
   secret: string;
+};
+
+/** Defaults for new sessions. `models` is what the agent offered most recently; empty before the first session. */
+export type Settings = {
+  model: string | null;
+  models: { value: string; name: string }[];
 };
 
 export class ApiError extends Error {
@@ -96,8 +107,12 @@ export const api = {
   getSession: (id: string) => call<Session>('GET', `/sessions/${encodeURIComponent(id)}`),
   createSession: (body: NewSession) => call<Session>('POST', '/sessions', body),
   deleteSession: (id: string) => call<void>('DELETE', `/sessions/${encodeURIComponent(id)}`),
+  addSessionRepo: (id: string, repo: string) =>
+    call<Session>('POST', `/sessions/${encodeURIComponent(id)}/repos`, { repo }),
   listRepos: () => call<string[]>('GET', '/repos'),
   me: () => call<{ user: string }>('GET', '/me'),
+  getSettings: () => call<Settings>('GET', '/settings'),
+  updateSettings: (body: { model: string | null }) => call<Settings>('PUT', '/settings', body),
   listCredentials: () => call<Credential[]>('GET', '/credentials'),
   createCredential: (body: NewCredential) => call<Credential>('POST', '/credentials', body),
   makeDefaultCredential: (id: string) => call<Credential>('POST', `/credentials/${encodeURIComponent(id)}/default`, {}),

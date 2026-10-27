@@ -207,18 +207,49 @@ test('reconnects after the socket drops without duplicating history', async ({ p
   await expect(permissionCard(page)).toBeVisible();
 });
 
-test('switches the permission mode', async ({ page }) => {
-  await createSession(page, 'Switch modes in sloppod');
-  await expect(permissionCard(page)).toBeVisible();
-  await permissionCard(page).getByRole('button', { name: 'Always allow edits' }).click();
-  await expect(page.getByTestId('mode-select')).toContainText('Accept edits');
-  await expect(agentMessages(page).filter({ hasText: FINAL })).toBeVisible();
+test('switches the model of a session', async ({ page, context }) => {
+  const sent: string[] = [];
+  page.on('websocket', (socket) => socket.on('framesent', ({ payload }) => sent.push(String(payload))));
+  const id = await createSession(page, 'Switch models in sloppod');
+  const select = page.getByTestId('model-select');
+  await expect(select).toContainText('Default (recommended)');
 
-  await page.getByTestId('mode-select').getByRole('combobox').click();
-  await page.getByRole('option', { name: 'Default' }).click();
-  await expect(page.getByTestId('mode-select')).toContainText('Default');
+  const other = await context.newPage();
+  await other.goto(`/sessions/${id}`);
+  await expect(other.getByTestId('model-select')).toContainText('Default (recommended)');
+
+  await select.getByRole('combobox').click();
+  await page.getByRole('option', { name: 'Opus' }).click();
+  await expect(select).toContainText('Opus');
+  expect(sent.some((frame) => frame.includes('"session/set_config_option"') && frame.includes('"opus"'))).toBe(true);
+  expect(sent.some((frame) => frame.includes('"session/set_mode"'))).toBe(false);
+
+  // Another viewer follows along, and the choice survives a reload.
+  await expect(other.getByTestId('model-select')).toContainText('Opus');
   await page.reload();
-  await expect(page.getByTestId('mode-select')).toContainText('Default');
+  await expect(page.getByTestId('model-select')).toContainText('Opus');
+});
+
+test('saves the default model for new sessions', async ({ page }) => {
+  const defaults = page.getByTestId('session-defaults');
+  async function choose(name: string) {
+    await page.goto('/settings');
+    await defaults.getByRole('combobox').click();
+    await page.getByRole('option', { name, exact: true }).click();
+    await defaults.getByRole('button', { name: 'Save' }).click();
+    await expect(defaults.getByRole('button', { name: 'Save' })).toBeDisabled();
+  }
+
+  await choose('Haiku');
+  await page.reload();
+  await expect(defaults.getByRole('combobox')).toContainText('Haiku');
+
+  await createSession(page, 'Use my default model in sloppod');
+  await expect(page.getByTestId('model-select')).toContainText('Haiku');
+
+  await choose('Agent default');
+  await page.reload();
+  await expect(defaults.getByRole('combobox')).toContainText('Agent default');
 });
 
 test('queues messages while the agent starts', async ({ page }) => {
@@ -255,6 +286,64 @@ test('runs a session without a repository', async ({ page }) => {
   const row = page.getByTestId('session-row').filter({ hasText: prompt });
   await expect(row).toBeVisible();
   await expect(row).not.toContainText('bo0tzz/');
+});
+
+test('approves a repository access request', async ({ page }) => {
+  await createSession(page, 'Please request a repository for this');
+  await expect(page.getByTestId('session-subtitle')).toHaveText('No repository');
+
+  const card = page.getByTestId('proposal-card');
+  await expect(card).toHaveAttribute('data-kind', 'sloppod.repo.grant');
+  await expect(card).toContainText('Write access to immich-app/static-pages');
+  // Decided on the card itself; there's nothing more to review.
+  await expect(card.getByRole('button', { name: 'Review' })).toHaveCount(0);
+  await expect(card.getByTestId('proposal-reason')).toContainText('this session has none yet');
+  await card.getByRole('button', { name: 'Approve' }).click();
+  await expect(card).toBeHidden();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+
+  // The session now has the repository, and sloppod's notice shows as a notice, not a user message.
+  await expect(page.getByTestId('session-subtitle')).toHaveText('immich-app/static-pages');
+  await expect(page.getByTestId('system-notice')).toContainText('You now have write access to immich-app/static-pages');
+  await expect(userMessages(page)).toHaveCount(1);
+  await expect(agentMessages(page).filter({ hasText: 'I can push to immich-app/static-pages now' })).toBeVisible();
+});
+
+test('adds a repository from the session menu', async ({ page }) => {
+  await createSession(page, 'Just chat for now');
+  await expect(page.getByTestId('session-subtitle')).toHaveText('No repository');
+
+  const picker = page.getByTestId('add-repo');
+  const openPicker = async () => {
+    await page.getByRole('button', { name: 'Session actions' }).click();
+    await page.getByRole('menuitem', { name: 'Add repository…' }).click();
+    await picker.getByRole('combobox').click();
+  };
+  await openPicker();
+  await page.getByRole('option', { name: 'bo0tzz/memini' }).click();
+  await page.getByRole('button', { name: 'Add', exact: true }).click();
+  await expect(page.getByTestId('session-subtitle')).toHaveText('bo0tzz/memini');
+
+  // Repositories the session already has aren't offered again.
+  await openPicker();
+  await expect(page.getByRole('option', { name: 'bo0tzz/sloppod' })).toBeVisible();
+  await expect(page.getByRole('option', { name: 'bo0tzz/memini' })).toHaveCount(0);
+});
+
+test('shows a proposal of an unknown kind generically', async ({ page }) => {
+  const sessions: { id: string; title: string }[] = await (await page.request.get('/api/v1/sessions')).json();
+  const session = sessions.find((candidate) => candidate.title === 'Park and wake')!;
+  await page.goto(`/sessions/${session.id}`);
+
+  const card = page.getByTestId('proposal-card');
+  await expect(card).toHaveAttribute('data-kind', 'kube.apply');
+  await card.getByRole('button', { name: 'Review' }).click();
+  await expect(page.getByTestId('proposal-payload')).toContainText('"cluster": "home"');
+  await page.getByRole('button', { name: 'Reject…' }).click();
+  await page.getByRole('button', { name: 'Reject', exact: true }).click();
+  await expect(page.getByTestId('proposal-status')).toHaveText('Rejected');
+  await page.getByRole('button', { name: 'Done' }).click();
+  await expect(page.getByTestId('system-notice')).toContainText('Your proposal was rejected');
 });
 
 // Last, because it changes the mock's credentials; it puts them back at the end.

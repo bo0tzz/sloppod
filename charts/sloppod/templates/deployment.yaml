@@ -93,10 +93,6 @@ spec:
             - name: SLOPPOD_MEMINI_NAMESPACE_PREFIX
               value: {{ . | quote }}
             {{- end }}
-            - name: SLOPPOD_GIT_NAME
-              value: {{ .Values.git.name | quote }}
-            - name: SLOPPOD_GIT_EMAIL
-              value: {{ .Values.git.email | quote }}
             {{- if .Values.instructions }}
             - name: SLOPPOD_INSTRUCTIONS_FILE
               value: /etc/sloppod/config/instructions.md

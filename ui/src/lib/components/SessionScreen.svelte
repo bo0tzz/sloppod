@@ -10,11 +10,12 @@
     modalManager,
     toastManager,
   } from '@immich/ui';
-  import { mdiArrowDown, mdiCogOutline, mdiSourcePull, mdiTrashCanOutline } from '@mdi/js';
+  import { mdiArrowDown, mdiCogOutline, mdiSourcePull, mdiSourceRepository, mdiTrashCanOutline } from '@mdi/js';
   import { onMount } from 'svelte';
   import { api } from '#lib/api.ts';
   import { SessionView } from '#lib/session.svelte.ts';
   import { sessions } from '#lib/sessions.svelte.ts';
+  import AddRepoModal from './AddRepoModal.svelte';
   import ChatHeader from './ChatHeader.svelte';
   import PermissionCard from './PermissionCard.svelte';
   import PhaseBadge from './PhaseBadge.svelte';
@@ -48,7 +49,9 @@
   });
 
   let openProposalId = $state<string | null>(null);
+  const openProposal = $derived(view.proposals.find((proposal) => proposal.id === openProposalId));
   let showProposalList = $state(false);
+  let showAddRepo = $state(false);
 
   let scroller = $state<HTMLElement | null>(null);
   let content = $state<HTMLElement | null>(null);
@@ -129,6 +132,12 @@
         <ContextMenuButton
           aria-label="Session actions"
           items={[
+            {
+              title: 'Add repository…',
+              icon: mdiSourceRepository,
+              $if: () => Boolean(session) && session?.phase !== 'stopped',
+              onAction: () => (showAddRepo = true),
+            },
             { title: 'Settings', icon: mdiCogOutline, href: '/settings' },
             { title: 'Delete session', icon: mdiTrashCanOutline, color: 'danger', onAction: deleteSession },
           ]}
@@ -199,7 +208,11 @@
             />
           {/each}
           {#each pendingProposals as proposal (proposal.id)}
-            <ProposalCard {proposal} onOpen={() => (openProposalId = proposal.id)} />
+            <ProposalCard
+              {proposal}
+              onOpen={() => (openProposalId = proposal.id)}
+              onChange={(proposal) => view.upsertProposal(proposal)}
+            />
           {/each}
         </div>
       </div>
@@ -216,13 +229,25 @@
       showProposalList = false;
       openProposalId = proposalId;
     }}
+    onChange={(proposal) => view.upsertProposal(proposal)}
     onClose={() => (showProposalList = false)}
   />
 {/if}
 
-{#if openProposalId}
+{#if showAddRepo && session}
+  <AddRepoModal
+    {session}
+    onAdded={(updated, repo) => {
+      view.setSession(updated);
+      toastManager.success(`Added ${repo}`);
+    }}
+    onClose={() => (showAddRepo = false)}
+  />
+{/if}
+
+{#if openProposal}
   <ProposalModal
-    id={openProposalId}
+    proposal={openProposal}
     onChange={(proposal) => view.upsertProposal(proposal)}
     onClose={() => (openProposalId = null)}
   />

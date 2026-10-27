@@ -4,6 +4,7 @@
   import MessageView from './MessageView.svelte';
   import NoticeView from './NoticeView.svelte';
   import PlanView from './PlanView.svelte';
+  import SystemNotice from './SystemNotice.svelte';
   import ThoughtView from './ThoughtView.svelte';
   import ToolCallView from './ToolCallView.svelte';
 
@@ -12,7 +13,9 @@
 
 <div class="flex flex-col gap-3" data-testid="transcript">
   {#each items as item, index (item.key)}
-    {#if item.type === 'user' || item.type === 'agent'}
+    {#if item.type === 'user' && item.notice}
+      <SystemNotice message={item} />
+    {:else if item.type === 'user' || item.type === 'agent'}
       <MessageView message={item} />
     {:else if item.type === 'thought'}
       <ThoughtView thought={item} active={running && index === items.length - 1} />

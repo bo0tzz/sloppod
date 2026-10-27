@@ -27,6 +27,8 @@ pub struct SessionRow {
     pub agent_state: Option<Value>,
     /// The session's current model, used whenever its agent starts.
     pub model: Option<String>,
+    /// The repository the session is about, checked out as its working directory (ADR 1).
+    pub repo: Option<String>,
     grants: Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -47,11 +49,17 @@ impl SessionRow {
 
     pub fn to_api(&self) -> Session {
         let context = self.context();
-        let repo = context.writable_repo();
+        let repo = match &self.repo {
+            Some(repo) => context.writable_repo_for(repo),
+            None => context.writable_repo(),
+        };
         Session {
             id: self.id,
             title: self.title.clone(),
-            repo: repo.as_ref().map(|r| r.repo.to_owned()),
+            repo: repo
+                .as_ref()
+                .map(|r| r.repo.to_owned())
+                .or(self.repo.clone()),
             branch: repo.as_ref().map(|r| r.branch.to_owned()),
             grants: context
                 .grants
@@ -72,7 +80,7 @@ impl SessionRow {
     }
 }
 
-const SESSION_COLUMNS: &str = "id, owner, title, phase, agent_session_id, agent_state, model, created_at, updated_at, \
+const SESSION_COLUMNS: &str = "id, owner, title, phase, agent_session_id, agent_state, model, repo, created_at, updated_at, \
      coalesce((select jsonb_agg(jsonb_build_object('capability', g.capability, 'params', g.params) order by g.created_at) \
      from session_grants g where g.session_id = sessions.id), '[]'::jsonb) as grants";
 
@@ -83,13 +91,15 @@ pub struct NewSessionRow<'a> {
     pub custom_title: bool,
     pub pending_prompt: &'a str,
     pub model: Option<&'a str>,
+    pub repo: Option<&'a str>,
     pub grants: &'a [Grant],
 }
 
 pub async fn insert_session(db: &PgPool, new: NewSessionRow<'_>) -> sqlx::Result<SessionRow> {
     let mut tx = db.begin().await?;
     sqlx::query(
-        "insert into sessions (id, owner, title, custom_title, pending_prompt, model) values ($1, $2, $3, $4, $5, $6)",
+        "insert into sessions (id, owner, title, custom_title, pending_prompt, model, repo) \
+         values ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(new.id)
     .bind(new.owner)
@@ -97,8 +107,9 @@ pub async fn insert_session(db: &PgPool, new: NewSessionRow<'_>) -> sqlx::Result
     .bind(new.custom_title)
     .bind(new.pending_prompt)
     .bind(new.model)
-        .execute(&mut *tx)
-        .await?;
+    .bind(new.repo)
+    .execute(&mut *tx)
+    .await?;
     for grant in new.grants {
         sqlx::query(
             "insert into session_grants (session_id, capability, params) values ($1, $2, $3)",

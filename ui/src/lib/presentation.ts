@@ -1,5 +1,7 @@
-import type { Grant } from './api.ts';
 import {
+  mdiHelpCircleOutline,
+  mdiSourcePull,
+  mdiSourceRepository,
   mdiCheckCircle,
   mdiCircleOutline,
   mdiClockOutline,
@@ -17,8 +19,8 @@ import {
   mdiWeb,
 } from '@mdi/js';
 import type { Color } from '@immich/ui';
-import type { PlanEntry, ToolCallStatus, ToolKind } from './acp/types.ts';
-import type { CredentialKind, Phase, ProposalStatus } from './api.ts';
+import type { ConfigSelectGroup, ConfigSelectOption, PlanEntry, ToolCallStatus, ToolKind } from './acp/types.ts';
+import type { CredentialKind, Grant, Phase, Proposal, ProposalStatus } from './api.ts';
 
 export const phases: Record<Phase, { label: string; color: Color; description: string }> = {
   starting: { label: 'Starting', color: 'info', description: 'The pod is starting or the agent has not connected yet' },
@@ -59,9 +61,44 @@ export const proposalStatuses: Record<ProposalStatus, { label: string; color: Co
   pending: { label: 'Pending review', color: 'warning' },
   approved: { label: 'Approved', color: 'info' },
   rejected: { label: 'Rejected', color: 'secondary' },
-  executed: { label: 'Opened', color: 'success' },
+  executed: { label: 'Done', color: 'success' },
   failed: { label: 'Failed', color: 'danger' },
 };
+
+const executedLabels: Record<string, string> = {
+  'github.pr.create': 'Opened',
+  'sloppod.repo.grant': 'Granted',
+};
+
+export function proposalStatus(proposal: Proposal): { label: string; color: Color } {
+  const status = proposalStatuses[proposal.status] ?? { label: proposal.status, color: 'secondary' };
+  return proposal.status === 'executed' ? { ...status, label: executedLabels[proposal.kind] ?? status.label } : status;
+}
+
+const payloadText = (value: unknown) => (typeof value === 'string' ? value : '');
+
+/** How a proposal reads in cards and the modal, by kind. Unknown kinds fall back to their kind name. */
+export function proposalSummary(proposal: Proposal): { label: string; title: string; detail?: string; icon: string } {
+  const payload = proposal.payload;
+  switch (proposal.kind) {
+    case 'github.pr.create':
+      return {
+        label: 'Pull request',
+        title: payloadText(payload.title),
+        detail: `${payloadText(payload.repo)}: ${payloadText(payload.head)} → ${payloadText(payload.base)}`,
+        icon: mdiSourcePull,
+      };
+    case 'sloppod.repo.grant':
+      return {
+        label: 'Repository access',
+        title: `Write access to ${payloadText(payload.repo)}`,
+        detail: payloadText(payload.reason) || undefined,
+        icon: mdiSourceRepository,
+      };
+    default:
+      return { label: 'Proposal', title: proposal.kind, icon: mdiHelpCircleOutline };
+  }
+}
 
 /** MCP tools arrive titled `mcp__<server>__<tool>`; show the tool name and say which server it's from. */
 export function toolTitle(title: string): { title: string; server?: string } {
@@ -148,4 +185,13 @@ export function grantLabel(grant: Grant): string {
     default:
       return grant.capability;
   }
+}
+
+/** Flattens a config select's options for a plain select; grouped options get their group's name. */
+export function configSelectOptions(options: ConfigSelectOption[] | ConfigSelectGroup[]): { value: string; label: string }[] {
+  return options.flatMap((entry) =>
+    'group' in entry
+      ? entry.options.map((option) => ({ value: option.value, label: `${entry.name}: ${option.name}` }))
+      : [{ value: entry.value, label: entry.name }],
+  );
 }

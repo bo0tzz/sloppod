@@ -1,34 +1,62 @@
 //! Claude Code through `claude-agent-acp` (ADR 9).
 
 use serde_json::{Value, json};
-use sloppod_contracts::{AgentAdapter, AgentContext, AgentFile, AgentLaunch, Manifest};
+use sloppod_contracts::{AgentAdapter, AgentContext, AgentFile, AgentLaunch, Manifest, RepoGrant};
 
 /// Credentials in the pod are placeholders; the authorizer attaches the real ones (ADR 11).
 pub const PLACEHOLDER: &str = "sloppod-placeholder";
 const OAUTH_PLACEHOLDER: &str = "sk-ant-oat01-sloppod-placeholder";
 const MEMINI_PLUGIN: &str = "/opt/sloppod/plugins/memini";
+/// Claude Code tools that don't fit a sloppod session: scheduling starts turns the runtime doesn't see and dies with
+/// the pod, plan mode would leave auto mode on exit, and worktrees put work on branches the session can't push.
+const DISALLOWED_TOOLS: &[&str] = &[
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "ScheduleWakeup",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "EnterWorktree",
+    "ExitWorktree",
+];
 
 pub struct ClaudeCode;
 
 impl ClaudeCode {
     fn session_prompt(context: &AgentContext) -> String {
         let session = &context.session;
-        let workspace = match session.writable_repo() {
-            Some(sloppod_contracts::RepoGrant { repo, branch }) => format!(
+        let dir = &context.repo_dir;
+        let mut workspace = match context
+            .repo
+            .as_deref()
+            .and_then(|r| session.writable_repo_for(r))
+        {
+            Some(RepoGrant { repo, branch }) => format!(
                 "- Your working copy of {repo} is at {dir}, on your session branch `{branch}`. Commit there and push \
-                 with `git push origin HEAD:{branch}`; that is the only ref you can push.\n\
-                 - Outward actions are proposals that a human reviews. To open a pull request, push your branch and \
-                 call the `propose_pull_request` tool; sloppod opens the PR once it's approved. Direct writes to \
-                 GitHub (gh pr create, comments, API POSTs) are refused.\n",
-                dir = context.repo_dir,
+                 with `git push origin HEAD:{branch}`.\n"
             ),
-            _ => format!(
-                "- This session has no repository; your working directory {dir} is empty and kept across restarts. \
-                 You can read GitHub and clone repositories to look at them, but there is nothing you can push to, \
-                 and GitHub writes are refused.\n",
-                dir = context.repo_dir,
+            None => format!(
+                "- This session isn't about a repository; your working directory {dir} is kept across restarts. You \
+                 can read GitHub and clone repositories to look at them.\n"
             ),
         };
+        for RepoGrant { repo, branch } in session
+            .writable_repos()
+            .filter(|g| context.repo.as_deref() != Some(g.repo))
+        {
+            workspace.push_str(&format!(
+                "- You can also push to {repo}: clone it to {}/{repo} if it isn't there yet, and push your session \
+                 branch `{branch}`.\n",
+                context.repos_dir
+            ));
+        }
+        workspace.push_str(
+            "- In each repository, your session branch is the only ref you can push. For write access to another \
+             repository, call the `request_repository` tool.\n\
+             - Outward actions are proposals that a human reviews. To open a pull request, push your branch and call \
+             the `propose_pull_request` tool; sloppod opens the PR once it's approved. You're told when your \
+             proposals are decided. Direct writes to GitHub (gh pr create, comments, API POSTs) are refused.\n",
+        );
         format!(
             "You are running in a sloppod session: a sandboxed Kubernetes pod.\n\
              {workspace}\
@@ -97,7 +125,7 @@ impl AgentAdapter for ClaudeCode {
 
         let mcp_servers =
             json!([{"type": "http", "name": "sloppod", "url": context.tools_url, "headers": []}]);
-        let meta = json!({"claudeCode": {"options": {"plugins": plugins}}});
+        let meta = json!({"claudeCode": {"options": {"plugins": plugins, "disallowedTools": DISALLOWED_TOOLS}}});
         let system_prompt = json!({"mode": "append", "content": [{"type": "text", "text": Self::session_prompt(context)}]});
         let session_params =
             json!({"mcpServers": mcp_servers, "systemPrompt": system_prompt, "_meta": meta});

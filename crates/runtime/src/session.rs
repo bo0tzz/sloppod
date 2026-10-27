@@ -443,21 +443,108 @@ impl Hub {
         result
     }
 
+    /// Tells the agent something happened outside its turns, e.g. a proposal was decided: a new turn when it's
+    /// idle, steered into the running one, or queued until it's up.
+    pub async fn notify(self: &Arc<Self>, id: Uuid, text: String) {
+        let blocks = vec![json!({"type": "text", "text": text})];
+        let delivery = {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            if state.agent.is_none() || state.agent_session_id.is_none() {
+                state.queue.push(Queued {
+                    blocks: blocks.clone(),
+                    reply: None,
+                });
+                None
+            } else if state.turn_running {
+                Some(false)
+            } else {
+                state.turn_running = true;
+                Some(true)
+            }
+        };
+        self.record(
+            id,
+            json!({
+                "sessionUpdate": "user_message_chunk",
+                "messageId": Uuid::new_v4(),
+                "content": blocks[0],
+                "_meta": {"sloppod": {"notice": true}},
+            }),
+        )
+        .await;
+        match delivery {
+            None => {}
+            Some(true) => {
+                let hub = self.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = hub.run_turn(id, blocks).await {
+                        tracing::warn!(session = %id, error = %e, "notice turn failed");
+                    }
+                });
+            }
+            Some(false) => {
+                if let Err(e) = self.steer_in(id, blocks).await {
+                    tracing::warn!(session = %id, error = %e, "steering a notice in");
+                }
+            }
+        }
+    }
+
+    /// Steers blocks into the running turn. If that turn has just ended they start a new one here, so the turn
+    /// is tracked like any other rather than run detached by the adapter.
+    async fn steer_in(self: &Arc<Self>, id: Uuid, blocks: Vec<Value>) -> Result<Value, RpcError> {
+        for _ in 0..10 {
+            let (agent, agent_session_id) = self.agent_for(id).await?;
+            let result = agent
+                .request(
+                    "_session/steering",
+                    json!({
+                        "sessionId": agent_session_id,
+                        "prompt": blocks,
+                        "_meta": {"steering": {"idleBehavior": "promptRequired"}},
+                    }),
+                )
+                .await?;
+            if result["outcome"] != "promptRequired" {
+                return Ok(result);
+            }
+            let start = {
+                let live = self.live(id);
+                let mut state = live.state.lock().await;
+                !std::mem::replace(&mut state.turn_running, true)
+            };
+            if start {
+                let hub = self.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = hub.run_turn(id, blocks).await {
+                        tracing::warn!(session = %id, error = %e, "steered turn failed");
+                    }
+                });
+                return Ok(json!({"outcome": "startedNewTurn"}));
+            }
+            // Our record of the turn hasn't caught up with the agent's yet.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        Err(RpcError::new(
+            -32002,
+            "couldn't deliver the message; send it again",
+        ))
+    }
+
     /// Delivers a message into the running turn; before the agent is up it joins the queue instead.
-    pub async fn steer(&self, id: Uuid, mut params: Value) -> Result<Value, RpcError> {
-        let ready = self.agent_for(id).await;
-        let Ok((agent, agent_session_id)) = ready else {
-            let blocks = params["prompt"].as_array().cloned().unwrap_or_default();
+    pub async fn steer(self: &Arc<Self>, id: Uuid, params: Value) -> Result<Value, RpcError> {
+        let blocks = params["prompt"].as_array().cloned().unwrap_or_default();
+        if self.agent_for(id).await.is_err() {
             self.live(id).state.lock().await.queue.push(Queued {
                 blocks,
                 reply: None,
             });
             self.record_user_message(id, &params["prompt"], false).await;
             return Ok(json!({"outcome": "queued"}));
-        };
+        }
         self.record_user_message(id, &params["prompt"], true).await;
-        params["sessionId"] = json!(agent_session_id);
-        agent.request("_session/steering", params).await
+        self.steer_in(id, blocks).await
     }
 
     pub async fn cancel(&self, id: Uuid) {

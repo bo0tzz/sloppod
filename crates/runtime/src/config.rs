@@ -103,17 +103,6 @@ pub struct Config {
     #[arg(long, env = "SLOPPOD_DIRECT_HOSTS", value_delimiter = ',', default_value = DEFAULT_DIRECT_HOSTS)]
     pub direct_hosts: Vec<String>,
 
-    /// Git identity for commits made in sessions.
-    #[arg(long, env = "SLOPPOD_GIT_NAME", default_value = "sloppod")]
-    pub git_name: String,
-
-    #[arg(
-        long,
-        env = "SLOPPOD_GIT_EMAIL",
-        default_value = "sloppod@users.noreply.github.com"
-    )]
-    pub git_email: String,
-
     #[arg(long, env = "SLOPPOD_UI_DIR", default_value = "/usr/share/sloppod/ui")]
     pub ui_dir: PathBuf,
 

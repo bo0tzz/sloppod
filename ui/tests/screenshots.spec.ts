@@ -77,6 +77,21 @@ for (const [form, device] of Object.entries(viewports)) {
         await shot(page, 'permission');
       });
 
+      test('repository access request and the notice after approving it', async ({ page }) => {
+        const response = await page.request.post('/api/v1/sessions', {
+          data: { prompt: 'Please request a repository for this' },
+        });
+        const session: Session = await response.json();
+        await page.goto(`/sessions/${session.id}`);
+        const card = page.getByTestId('proposal-card');
+        await expect(card.getByTestId('proposal-reason')).toBeVisible();
+        await shot(page, 'repo-grant');
+        await card.getByRole('button', { name: 'Approve' }).click();
+        await expect(page.getByTestId('system-notice')).toBeVisible();
+        await expect(page.getByTestId('session-screen').getByTestId('phase')).toHaveAttribute('data-phase', 'idle');
+        await shot(page, 'notice');
+      });
+
       test('stopped session with a compaction', async ({ page }) => {
         const session = await seededSession(page, /^Summarise/);
         await page.goto(`/sessions/${session.id}`);

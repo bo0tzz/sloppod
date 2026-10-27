@@ -27,6 +27,8 @@ helm upgrade --install cilium cilium --repo https://helm.cilium.io --version 1.2
 k apply --server-side -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v1.0.8/sandbox.yaml
 k create namespace sloppod --dry-run=client -o yaml | k apply -f -
 k apply -n sloppod -f "$here/postgres.yaml"
+k -n sloppod get secret sloppod-master-key >/dev/null 2>&1 ||
+  k -n sloppod create secret generic sloppod-master-key --from-literal=master-key="$(openssl rand -base64 32)"
 k -n agent-sandbox-system rollout status deploy --timeout 5m
 k -n sloppod rollout status deploy/postgres --timeout 5m
 echo "dev cluster ready: --context $ctx, namespace sloppod"

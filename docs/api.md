@@ -15,6 +15,7 @@ GET    /api/v1/sessions             -> Session[]   (most recently updated first)
 POST   /api/v1/sessions             -> Session     body: NewSession
 GET    /api/v1/sessions/{id}        -> Session
 DELETE /api/v1/sessions/{id}        -> 204         stops the session and deletes its pod and volume
+POST   /api/v1/sessions/{id}/repos  -> Session     body: {repo: string}; grants write access to another repository and tells the agent (no-op if it has it)
 GET    /api/v1/repos                -> string[]    repositories sessions can be granted, e.g. ["bo0tzz/sloppod"]
 GET    /api/v1/me                   -> {user: string}
 GET    /api/v1/settings             -> Settings
@@ -63,7 +64,7 @@ type Phase =
   | "stopped";
 ```
 
-`POST /api/v1/sessions` derives the repository and grants before it returns; they don't change afterwards. Until the agent names the session, its title is the first line of the first message. It returns `409` when the user has no Claude account configured, and `400` with `{error}` when a given `repo` isn't accessible.
+`POST /api/v1/sessions` derives the repository and grants before it returns. A session gains more repositories later through `POST /api/v1/sessions/{id}/repos`, or when the agent requests one and the user approves (`sloppod.repo.grant` proposals). `repo` is the repository the session was started for, which is checked out as its working directory, or else the first one it was given; `branch` is its session branch, the same in every repository. Until the agent names the session, its title is the first line of the first message. It returns `409` when the user has no Claude account configured, and `400` with `{error}` when a given `repo` isn't accessible.
 
 ### Credentials
 
@@ -96,7 +97,12 @@ type Credential = {
 
 ### Proposals
 
-Outward actions the agent proposed ([ADR 3](adr/0003-proposals-and-trusted-executor.md)). The only kind so far is `github.pr.create`.
+Outward actions and access the agent asked for ([ADR 3](adr/0003-proposals-and-trusted-executor.md), [ADR 2](adr/0002-capabilities.md)). Kinds:
+
+- `github.pr.create`: payload `{repo, base, head, title, body, draft}`; the detail adds `diff` and `commits`.
+- `sloppod.repo.grant`: write access to a repository; payload `{repo, reason, branch}`; the detail adds nothing.
+
+When a proposal is decided or carried out, the runtime tells the agent: the notice is recorded as a `user_message_chunk` with `_meta.sloppod.notice: true` and delivered as a new turn when the agent is idle, steered into a running turn, or queued until the agent is up.
 
 ```
 GET  /api/v1/proposals?session={id}&status={status}  -> Proposal[]
@@ -109,9 +115,9 @@ POST /api/v1/proposals/{id}/reject                   -> Proposal   body: {reason
 type Proposal = {
   id: string;
   session_id: string;
-  kind: "github.pr.create";
+  kind: "github.pr.create" | "sloppod.repo.grant";
   status: "pending" | "approved" | "rejected" | "executed" | "failed";
-  payload: { repo: string; base: string; head: string; title: string; body: string; draft: boolean };
+  payload: Record<string, unknown>;  // per kind, see above
   result?: { url: string; number: number };   // when executed
   error?: string;                              // when failed
   reason?: string;                             // when rejected
@@ -120,12 +126,13 @@ type Proposal = {
 };
 
 type ProposalDetail = Proposal & {
-  diff: string;          // unified diff of base...head
-  commits: { sha: string; message: string }[];
+  // github.pr.create only:
+  diff?: string;          // unified diff of base...head
+  commits?: { sha: string; message: string }[];
 };
 ```
 
-Approving executes the proposal immediately; the response carries the final status.
+Approving executes the proposal immediately; the response carries the final status (`executed` or `failed`).
 
 ## ACP at `/acp`
 
@@ -148,10 +155,10 @@ Runtime → UI:
 
 | Method | Notes |
 |---|---|
-| `session/update` | Standard ACP updates: `user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `available_commands_update`, `current_mode_update`, and compaction reports. Prompts sent by any UI are echoed as `user_message_chunk` with a `messageId` per prompt, so every viewer sees them; steers carry `_meta.sloppod.steering: true`. |
+| `session/update` | Standard ACP updates: `user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `available_commands_update`, `config_option_update`, and compaction reports. Prompts sent by any UI are echoed as `user_message_chunk` with a `messageId` per prompt, so every viewer sees them; steers carry `_meta.sloppod.steering: true`, and notices to the agent (see Proposals) `_meta.sloppod.notice: true`. |
 | `session/request_permission` (request) | Sent to every UI that has the session loaded, including requests still open when a UI loads the session (after the `session/load` response). The first answer wins. |
 | `_sloppod/permission_resolved` `{sessionId, toolCallId}` | Sent to every UI, including the one that answered, once a request is answered or cancelled. |
-| `_sloppod/session` `{session: Session}` | The session's phase or title changed. |
+| `_sloppod/session` `{session: Session}` | The session's phase, title, repository or grants changed. |
 | `_sloppod/proposal` `{proposal: Proposal}` | A proposal for a loaded session was created or changed. |
 
 ## Session pods
@@ -160,7 +167,8 @@ Session pods use two more endpoints, on their own port (8081, `sessions`); that 
 
 - `/link/v1`: the supervisor link ([ADR 17](adr/0017-in-pod-supervisor.md)), a WebSocket authenticated with the pod's projected ServiceAccount token. Its types are in `crates/protocol`.
 - `/mcp`: an MCP server (streamable HTTP, JSON responses) registered with the agent at session start. It identifies the session by the pod's IP. Its tools:
-  - `propose_pull_request {title, body, base?, draft?}` creates a `github.pr.create` proposal from the session branch.
-  - `get_proposal {id}` returns a proposal's status and result. The agent isn't notified when a proposal is decided; it checks with this tool.
+  - `propose_pull_request {title, body, repo?, base?, draft?}` creates a `github.pr.create` proposal from the session branch (`repo` is needed when the session can write to more than one).
+  - `request_repository {repo, reason}` creates a `sloppod.repo.grant` proposal.
+  - `get_proposal {id}` returns a proposal's status and result. The agent is also told when its proposals are decided.
 
 In the pod, the repository is checked out at `/workspace/repo` on the session branch. `/workspace` is the session's own volume, kept across pod restarts.
