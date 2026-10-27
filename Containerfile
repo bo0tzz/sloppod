@@ -47,7 +47,7 @@ ARG MISE_VERSION=2026.10.18
 ARG MISE_SHA256=e97c38973336aa2ff350fea50f47b412b266fe263b102b7200ff1e9b118c6942
 ARG ADAPTER_VERSION=0.97.0
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl git gh jq less procps ripgrep unzip xz-utils zstd \
+        ca-certificates curl git gh jq less procps ripgrep tini unzip xz-utils zstd \
         build-essential pkg-config \
         # Shared libraries a headless Chromium links against, so sessions can install one (e.g. Playwright's) and
         # run it. The browser itself is a session's own tool.
@@ -65,4 +65,5 @@ COPY --from=build /out/sloppod-supervisor /usr/local/bin/sloppod-supervisor
 # The node image's `node` user is uid 1000, which session pods run as.
 USER 1000:1000
 WORKDIR /workspace
-ENTRYPOINT ["sloppod-supervisor"]
+# tini reaps the orphaned processes agents leave behind, which the supervisor as PID 1 wouldn't.
+ENTRYPOINT ["tini", "--", "sloppod-supervisor"]
