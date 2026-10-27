@@ -292,6 +292,19 @@ test('an open proposal follows a decision made elsewhere', async ({ page }) => {
   await expect(page.getByRole('button', { name: 'Done' })).toBeVisible();
 });
 
+test('retries loading a session that failed to load', async ({ page }) => {
+  const sessions: { id: string; title: string }[] = await (await page.request.get('/api/v1/sessions')).json();
+  const session = sessions.find((candidate) => candidate.title === 'Park and wake')!;
+  let failures = 1;
+  await page.route(`**/api/v1/sessions/${session.id}`, (route) =>
+    failures-- > 0 ? route.fulfill({ status: 500, json: { error: 'database unavailable' } }) : route.fallback(),
+  );
+  await page.goto(`/sessions/${session.id}`);
+  await expect(page.getByTestId('load-error')).toContainText('database unavailable');
+  await expect(page.getByTestId('load-error')).toBeHidden();
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText('Park and wake');
+});
+
 test('rejects a proposal with a reason', async ({ page }) => {
   await createSession(page, 'Propose something for sloppod I will reject');
   await finishTurn(page);
