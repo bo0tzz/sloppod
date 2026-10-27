@@ -220,6 +220,9 @@ pub mod link {
         pub clone_url: String,
         pub branch: String,
         pub path: String,
+        /// A commit to check out, detached, at every start, e.g. the one a review session reviews.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub commit: Option<String>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]

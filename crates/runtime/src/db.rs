@@ -685,6 +685,35 @@ pub async fn set_review_session(db: &PgPool, proposal: Uuid, session: Uuid) -> s
     Ok(())
 }
 
+/// Points a session's grant of `repo` at `commit`, which the session checks out at its next start.
+pub async fn set_repo_commit(
+    db: &PgPool,
+    session: Uuid,
+    repo: &str,
+    commit: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "update session_grants set params = jsonb_set(params, '{commit}', to_jsonb($3::text)) \
+         where session_id = $1 and capability = 'repo' and lower(params->>'repo') = lower($2)",
+    )
+    .bind(session)
+    .bind(repo)
+    .bind(commit)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// A session's proposals that are still with their reviewer: in review, or waiting on the author's fixes.
+pub async fn proposals_in_review(db: &PgPool, session: Uuid) -> sqlx::Result<Vec<ProposalRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "select {PROPOSAL_COLUMNS} from proposals where session_id = $1 and status in ('in_review', 'changes_requested')"
+    )))
+    .bind(session)
+    .fetch_all(db)
+    .await
+}
+
 /// The proposal a review session reviews.
 pub async fn reviewed_proposal(db: &PgPool, session: Uuid) -> sqlx::Result<Option<ProposalRow>> {
     sqlx::query_as(AssertSqlSafe(format!(

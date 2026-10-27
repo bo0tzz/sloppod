@@ -323,3 +323,24 @@ async fn parked_sessions_are_left_alone_on_startup(db: PgPool) {
         Phase::Parked
     );
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn finds_proposals_still_with_their_reviewer(db: PgPool) {
+    let s = session(&db, "dev").await;
+    let mut ids = Vec::new();
+    for status in ["in_review", "changes_requested", "pending"] {
+        ids.push(
+            db::insert_proposal(&db, s, "github.pr.create", status, &json!({}))
+                .await
+                .unwrap()
+                .id,
+        );
+    }
+    let found: Vec<Uuid> = db::proposals_in_review(&db, s)
+        .await
+        .unwrap()
+        .iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(found, &ids[..2]);
+}
