@@ -14,7 +14,7 @@ use sloppod_contracts::{EgressSpec, Grant, PlacementSpec};
 use sloppod_protocol::api::{Decision, NewCredential, NewSession, NewStandingApproval, Phase};
 use uuid::Uuid;
 
-use crate::credentials::{CHATGPT, CLAUDE};
+use crate::credentials::CHATGPT;
 use crate::memini::MeminiAdmin;
 use crate::placement::{TOKEN_DIR, WORKDIR};
 use crate::pods::SESSION_LABEL;
@@ -267,10 +267,15 @@ async fn create_session(
     if prompt.is_empty() {
         return Err(bad_request("a session starts from a message"));
     }
-    if state.credentials.secret(&user, CLAUDE).await?.is_none() {
+    let agent = new.agent.as_deref().unwrap_or("claude-code");
+    let Some(adapter) = state.agents.get(agent) else {
+        return Err(bad_request(format!("there's no agent called {agent}")));
+    };
+    let (kind, account) = adapter.credential();
+    if state.credentials.secret(&user, kind).await?.is_none() {
         return Err(ApiError(
             StatusCode::CONFLICT,
-            "add a Claude account in settings before starting a session".into(),
+            format!("add {account} in settings before starting a session"),
         ));
     }
     let repos = accessible_repos(&state, &user).await;
@@ -320,6 +325,7 @@ async fn create_session(
             title: &title,
             custom_title: custom.is_some(),
             pending_prompt: prompt,
+            agent,
             model: model.as_deref(),
             repo: repo.as_deref(),
             grants: &grants,

@@ -293,11 +293,17 @@ pub struct AgentLaunch {
     pub load_session: Value,
     /// ACP client capabilities the runtime announces.
     pub client_capabilities: Value,
+    /// The ACP session mode to switch to after creating or loading a session.
+    pub mode: Option<String>,
 }
 
 /// Starts an agent in a session pod; the agent then speaks ACP over stdio (ADR 9).
 pub trait AgentAdapter: Send + Sync {
     fn manifest(&self) -> Manifest;
+    /// The name sessions pick this agent by, e.g. `claude-code`.
+    fn agent(&self) -> String;
+    /// The kind of credential its model needs from the session's owner, e.g. `claude`, and what to call it.
+    fn credential(&self) -> (&'static str, &'static str);
     fn launch(&self, context: &AgentContext) -> AgentLaunch;
 }
 

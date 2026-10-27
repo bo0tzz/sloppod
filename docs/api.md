@@ -38,6 +38,7 @@ type NewSession = {
   prompt: string;        // the first message; recorded right away and sent once the agent is up
   repo?: string;         // "owner/name"; derived from the prompt when absent
   title?: string;        // kept as given; without one, the agent's automatic title is used
+  agent?: string;        // the agent to run: "claude-code" (the default) or "codex"
 };
 
 type Session = {
@@ -47,6 +48,7 @@ type Session = {
   branch: string | null; // the session branch, e.g. "sloppod/3f2a…"
   grants: Grant[];
   phase: Phase;
+  agent: string;         // "claude-code" or "codex"
   created_at: string;    // RFC 3339
   updated_at: string;
   active_at: string;   // when something last happened (an event was recorded); `GET /sessions` is ordered by it, newest first
@@ -67,7 +69,7 @@ type Phase =
   | "stopped";
 ```
 
-`POST /api/v1/sessions` derives the repository and grants before it returns. A session gains more repositories later through `POST /api/v1/sessions/{id}/repos`, or when the agent requests one and the user approves (`sloppod.repo.grant` proposals). `repo` is the repository the session was started for, which is checked out as its working directory, or else the first one it was given; `branch` is its session branch, the same in every repository. Until the agent names the session, its title is the first line of the first message. It returns `409` when the user has no Claude account configured, and `400` with `{error}` when a given `repo` isn't accessible.
+`POST /api/v1/sessions` derives the repository and grants before it returns. A session gains more repositories later through `POST /api/v1/sessions/{id}/repos`, or when the agent requests one and the user approves (`sloppod.repo.grant` proposals). `repo` is the repository the session was started for, which is checked out as its working directory, or else the first one it was given; `branch` is its session branch, the same in every repository. Until the agent names the session, its title is the first line of the first message. It returns `409` when the user has no credential for the agent's model (a Claude account for Claude Code, a ChatGPT login for Codex), and `400` with `{error}` when a given `repo` isn't accessible or `agent` isn't one the runtime has.
 
 ### Credentials
 
@@ -179,7 +181,7 @@ UI → runtime:
 | `_session/steering` `{sessionId, prompt: ContentBlock[]}` | Delivers a message into the running turn. Before the agent is up it joins the queue like a prompt and returns `{outcome: "queued"}`. |
 | `session/set_config_option` `{sessionId, configId, value}` | Changes one of the session's config options from the load response's `configOptions`, e.g. `model`. Responds `{configOptions}`. The session keeps its model across restarts. |
 
-Sessions always run in the agent's auto mode: the agent decides which tool calls need a person, and the sandbox and the session's grants bound what any of them can reach. Mode isn't configurable.
+Sessions always run in their agent's most autonomous mode, Claude Code's auto mode or Codex's full access: the sandbox and the session's grants bound what any tool call can reach. Mode isn't configurable.
 
 Runtime → UI:
 

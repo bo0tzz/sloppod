@@ -33,6 +33,9 @@ enum Cmd {
         repo: Option<String>,
         #[arg(long)]
         title: Option<String>,
+        /// The agent to run, e.g. `codex`; Claude Code by default.
+        #[arg(long)]
+        agent: Option<String>,
     },
     /// Send a prompt and stream the turn.
     Prompt {
@@ -132,11 +135,13 @@ async fn main() -> anyhow::Result<()> {
             repo,
             title,
             prompt,
+            agent,
         } => {
             let body = NewSession {
                 repo,
                 title,
                 prompt,
+                agent,
             };
             let session: Session = serde_json::from_value(
                 check(

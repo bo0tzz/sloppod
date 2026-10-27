@@ -253,7 +253,11 @@ async fn launch_for(
     session: &db::SessionRow,
     context: &AgentContext,
 ) -> anyhow::Result<(Launch, sloppod_contracts::AgentLaunch)> {
-    let agent = state.adapter.launch(context);
+    let agent = state
+        .agents
+        .get(&session.agent)
+        .with_context(|| format!("no agent called {}", session.agent))?
+        .launch(context);
     let transcript = db::transcripts(&state.db, session.id)
         .await?
         .into_iter()
@@ -535,7 +539,7 @@ async fn start_agent_session(
             state.hub.set_loading(session.id, false).await;
             match response {
                 Ok(mut response) => {
-                    auto_mode(agent, &session, existing, &mut response).await;
+                    set_mode(agent, &session, launch, existing, &mut response).await;
                     (existing.clone(), response)
                 }
                 Err(e) => {
@@ -575,26 +579,31 @@ async fn new_agent_session(
         .as_str()
         .context("session/new without sessionId")?
         .to_owned();
-    auto_mode(agent, session, &agent_session_id, &mut response).await;
+    set_mode(agent, session, launch, &agent_session_id, &mut response).await;
     Ok((agent_session_id, response))
 }
 
-/// Sessions always run in the agent's auto mode; the sandbox and grants bound what it can do.
-async fn auto_mode(
+async fn set_mode(
     agent: &Arc<AgentConn>,
     session: &db::SessionRow,
+    launch: &sloppod_contracts::AgentLaunch,
     agent_session_id: &str,
     response: &mut Value,
 ) {
+    let Some(mode) = &launch.mode else {
+        return;
+    };
     match agent
         .request(
             "session/set_mode",
-            json!({"sessionId": agent_session_id, "modeId": "auto"}),
+            json!({"sessionId": agent_session_id, "modeId": mode}),
         )
         .await
     {
-        Ok(_) => response["modes"]["currentModeId"] = json!("auto"),
-        Err(e) => tracing::warn!(session = %session.id, error = %e, "switching to auto mode"),
+        Ok(_) => response["modes"]["currentModeId"] = json!(mode),
+        Err(e) => {
+            tracing::warn!(session = %session.id, %mode, error = %e, "switching the agent's mode")
+        }
     }
 }
 
