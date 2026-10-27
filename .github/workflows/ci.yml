@@ -8,9 +8,11 @@ on:
 permissions:
   contents: read
 
+# A new push to a PR cancels its previous run; every other run gets its own group, so none is cancelled or
+# dropped from the queue.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   check:
