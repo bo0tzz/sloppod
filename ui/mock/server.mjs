@@ -360,7 +360,10 @@ async function runTurn(session, text, { echo = true } = {}) {
     throw error;
   } finally {
     session.turn = null;
-    if (sessions.has(session.data.id) && session.data.phase !== 'stopped') session.setPhase('idle');
+    if (sessions.has(session.data.id) && session.data.phase !== 'stopped') {
+      session.setPhase('idle');
+      startWaiting(session);
+    }
   }
 }
 
@@ -687,6 +690,22 @@ function createSession({ prompt, repo, title }) {
   return session;
 }
 
+/** Messages queued behind the running turn, `{ id, text, resolve, reject }`; UIs show them and can steer them in. */
+const waitingList = (session) => (session.waiting ??= []);
+
+function broadcastQueue(session, conns = session.subscribers) {
+  const messages = waitingList(session).map(({ id, text }) => ({ id, prompt: [{ type: 'text', text }] }));
+  for (const conn of conns ?? []) conn.notify('_sloppod/queue', { sessionId: session.data.id, messages });
+}
+
+/** Like the runtime, runs the next queued message once a turn ends. */
+function startWaiting(session) {
+  const next = waitingList(session).shift();
+  if (!next) return;
+  broadcastQueue(session);
+  runTurn(session, next.text).then(next.resolve, next.reject);
+}
+
 function queuePrompt(session, text, done = () => {}, fail = () => {}) {
   echoUser(session, text);
   session.queue.push({ text, done, fail });
@@ -757,6 +776,7 @@ function handleCall(conn, message) {
       conn.loaded.add(session.data.id);
       conn.respond(id, { configOptions: session.configOptions() });
       for (const pending of session.pending.values()) sendPending(session, pending, conn);
+      broadcastQueue(session, [conn]);
       return;
     }
 
@@ -773,7 +793,13 @@ function handleCall(conn, message) {
         return;
       }
       if (session.turn) {
-        conn.error(id, -32000, 'A turn is already running; use _session/steering');
+        waitingList(session).push({
+          id: randomUUID(),
+          text: promptText(params.prompt),
+          resolve: (stopReason) => conn.respond(id, { stopReason }),
+          reject: (error) => conn.error(id, -32603, String(error)),
+        });
+        broadcastQueue(session);
         return;
       }
       if (session.data.phase !== 'idle') {
@@ -790,6 +816,28 @@ function handleCall(conn, message) {
     case 'session/cancel':
       if (session) cancelTurn(session);
       return;
+
+    case '_sloppod/steer_queued': {
+      if (!needLoaded()) return;
+      const waiting = waitingList(session);
+      const index = waiting.findIndex((message) => message.id === params.id);
+      if (index < 0) {
+        conn.error(id, -32002, "that message isn't queued any more");
+        return;
+      }
+      const [message] = waiting.splice(index, 1);
+      broadcastQueue(session);
+      if (session.turn) {
+        echoUser(session, message.text, { steering: true });
+        session.turn.steers.push({ text: message.text });
+        conn.respond(id, { outcome: 'injected' });
+        message.resolve('end_turn');
+      } else {
+        runTurn(session, message.text).then(message.resolve, message.reject);
+        conn.respond(id, { outcome: 'startedNewTurn' });
+      }
+      return;
+    }
 
     case '_session/steering': {
       if (!needLoaded()) return;

@@ -103,7 +103,7 @@ impl Conn {
     async fn load(
         self: &Arc<Self>,
         session: Uuid,
-    ) -> Result<(Value, Vec<(u64, String, Value)>), RpcError> {
+    ) -> Result<(Value, Vec<(u64, String, Value)>, Value), RpcError> {
         if db::owned_session(&self.state.db, session, &self.user)
             .await
             .map_err(internal)?
@@ -122,7 +122,7 @@ impl Conn {
         if let Some(old) = self.loaded.lock().await.insert(session, task) {
             old.abort();
         }
-        Ok((replay.agent_state, replay.permissions))
+        Ok((replay.agent_state, replay.permissions, replay.queue))
     }
 
     async fn handle_request(self: Arc<Self>, id: Value, method: String, params: Value) {
@@ -132,11 +132,12 @@ impl Conn {
         let hub = &self.state.hub;
         if let ("session/load" | "session/resume", Some(session)) = (method.as_str(), session) {
             match self.load(session).await {
-                Ok((state, permissions)) => {
+                Ok((state, permissions, queue)) => {
                     self.reply(id, Ok(state));
                     for (pid, method, params) in permissions {
                         self.send_permission(session, pid, method, params).await;
                     }
+                    self.send(queue);
                 }
                 Err(e) => self.reply(id, Err(e)),
             }
@@ -159,6 +160,7 @@ impl Conn {
             )),
             ("session/prompt", Some(session)) => hub.prompt(session, params).await,
             ("_session/steering", Some(session)) => hub.steer(session, params).await,
+            ("_sloppod/steer_queued", Some(session)) => hub.steer_queued(session, params).await,
             ("session/set_config_option", Some(session)) => {
                 hub.set_config_option(session, params).await
             }

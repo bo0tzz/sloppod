@@ -2,7 +2,7 @@
   import { Button, Select, toastManager } from '@immich/ui';
   import { mdiSend, mdiSteering, mdiStop } from '@mdi/js';
   import { configSelectOptions } from '#lib/presentation.ts';
-  import type { SessionView } from '#lib/session.svelte.ts';
+  import { queuedText, type SessionView } from '#lib/session.svelte.ts';
   import Composer from './Composer.svelte';
 
   let { view }: { view: SessionView } = $props();
@@ -14,12 +14,13 @@
   const phase = $derived(view.session?.phase);
   // While the agent is starting or coming back, the runtime queues prompts and runs them as one turn.
   const queued = $derived(phase === 'starting' || phase === 'disconnected');
-  const steering = $derived(!queued && view.turnRunning);
+  // While a turn runs, sending queues the message for the next turn; each queued message can be steered in.
+  const working = $derived(!queued && view.turnRunning);
+  let steeringId = $state<string | null>(null);
 
   const blockedReason = $derived.by(() => {
     if (view.connection !== 'open') return 'Reconnecting…';
     if (phase === 'stopped') return 'This session has stopped.';
-    if (steering && !view.steeringSupported) return "The agent can't take messages mid-turn.";
     return null;
   });
   const queuedHint = $derived(
@@ -48,31 +49,32 @@
     const message = text.trim();
     if (!message || blockedReason || sending) return;
     sending = true;
+    text = '';
+    view.prompt(message).then(
+      (stopReason) => {
+        if (stopReason && stopReason in unusualStops) {
+          toastManager.warning({ title: 'The turn ended early', description: unusualStops[stopReason] });
+        }
+      },
+      (error) => {
+        // A dropped socket doesn't end the turn; the reload shows what happened.
+        if (view.connection !== 'open') return;
+        if (!text) text = message;
+        toastManager.danger({ title: "Couldn't send the prompt", description: errorMessage(error) });
+      },
+    );
+    sending = false;
+    textarea?.focus();
+  }
+
+  async function steer(id: string) {
+    steeringId = id;
     try {
-      if (steering) {
-        await view.steer(message);
-        text = '';
-      } else {
-        text = '';
-        view.prompt(message).then(
-          (stopReason) => {
-            if (stopReason && stopReason in unusualStops) {
-              toastManager.warning({ title: 'The turn ended early', description: unusualStops[stopReason] });
-            }
-          },
-          (error) => {
-            // A dropped socket doesn't end the turn; the reload shows what happened.
-            if (view.connection !== 'open') return;
-            if (!text) text = message;
-            toastManager.danger({ title: "Couldn't send the prompt", description: errorMessage(error) });
-          },
-        );
-      }
+      await view.steerQueued(id);
     } catch (error) {
       toastManager.danger({ title: "Couldn't steer the agent", description: errorMessage(error) });
     } finally {
-      sending = false;
-      textarea?.focus();
+      steeringId = null;
     }
   }
 
@@ -86,14 +88,41 @@
   }
 </script>
 
+{#if view.queue.length > 0}
+  <div class="border-light-200 shrink-0 border-t px-3 pt-2" data-testid="queued-messages">
+    <ul class="mx-auto flex w-full max-w-3xl flex-col gap-1">
+      {#each view.queue as message (message.id)}
+        <li class="bg-light-100 flex items-center gap-2 rounded-xl px-3 py-1.5 text-sm" data-testid="queued-message">
+          <span class="text-muted shrink-0 text-xs">Queued</span>
+          <span class="min-w-0 grow truncate" title={queuedText(message)}>{queuedText(message)}</span>
+          {#if view.steeringSupported}
+            <Button
+              size="tiny"
+              shape="round"
+              color="warning"
+              variant="outline"
+              leadingIcon={mdiSteering}
+              loading={steeringId === message.id}
+              disabled={steeringId !== null}
+              onclick={() => steer(message.id)}
+            >
+              Steer
+            </Button>
+          {/if}
+        </li>
+      {/each}
+    </ul>
+  </div>
+{/if}
+
 <Composer
   bind:text
   bind:ref={textarea}
-  label={steering ? 'Steering message' : 'Prompt'}
-  placeholder={steering ? 'Steer the agent…' : 'Message the agent…'}
-  sendLabel={steering ? 'Steer' : 'Send'}
-  sendIcon={steering ? mdiSteering : mdiSend}
-  sendColor={steering ? 'warning' : 'primary'}
+  label="Prompt"
+  placeholder={working ? 'Queue a message for when the agent is done…' : 'Message the agent…'}
+  sendLabel="Send"
+  sendIcon={mdiSend}
+  sendColor="primary"
   {canSend}
   {sending}
   onSend={send}
@@ -107,7 +136,7 @@
     {/if}
   {/snippet}
   {#snippet trailing()}
-    {#if steering}
+    {#if working}
       <Button size="small" shape="round" color="danger" variant="outline" leadingIcon={mdiStop} onclick={() => view.cancel()}>
         Stop
       </Button>
