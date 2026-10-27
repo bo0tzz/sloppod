@@ -211,6 +211,15 @@ pub fn policy_name(session_id: &str) -> String {
     format!("sloppod-session-{session_id}")
 }
 
+/// A Cilium `toFQDNs` selector; hosts with a `*` are patterns.
+fn fqdn_selector(host: &str) -> Value {
+    if host.contains('*') {
+        json!({"matchPattern": host})
+    } else {
+        json!({"matchName": host})
+    }
+}
+
 #[async_trait]
 impl Enforcer for Cilium {
     fn manifest(&self) -> Manifest {
@@ -218,12 +227,7 @@ impl Enforcer for Cilium {
     }
 
     async fn apply(&self, egress: &EgressSpec) -> Result<()> {
-        let fqdns = |hosts: &[String]| {
-            hosts
-                .iter()
-                .map(|h| json!({"matchName": h}))
-                .collect::<Vec<_>>()
-        };
+        let fqdns = |hosts: &[String]| hosts.iter().map(|h| fqdn_selector(h)).collect::<Vec<_>>();
         let runtime: serde_json::Map<String, Value> = self
             .runtime_labels
             .iter()
@@ -283,5 +287,22 @@ impl Enforcer for Cilium {
             Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
             Err(e) => Err(err(e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selects_names_and_patterns() {
+        assert_eq!(
+            fqdn_selector("crates.io"),
+            json!({"matchName": "crates.io"})
+        );
+        assert_eq!(
+            fqdn_selector("productionresultssa*.blob.core.windows.net"),
+            json!({"matchPattern": "productionresultssa*.blob.core.windows.net"})
+        );
     }
 }
