@@ -616,14 +616,21 @@ async fn prepare(
             }
         }
         if let Some(commit) = &repo.commit {
-            let remote_branch = format!("refs/heads/{}", repo.branch);
-            run_cmd(
-                &env,
-                &repo.path,
-                "git",
-                &["fetch", "origin", &remote_branch],
-            )
-            .await?;
+            // The commit itself, which the branch may have moved away from since; the branch if the remote won't
+            // serve a commit by name.
+            if run_cmd(&env, &repo.path, "git", &["fetch", "origin", commit])
+                .await
+                .is_err()
+            {
+                let remote_branch = format!("refs/heads/{}", repo.branch);
+                run_cmd(
+                    &env,
+                    &repo.path,
+                    "git",
+                    &["fetch", "origin", &remote_branch],
+                )
+                .await?;
+            }
             run_cmd(&env, &repo.path, "git", &["checkout", "--detach", commit]).await?;
         }
         if launch.install_tools && has_mise_config(dir) {

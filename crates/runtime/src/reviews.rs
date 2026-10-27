@@ -534,7 +534,7 @@ fn rest(state: &AppState, session: Uuid, proposal: Uuid) {
             Ok(Some(p)) if p.status == "changes_requested"
         );
         let result: anyhow::Result<()> = match db::get_session(&state.db, session).await {
-            Ok(Some(row)) if waiting => api::park(&state, &row).await.map_err(Into::into),
+            Ok(Some(row)) if waiting => park_between_rounds(&state, &row, proposal).await,
             Ok(_) => Ok(()),
             Err(e) => Err(e.into()),
         };
@@ -542,6 +542,24 @@ fn rest(state: &AppState, session: Uuid, proposal: Uuid) {
             tracing::warn!(%session, error = %e, "parking a review session between rounds");
         }
     });
+}
+
+/// Parks a review session that waits on its author, and wakes it straight away if the author asked for the next
+/// round meanwhile: that round's wake found it still running and did nothing, and its notice waits in the queue.
+async fn park_between_rounds(
+    state: &AppState,
+    session: &db::SessionRow,
+    proposal: Uuid,
+) -> anyhow::Result<()> {
+    api::park(state, session).await?;
+    let still_waiting = matches!(
+        db::get_proposal(&state.db, proposal).await?,
+        Some(p) if p.status == "changes_requested"
+    );
+    if !still_waiting && let Some(row) = db::get_session(&state.db, session.id).await? {
+        api::wake(state, &row).await?;
+    }
+    Ok(())
 }
 
 /// Withdraws a deleted session's proposals that are still in review, and deletes their review sessions.
