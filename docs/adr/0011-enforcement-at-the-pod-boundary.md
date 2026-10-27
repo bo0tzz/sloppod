@@ -101,7 +101,7 @@ Milestone 1, 2026-10-26, in kind with the real runtime:
 2026-10-27: GitHub tokens follow the session's grants ([#36](https://github.com/bo0tzz/sloppod/issues/36)). Until then, sessions got installation tokens with every repository and permission the App has, cached per installation and shared across sessions and users. A session could therefore read every private repository in its installation, and its push token could do anything the App can. Now:
 
 - A push gets a token for the one granted repository, with `contents: write`.
-- A read (git or API) through a granted repository gets a token for the granted repositories in that repository's installation, at read level only: `actions`, `checks`, `contents`, `issues`, `metadata`, `pull_requests` and `statuses`, as far as the App has them. It's a fixed list, because some permissions (`workflows`) have no read level.
+- A read (git or API) through a granted repository gets a token for the granted repositories in that repository's installation, at read level only. An API path that names no granted repository uses the first granted one whose installation still mints a token; with none, the read goes unauthenticated. Read levels: `actions`, `checks`, `contents`, `issues`, `metadata`, `pull_requests` and `statuses`, as far as the App has them. It's a fixed list, because some permissions (`workflows`) have no read level.
 - Tokens are cached per (installation, repositories, permissions). Sessions with the same grants share a token, and none gets one wider than its own grants.
 - The runtime's own calls keep the installation-wide token, e.g. carrying out approved proposals or looking up the App's bot user. That token never reaches a session.
 

@@ -169,13 +169,24 @@ impl GitHubPolicy {
                 session,
             )));
         }
-        // Reads carry a read-only token covering the granted repositories (in the first one's installation), which
-        // also reads public data. Sessions without a repository grant, or a GitHub App, read unauthenticated.
+        // Reads carry a read-only token covering the granted repositories in one installation, which also reads
+        // public data: the installation of the repository the path names, if it's granted, or else the first granted
+        // repository whose installation still works. Without any, or without a GitHub App, reads are unauthenticated.
         let granted: Vec<&str> = session.repos().collect();
-        let token = match (self.app(session).await, granted.first()) {
-            (Some(app), Some(repo)) => Some(app.read_token(repo, &granted).await.map_err(err)?),
-            _ => None,
-        };
+        let mut token = None;
+        if let Some(app) = self.app(session).await {
+            for repo in read_token_order(path, &granted) {
+                match app.read_token(repo, &granted).await {
+                    Ok(minted) => {
+                        token = Some(minted);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(session = %session.session_id, repo, error = %e, "minting a read token")
+                    }
+                }
+            }
+        }
         let headers = token
             .map(|t| vec![("authorization".into(), format!("token {t}"))])
             .unwrap_or_default();
@@ -238,6 +249,24 @@ fn proposal_hint(what: &str, session: &SessionContext) -> String {
         "sloppod: {what}. Outward actions go through human review: {pull_request}. To file issues, call the \
          propose_issues tool. Other GitHub writes (comments, reviews, releases) aren't available to sessions yet.\n"
     )
+}
+
+/// Granted repositories to mint a read token through, in order: the one the API path names first, if any.
+fn read_token_order<'a>(path: &str, granted: &[&'a str]) -> Vec<&'a str> {
+    let named = path.strip_prefix("/repos/").and_then(|rest| {
+        let mut parts = rest.splitn(3, '/');
+        Some(format!("{}/{}", parts.next()?, parts.next()?))
+    });
+    let first = named.and_then(|named| {
+        granted
+            .iter()
+            .find(|g| g.eq_ignore_ascii_case(&named))
+            .copied()
+    });
+    first
+        .into_iter()
+        .chain(granted.iter().copied().filter(|g| Some(*g) != first))
+        .collect()
 }
 
 fn basic(token: &str) -> String {
@@ -439,6 +468,25 @@ mod tests {
         assert!(message.starts_with("0008\u{2}no\n"));
         assert!(message.contains("ng refs/heads/main refused by sloppod"));
         assert!(message.ends_with("00000000"));
+    }
+
+    #[test]
+    fn reads_go_through_the_named_repository_first() {
+        let granted = ["o/a", "o/b", "p/c"];
+        assert_eq!(
+            read_token_order("/repos/o/b/pulls", &granted),
+            ["o/b", "o/a", "p/c"]
+        );
+        assert_eq!(
+            read_token_order("/repos/O/B", &granted),
+            ["o/b", "o/a", "p/c"]
+        );
+        assert_eq!(
+            read_token_order("/repos/x/y/issues", &granted),
+            ["o/a", "o/b", "p/c"]
+        );
+        assert_eq!(read_token_order("/user", &granted), ["o/a", "o/b", "p/c"]);
+        assert!(read_token_order("/user", &[]).is_empty());
     }
 
     #[test]
