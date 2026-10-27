@@ -35,6 +35,10 @@ pub struct Config {
     #[arg(long, env = "SLOPPOD_SERVICE", default_value = "sloppod")]
     pub service: String,
 
+    /// The cluster's DNS domain. Sessions may look up names under it, and otherwise only hosts they may reach.
+    #[arg(long, env = "SLOPPOD_CLUSTER_DOMAIN", default_value = "cluster.local")]
+    pub cluster_domain: String,
+
     /// Labels selecting runtime pods, for session egress policy (`k=v,k=v`).
     #[arg(
         long,
