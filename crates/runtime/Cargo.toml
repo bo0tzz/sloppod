@@ -28,6 +28,7 @@ graphql-parser.workspace = true
 jsonwebtoken.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
+percent-encoding.workspace = true
 prost.workspace = true
 rand.workspace = true
 rcgen.workspace = true

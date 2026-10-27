@@ -17,6 +17,34 @@ use crate::{AppState, db};
 
 /// Where sessions find memini on the runtime's sessions port.
 pub const PREFIX: &str = "/memini";
+
+/// The memini path and query a request is for, in the one form the policy checks and memini receives: dot
+/// segments resolved and percent-encoding decoded by URL parsing, empty segments dropped, then encoded again.
+fn canonical_path(path_and_query: &str) -> anyhow::Result<String> {
+    let parsed = reqwest::Url::parse("http://memini.invalid/")?.join(path_and_query)?;
+    let segments = parsed
+        .path_segments()
+        .into_iter()
+        .flatten()
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            percent_encoding::percent_decode_str(segment)
+                .decode_utf8()
+                .map(|s| s.into_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .context("the path isn't valid UTF-8")?;
+    let mut canonical = reqwest::Url::parse("http://memini.invalid/")?;
+    canonical
+        .path_segments_mut()
+        .map_err(|()| anyhow::anyhow!("no path"))?
+        .extend(&segments);
+    canonical.set_query(parsed.query());
+    Ok(match canonical.query() {
+        Some(query) => format!("{}?{query}", canonical.path()),
+        None => canonical.path().to_owned(),
+    })
+}
 const MAX_BODY: usize = 8 << 20;
 
 /// Streams responses (MCP uses server-sent events), so there's no overall timeout.
@@ -88,6 +116,9 @@ async fn forward(state: &AppState, peer: SocketAddr, request: Request) -> anyhow
         Some(rest) if rest.starts_with('/') => rest.to_owned(),
         Some(rest) => format!("/{rest}"),
         None => path_and_query.to_owned(),
+    };
+    let Ok(path) = canonical_path(&path) else {
+        return Ok((StatusCode::BAD_REQUEST, "sloppod: invalid memini path\n").into_response());
     };
     let body = axum::body::to_bytes(body, MAX_BODY)
         .await
@@ -163,4 +194,26 @@ async fn forward(state: &AppState, peer: SocketAddr, request: Request) -> anyhow
         }
     }
     Ok(proxied.body(Body::from_stream(response.bytes_stream()))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_are_canonical() {
+        for (raw, canonical) in [
+            ("/v1/memories", "/v1/memories"),
+            ("/v1/x/../pins", "/v1/pins"),
+            ("/v1/x/%2e%2e/keys", "/v1/keys"),
+            ("/v1/%6Beys", "/v1/keys"),
+            ("/v1//keys/", "/v1/keys"),
+            ("/v1/./memories?q=a%20b", "/v1/memories?q=a%20b"),
+            ("/v1/namespaces/a%2Fb", "/v1/namespaces/a%2Fb"),
+            ("/../../v1/keys", "/v1/keys"),
+            ("/", "/"),
+        ] {
+            assert_eq!(canonical_path(raw).unwrap(), canonical, "{raw}");
+        }
+    }
 }

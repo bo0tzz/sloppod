@@ -3261,6 +3261,7 @@ dependencies = [
  "jsonwebtoken",
  "k8s-openapi",
  "kube",
+ "percent-encoding",
  "prost",
  "rand 0.10.3",
  "rcgen",
