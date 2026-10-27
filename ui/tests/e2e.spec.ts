@@ -154,6 +154,24 @@ test('stops a running turn', async ({ page }) => {
   );
 });
 
+test('Esc stops a running turn, unless it closes a dialog first', async ({ page }) => {
+  await createSession(page, 'Stop me with Esc in sloppod');
+  await expect(permissionCard(page)).toBeVisible();
+
+  await page.getByRole('button', { name: 'Proposals' }).click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
+  await expect(permissionCard(page)).toBeVisible();
+
+  await page.getByRole('textbox', { name: 'Prompt' }).focus();
+  await page.keyboard.press('Escape');
+  await expect(permissionCard(page)).toBeHidden();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+  await expect(page.getByRole('button', { name: 'Stop' })).toBeHidden();
+});
+
 test('approves a proposal with an edited title', async ({ page }) => {
   const id = await createSession(page, 'Propose a PR for sloppod');
   await finishTurn(page);
