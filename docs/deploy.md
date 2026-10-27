@@ -65,8 +65,6 @@ spec:
     session:
       model: claude-opus-5-5
       memory: 8Gi
-      # `auto` lets Claude Code's classifier handle permission prompts; the pod boundary is the hard limit.
-      defaultMode: auto
     # Optional: your user-level CLAUDE.md, rendered into every session.
     # instructions: |
     #   ...

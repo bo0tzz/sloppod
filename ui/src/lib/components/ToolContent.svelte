@@ -24,10 +24,19 @@
     return match ? match[1] : null;
   }
 
-  const showInput = $derived(content.length === 0 && hasInput(rawInput));
+  const input = $derived(rawInput && typeof rawInput === 'object' ? (rawInput as Record<string, unknown>) : null);
+  const command = $derived(typeof input?.command === 'string' ? input.command : null);
+  const description = $derived(typeof input?.description === 'string' ? input.description : null);
+  const showInput = $derived(content.length === 0 && hasInput(rawInput) && command === null);
 </script>
 
 <div class="flex flex-col gap-2">
+  {#if command !== null}
+    {#if description}
+      <p class="text-muted text-xs">{description}</p>
+    {/if}
+    <pre class="tool-output" data-testid="tool-command">$ {command}</pre>
+  {/if}
   {#if locations.length > 0}
     <ul class="flex flex-wrap gap-1.5" data-testid="locations">
       {#each locations as location, index (index)}

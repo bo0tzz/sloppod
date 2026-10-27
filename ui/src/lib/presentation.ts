@@ -1,3 +1,4 @@
+import type { Grant } from './api.ts';
 import {
   mdiCheckCircle,
   mdiCircleOutline,
@@ -127,3 +128,24 @@ export const credentialKinds: CredentialKindSpec[] = [
     secret: { label: 'Admin key' },
   },
 ];
+
+/** What a grant lets a session do, in plain words. */
+export function grantLabel(grant: Grant): string {
+  const param = (name: string) => (typeof grant.params[name] === 'string' ? (grant.params[name] as string) : '');
+  switch (grant.capability) {
+    case 'model':
+      return 'the model API';
+    case 'github':
+      return 'read GitHub';
+    case 'packages':
+      return 'package registries';
+    case 'repo':
+      return param('access') === 'rw'
+        ? `push to ${param('branch')} on ${param('repo')}`
+        : `read ${param('repo')}`;
+    case 'memory':
+      return `memory (${param('namespace')})`;
+    default:
+      return grant.capability;
+  }
+}

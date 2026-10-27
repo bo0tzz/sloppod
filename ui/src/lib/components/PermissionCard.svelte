@@ -3,15 +3,19 @@
   import { mdiShieldAlertOutline } from '@mdi/js';
   import type { PermissionOption } from '#lib/acp/types.ts';
   import type { ToolItem } from '#lib/acp/transcript.svelte.ts';
-  import { hasInput, toolKindIcons, toolTitle } from '#lib/presentation.ts';
+  import type { Grant } from '#lib/api.ts';
+  import { grantLabel, hasInput, toolKindIcons, toolTitle } from '#lib/presentation.ts';
   import type { PendingPermission } from '#lib/session.svelte.ts';
   import ToolContent from './ToolContent.svelte';
 
   let {
     request,
     tool,
+    grants = [],
     onAnswer,
-  }: { request: PendingPermission; tool?: ToolItem; onAnswer: (optionId: string) => void } = $props();
+  }: { request: PendingPermission; tool?: ToolItem; grants?: Grant[]; onAnswer: (optionId: string) => void } = $props();
+
+  const access = $derived(grants.map(grantLabel).join(', '));
 
   // The request may carry only part of the tool call; fill the rest from the transcript.
   const call = $derived(request.toolCall);
@@ -47,6 +51,10 @@
       <ToolContent {content} {locations} {rawInput} />
     </div>
   {/if}
+  <p class="text-muted text-xs" data-testid="permission-scope">
+    The agent's own permission check. Approving lets it run this inside its sandbox; it doesn't give the session any
+    new access. The session can reach {access || 'nothing outside its pod'}, approved or not.
+  </p>
   <div class="flex flex-wrap justify-end gap-2 pt-1">
     {#each request.options as option (option.optionId)}
       {@const style = optionStyles[option.kind] ?? { color: 'secondary', variant: 'outline' }}

@@ -193,6 +193,7 @@
           {#each view.permissions as request (request.rpcId)}
             <PermissionCard
               {request}
+              grants={session?.grants ?? []}
               tool={view.transcript.tool(request.toolCall.toolCallId)}
               onAnswer={(optionId) => view.answerPermission(request, optionId)}
             />
