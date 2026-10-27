@@ -70,8 +70,14 @@
   let proposalList = $state<'all' | 'open' | null>(null);
   let showAddRepo = $state(false);
   let showGrants = $state(false);
-  /** This session's standing approval for pull requests, if its pull requests are approved automatically. */
-  let autoApproval = $state<string | null>(null);
+  /** This session's standing approvals for pull requests; any one of them approves its pull requests. */
+  let autoApprovals = $state<string[]>([]);
+  let togglingApproval = $state(false);
+
+  async function loadAutoApprovals() {
+    const approvals = await api.listStandingApprovals();
+    autoApprovals = approvals.filter((a) => a.session_id === id && a.kind === 'github.pr.create').map((a) => a.id);
+  }
 
   const waiting = $derived(view.permissions.length > 0 || view.questions.length > 0 || openProposals.length > 0);
   let width = $state(0);
@@ -83,11 +89,7 @@
   let atBottom = $state(true);
 
   onMount(() => {
-    api.listStandingApprovals().then(
-      (approvals) =>
-        (autoApproval = approvals.find((a) => a.session_id === id && a.kind === 'github.pr.create')?.id ?? null),
-      () => {},
-    );
+    loadAutoApprovals().catch(() => {});
     view.start();
     return () => view.stop();
   });
@@ -125,23 +127,24 @@
   }
 
   async function toggleAutoApproval() {
+    if (togglingApproval) return;
+    togglingApproval = true;
     try {
-      if (autoApproval) {
-        await api.revokeStandingApproval(autoApproval);
-        autoApproval = null;
+      // Fresh, so another tab's changes count: any live approval keeps approving until all are revoked.
+      await loadAutoApprovals();
+      if (autoApprovals.length > 0) {
+        await Promise.all(autoApprovals.map((approval) => api.revokeStandingApproval(approval)));
       } else {
-        const approval = await api.createStandingApproval({
-          kind: 'github.pr.create',
-          session_id: id,
-          edits: { auto_merge: true },
-        });
-        autoApproval = approval.id;
+        await api.createStandingApproval({ kind: 'github.pr.create', session_id: id, edits: { auto_merge: true } });
       }
+      await loadAutoApprovals();
     } catch (error) {
       toastManager.danger({
         title: "Couldn't change automatic approval",
         description: error instanceof Error ? error.message : String(error),
       });
+    } finally {
+      togglingApproval = false;
     }
   }
 
@@ -260,7 +263,7 @@
               onAction: toggleReview,
             },
             {
-              title: autoApproval ? 'Stop approving its pull requests' : 'Approve its pull requests automatically',
+              title: autoApprovals.length > 0 ? 'Stop approving its pull requests' : 'Approve its pull requests automatically',
               icon: mdiCheckDecagramOutline,
               $if: () => session?.kind === 'work',
               onAction: toggleAutoApproval,
