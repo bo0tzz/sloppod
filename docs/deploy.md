@@ -5,7 +5,7 @@ sloppod ships as an OCI Helm chart, `oci://ghcr.io/bo0tzz/charts/sloppod`, publi
 - `ghcr.io/bo0tzz/sloppod`: the runtime and UI
 - `ghcr.io/bo0tzz/sloppod-session`: the session image with the supervisor, the Claude Code adapter, mise and the memini plugin
 
-Published chart versions are `0.1.0-main.<run>`, with `appVersion` set to the commit; the images are tagged with the commit and `latest`. Installing the chart from a checkout instead needs `image.tag` and `session.image.tag` set, because the in-repo `appVersion` (`0.1.0`) isn't an image tag.
+Releases are `v<version>` tags: chart `<version>` on images tagged `v<version>` (and `latest`). Every push to `main` also publishes chart `<next version>-main.<run>` on images tagged with the commit (and `main`), which semver ranges without a prerelease part skip. Installing the chart from a checkout instead needs `image.tag` and `session.image.tag` set, because the in-repo `appVersion` isn't an image tag.
 
 ## Cluster prerequisites
 
@@ -46,7 +46,7 @@ spec:
   interval: 10m
   url: oci://ghcr.io/bo0tzz/charts/sloppod
   ref:
-    semver: ">=0.1.0-0"
+    tag: "0.1.0"
 ---
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
