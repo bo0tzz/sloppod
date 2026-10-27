@@ -235,6 +235,10 @@ pub mod link {
             message: Value,
         },
         SyncTranscript,
+        /// The runtime's copy of a transcript file doesn't match; send all of it.
+        ResyncTranscript {
+            name: String,
+        },
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,8 +257,15 @@ pub mod link {
         Acp {
             message: Value,
         },
+        /// Whole transcript files (supervisors before incremental sync).
         Transcript {
             files: Vec<TranscriptFile>,
+        },
+        /// The bytes appended to a transcript file from `offset` on; offset 0 replaces the whole file.
+        TranscriptAppend {
+            name: String,
+            offset: u64,
+            content_b64: String,
         },
         AgentExited {
             code: Option<i32>,

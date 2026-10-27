@@ -123,6 +123,10 @@ impl AgentConn {
         let _ = self.tx.send(ToSupervisor::SyncTranscript);
     }
 
+    fn resync_transcript(&self, name: String) {
+        let _ = self.tx.send(ToSupervisor::ResyncTranscript { name });
+    }
+
     /// Takes over a request an earlier link sent the agent, so its answer still reaches someone.
     pub(crate) fn adopt(&self, id: i64) -> oneshot::Receiver<Result<Value, RpcError>> {
         let (tx, rx) = oneshot::channel();
@@ -453,6 +457,34 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
                         db::upsert_transcript(&state.db, session_id, &file.name, &content).await
                     {
                         tracing::error!(session = %session_id, error = %e, "storing transcript");
+                    }
+                }
+            }
+            FromSupervisor::TranscriptAppend {
+                name,
+                offset,
+                content_b64,
+            } => {
+                let Ok(content) = base64::engine::general_purpose::STANDARD.decode(&content_b64)
+                else {
+                    tracing::warn!(session = %session_id, file = %name, "undecodable transcript sync");
+                    continue;
+                };
+                let stored = if offset == 0 {
+                    db::upsert_transcript(&state.db, session_id, &name, &content)
+                        .await
+                        .map(|()| true)
+                } else {
+                    db::append_transcript(&state.db, session_id, &name, offset, &content).await
+                };
+                match stored {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::warn!(session = %session_id, file = %name, offset, "transcript out of step; asking for all of it");
+                        agent.resync_transcript(name);
+                    }
+                    Err(e) => {
+                        tracing::error!(session = %session_id, error = %e, "storing transcript")
                     }
                 }
             }

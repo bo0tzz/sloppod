@@ -257,6 +257,27 @@ pub async fn events(db: &PgPool, id: Uuid) -> sqlx::Result<Vec<(i64, Value)>> {
     Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
 }
 
+/// Appends to a transcript if the stored copy is exactly `offset` bytes long; returns whether it was.
+pub async fn append_transcript(
+    db: &PgPool,
+    id: Uuid,
+    name: &str,
+    offset: u64,
+    content: &[u8],
+) -> sqlx::Result<bool> {
+    let result = sqlx::query(
+        "update transcripts set content = content || $4, updated_at = now() \
+         where session_id = $1 and name = $2 and length(content) = $3",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(offset as i64)
+    .bind(content)
+    .execute(db)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 pub async fn upsert_transcript(
     db: &PgPool,
     id: Uuid,
