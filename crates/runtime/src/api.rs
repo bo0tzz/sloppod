@@ -522,6 +522,7 @@ async fn delete_session(
     let session = db::owned_session(&state.db, id, &user)
         .await?
         .ok_or_else(not_found)?;
+    reviews::abandon(&state, id).await?;
     remove_session(&state, &session).await?;
     Ok(StatusCode::NO_CONTENT)
 }

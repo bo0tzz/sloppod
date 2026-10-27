@@ -303,6 +303,13 @@ async fn launch_for(
                 clone_url: format!("https://github.com/{}.git", grant.repo),
                 branch: grant.branch.to_owned(),
                 path: REPO_DIR.to_owned(),
+                commit: context
+                    .session
+                    .grants
+                    .iter()
+                    .find(|g| g.capability == "repo" && g.param("repo") == Some(grant.repo))
+                    .and_then(|g| g.param("commit"))
+                    .map(str::to_owned),
             }),
         install_tools: session.repo.is_some(),
         command: agent.command.clone(),
