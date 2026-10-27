@@ -651,24 +651,69 @@ test('manages credentials and nudges when they are missing', async ({ page }) =>
   await expect(page.getByTestId('nudge-repos')).toHaveCount(0);
 });
 
-test('a standing approval approves matching proposals as they are made', async ({ page }) => {
-  await page.goto('/settings');
-  const section = page.getByTestId('standing-approvals');
-  // The defaults: pull requests on any repository, until revoked, merged when checks pass.
-  await section.getByRole('button', { name: 'Add' }).click();
-  await expect(section.getByTestId('standing-approval')).toContainText('Pull requests on any repository');
-
+test('a session whose pull requests are approved automatically', async ({ page }) => {
   const id = await createSession(page, 'Propose a PR for sloppod');
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await page.getByRole('menuitem', { name: 'Approve its pull requests automatically' }).click();
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await expect(page.getByRole('menuitem', { name: 'Stop approving its pull requests' })).toBeVisible();
+  await page.keyboard.press('Escape');
   await finishTurn(page);
   await expect(page.getByTestId('system-notice')).toContainText(/github\.com\/bo0tzz\/sloppod\/pull\/\d+/);
   const proposals: Proposal[] = await (await page.request.get(`/api/v1/proposals?session=${id}`)).json();
   expect(proposals[0].decided_by).toMatch(/^standing-approval:/);
   expect(proposals[0].payload.auto_merge).toBe(true);
 
-  // Revoked, so later proposals wait for review again.
+  // Another session isn't covered while this one's approval is live.
+  await createSession(page, 'Propose another PR for sloppod');
+  await finishTurn(page);
+  await expect(page.getByTestId('proposal-card')).toHaveAttribute('data-status', 'pending');
+
+  // Settings lists it by session, and revokes it.
   await page.goto('/settings');
+  const section = page.getByTestId('standing-approvals');
+  await expect(section.getByTestId('standing-approval')).toContainText('Pull requests from Propose a PR for sloppod');
   await section.getByRole('button', { name: 'Revoke' }).click();
   await expect(section.getByTestId('standing-approval')).toHaveCount(0);
+});
+
+test('a stale Stop never turns automatic approval on', async ({ page }) => {
+  const id = await createSession(page, 'Propose a PR for sloppod, stale menu');
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await page.getByRole('menuitem', { name: 'Approve its pull requests automatically' }).click();
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await expect(page.getByRole('menuitem', { name: 'Stop approving its pull requests' })).toBeVisible();
+  // Another tab revokes it while this menu still says Stop.
+  const approvals: { id: string; session_id?: string }[] = await (await page.request.get('/api/v1/standing-approvals')).json();
+  for (const approval of approvals.filter((a) => a.session_id === id)) {
+    await page.request.delete(`/api/v1/standing-approvals/${approval.id}`);
+  }
+  await page.getByRole('menuitem', { name: 'Stop approving its pull requests' }).click();
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await expect(page.getByRole('menuitem', { name: 'Approve its pull requests automatically' })).toBeVisible();
+  const after: { session_id?: string }[] = await (await page.request.get('/api/v1/standing-approvals')).json();
+  expect(after.filter((a) => a.session_id === id)).toHaveLength(0);
+});
+
+test('stopping automatic approval revokes every approval of the session', async ({ page }) => {
+  const id = await createSession(page, 'Propose a PR for sloppod twice approved');
+  for (const target of [undefined, 'bo0tzz/sloppod']) {
+    const created = await page.request.post('/api/v1/standing-approvals', {
+      data: { kind: 'github.pr.create', session_id: id, target, edits: { auto_merge: true } },
+    });
+    expect(created.ok()).toBe(true);
+  }
+  await page.reload();
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await page.getByRole('menuitem', { name: 'Stop approving its pull requests' }).click();
+  await expect
+    .poll(async () => {
+      const approvals: { session_id?: string }[] = await (await page.request.get('/api/v1/standing-approvals')).json();
+      return approvals.filter((a) => a.session_id === id).length;
+    })
+    .toBe(0);
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await expect(page.getByRole('menuitem', { name: 'Approve its pull requests automatically' })).toBeVisible();
 });
 
 test('a stale copy of a proposal does not undo its approval', async ({ page }) => {

@@ -167,11 +167,11 @@ Approving returns as soon as the decision is recorded, with status `approved`; t
 
 ### Standing approvals
 
-Pre-approved proposal patterns ([ADR 3](adr/0003-proposals-and-trusted-executor.md)): a proposal from one of the owner's sessions that matches a live standing approval (its kind, its target, and its session if it names one) is approved as soon as it's made, with the standing approval's edits, and carried out like any other approval. Its `decided_by` names the standing approval, and the agent's tool reply says it was approved. Every built-in kind's target is its repository.
+Pre-approved proposal patterns ([ADR 3](adr/0003-proposals-and-trusted-executor.md)): each standing approval covers one session, and a proposal from that session that matches it (its kind, and its target if it names one) is approved as soon as it's made, with the standing approval's edits, and carried out like any other approval. Its `decided_by` names the standing approval, and the agent's tool reply says it was approved. Every built-in kind's target is its repository.
 
 ```
 GET    /api/v1/standing-approvals        -> StandingApproval[]   (live ones: not revoked, not expired)
-POST   /api/v1/standing-approvals        -> StandingApproval     body: {kind, target?, session_id?, edits?, expires_at?}
+POST   /api/v1/standing-approvals        -> StandingApproval     body: {kind, session_id, target?, edits?, expires_at?}; 400 without session_id
 DELETE /api/v1/standing-approvals/{id}   -> 204                  revokes it
 ```
 
@@ -180,7 +180,7 @@ type StandingApproval = {
   id: string;
   kind: string;          // a proposal kind, e.g. "github.pr.create"
   target?: string;       // owner/name; absent matches any
-  session_id?: string;   // absent matches all of the owner's sessions
+  session_id: string;    // the one session it covers
   edits: { auto_merge?: boolean };  // the only edit a standing approval can make
   expires_at?: string;   // RFC 3339; absent means until revoked
   created_at: string;

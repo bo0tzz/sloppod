@@ -12,6 +12,7 @@
   } from '@immich/ui';
   import {
     mdiArrowDown,
+    mdiCheckDecagramOutline,
     mdiCogOutline,
     mdiMagnifyScan,
     mdiShieldKeyOutline,
@@ -69,6 +70,14 @@
   let proposalList = $state<'all' | 'open' | null>(null);
   let showAddRepo = $state(false);
   let showGrants = $state(false);
+  /** This session's standing approvals for pull requests; any one of them approves its pull requests. */
+  let autoApprovals = $state<string[]>([]);
+  let togglingApproval = $state(false);
+
+  async function loadAutoApprovals() {
+    const approvals = await api.listStandingApprovals();
+    autoApprovals = approvals.filter((a) => a.session_id === id && a.kind === 'github.pr.create').map((a) => a.id);
+  }
 
   const waiting = $derived(view.permissions.length > 0 || view.questions.length > 0 || openProposals.length > 0);
   let width = $state(0);
@@ -80,6 +89,7 @@
   let atBottom = $state(true);
 
   onMount(() => {
+    loadAutoApprovals().catch(() => {});
     view.start();
     return () => view.stop();
   });
@@ -113,6 +123,29 @@
         title: "Couldn't change the review setting",
         description: error instanceof Error ? error.message : String(error),
       });
+    }
+  }
+
+  /** Turns automatic approval on or off as chosen, whatever another tab did since the menu was drawn. */
+  async function setAutoApproval(on: boolean) {
+    if (togglingApproval) return;
+    togglingApproval = true;
+    try {
+      // Fresh, so another tab's changes count: any live approval keeps approving until all are revoked.
+      await loadAutoApprovals();
+      if (!on) {
+        await Promise.all(autoApprovals.map((approval) => api.revokeStandingApproval(approval)));
+      } else if (autoApprovals.length === 0) {
+        await api.createStandingApproval({ kind: 'github.pr.create', session_id: id, edits: { auto_merge: true } });
+      }
+      await loadAutoApprovals();
+    } catch (error) {
+      toastManager.danger({
+        title: "Couldn't change automatic approval",
+        description: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      togglingApproval = false;
     }
   }
 
@@ -229,6 +262,12 @@
               icon: mdiMagnifyScan,
               $if: () => session?.kind === 'work',
               onAction: toggleReview,
+            },
+            {
+              title: autoApprovals.length > 0 ? 'Stop approving its pull requests' : 'Approve its pull requests automatically',
+              icon: mdiCheckDecagramOutline,
+              $if: () => session?.kind === 'work',
+              onAction: () => setAutoApproval(autoApprovals.length === 0),
             },
             { title: 'Settings', icon: mdiCogOutline, href: '/settings' },
             { title: 'Delete session', icon: mdiTrashCanOutline, color: 'danger', onAction: deleteSession },
