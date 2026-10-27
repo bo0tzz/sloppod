@@ -35,6 +35,10 @@
   const session = $derived(view.session);
   const title = $derived(session?.title || 'New session');
   const pendingProposals = $derived(view.proposals.filter((proposal) => proposal.status === 'pending'));
+  // Approved proposals are carried out in the background; their cards stay until that's done, or show why it failed.
+  const openProposals = $derived(
+    view.proposals.filter((proposal) => ['pending', 'approved', 'failed'].includes(proposal.status)),
+  );
   const showReconnecting = $derived(view.loaded && view.connection !== 'open');
   const activity = $derived.by(() => {
     switch (session?.phase) {
@@ -197,7 +201,7 @@
       {/if}
     </div>
 
-    {#if view.permissions.length > 0 || view.questions.length > 0 || pendingProposals.length > 0}
+    {#if view.permissions.length > 0 || view.questions.length > 0 || openProposals.length > 0}
       <div class="border-light-200 max-h-[55dvh] shrink-0 overflow-y-auto border-t px-3 py-2">
         <div class="mx-auto flex w-full max-w-3xl flex-col gap-2">
           {#each view.questions as question (question.rpcId)}
@@ -211,7 +215,7 @@
               onAnswer={(optionId) => view.answerPermission(request, optionId)}
             />
           {/each}
-          {#each pendingProposals as proposal (proposal.id)}
+          {#each openProposals as proposal (proposal.id)}
             <ProposalCard
               {proposal}
               onOpen={() => (openProposalId = proposal.id)}
