@@ -290,14 +290,15 @@ function grantRepo(session, repo) {
 }
 
 /**
- * A request the agent is blocked on until someone answers: a permission request or a question (form
- * elicitation). Sent to every viewer, re-sent to UIs that load the session while it's open; first answer wins.
+ * A request for the user: a permission request or a question (form elicitation). Sent to every viewer, re-sent to
+ * UIs that load the session while it's open; first answer wins. A blocking one belongs to the turn: the session
+ * waits on it and cancelling the turn cancels it. An `ask_user` question isn't blocking.
  */
-function requestFromUser(session, { method, params, toolCallId, cancelled }) {
+function requestFromUser(session, { method, params, toolCallId, cancelled, blocking = true }) {
   return new Promise((resolve) => {
-    const pending = { method, params, toolCallId, cancelled, resolve, requests: new Map() };
+    const pending = { method, params, toolCallId, cancelled, blocking, resolve, requests: new Map() };
     session.pending.set(pending, pending);
-    session.setPhase('waiting');
+    if (blocking) session.setPhase('waiting');
     for (const conn of session.subscribers) sendPending(session, pending, conn);
   });
 }
@@ -328,7 +329,8 @@ function resolvePending(session, pending, result) {
     });
   }
   pending.requests.clear();
-  if (session.data.phase === 'waiting' && session.pending.size === 0) session.setPhase('working');
+  const blocked = [...session.pending.values()].some((other) => other.blocking);
+  if (session.data.phase === 'waiting' && !blocked) session.setPhase('working');
   pending.resolve(result);
 }
 
@@ -417,6 +419,29 @@ async function agentScript(session, turn, prompt) {
         { content: 'Push and propose a pull request', priority: 'low', status: statuses[3] },
       ],
     });
+
+  if (/ask_user/i.test(prompt)) {
+    await step(1);
+    const askId = randomUUID();
+    tool({ toolCallId: askId, title: 'mcp__sloppod__ask_user', kind: 'other', status: 'pending', rawInput: { questions: [QUESTIONS[0]] } });
+    void requestFromUser(session, {
+      method: 'elicitation/create',
+      params: questionsToElicitation([QUESTIONS[0]], session.data.id),
+      cancelled: { action: 'cancel' },
+      blocking: false,
+    }).then((response) => {
+      const answers = response.action === 'accept' ? summariseAnswers([QUESTIONS[0]], response.content ?? {}) : [];
+      const notice = answers.length
+        ? `sloppod: the user answered your question:\n- ${QUESTIONS[0].question}: ${answers.join(' ')}`
+        : `sloppod: the user dismissed your question without answering it:\n- ${QUESTIONS[0].question}`;
+      void notifyAgent(session, notice, answers.length ? `Thanks, going with that. ${answers.join(' ')}` : "I'll use my own judgement then.");
+    });
+    update(askId, { status: 'completed' });
+    await say("I've asked you about the backoff; I'll carry on meanwhile.");
+    await step(4);
+    await say('Done with the parts that don\'t depend on your answer.');
+    return;
+  }
 
   if (/ask me/i.test(prompt)) {
     await step(2);
@@ -886,7 +911,9 @@ const startupDelay = (prompt) => (/slow start/i.test(prompt) ? 3000 : DELAY * 8)
 
 function cancelTurn(session) {
   if (session.turn) session.turn.cancelled = true;
-  for (const pending of [...session.pending.values()]) resolvePending(session, pending, pending.cancelled);
+  for (const pending of [...session.pending.values()]) {
+    if (pending.blocking) resolvePending(session, pending, pending.cancelled);
+  }
 }
 
 // --- ACP over WebSocket ---------------------------------------------------------------------

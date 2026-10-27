@@ -62,16 +62,21 @@ pub fn elicitation(questions: &Value, session_id: &str) -> Result<Value, String>
     }))
 }
 
-/// The notice that tells the agent how the user answered its questions.
+/// The notice that tells the agent how the user answered its questions, or that they dismissed them; either names
+/// the questions, so an agent with several open can tell which this is.
 pub fn answer_text(questions: &Value, response: &Value) -> String {
+    let questions = questions.as_array().map(Vec::as_slice).unwrap_or_default();
+    let text = |question: &Value| question["question"].as_str().unwrap_or_default().to_owned();
     if response["action"] != "accept" {
-        return "sloppod: the user dismissed your question without answering it.".into();
+        let asked: Vec<String> = questions.iter().map(|q| format!("- {}", text(q))).collect();
+        return format!(
+            "sloppod: the user dismissed your question without answering it:\n{}",
+            asked.join("\n")
+        );
     }
     let content = &response["content"];
     let answers: Vec<String> = questions
-        .as_array()
-        .into_iter()
-        .flatten()
+        .iter()
         .enumerate()
         .map(|(index, question)| {
             let picked = match &content[format!("question_{index}")] {
@@ -93,10 +98,7 @@ pub fn answer_text(questions: &Value, response: &Value) -> String {
                 (true, false) => custom.to_owned(),
                 (false, false) => format!("{picked} (note: {custom})"),
             };
-            format!(
-                "- {}: {answer}",
-                question["question"].as_str().unwrap_or_default()
-            )
+            format!("- {}: {answer}", text(question))
         })
         .collect();
     format!(
@@ -147,6 +149,9 @@ mod tests {
             "sloppod: the user answered your question:\n- Which backoff?: Exponential (note: capped at 10 s)\n- \
              Which tests?: Unit, End-to-end"
         );
-        assert!(answer_text(&questions(), &json!({"action": "cancel"})).contains("dismissed"));
+        assert_eq!(
+            answer_text(&questions(), &json!({"action": "cancel"})),
+            "sloppod: the user dismissed your question without answering it:\n- Which backoff?\n- Which tests?"
+        );
     }
 }

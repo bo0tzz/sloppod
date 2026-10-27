@@ -574,6 +574,29 @@ test('skips questions from the agent', async ({ page }) => {
   await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
 });
 
+test('stopping the turn cancels its question', async ({ page }) => {
+  await createSession(page, 'Ask me first');
+  await expect(questionCard(page)).toBeVisible();
+  await page.getByRole('button', { name: 'Stop' }).click();
+  await expect(questionCard(page)).toBeHidden();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+});
+
+test('a question asked with ask_user outlives the turn and a stop', async ({ page }) => {
+  await createSession(page, 'Use ask_user about the backoff');
+  await expect(questionCard(page)).toBeVisible();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'working');
+  await page.getByRole('button', { name: 'Stop' }).click();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+  await expect(questionCard(page)).toBeVisible();
+
+  await questionField(page, 'question_0_custom').getByRole('textbox').fill('Exponential, capped');
+  await questionCard(page).getByRole('button', { name: 'Answer' }).click();
+  await expect(questionCard(page)).toBeHidden();
+  await expect(page.getByText('sloppod: the user answered your question:', { exact: false })).toBeVisible();
+  await expect(agentMessages(page).filter({ hasText: 'Thanks, going with that. Backoff: Exponential, capped.' })).toBeVisible();
+});
+
 test('shows an open question again after a reload', async ({ page }) => {
   await createSession(page, 'Ask me something, then reload');
   await expect(questionCard(page)).toBeVisible();
