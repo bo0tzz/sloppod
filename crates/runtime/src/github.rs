@@ -33,6 +33,51 @@ const READ_PERMISSIONS: &[&str] = &[
 ];
 
 /// One cached token, minted by whichever caller gets the slot first; the others wait for it.
+/// When the authorizer let pushes to branches through. A push it admitted may still be landing, so work that needs
+/// branches to hold still checks here as well as their heads. The runtime is one process (ADR 14), so this is too.
+#[derive(Default)]
+pub struct PushLog {
+    admitted: Mutex<HashMap<(String, String), Instant>>,
+}
+
+impl PushLog {
+    pub fn admit(&self, repo: &str, branch: &str) {
+        self.admitted
+            .lock()
+            .unwrap()
+            .insert((repo.to_lowercase(), branch.to_owned()), Instant::now());
+    }
+
+    /// The first of `branches` a push was let through to since `settle` before `since`.
+    pub fn pushed_since<'a>(
+        &self,
+        repo: &str,
+        branches: &[&'a str],
+        since: Instant,
+        settle: Duration,
+    ) -> Option<&'a str> {
+        let admitted = self.admitted.lock().unwrap();
+        branches.iter().copied().find(|branch| {
+            admitted
+                .get(&(repo.to_lowercase(), (*branch).to_owned()))
+                .is_some_and(|at| *at + settle >= since)
+        })
+    }
+}
+
+/// How long a push the authorizer let through may take to land, for work that needs branches to hold still.
+const PUSH_SETTLE: Duration = Duration::from_secs(10 * 60);
+
+/// A linked stack to merge: its number, its pull requests and each layer's branch and proposed commit, bottom to
+/// top, and the top pull request's node id.
+#[derive(Clone, Copy)]
+pub struct StackMerge<'a> {
+    pub stack: u64,
+    pub pulls: &'a [u64],
+    pub top_node_id: &'a str,
+    pub layers: &'a [(&'a str, &'a str)],
+}
+
 type TokenSlot = Arc<tokio::sync::Mutex<Option<AccessToken>>>;
 
 /// What a token is minted for. `None` is everything the installation has.
@@ -571,7 +616,7 @@ impl GitHubApp {
     /// Turns auto-merge off on open pull requests from `branch`, returning their numbers.
     pub async fn disable_auto_merge(&self, repo: &str, branch: &str) -> anyhow::Result<Vec<u64>> {
         let owner = repo.split('/').next().unwrap_or_default();
-        let pulls: Vec<Value> = self
+        let headed: Vec<Value> = self
             .repo_get(
                 repo,
                 &format!("/pulls?state=open&head={owner}:{branch}"),
@@ -581,28 +626,57 @@ impl GitHubApp {
             .error_for_status()?
             .json()
             .await?;
+        // A stack merges through auto-merge on its top pull request, so a push to any layer turns that off too.
+        let mut numbers: Vec<u64> = Vec::new();
+        for pull in headed.iter().filter_map(|p| p["number"].as_u64()) {
+            numbers.push(pull);
+            if let Some(stack) = self.stack_of(repo, pull).await? {
+                numbers.extend(self.stack_members(repo, stack).await?);
+            }
+        }
+        numbers.sort_unstable();
+        numbers.dedup();
         let mut disabled = Vec::new();
-        for pull in pulls.iter().filter(|pull| !pull["auto_merge"].is_null()) {
-            let token = self.token_for(repo).await?;
-            let response: Value = self
-                .http
-                .post(self.url("/graphql"))
-                .bearer_auth(token)
-                .json(&json!({
-                    "query": "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }",
-                    "variables": {"id": pull["node_id"]},
-                }))
-                .send()
+        for number in numbers {
+            let pull: Value = self
+                .repo_get(
+                    repo,
+                    &format!("/pulls/{number}"),
+                    "application/vnd.github+json",
+                )
                 .await?
                 .error_for_status()?
                 .json()
                 .await?;
-            if let Some(error) = response["errors"].as_array().and_then(|e| e.first()) {
-                bail!("{}", error["message"].as_str().unwrap_or("unknown error"));
+            if pull["state"] != "open" || pull["auto_merge"].is_null() {
+                continue;
             }
-            disabled.extend(pull["number"].as_u64());
+            self.disable_pull_auto_merge_in(repo, pull["node_id"].as_str().unwrap_or_default())
+                .await?;
+            disabled.push(number);
         }
         Ok(disabled)
+    }
+
+    async fn disable_pull_auto_merge_in(&self, repo: &str, node_id: &str) -> anyhow::Result<()> {
+        let token = self.token_for(repo).await?;
+        let response: Value = self
+            .http
+            .post(self.url("/graphql"))
+            .bearer_auth(token)
+            .json(&json!({
+                "query": "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }",
+                "variables": {"id": node_id},
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if let Some(error) = response["errors"].as_array().and_then(|e| e.first()) {
+            bail!("{}", error["message"].as_str().unwrap_or("unknown error"));
+        }
+        Ok(())
     }
 
     async fn repo_post(&self, repo: &str, path: &str, payload: &Value) -> anyhow::Result<Value> {
@@ -699,18 +773,111 @@ impl GitHubApp {
     }
 
     /// The number of the stack a pull request is in, if any (GitHub's stacked pull requests).
+    /// None too when the repository doesn't have stacked pull requests, which GitHub answers with a 404.
     pub async fn stack_of(&self, repo: &str, pull: u64) -> anyhow::Result<Option<u64>> {
-        let stacks: Vec<Value> = self
+        let response = self
             .repo_get(
                 repo,
                 &format!("/stacks?pull_request={pull}"),
+                "application/vnd.github+json",
+            )
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let stacks: Vec<Value> = response.error_for_status()?.json().await?;
+        Ok(stacks.first().and_then(|stack| stack["number"].as_u64()))
+    }
+
+    /// Has a stack merge itself once its required checks pass, through auto-merge on its top pull request, at
+    /// `top_sha`. Refused unless the stack holds exactly `pulls`, bottom to top: others in it would merge unreviewed.
+    ///
+    /// `layers` are each layer's branch and the commit it was proposed at, bottom to top. After turning auto-merge
+    /// on, every layer must still be there with no push let through to it since `since`, or it's turned off again:
+    /// the push guard only turns off auto-merge that's already on, and a push it let through earlier may land late.
+    pub async fn auto_merge_stack(
+        &self,
+        repo: &str,
+        merge: &StackMerge<'_>,
+        pushes: &PushLog,
+        since: Instant,
+    ) -> anyhow::Result<()> {
+        let StackMerge {
+            stack,
+            pulls,
+            top_node_id,
+            layers,
+        } = *merge;
+        let members = self.stack_members(repo, stack).await?;
+        if members != pulls {
+            bail!("stack #{stack} holds other pull requests than these");
+        }
+        let Some((_, top_sha)) = layers.last() else {
+            bail!("the stack has no layers");
+        };
+        let branches: Vec<&str> = layers.iter().map(|(branch, _)| *branch).collect();
+        // The authorizer sees a push start, not land, so a push it let through lately may still be on its way.
+        if let Some(branch) = pushes.pushed_since(repo, &branches, since, PUSH_SETTLE) {
+            bail!(
+                "`{branch}` was pushed to in the last few minutes, and that push may still be landing"
+            );
+        }
+        if let Some(branch) = self.moved_layer(repo, layers).await? {
+            bail!("`{branch}` moved since it was proposed");
+        }
+        self.enable_auto_merge(repo, top_node_id, top_sha).await?;
+        // A push let through in the meantime: GitHub can't merge its commits before their required checks pass, so
+        // turning auto-merge off again in time is enough. Any doubt turns it off.
+        let doubt = match self.moved_layer(repo, layers).await {
+            Ok(Some(branch)) => Some(format!("`{branch}` moved while the stack was being opened")),
+            Ok(None) => pushes
+                .pushed_since(repo, &branches, since, Duration::ZERO)
+                .map(|branch| format!("`{branch}` was pushed to while the stack was being opened")),
+            Err(e) => Some(format!("its layers couldn't be checked ({e})")),
+        };
+        let Some(doubt) = doubt else {
+            return Ok(());
+        };
+        match self.disable_pull_auto_merge_in(repo, top_node_id).await {
+            Ok(()) => bail!("{doubt}"),
+            Err(e) => bail!(
+                "{doubt}, and auto-merge couldn't be turned off again ({e}): turn it off by hand"
+            ),
+        }
+    }
+
+    /// The first layer not at the commit it was proposed at.
+    async fn moved_layer<'a>(
+        &self,
+        repo: &str,
+        layers: &[(&'a str, &str)],
+    ) -> anyhow::Result<Option<&'a str>> {
+        for (branch, sha) in layers {
+            if self.branch_sha(repo, branch).await? != *sha {
+                return Ok(Some(branch));
+            }
+        }
+        Ok(None)
+    }
+
+    /// A stack's pull requests, bottom to top.
+    pub async fn stack_members(&self, repo: &str, stack: u64) -> anyhow::Result<Vec<u64>> {
+        let stack: Value = self
+            .repo_get(
+                repo,
+                &format!("/stacks/{stack}"),
                 "application/vnd.github+json",
             )
             .await?
             .error_for_status()?
             .json()
             .await?;
-        Ok(stacks.first().and_then(|stack| stack["number"].as_u64()))
+        Ok(stack["pull_requests"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|pull| pull["number"].as_u64())
+            .collect())
     }
 
     /// Links pull requests, bottom to top, into a stack; returns its number.
@@ -821,6 +988,121 @@ mod tests {
         minted: Mutex<Vec<(u64, Value)>>,
         /// Holds each mint until this many are in flight at once.
         rendezvous: Option<tokio::sync::Barrier>,
+        /// Open pull requests of `o/r`: number, head branch, and whether auto-merge is on.
+        pulls: Mutex<Vec<(u64, &'static str, bool)>>,
+        /// Stacks of `o/r` by number, with their pull requests bottom to top; None for a repository without them.
+        stacks: Option<Vec<(u64, Vec<u64>)>>,
+        /// Branch heads of `o/r`.
+        heads: Mutex<HashMap<String, String>>,
+        /// Head lookups fail while any pull request has auto-merge on.
+        heads_fail_once_merging: bool,
+    }
+
+    async fn commit(
+        State(fake): State<Arc<Fake>>,
+        Path((_, _, reference)): Path<(String, String, String)>,
+    ) -> Result<Json<Value>, StatusCode> {
+        if fake.heads_fail_once_merging && fake.pulls.lock().unwrap().iter().any(|p| p.2) {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        let heads = fake.heads.lock().unwrap();
+        heads
+            .get(&reference)
+            .map(|sha| Json(json!({"sha": sha})))
+            .ok_or(StatusCode::NOT_FOUND)
+    }
+
+    fn pull_json(&(number, head, auto_merge): &(u64, &str, bool)) -> Value {
+        json!({
+            "number": number,
+            "state": "open",
+            "node_id": format!("PR{number}"),
+            "head": {"ref": head},
+            "auto_merge": if auto_merge { json!({"merge_method": "squash"}) } else { Value::Null },
+        })
+    }
+
+    async fn pulls(
+        State(fake): State<Arc<Fake>>,
+        axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        let head = query
+            .get("head")
+            .and_then(|h| h.split_once(':'))
+            .map(|(_, b)| b.to_owned());
+        let pulls = fake.pulls.lock().unwrap();
+        Json(json!(
+            pulls
+                .iter()
+                .filter(|p| head.as_deref().is_none_or(|h| h == p.1))
+                .map(pull_json)
+                .collect::<Vec<_>>()
+        ))
+    }
+
+    async fn pull(
+        State(fake): State<Arc<Fake>>,
+        Path((_, _, number)): Path<(String, String, u64)>,
+    ) -> Result<Json<Value>, StatusCode> {
+        let pulls = fake.pulls.lock().unwrap();
+        pulls
+            .iter()
+            .find(|p| p.0 == number)
+            .map(|p| Json(pull_json(p)))
+            .ok_or(StatusCode::NOT_FOUND)
+    }
+
+    fn stack_json(number: u64, members: &[u64]) -> Value {
+        json!({"number": number, "pull_requests": members.iter().map(|n| json!({"number": n})).collect::<Vec<_>>()})
+    }
+
+    async fn stacks(
+        State(fake): State<Arc<Fake>>,
+        axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+    ) -> Result<Json<Value>, StatusCode> {
+        let stacks = fake.stacks.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+        let pull: Option<u64> = query.get("pull_request").and_then(|p| p.parse().ok());
+        Ok(Json(json!(
+            stacks
+                .iter()
+                .filter(|(_, members)| pull.is_none_or(|p| members.contains(&p)))
+                .map(|(number, members)| stack_json(*number, members))
+                .collect::<Vec<_>>()
+        )))
+    }
+
+    async fn stack(
+        State(fake): State<Arc<Fake>>,
+        Path((_, _, number)): Path<(String, String, u64)>,
+    ) -> Result<Json<Value>, StatusCode> {
+        let stacks = fake.stacks.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+        stacks
+            .iter()
+            .find(|(n, _)| *n == number)
+            .map(|(n, members)| Json(stack_json(*n, members)))
+            .ok_or(StatusCode::NOT_FOUND)
+    }
+
+    async fn repository() -> Json<Value> {
+        Json(json!({"allow_squash_merge": true}))
+    }
+
+    /// Turns auto-merge on or off for the pull request whose node id the mutation names.
+    async fn graphql(State(fake): State<Arc<Fake>>, Json(body): Json<Value>) -> Json<Value> {
+        let on = body["query"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("enablePullRequestAutoMerge");
+        let id = body["variables"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        for pull in fake.pulls.lock().unwrap().iter_mut() {
+            if format!("PR{}", pull.0) == id {
+                pull.2 = on;
+            }
+        }
+        Json(json!({"data": {}}))
     }
 
     async fn installation(
@@ -875,6 +1157,13 @@ mod tests {
         let router = Router::new()
             .route("/repos/{owner}/{name}/installation", get(installation))
             .route("/app/installations/{id}/access_tokens", post(mint))
+            .route("/repos/{owner}/{name}", get(repository))
+            .route("/repos/{owner}/{name}/pulls", get(pulls))
+            .route("/repos/{owner}/{name}/pulls/{number}", get(pull))
+            .route("/repos/{owner}/{name}/stacks", get(stacks))
+            .route("/repos/{owner}/{name}/stacks/{number}", get(stack))
+            .route("/repos/{owner}/{name}/commits/{reference}", get(commit))
+            .route("/graphql", post(graphql))
             .with_state(fake.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api = format!("http://{}", listener.local_addr().unwrap());
@@ -882,6 +1171,173 @@ mod tests {
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).unwrap();
         let app = GitHubApp::with_api(&api, "1".into(), key.serialize_pem().as_bytes()).unwrap();
         (fake, app)
+    }
+
+    /// The stack #7 of three layers, the top one set to merge the stack.
+    fn stacked() -> Fake {
+        Fake {
+            pulls: Mutex::new(vec![
+                (1, "s-1", false),
+                (2, "s-2", false),
+                (3, "s-3", true),
+                (4, "other", true),
+            ]),
+            stacks: Some(vec![(7, vec![1, 2, 3])]),
+            ..Fake::default()
+        }
+    }
+
+    fn auto_merging(fake: &Fake) -> Vec<u64> {
+        fake.pulls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.2)
+            .map(|p| p.0)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_push_to_any_layer_stops_the_stack_merging() {
+        let (fake, app) = serve(stacked()).await;
+        assert_eq!(app.disable_auto_merge("o/r", "s-1").await.unwrap(), [3]);
+        assert_eq!(auto_merging(&fake), [4]);
+    }
+
+    #[tokio::test]
+    async fn a_push_without_stacks_stops_its_own_pull_request() {
+        let fake = Fake {
+            pulls: Mutex::new(vec![(1, "s-1", true), (4, "other", true)]),
+            stacks: None,
+            ..Fake::default()
+        };
+        let (fake, app) = serve(fake).await;
+        assert_eq!(app.disable_auto_merge("o/r", "s-1").await.unwrap(), [1]);
+        assert_eq!(auto_merging(&fake), [4]);
+    }
+
+    /// The unmerged stack #7 of three layers, each at the commit it was proposed at.
+    fn unmerged() -> Fake {
+        Fake {
+            pulls: Mutex::new(vec![
+                (1, "s-1", false),
+                (2, "s-2", false),
+                (3, "s-3", false),
+            ]),
+            stacks: Some(vec![(7, vec![1, 2, 3])]),
+            heads: Mutex::new(
+                [("s-1", "a"), ("s-2", "b"), ("s-3", "c")]
+                    .into_iter()
+                    .map(|(b, s)| (b.to_owned(), s.to_owned()))
+                    .collect(),
+            ),
+            ..Fake::default()
+        }
+    }
+
+    const LAYERS: &[(&str, &str)] = &[("s-1", "a"), ("s-2", "b"), ("s-3", "c")];
+
+    fn merge<'a>(pulls: &'a [u64]) -> StackMerge<'a> {
+        StackMerge {
+            stack: 7,
+            pulls,
+            top_node_id: "PR3",
+            layers: LAYERS,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stack_merges_only_with_exactly_its_proposed_layers() {
+        let (fake, app) = serve(unmerged()).await;
+        let pushes = PushLog::default();
+        let since = Instant::now();
+        // The upper two of an existing three-layer stack.
+        assert!(
+            app.auto_merge_stack("o/r", &merge(&[2, 3]), &pushes, since)
+                .await
+                .is_err()
+        );
+        assert!(auto_merging(&fake).is_empty());
+        app.auto_merge_stack("o/r", &merge(&[1, 2, 3]), &pushes, since)
+            .await
+            .unwrap();
+        assert_eq!(auto_merging(&fake), [3]);
+    }
+
+    #[tokio::test]
+    async fn a_layer_that_moved_meanwhile_stops_the_stack_merging() {
+        let (fake, app) = serve(unmerged()).await;
+        let since = Instant::now();
+        fake.heads.lock().unwrap().insert("s-1".into(), "a2".into());
+        let refused = app
+            .auto_merge_stack("o/r", &merge(&[1, 2, 3]), &PushLog::default(), since)
+            .await;
+        assert!(refused.unwrap_err().to_string().contains("s-1"));
+        assert!(auto_merging(&fake).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_push_let_through_meanwhile_stops_the_stack_merging() {
+        let (fake, app) = serve(unmerged()).await;
+        let pushes = PushLog::default();
+        let since = Instant::now();
+        // Let through after the stack started opening, its commits not on the branch yet.
+        pushes.admit("O/R", "s-2");
+        let refused = app
+            .auto_merge_stack("o/r", &merge(&[1, 2, 3]), &pushes, since)
+            .await;
+        assert!(refused.unwrap_err().to_string().contains("s-2"));
+        assert!(auto_merging(&fake).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_recent_push_that_may_still_land_keeps_auto_merge_off() {
+        let (fake, app) = serve(unmerged()).await;
+        let pushes = PushLog::default();
+        // Let through before the stack started opening, and maybe still landing.
+        pushes.admit("o/r", "s-1");
+        let since = Instant::now();
+        let refused = app
+            .auto_merge_stack("o/r", &merge(&[1, 2, 3]), &pushes, since)
+            .await;
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("may still be landing")
+        );
+        assert!(auto_merging(&fake).is_empty());
+
+        // Long enough ago, with every layer at its proposed commit, it's fine.
+        let settled = since + PUSH_SETTLE + Duration::from_secs(1);
+        app.auto_merge_stack("o/r", &merge(&[1, 2, 3]), &pushes, settled)
+            .await
+            .unwrap();
+        assert_eq!(auto_merging(&fake), [3]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_check_after_turning_auto_merge_on_turns_it_off() {
+        let fake = Fake {
+            heads_fail_once_merging: true,
+            ..unmerged()
+        };
+        let (fake, app) = serve(fake).await;
+        let refused = app
+            .auto_merge_stack(
+                "o/r",
+                &merge(&[1, 2, 3]),
+                &PushLog::default(),
+                Instant::now(),
+            )
+            .await;
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("couldn't be checked")
+        );
+        assert!(auto_merging(&fake).is_empty());
     }
 
     #[tokio::test]

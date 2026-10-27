@@ -132,11 +132,15 @@ async fn main() -> anyhow::Result<()> {
     let mut policies = Policies::default();
     policies.register(Arc::new(ModelPolicy::new(credentials.clone())));
     policies.register(Arc::new(CodexPolicy::new(credentials.clone())));
-    policies.register(Arc::new(GitHubPolicy::new(credentials.clone())));
+    let pushes = Arc::new(github::PushLog::default());
+    policies.register(Arc::new(GitHubPolicy::new(
+        credentials.clone(),
+        pushes.clone(),
+    )));
 
     let mut proposals = ProposalKinds::default();
     proposals.register(Arc::new(proposals::PullRequest::new(credentials.clone())));
-    proposals.register(Arc::new(proposals::Stack::new(credentials.clone())));
+    proposals.register(Arc::new(proposals::Stack::new(credentials.clone(), pushes)));
     proposals.register(Arc::new(proposals::Issues::new(credentials.clone())));
     proposals.register(Arc::new(proposals::RepoAccess::new(
         db.clone(),

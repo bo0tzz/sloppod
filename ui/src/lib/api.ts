@@ -132,6 +132,7 @@ export type StackPayload = {
   repo: string;
   base: string;
   pull_requests: { head: string; base: string; head_sha: string; title: string; body: string; draft: boolean }[];
+  auto_merge?: boolean;
 };
 
 export type CredentialKind = 'claude' | 'github-app' | 'memini' | 'chatgpt';

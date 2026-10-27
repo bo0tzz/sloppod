@@ -1198,12 +1198,14 @@ function approve(proposal, body, decidedBy) {
     notice = `Your pull request was approved and opened: ${proposal.result.url}`;
     ack = 'Great, the pull request is open.';
   } else if (proposal.kind === 'github.stack.create') {
+    if (typeof body.auto_merge === 'boolean') proposal.payload.auto_merge = body.auto_merge;
     const opened = proposal.payload.pull_requests.map((_, index) => {
       const number = 300 + proposals.size * 10 + index;
       return { url: `https://github.com/${proposal.payload.repo}/pull/${number}`, number };
     });
     proposal.status = 'executed';
-    proposal.result = { pull_requests: opened, stack: 7, message: `Opened ${opened.map((p) => p.url).join(', ')} as stack #7.` };
+    const merging = proposal.payload.auto_merge ? ' The stack merges once its required checks pass.' : '';
+    proposal.result = { pull_requests: opened, stack: 7, auto_merge: Boolean(proposal.payload.auto_merge), message: `Opened ${opened.map((p) => p.url).join(', ')} as stack #7.${merging}` };
     notice = `Your stack was approved. ${proposal.result.message}`;
     ack = 'Great, the stack is open.';
   } else if (proposal.kind === 'github.issue.create') {

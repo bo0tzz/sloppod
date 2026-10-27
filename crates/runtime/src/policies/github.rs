@@ -8,13 +8,14 @@ use sloppod_contracts::{
 };
 
 use crate::credentials::Credentials;
-use crate::github::GitHubApp;
+use crate::github::{GitHubApp, PushLog};
 use crate::proposals::is_session_branch;
 
 /// GitHub: reads and session-branch pushes with the owner's GitHub App, through tokens scoped to the session's
 /// grants (ADR 11); all other writes go through proposals.
 pub struct GitHubPolicy {
     credentials: Arc<Credentials>,
+    pushes: Arc<PushLog>,
 }
 
 fn err(e: impl std::fmt::Display) -> Error {
@@ -22,8 +23,11 @@ fn err(e: impl std::fmt::Display) -> Error {
 }
 
 impl GitHubPolicy {
-    pub fn new(credentials: Arc<Credentials>) -> Self {
-        Self { credentials }
+    pub fn new(credentials: Arc<Credentials>, pushes: Arc<PushLog>) -> Self {
+        Self {
+            credentials,
+            pushes,
+        }
     }
 
     /// The owner's GitHub App, if they configured one.
@@ -96,6 +100,7 @@ impl GitHubPolicy {
                                 .iter()
                                 .filter_map(|r| r.strip_prefix("refs/heads/"))
                             {
+                                self.pushes.admit(repo, pushed);
                                 let disabled =
                                     app.disable_auto_merge(repo, pushed).await.map_err(err)?;
                                 if !disabled.is_empty() {
