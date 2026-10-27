@@ -20,6 +20,7 @@ use crate::placement::{TOKEN_DIR, WORKDIR};
 use crate::pods::SESSION_LABEL;
 use crate::policies::SESSION_KEY;
 use crate::proposals::{self, Verdict};
+use crate::session::ParkError;
 use crate::users::User;
 use crate::{AppState, db, reviews};
 
@@ -562,20 +563,24 @@ async fn wake_session(
 }
 
 /// Parks a session (ADR 5): its pod ends, and its volume, transcript, branch, grants and keys stay.
-pub async fn park(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
-    state.hub.park(session.id).await;
-    state.placement.suspend(&session.id.to_string()).await?;
-    Ok(())
+pub async fn park(state: &AppState, session: &db::SessionRow) -> Result<(), ParkError> {
+    let id = session.id.to_string();
+    state
+        .hub
+        .park(session.id, || async {
+            state
+                .placement
+                .suspend(&id)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+        .await
 }
 
 /// Brings a parked session back: its pod starts again and the agent resumes its conversation. Other sessions are
 /// left as they are.
 pub async fn wake(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
-    if session.phase() != Phase::Parked {
-        return Ok(());
-    }
-    state.hub.set_phase(session.id, Phase::Starting).await;
-    place(state, session).await
+    state.hub.wake(session.id, || place(state, session)).await
 }
 
 /// Stops a session and deletes its pod, volume, egress policy and keys.

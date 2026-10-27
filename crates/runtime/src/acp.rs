@@ -156,6 +156,14 @@ impl Conn {
             && let Err(e) = api::wake(&self.state, &row).await
         {
             tracing::warn!(%session, error = %e, "waking a parked session");
+            self.reply(
+                id,
+                Err(RpcError::new(
+                    -32603,
+                    format!("couldn't wake the session: {e}"),
+                )),
+            );
+            return;
         }
         let result = match (method.as_str(), session) {
             ("initialize", _) => Ok(self.initialize()),
