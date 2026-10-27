@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
-use sloppod_contracts::{Grant, ReviewSubject};
+use sloppod_contracts::{Grant, READ_ONLY, ReviewSubject};
 use sloppod_protocol::api::{ProposalStatus, ReviewPolicy, SessionKind};
 use uuid::Uuid;
 
@@ -69,7 +69,7 @@ pub async fn start(
         Grant::new("packages", json!({})),
         Grant::new(
             "repo",
-            json!({"repo": subject.repo, "access": "r", "branch": subject.head, "commit": subject.head_sha}),
+            json!({"repo": subject.repo, "access": READ_ONLY, "branch": subject.head, "commit": subject.head_sha}),
         ),
     ];
     db::insert_session(

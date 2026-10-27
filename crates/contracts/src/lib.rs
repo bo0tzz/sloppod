@@ -92,7 +92,7 @@ impl SessionContext {
     }
 
     /// The session's repository grants with `access`, each with its branch.
-    fn repo_grants(&self, access: &'static str) -> impl Iterator<Item = RepoGrant<'_>> {
+    fn repo_grants(&self, access: &str) -> impl Iterator<Item = RepoGrant<'_>> {
         self.grants
             .iter()
             .filter(move |g| g.capability == "repo" && g.param("access") == Some(access))
@@ -106,7 +106,7 @@ impl SessionContext {
 
     /// Repositories the session may push to, each with its session branch.
     pub fn writable_repos(&self) -> impl Iterator<Item = RepoGrant<'_>> {
-        self.repo_grants("rw")
+        self.repo_grants(READ_WRITE)
     }
 
     /// The first repository the session may push to, if any.
@@ -121,10 +121,14 @@ impl SessionContext {
 
     /// A read-only grant of `repo` with the branch to check out, e.g. a review session's (ADR 24).
     pub fn readable_repo_for(&self, repo: &str) -> Option<RepoGrant<'_>> {
-        self.repo_grants("r")
+        self.repo_grants(READ_ONLY)
             .find(|g| g.repo.eq_ignore_ascii_case(repo))
     }
 }
+
+/// A repository grant's `access`: read only, or read and push the session's branches (ADR 2).
+pub const READ_ONLY: &str = "ro";
+pub const READ_WRITE: &str = "rw";
 
 /// One HTTP request leaving a session pod, as seen by the egress listener.
 #[derive(Debug, Clone, Serialize, Deserialize)]

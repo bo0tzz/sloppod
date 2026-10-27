@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use sloppod_contracts::{Error, Grant, Manifest, ProposalKind, Result, SessionContext, ToolSpec};
+use sloppod_contracts::{
+    Error, Grant, Manifest, ProposalKind, READ_WRITE, Result, SessionContext, ToolSpec,
+};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -20,7 +22,7 @@ pub async fn grant_repo(db: &PgPool, session: &SessionContext, repo: &str) -> an
     let branch = session_branch(session.session_id.parse()?);
     let grant = Grant::new(
         "repo",
-        json!({"repo": repo, "access": "rw", "branch": branch}),
+        json!({"repo": repo, "access": READ_WRITE, "branch": branch}),
     );
     db::add_grant(db, session.session_id.parse()?, &grant).await?;
     Ok(true)
