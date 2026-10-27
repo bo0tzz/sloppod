@@ -102,7 +102,7 @@ Outward actions and access the agent asked for ([ADR 3](adr/0003-proposals-and-t
 - `github.pr.create`: payload `{repo, base, head, title, body, draft, auto_merge}`; the detail adds `diff` and `commits`. With `auto_merge`, which the agent can ask for and the reviewer decides, sloppod turns on GitHub's auto-merge after opening the PR (with the first merge method the repository allows), so it merges once its required checks pass; the result's `message` says whether that worked.
 - `sloppod.repo.grant`: write access to a repository; payload `{repo, reason, branch}`; the detail adds nothing.
 
-When a proposal is decided or carried out, the runtime tells the agent: the notice is recorded as a `user_message_chunk` with `_meta.sloppod.notice: true` and delivered as a new turn when the agent is idle, steered into a running turn, or queued until the agent is up.
+When a proposal is decided or carried out, the runtime tells the agent: the notice is recorded as a `user_message_chunk` with `_meta.sloppod.notice: true` and delivered as a new turn when the agent is idle, steered into a running turn, or queued until the agent is up. Sessions whose turn a runtime restart cut off get a notice of the same kind once their agent is back, naming the build now running (`SLOPPOD_BUILD`, the chart's app version).
 
 ```
 GET  /api/v1/proposals?session={id}&status={status}  -> Proposal[]
