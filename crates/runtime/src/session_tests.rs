@@ -519,3 +519,39 @@ async fn a_message_queued_while_parking_wakes_the_session() {
     }
     assert_eq!(h.phase().await, "starting");
 }
+
+#[tokio::test]
+async fn messages_are_recorded_under_the_ids_their_ui_gave_them() {
+    let mut h = Harness::ready().await;
+    let (hub, id) = (h.hub.clone(), h.id);
+    let prompt = |text: &str, message_id: Uuid| {
+        let hub = hub.clone();
+        let params = json!({
+            "sessionId": id,
+            "prompt": [{"type": "text", "text": text}],
+            "_meta": {"sloppod": {"messageId": message_id}},
+        });
+        tokio::spawn(async move { hub.prompt(id, params).await })
+    };
+    let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+    let turn = prompt("Fix the build", first);
+    let request = h.next().await;
+    // Sent during the turn, it waits behind it under the same id.
+    let queued = prompt("Then the docs", second);
+    assert_eq!(wait_for_queue(&h, 1).await, [second.to_string()]);
+
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+    let next = h.next().await;
+    h.respond(&next, json!({"stopReason": "end_turn"})).await;
+    queued.await.unwrap().unwrap();
+
+    let ids: Vec<String> = h
+        .store
+        .updates(h.id)
+        .iter()
+        .filter(|u| u["sessionUpdate"] == "user_message_chunk")
+        .map(|u| u["messageId"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(ids, [first.to_string(), second.to_string()]);
+}

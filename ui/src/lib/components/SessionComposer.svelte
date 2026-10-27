@@ -2,6 +2,7 @@
   import { Button, Select, toastManager } from '@immich/ui';
   import { mdiSend, mdiSteering, mdiStop } from '@mdi/js';
   import { configSelectOptions } from '#lib/presentation.ts';
+  import { ConnectionClosedError } from '#lib/acp/connection.ts';
   import { queuedText, type SessionView } from '#lib/session.svelte.ts';
   import Composer from './Composer.svelte';
 
@@ -45,21 +46,34 @@
     return error instanceof Error ? error.message : String(error);
   }
 
+  // A message the session view couldn't deliver after a reconnect comes back to the box.
+  $effect(() => {
+    const message = view.undelivered;
+    if (message === null) return;
+    view.undelivered = null;
+    if (!text) text = message;
+    toastManager.danger({
+      title: "Your last message didn't arrive",
+      description: 'The connection dropped before the runtime got it. It is back in the box to send again.',
+    });
+  });
+
   async function send() {
     const message = text.trim();
     if (!message || blockedReason || sending) return;
     sending = true;
     text = '';
-    view.prompt(message).then(
+    const id = crypto.randomUUID();
+    view.prompt(message, id).then(
       (stopReason) => {
         if (stopReason && stopReason in unusualStops) {
           toastManager.warning({ title: 'The turn ended early', description: unusualStops[stopReason] });
         }
       },
       (error) => {
-        // A dropped socket doesn't end the turn; the reload shows what happened.
-        if (view.connection !== 'open') return;
-        if (!text) text = message;
+        // A dropped connection is the session view's to settle once it has reloaded.
+        if (error instanceof ConnectionClosedError) return;
+        if (!view.received(id) && !text) text = message;
         toastManager.danger({ title: "Couldn't send the prompt", description: errorMessage(error) });
       },
     );

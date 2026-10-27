@@ -401,7 +401,7 @@ async fn create_session(
 
     state
         .hub
-        .record_user_message(id, &json!([{"type": "text", "text": prompt}]), false)
+        .record_user_message(id, &json!([{"type": "text", "text": prompt}]), false, None)
         .await;
     let row = db::get_session(&state.db, id)
         .await?

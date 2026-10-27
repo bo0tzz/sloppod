@@ -233,12 +233,12 @@ function promptText(prompt) {
     .join('');
 }
 
-function echoUser(session, text, { steering = false, notice = false } = {}) {
+function echoUser(session, text, { steering = false, notice = false, messageId = randomUUID() } = {}) {
   const sloppod = { ...(steering ? { steering: true } : {}), ...(notice ? { notice: true } : {}) };
   session.emit({
     sessionUpdate: 'user_message_chunk',
     content: { type: 'text', text },
-    messageId: randomUUID(),
+    messageId,
     ...(steering || notice ? { _meta: { sloppod } } : {}),
   });
 }
@@ -332,11 +332,11 @@ function resolvePending(session, pending, result) {
   pending.resolve(result);
 }
 
-async function runTurn(session, text, { echo = true } = {}) {
+async function runTurn(session, text, { echo = true, messageId } = {}) {
   const turn = { cancelled: false, steers: [] };
   session.turn = turn;
   session.setPhase('working');
-  if (echo) echoUser(session, text);
+  if (echo) echoUser(session, text, { messageId });
   if (!session.data.title) {
     const title = text.split('\n')[0].slice(0, 60);
     session.emit({ sessionUpdate: 'session_info_update', title, updatedAt: now() });
@@ -850,11 +850,11 @@ function startWaiting(session) {
   const next = waitingList(session).shift();
   if (!next) return;
   broadcastQueue(session);
-  runTurn(session, next.text).then(next.resolve, next.reject);
+  runTurn(session, next.text, { messageId: next.id }).then(next.resolve, next.reject);
 }
 
-function queuePrompt(session, text, done = () => {}, fail = () => {}) {
-  echoUser(session, text);
+function queuePrompt(session, text, done = () => {}, fail = () => {}, messageId = undefined) {
+  echoUser(session, text, { messageId });
   session.queue.push({ text, done, fail });
 }
 
@@ -929,6 +929,15 @@ function handleCall(conn, message) {
 
     case 'session/prompt': {
       if (!needLoaded()) return;
+      const messageId = params._meta?.sloppod?.messageId ?? randomUUID();
+      // Tests drop the connection as a prompt arrives, before or after the runtime takes it.
+      const drop = dropNextPrompt;
+      dropNextPrompt = null;
+      if (drop === 'before') {
+        conn.ws.terminate();
+        return;
+      }
+      if (drop === 'after') setTimeout(() => conn.ws.terminate(), 0);
       if (session.data.phase === 'parked') session.setPhase('starting');
       if (session.data.phase === 'starting' || session.data.phase === 'disconnected') {
         queuePrompt(
@@ -936,13 +945,14 @@ function handleCall(conn, message) {
           promptText(params.prompt),
           (stopReason) => conn.respond(id, { stopReason }),
           (error) => conn.error(id, -32603, String(error)),
+          messageId,
         );
         startAgent(session, DELAY * 8);
         return;
       }
       if (session.turn) {
         waitingList(session).push({
-          id: randomUUID(),
+          id: messageId,
           text: promptText(params.prompt),
           resolve: (stopReason) => conn.respond(id, { stopReason }),
           reject: (error) => conn.error(id, -32603, String(error)),
@@ -954,7 +964,7 @@ function handleCall(conn, message) {
         conn.error(id, -32000, `The session is ${session.data.phase}`);
         return;
       }
-      runTurn(session, promptText(params.prompt)).then(
+      runTurn(session, promptText(params.prompt), { messageId }).then(
         (stopReason) => conn.respond(id, { stopReason }),
         (error) => conn.error(id, -32603, String(error)),
       );
@@ -1439,10 +1449,17 @@ async function seed() {
 
 // --- server ---------------------------------------------------------------------------------
 
+/** Set by `/_mock/drop-next-prompt`: drop the connection the next prompt arrives on, before or after taking it. */
+let dropNextPrompt = null;
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   try {
     if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
+    if (url.pathname === '/_mock/drop-next-prompt' && req.method === 'POST') {
+      dropNextPrompt = url.searchParams.get('when') === 'after' ? 'after' : 'before';
+      return json(res, 200, { dropNextPrompt });
+    }
     if (url.pathname === '/_mock/drop' && req.method === 'POST') {
       for (const conn of connections) conn.ws.terminate();
       return json(res, 200, { dropped: connections.size });

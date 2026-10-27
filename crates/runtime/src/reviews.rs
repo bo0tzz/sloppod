@@ -92,7 +92,7 @@ pub async fn start(
     db::set_review_session(&state.db, proposal.id, id).await?;
     state
         .hub
-        .record_user_message(id, &json!([{"type": "text", "text": prompt}]), false)
+        .record_user_message(id, &json!([{"type": "text", "text": prompt}]), false, None)
         .await;
     let session = db::get_session(&state.db, id)
         .await?

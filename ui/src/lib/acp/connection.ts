@@ -26,6 +26,13 @@ type Pending = { resolve: (value: unknown) => void; reject: (error: Error) => vo
 const MAX_BACKOFF_MS = 10_000;
 
 /** JSON-RPC 2.0 over a WebSocket that reconnects with backoff until closed. */
+/** A request was cut off by the connection closing: the runtime may well have received it. */
+export class ConnectionClosedError extends Error {
+  constructor() {
+    super('Connection closed');
+  }
+}
+
 export class AcpConnection {
   #url: string;
   #handlers: ConnectionHandlers;
@@ -75,12 +82,13 @@ export class AcpConnection {
     ws.onclose = () => {
       if (ws !== this.#ws) return;
       this.#ws = null;
-      this.#failPending(new Error('Connection closed'));
+      // The state changes first, so whoever handles a failed request sees the connection gone.
       if (this.#closed) {
         this.#setState('closed');
       } else {
         this.#scheduleReconnect();
       }
+      this.#failPending(new ConnectionClosedError());
     };
   }
 
@@ -93,7 +101,7 @@ export class AcpConnection {
   close() {
     this.#closed = true;
     clearTimeout(this.#timer);
-    this.#failPending(new Error('Connection closed'));
+    this.#failPending(new ConnectionClosedError());
     this.#ws?.close();
     this.#ws = null;
     this.#setState('closed');

@@ -844,6 +844,37 @@ test('a deleted session can be restored from Settings', async ({ page }) => {
   expect(session.deleted_at).toBeUndefined();
 });
 
+test('a message cut off by a dropped connection is sent again, once', async ({ page }) => {
+  await createSession(page, 'Keep my messages in sloppod');
+  await finishTurn(page);
+  await page.request.post('/_mock/drop-next-prompt?when=before');
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Did this arrive?');
+  await box.press('Enter');
+
+  await expect(userMessages(page).filter({ hasText: 'Did this arrive?' })).toHaveCount(1);
+  await expect(page.getByTestId('reconnecting')).toBeHidden();
+  await expect(box).toHaveValue('');
+  // Still once while the turn it started runs.
+  await expect(phase(page)).not.toHaveAttribute('data-phase', 'idle');
+  await page.waitForTimeout(500);
+  await expect(userMessages(page).filter({ hasText: 'Did this arrive?' })).toHaveCount(1);
+});
+
+test('a message that arrived before the connection dropped is not put back', async ({ page }) => {
+  await createSession(page, 'Do not repeat my messages in sloppod');
+  await finishTurn(page);
+  await page.request.post('/_mock/drop-next-prompt?when=after');
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('This one arrived');
+  await box.press('Enter');
+
+  await expect(page.getByTestId('reconnecting')).toBeVisible();
+  await expect(page.getByTestId('reconnecting')).toBeHidden();
+  await expect(userMessages(page).filter({ hasText: 'This one arrived' })).toHaveCount(1);
+  await expect(box).toHaveValue('');
+});
+
 test('lists the session grants from the session menu', async ({ page }) => {
   await createSession(page, 'Fix the build in bo0tzz/sloppod');
   await page.getByRole('button', { name: 'Session actions' }).click();

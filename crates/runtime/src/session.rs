@@ -341,7 +341,8 @@ impl Hub {
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         Box::pin(async move {
             for q in queued.iter().filter(|q| q.id.is_some()) {
-                self.record_user_message(id, &json!(q.blocks), false).await;
+                self.record_user_message(id, &json!(q.blocks), false, q.id)
+                    .await;
             }
             let mut blocks: Vec<Value> = pending
                 .into_iter()
@@ -536,8 +537,16 @@ impl Hub {
         }
     }
 
-    pub async fn record_user_message(&self, id: Uuid, prompt: &Value, steering: bool) {
-        let message_id = Uuid::new_v4();
+    /// Records what the user sent, under the id their UI gave it if any, so a UI that lost its connection can
+    /// tell whether it arrived.
+    pub async fn record_user_message(
+        &self,
+        id: Uuid,
+        prompt: &Value,
+        steering: bool,
+        message_id: Option<Uuid>,
+    ) {
+        let message_id = message_id.unwrap_or_else(Uuid::new_v4);
         for block in prompt.as_array().into_iter().flatten() {
             let mut update = json!({"sessionUpdate": "user_message_chunk", "messageId": message_id, "content": block});
             if steering {
@@ -551,6 +560,7 @@ impl Hub {
     /// turn ends.
     pub async fn prompt(self: &Arc<Self>, id: Uuid, params: Value) -> Result<Value, RpcError> {
         let blocks = params["prompt"].as_array().cloned().unwrap_or_default();
+        let message_id = client_message_id(&params);
         let (queued, behind_turn) = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
@@ -561,7 +571,7 @@ impl Hub {
             } else {
                 let (reply, receiver) = oneshot::channel();
                 state.queue.push(Queued {
-                    id: agent_up.then(Uuid::new_v4),
+                    id: agent_up.then(|| message_id.unwrap_or_else(Uuid::new_v4)),
                     blocks: blocks.clone(),
                     reply: Some(reply),
                 });
@@ -571,7 +581,8 @@ impl Hub {
         if behind_turn {
             self.broadcast_queue(id).await;
         } else {
-            self.record_user_message(id, &params["prompt"], false).await;
+            self.record_user_message(id, &params["prompt"], false, message_id)
+                .await;
         }
         if queued.is_some() && !behind_turn {
             self.wake_for_message(id).await?;
@@ -649,7 +660,7 @@ impl Hub {
             state.queue.remove(index)
         };
         self.broadcast_queue(id).await;
-        self.record_user_message(id, &json!(queued.blocks), true)
+        self.record_user_message(id, &json!(queued.blocks), true, queued.id)
             .await;
         let result = self.steer_in(id, queued.blocks).await;
         if let Some(reply) = queued.reply {
@@ -751,17 +762,20 @@ impl Hub {
     /// Delivers a message into the running turn; before the agent is up it joins the queue instead.
     pub async fn steer(self: &Arc<Self>, id: Uuid, params: Value) -> Result<Value, RpcError> {
         let blocks = params["prompt"].as_array().cloned().unwrap_or_default();
+        let message_id = client_message_id(&params);
         if self.agent_for(id).await.is_err() {
             self.live(id).state.lock().await.queue.push(Queued {
                 id: None,
                 blocks,
                 reply: None,
             });
-            self.record_user_message(id, &params["prompt"], false).await;
+            self.record_user_message(id, &params["prompt"], false, message_id)
+                .await;
             self.wake_for_message(id).await?;
             return Ok(json!({"outcome": "queued"}));
         }
-        self.record_user_message(id, &params["prompt"], true).await;
+        self.record_user_message(id, &params["prompt"], true, message_id)
+            .await;
         self.steer_in(id, blocks).await
     }
 
@@ -952,6 +966,13 @@ impl Hub {
         }
         self.set_phase(id, Phase::Stopped).await;
     }
+}
+
+/// The id the UI gave a message it sent (`_meta.sloppod.messageId`), if it gave one.
+fn client_message_id(params: &Value) -> Option<Uuid> {
+    params["_meta"]["sloppod"]["messageId"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
 }
 
 fn tool_call_id(params: &Value) -> Option<String> {

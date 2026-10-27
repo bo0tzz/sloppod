@@ -1,4 +1,10 @@
-import { AcpConnection, acpUrl, type ConnectionState, type RequestId } from './acp/connection.ts';
+import {
+  AcpConnection,
+  acpUrl,
+  ConnectionClosedError,
+  type ConnectionState,
+  type RequestId,
+} from './acp/connection.ts';
 import { Transcript } from './acp/transcript.svelte.ts';
 import type {
   ContentBlock,
@@ -59,6 +65,10 @@ export class SessionView {
   #conn: AcpConnection;
   /** Receives the history replay of a (re)load, and replaces `transcript` once the load completes. */
   #replay: Transcript | null = null;
+  /** Messages a dropped connection cut off before the runtime confirmed them; the next load settles each. */
+  #unconfirmed: { id: string; text: string }[] = [];
+  /** A message that couldn't be delivered, for the composer to put back; it clears this once it has. */
+  undelivered = $state<string | null>(null);
 
   constructor(id: string) {
     this.id = id;
@@ -134,6 +144,7 @@ export class SessionView {
       this.#replay = null;
     }
     this.loaded = true;
+    this.#settleUnconfirmed();
     await rest;
   }
 
@@ -226,17 +237,45 @@ export class SessionView {
     }
   }
 
-  /** Starts a turn. The returned promise settles with the stop reason when the turn ends. */
-  async prompt(text: string): Promise<StopReason | undefined> {
+  /**
+   * Starts a turn. The returned promise settles with the stop reason when the turn ends. The message carries an id
+   * the runtime records it under, so if the connection drops first, the next load can tell whether it arrived: if
+   * not, it's sent again once, and if that fails it ends up in `undelivered`.
+   */
+  async prompt(text: string, id: string = crypto.randomUUID()): Promise<StopReason | undefined> {
     this.promptsInFlight++;
     try {
       const result = await this.#conn.request<{ stopReason: StopReason }>('session/prompt', {
         sessionId: this.id,
         prompt: textPrompt(text),
+        _meta: { sloppod: { messageId: id } },
       });
       return result?.stopReason;
+    } catch (error) {
+      if (error instanceof ConnectionClosedError) this.#unconfirmed.push({ id, text });
+      throw error;
     } finally {
       this.promptsInFlight--;
+    }
+  }
+
+  /** Whether the runtime has a message: recorded in the transcript, or waiting in the queue. */
+  received(id: string): boolean {
+    return (
+      this.transcript.items.some((item) => item.type === 'user' && item.messageId === id) ||
+      this.queue.some((message) => message.id === id)
+    );
+  }
+
+  /** After a load: messages that arrived are done; ones that didn't are sent again, once. */
+  #settleUnconfirmed() {
+    const unconfirmed = this.#unconfirmed.splice(0);
+    for (const message of unconfirmed) {
+      if (this.received(message.id)) continue;
+      this.prompt(message.text, message.id).catch((error) => {
+        if (error instanceof ConnectionClosedError || this.received(message.id)) return;
+        this.undelivered = message.text;
+      });
     }
   }
 
