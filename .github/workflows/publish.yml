@@ -11,21 +11,16 @@ permissions:
   contents: read
   packages: write
 
-# Per ref, so a push to main never replaces a pending release; on main only the newest pending build survives.
+# Per ref, so a push to main never replaces a pending release. On main a newer push cancels the build in progress,
+# so builds don't queue up behind each other; releases always finish.
 concurrency:
   group: publish-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
 
 jobs:
+  # Both images in one job, one after the other, so the second reuses the first's Rust build.
   images:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - target: runtime
-            image: ghcr.io/bo0tzz/sloppod
-          - target: session
-            image: ghcr.io/bo0tzz/sloppod-session
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -34,18 +29,36 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      - name: Build and push the runtime image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Containerfile
-          target: ${{ matrix.target }}
+          target: runtime
           push: true
           tags: |
-            ${{ matrix.image }}:${{ github.sha }}
-            ${{ github.ref_type == 'tag' && format('{0}:{1}', matrix.image, github.ref_name) || format('{0}:main', matrix.image) }}
-            ${{ github.ref_type == 'tag' && format('{0}:latest', matrix.image) || '' }}
-          cache-from: type=gha,scope=${{ matrix.target }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
+            ghcr.io/bo0tzz/sloppod:${{ github.sha }}
+            ${{ github.ref_type == 'tag' && format('ghcr.io/bo0tzz/sloppod:{0}', github.ref_name) || 'ghcr.io/bo0tzz/sloppod:main' }}
+            ${{ github.ref_type == 'tag' && 'ghcr.io/bo0tzz/sloppod:latest' || '' }}
+          cache-from: |
+            type=gha,scope=runtime
+            type=gha,scope=session
+          cache-to: type=gha,mode=max,scope=runtime
+      - name: Build and push the session image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Containerfile
+          target: session
+          push: true
+          tags: |
+            ghcr.io/bo0tzz/sloppod-session:${{ github.sha }}
+            ${{ github.ref_type == 'tag' && format('ghcr.io/bo0tzz/sloppod-session:{0}', github.ref_name) || 'ghcr.io/bo0tzz/sloppod-session:main' }}
+            ${{ github.ref_type == 'tag' && 'ghcr.io/bo0tzz/sloppod-session:latest' || '' }}
+          cache-from: |
+            type=gha,scope=runtime
+            type=gha,scope=session
+          cache-to: type=gha,mode=max,scope=session
 
   chart:
     needs: images
