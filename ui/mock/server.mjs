@@ -1052,7 +1052,10 @@ async function readBody(req) {
 }
 
 const sortedSessions = () =>
-  [...sessions.values()].map((s) => s.data).sort((a, b) => Date.parse(b.active_at) - Date.parse(a.active_at));
+  [...sessions.values()]
+    .map((s) => s.data)
+    .filter((d) => !d.deleted_at)
+    .sort((a, b) => Date.parse(b.active_at) - Date.parse(a.active_at));
 
 async function handleApi(req, res, url) {
   const parts = url.pathname.replace(/^\/api\/v1\/?/, '').split('/').filter(Boolean);
@@ -1097,6 +1100,9 @@ async function handleApi(req, res, url) {
       startAgent(session, startupDelay(body.prompt));
       return json(res, 201, session.data);
     }
+    if (parts.length === 2 && parts[1] === 'deleted' && method === 'GET') {
+      return json(res, 200, [...sessions.values()].map((s) => s.data).filter((d) => d.deleted_at));
+    }
     const session = sessions.get(parts[1]);
     if (!session) return json(res, 404, { error: 'session not found' });
     if (parts.length === 2 && method === 'GET') return json(res, 200, session.data);
@@ -1113,6 +1119,9 @@ async function handleApi(req, res, url) {
       }
       session.setPhase('parked');
       return json(res, 200, session.data);
+    }
+    if (parts.length === 3 && parts[2] === 'wake' && method === 'POST' && session.data.deleted_at) {
+      return json(res, 409, { error: 'the session is deleted; restore it first' });
     }
     if (parts.length === 3 && parts[2] === 'wake' && method === 'POST') {
       if (session.data.phase === 'parked') {
@@ -1137,10 +1146,16 @@ async function handleApi(req, res, url) {
     }
     if (parts.length === 2 && method === 'DELETE') {
       cancelTurn(session);
-      session.setPhase('stopped');
-      sessions.delete(session.data.id);
+      session.data.deleted_at = now();
+      session.setPhase('parked');
       res.writeHead(204).end();
       return;
+    }
+    if (parts.length === 3 && parts[2] === 'restore' && method === 'POST') {
+      if (!session.data.deleted_at) return json(res, 404, { error: 'not found' });
+      delete session.data.deleted_at;
+      session.broadcast();
+      return json(res, 200, session.data);
     }
   }
 

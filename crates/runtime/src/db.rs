@@ -40,6 +40,8 @@ pub struct SessionRow {
     pub updated_at: DateTime<Utc>,
     /// When an event was last recorded; the session list is ordered by it.
     pub active_at: DateTime<Utc>,
+    /// When it was deleted; it's restorable until it's purged.
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 impl SessionRow {
@@ -62,6 +64,7 @@ impl SessionRow {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             active_at: Utc::now(),
+            deleted_at: None,
         }
     }
 
@@ -107,6 +110,7 @@ impl SessionRow {
             created_at: self.created_at.to_rfc3339(),
             updated_at: self.updated_at.to_rfc3339(),
             active_at: self.active_at.to_rfc3339(),
+            deleted_at: self.deleted_at.map(|d| d.to_rfc3339()),
         }
     }
 
@@ -115,7 +119,7 @@ impl SessionRow {
     }
 }
 
-const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, repo, created_at, updated_at, active_at, \
+const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, repo, created_at, updated_at, active_at, deleted_at, \
      coalesce((select jsonb_agg(jsonb_build_object('capability', g.capability, 'params', g.params) order by g.created_at) \
      from session_grants g where g.session_id = sessions.id), '[]'::jsonb) as grants";
 
@@ -169,11 +173,64 @@ pub async fn insert_session(db: &PgPool, new: NewSessionRow<'_>) -> sqlx::Result
 
 pub async fn list_sessions(db: &PgPool, owner: &str) -> sqlx::Result<Vec<SessionRow>> {
     sqlx::query_as(AssertSqlSafe(format!(
-        "select {SESSION_COLUMNS} from sessions where owner = $1 and kind = 'work' order by active_at desc"
+        "select {SESSION_COLUMNS} from sessions where owner = $1 and kind = 'work' and deleted_at is null \
+         order by active_at desc"
     )))
     .bind(owner)
     .fetch_all(db)
     .await
+}
+
+/// The owner's sessions that are deleted but not purged yet, most recently deleted first.
+pub async fn deleted_sessions(db: &PgPool, owner: &str) -> sqlx::Result<Vec<SessionRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "select {SESSION_COLUMNS} from sessions where owner = $1 and kind = 'work' and deleted_at is not null \
+         and purge_started_at is null order by deleted_at desc"
+    )))
+    .bind(owner)
+    .fetch_all(db)
+    .await
+}
+
+/// Marks a session deleted.
+pub async fn mark_deleted(db: &PgPool, id: Uuid) -> sqlx::Result<()> {
+    sqlx::query("update sessions set deleted_at = now() where id = $1 and deleted_at is null")
+        .bind(id)
+        .execute(db)
+        .await
+        .map(|_| ())
+}
+
+/// Restores a deleted session, unless a purge has claimed it; returns whether it did.
+pub async fn restore(db: &PgPool, id: Uuid) -> sqlx::Result<bool> {
+    let result = sqlx::query(
+        "update sessions set deleted_at = null where id = $1 and deleted_at is not null and purge_started_at is null",
+    )
+    .bind(id)
+    .execute(db)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Claims the sessions deleted longer than `age` ago for purging, including ones an earlier purge didn't finish.
+/// A claimed session can no longer be restored.
+pub async fn claim_purges(db: &PgPool, age: chrono::Duration) -> sqlx::Result<Vec<SessionRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "update sessions set purge_started_at = coalesce(purge_started_at, now()) \
+         where deleted_at < $1 and purged_at is null returning {SESSION_COLUMNS}"
+    )))
+    .bind(Utc::now() - age)
+    .fetch_all(db)
+    .await
+}
+
+/// Records that a purge removed everything of the session.
+pub async fn finish_purge(db: &PgPool, id: Uuid) -> sqlx::Result<()> {
+    sqlx::query("update sessions set purged_at = now() where id = $1")
+        .bind(id)
+        .execute(db)
+        .await
+        .map(|_| ())
 }
 
 pub async fn active_sessions(db: &PgPool) -> sqlx::Result<Vec<SessionRow>> {

@@ -26,3 +26,5 @@ Chosen option: **the admin key for management, a key per session for traffic**.
 - Good: a gap in the authorizer can't reach key management; session keys aren't admin.
 - Good: memini's activity names the session that acted, settings can differ per session, and revoking one session's memory is one key.
 - Bad: one memini key per session to create and clean up. A runtime that dies between creating a session and storing its key leaves an orphan; nothing sweeps those yet.
+
+2026-10-27: deleting a session no longer deletes its key at once. A deleted session can be restored for a week (#118), so its key is kept with the rest of it, and goes when the session is purged after that week.

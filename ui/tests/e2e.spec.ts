@@ -819,6 +819,31 @@ test('wakes a parked session from the session menu', async ({ page }) => {
   await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
 });
 
+test('a deleted session can be restored from Settings', async ({ page }) => {
+  const id = await createSession(page, 'Delete me in sloppod, then restore me');
+  await finishTurn(page);
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await page.getByRole('menuitem', { name: 'Delete session' }).click();
+  await expect(page.getByText('you can restore it from Settings')).toBeVisible();
+  await page.getByRole('button', { name: 'Delete', exact: true }).click();
+  await expect(page).toHaveURL(/\/$/);
+  await expect(page.getByTestId('session-row').filter({ hasText: 'Delete me' })).toHaveCount(0);
+
+  // Deleted, it stays parked until it's restored.
+  expect((await page.request.post(`/api/v1/sessions/${id}/wake`)).status()).toBe(409);
+
+  await page.goto('/settings');
+  const deleted = page.getByTestId('deleted-sessions').getByTestId('deleted-session');
+  await expect(deleted.filter({ hasText: 'Delete me' })).toBeVisible();
+  await deleted.filter({ hasText: 'Delete me' }).getByRole('button', { name: 'Restore' }).click();
+  await expect(deleted.filter({ hasText: 'Delete me' })).toHaveCount(0);
+
+  // Back among the sessions, parked.
+  const session: { phase: string; deleted_at?: string } = await (await page.request.get(`/api/v1/sessions/${id}`)).json();
+  expect(session.phase).toBe('parked');
+  expect(session.deleted_at).toBeUndefined();
+});
+
 test('lists the session grants from the session menu', async ({ page }) => {
   await createSession(page, 'Fix the build in bo0tzz/sloppod');
   await page.getByRole('button', { name: 'Session actions' }).click();

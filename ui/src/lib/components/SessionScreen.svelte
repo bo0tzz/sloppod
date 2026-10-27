@@ -165,7 +165,9 @@
   async function deleteSession() {
     const confirmed = await modalManager.showDialog({
       title: 'Delete session?',
-      prompt: 'This stops the session and deletes its pod and volume.',
+      prompt:
+        'It stops and leaves your sessions. For a week you can restore it from Settings, with its files, branch and ' +
+        'memory; after that it is gone for good. To just stop it for now, park it instead.',
       confirmText: 'Delete',
       icon: mdiTrashCanOutline,
     });

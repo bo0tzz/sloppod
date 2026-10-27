@@ -344,3 +344,72 @@ async fn finds_proposals_still_with_their_reviewer(db: PgPool) {
         .collect();
     assert_eq!(found, &ids[..2]);
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn deleted_sessions_stay_restorable_until_purged(db: PgPool) {
+    let kept = session(&db, "dev").await;
+    let deleted = session(&db, "dev").await;
+    db::mark_deleted(&db, deleted).await.unwrap();
+    let listed = |rows: Vec<db::SessionRow>| rows.iter().map(|s| s.id).collect::<Vec<_>>();
+    assert_eq!(listed(db::list_sessions(&db, "dev").await.unwrap()), [kept]);
+    assert_eq!(
+        listed(db::deleted_sessions(&db, "dev").await.unwrap()),
+        [deleted]
+    );
+    assert!(
+        db::claim_purges(&db, chrono::Duration::days(7))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Restored, it's back among the sessions and no purge claims it.
+    assert!(db::restore(&db, deleted).await.unwrap());
+    assert!(!db::restore(&db, deleted).await.unwrap());
+    assert!(
+        db::claim_purges(&db, chrono::Duration::zero())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        listed(db::list_sessions(&db, "dev").await.unwrap()).len(),
+        2
+    );
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_purge_claim_wins_over_restoring_and_is_retried_until_done(db: PgPool) {
+    let s = session(&db, "dev").await;
+    db::mark_deleted(&db, s).await.unwrap();
+    let claimed = |rows: Vec<db::SessionRow>| rows.iter().map(|s| s.id).collect::<Vec<_>>();
+    assert_eq!(
+        claimed(
+            db::claim_purges(&db, chrono::Duration::zero())
+                .await
+                .unwrap()
+        ),
+        [s]
+    );
+
+    // Claimed, it can't be restored, and it's no longer offered for restoring.
+    assert!(!db::restore(&db, s).await.unwrap());
+    assert!(db::deleted_sessions(&db, "dev").await.unwrap().is_empty());
+
+    // Cleanup failed, so the next sweep claims it again; once done, never again.
+    assert_eq!(
+        claimed(
+            db::claim_purges(&db, chrono::Duration::zero())
+                .await
+                .unwrap()
+        ),
+        [s]
+    );
+    db::finish_purge(&db, s).await.unwrap();
+    assert!(
+        db::claim_purges(&db, chrono::Duration::zero())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
