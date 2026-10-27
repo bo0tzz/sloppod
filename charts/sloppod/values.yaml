@@ -15,7 +15,8 @@ session:
     storageClass: ""
   cpu: ""
   memory: 4Gi
-  # Hosts sessions may reach without the authorizer, e.g. package registries. Empty keeps the built-in list.
+  # Hosts sessions may reach without the authorizer, e.g. package registries. Empty keeps the built-in list. A `*`
+  # matches within one DNS label, e.g. `productionresultssa*.blob.core.windows.net`.
   directHosts: []
 
 # Postgres connection URI, from an existing Secret (e.g. CloudNativePG's `<cluster>-app`, key `uri`).
