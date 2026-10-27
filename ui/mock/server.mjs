@@ -611,6 +611,7 @@ function createProposal(session) {
       title: 'Reconnect the ACP socket with exponential backoff',
       body: 'Reconnects used a fixed one-second delay, which hammers a restarting runtime.\n\n## Changes\n\n- Back off exponentially from 500 ms, capped at 10 s\n- Reset the backoff after a successful `session/load`\n- Add an end-to-end test for reconnecting',
       draft: false,
+      auto_merge: true,
     },
     created_at: now(),
     diff,
@@ -948,6 +949,7 @@ async function handleApi(req, res, url) {
       } else if (proposal.kind === 'github.pr.create') {
         if (typeof body.title === 'string') proposal.payload.title = body.title;
         if (typeof body.body === 'string') proposal.payload.body = body.body;
+        if (typeof body.auto_merge === 'boolean') proposal.payload.auto_merge = body.auto_merge;
         const number = 100 + proposals.size;
         proposal.status = 'executed';
         proposal.result = { url: `https://github.com/${proposal.payload.repo}/pull/${number}`, number };

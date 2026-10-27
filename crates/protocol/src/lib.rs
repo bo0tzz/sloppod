@@ -116,6 +116,9 @@ pub mod api {
         pub title: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub body: Option<String>,
+        /// Pull requests: whether to merge once required checks pass, overriding what the agent asked for.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub auto_merge: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub reason: Option<String>,
     }
