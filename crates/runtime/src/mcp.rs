@@ -199,103 +199,111 @@ async fn call(state: &AppState, session: Uuid, params: &Value) -> Value {
     if !tools(state, kind).iter().any(|t| t["name"] == name) {
         return text(format!("{name} isn't one of this session's tools"), true);
     }
-    if name == "submit_review" {
-        return match reviews::submit(state, session, &arguments).await {
-            Ok(message) => text(message, false),
-            Err(e) => text(e, true),
-        };
+    let result = match name {
+        "submit_review" => reviews::submit(state, session, &arguments).await,
+        "request_review" => reviews::request(state, session, &arguments).await,
+        "ask_user" => ask_user(state, session, &arguments).await,
+        LIST_GRANTS => list_grants_text(state, session).await,
+        "get_proposal" => get_proposal(state, session, &arguments).await,
+        "withdraw_proposal" => withdraw_proposal(state, session, &arguments).await,
+        _ => propose(state, session, name, arguments).await,
+    };
+    match result {
+        Ok(message) => text(message, false),
+        Err(e) => text(e, true),
     }
-    if name == "ask_user" {
-        return match state.hub.ask(session, arguments["questions"].clone()).await {
-            Ok(()) => text(
-                "Asked. The answer arrives later as a message; carry on with what doesn't depend on it.".into(),
-                false,
-            ),
-            Err(e) => text(e, true),
-        };
+}
+
+async fn ask_user(state: &AppState, session: Uuid, arguments: &Value) -> Result<String, String> {
+    state
+        .hub
+        .ask(session, arguments["questions"].clone())
+        .await?;
+    Ok(
+        "Asked. The answer arrives later as a message; carry on with what doesn't depend on it."
+            .into(),
+    )
+}
+
+async fn list_grants_text(state: &AppState, session: Uuid) -> Result<String, String> {
+    match db::get_session(&state.db, session).await {
+        Ok(Some(row)) => Ok(grant_list(&row.context().grants)),
+        _ => Err("couldn't load the session".into()),
     }
-    if name == "request_review" {
-        return match reviews::request(state, session, &arguments).await {
-            Ok(message) => text(message, false),
-            Err(e) => text(e, true),
-        };
+}
+
+fn proposal_id(arguments: &Value) -> Option<Uuid> {
+    arguments["id"].as_str().and_then(|s| s.parse().ok())
+}
+
+async fn get_proposal(
+    state: &AppState,
+    session: Uuid,
+    arguments: &Value,
+) -> Result<String, String> {
+    let proposal = match proposal_id(arguments) {
+        Some(id) => db::get_proposal(&state.db, id).await.ok().flatten(),
+        None => None,
+    };
+    match proposal {
+        Some(p) if p.session_id == session => {
+            Ok(serde_json::to_string_pretty(&p.to_api()).unwrap_or_default())
+        }
+        _ => Err("no such proposal".into()),
     }
-    if name == LIST_GRANTS {
-        return match db::get_session(&state.db, session).await {
-            Ok(Some(row)) => text(grant_list(&row.context().grants), false),
-            _ => text("couldn't load the session".into(), true),
-        };
-    }
-    if name == "get_proposal" {
-        let id = arguments["id"]
-            .as_str()
-            .and_then(|s| s.parse::<Uuid>().ok());
-        let proposal = match id {
-            Some(id) => db::get_proposal(&state.db, id).await.ok().flatten(),
-            None => None,
-        };
-        return match proposal {
-            Some(p) if p.session_id == session => text(
-                serde_json::to_string_pretty(&p.to_api()).unwrap_or_default(),
-                false,
-            ),
-            _ => text("no such proposal".into(), true),
-        };
-    }
-    if name == "withdraw_proposal" {
-        let Some(id) = arguments["id"]
-            .as_str()
-            .and_then(|s| s.parse::<Uuid>().ok())
-        else {
-            return text("give the proposal's id".into(), true);
-        };
-        let reason = arguments["reason"]
-            .as_str()
-            .map(str::trim)
-            .filter(|r| !r.is_empty());
-        return match db::withdraw_proposal(&state.db, id, session, reason).await {
-            Ok(Some(row)) => {
-                state.hub.broadcast_proposal(&row.to_api());
-                if let Some(review) = row.review_session_id {
-                    reviews::end(state, review);
-                }
-                text(format!("Proposal {id} is withdrawn."), false)
+}
+
+async fn withdraw_proposal(
+    state: &AppState,
+    session: Uuid,
+    arguments: &Value,
+) -> Result<String, String> {
+    let id = proposal_id(arguments).ok_or("give the proposal's id")?;
+    let reason = arguments["reason"]
+        .as_str()
+        .map(str::trim)
+        .filter(|r| !r.is_empty());
+    match db::withdraw_proposal(&state.db, id, session, reason).await {
+        Ok(Some(row)) => {
+            state.hub.broadcast_proposal(&row.to_api());
+            if let Some(review) = row.review_session_id {
+                reviews::end(state, review);
             }
-            Ok(None) => text(
-                "no undecided proposal of yours with that id; decided ones can't be withdrawn"
-                    .into(),
-                true,
-            ),
-            Err(e) => text(format!("couldn't withdraw it: {e}"), true),
-        };
+            Ok(format!("Proposal {id} is withdrawn."))
+        }
+        Ok(None) => Err(
+            "no undecided proposal of yours with that id; decided ones can't be withdrawn".into(),
+        ),
+        Err(e) => Err(format!("couldn't withdraw it: {e}")),
     }
-    match proposals::propose(state, session, name, arguments).await {
-        Ok(proposal) if proposal.status == ProposalStatus::InReview => text(
-            format!(
-                "Proposal {} created; another model is reviewing it before a human sees it. Its findings, if any, \
-                 come back to you.",
-                proposal.id
-            ),
-            false,
+}
+
+async fn propose(
+    state: &AppState,
+    session: Uuid,
+    tool: &str,
+    arguments: Value,
+) -> Result<String, String> {
+    let proposal = proposals::propose(state, session, tool, arguments)
+        .await
+        .map_err(|e| format!("Proposal refused: {e}"))?;
+    Ok(match proposal.status {
+        ProposalStatus::InReview => format!(
+            "Proposal {} created; another model is reviewing it before a human sees it. Its findings, if any, come \
+             back to you.",
+            proposal.id
         ),
-        Ok(proposal) if proposal.status == ProposalStatus::Pending => text(
-            format!(
-                "Proposal {} created and waiting for human review. Nothing has happened yet; once it's approved sloppod \
-                 carries it out. Check its status with get_proposal.",
-                proposal.id
-            ),
-            false,
+        ProposalStatus::Pending => format!(
+            "Proposal {} created and waiting for human review. Nothing has happened yet; once it's approved sloppod \
+             carries it out. Check its status with get_proposal.",
+            proposal.id
         ),
-        Ok(proposal) => text(
-            format!(
-                "Proposal {} was approved by a standing approval and is being carried out; you'll be told how it went. \
-                 Check its status with get_proposal.",
-                proposal.id
-            ),
-            false,
+        _ => format!(
+            "Proposal {} was approved by a standing approval and is being carried out; you'll be told how it went. \
+             Check its status with get_proposal.",
+            proposal.id
         ),
-        Err(e) => text(format!("Proposal refused: {e}"), true),
-    }
+    })
 }
 
 fn grant_list(grants: &[sloppod_contracts::Grant]) -> String {
