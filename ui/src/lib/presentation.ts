@@ -80,7 +80,7 @@ export type CredentialKindSpec = {
   noun: string;
   description: string;
   empty: string;
-  fields: { key: string; label: string; type?: string; placeholder?: string }[];
+  fields: { key: string; label: string; type?: string; placeholder?: string; description?: string; optional?: boolean }[];
   secret: { label: string; description?: string; multiline?: boolean; placeholder?: string };
 };
 
@@ -114,7 +114,16 @@ export const credentialKinds: CredentialKindSpec[] = [
     noun: 'memini server',
     description: 'Shared memory across sessions.',
     empty: 'No memini server yet.',
-    fields: [{ key: 'url', label: 'URL', type: 'url', placeholder: 'https://memini.example.com' }],
+    fields: [
+      { key: 'url', label: 'URL', type: 'url', placeholder: 'https://memini.example.com' },
+      {
+        key: 'home',
+        label: 'Your namespace',
+        placeholder: 'personal/you',
+        description: 'Your personal memini namespace; sessions read it alongside their project.',
+        optional: true,
+      },
+    ],
     secret: { label: 'Admin key' },
   },
 ];

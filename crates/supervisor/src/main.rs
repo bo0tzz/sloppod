@@ -142,7 +142,7 @@ async fn run(args: &Args, terminate: &mut tokio::signal::unix::Signal) -> anyhow
         }
     };
 
-    let mut child = Command::new(&launch.command[0])
+    let spawned = Command::new(&launch.command[0])
         .args(&launch.command[1..])
         .envs(env)
         .current_dir(&launch.cwd)
@@ -151,7 +151,18 @@ async fn run(args: &Args, terminate: &mut tokio::signal::unix::Signal) -> anyhow
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("starting {:?}", launch.command))?;
+        .with_context(|| format!("starting {:?} in {}", launch.command, launch.cwd));
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(e) => {
+            send(FromSupervisor::Error {
+                message: format!("{e:#}"),
+            });
+            drop(out);
+            let _ = writer.await;
+            return Err(e);
+        }
+    };
     let mut stdin = child.stdin.take().context("agent stdin")?;
     let mut stdout = BufReader::new(child.stdout.take().context("agent stdout")?).lines();
     send(FromSupervisor::AgentStarted);
@@ -303,6 +314,10 @@ async fn prepare(
     }
 
     std::fs::create_dir_all(&launch.transcript_dir)?;
+    // Sessions without a repository work in an empty directory of their own.
+    if launch.repo.is_none() {
+        std::fs::create_dir_all(&launch.cwd)?;
+    }
     for file in &launch.transcript {
         let path = Path::new(&launch.transcript_dir).join(&file.name);
         if !path.exists() {

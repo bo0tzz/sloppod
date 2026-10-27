@@ -31,7 +31,7 @@
   let secret = $state('');
 
   const complete = $derived(
-    name.trim() !== '' && secret.trim() !== '' && spec.fields.every((field) => (config[field.key] ?? '').trim() !== ''),
+    name.trim() !== '' && secret.trim() !== '' && spec.fields.every((field) => field.optional || (config[field.key] ?? '').trim() !== ''),
   );
 
   const fieldLabel = (key: string) => spec.fields.find((field) => field.key === key)?.label ?? key;
@@ -54,7 +54,9 @@
     saving = true;
     error = null;
     try {
-      const trimmed = Object.fromEntries(spec.fields.map((field) => [field.key, (config[field.key] ?? '').trim()]));
+      const trimmed = Object.fromEntries(
+        spec.fields.map((field) => [field.key, (config[field.key] ?? '').trim()]).filter(([, value]) => value !== ''),
+      );
       await api.createCredential({ kind: spec.kind, name: name.trim(), config: trimmed, secret: secret.trim() });
       toastManager.success(`Added ${name.trim()}`);
       reset();
@@ -143,7 +145,7 @@
         <Input bind:value={name} autocomplete="off" />
       </Field>
       {#each spec.fields as field (field.key)}
-        <Field label={field.label} required="indicator">
+        <Field label={field.label} description={field.description} required={field.optional ? undefined : 'indicator'}>
           <Input bind:value={config[field.key]} type={field.type ?? 'text'} placeholder={field.placeholder} autocomplete="off" />
         </Field>
       {/each}
