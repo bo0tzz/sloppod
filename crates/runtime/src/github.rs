@@ -1,23 +1,36 @@
 //! GitHub App client: installation tokens for the authorizer, and the API calls proposals need.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::OnceCell;
 
 const API: &str = "https://api.github.com";
 
+/// Lookups the authorizer makes while deciding a request, which Envoy gives 10 s in all.
+const AUTHZ_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a repository's installation is trusted: reinstalling the app changes it.
+const INSTALLATION_TTL: Duration = Duration::from_secs(600);
+/// How long "not installed" is trusted, so reads of public repositories don't ask GitHub every time.
+const NOT_INSTALLED_TTL: Duration = Duration::from_secs(60);
+
+/// One cached token, minted by whichever caller gets the slot first; the others wait for it.
+type TokenSlot = Arc<tokio::sync::Mutex<Option<AccessToken>>>;
+
 pub struct GitHubApp {
+    api: String,
     app_id: String,
     key: EncodingKey,
     http: reqwest::Client,
-    installations: Mutex<HashMap<String, u64>>,
-    tokens: Mutex<HashMap<u64, (String, DateTime<Utc>)>>,
+    /// Repository to installation, or `None` for not installed, with when it was looked up.
+    installations: Mutex<HashMap<String, (Option<u64>, Instant)>>,
+    tokens: Mutex<HashMap<u64, TokenSlot>>,
     identity: OnceCell<GitIdentity>,
 }
 
@@ -34,6 +47,22 @@ struct AccessToken {
     expires_at: DateTime<Utc>,
 }
 
+impl AccessToken {
+    fn fresh(&self) -> bool {
+        self.expires_at - Utc::now() > chrono::Duration::minutes(5)
+    }
+}
+
+fn installation_cached(entry: (Option<u64>, Instant), now: Instant) -> Option<Option<u64>> {
+    let (id, at) = entry;
+    let ttl = if id.is_some() {
+        INSTALLATION_TTL
+    } else {
+        NOT_INSTALLED_TTL
+    };
+    (now.duration_since(at) < ttl).then_some(id)
+}
+
 pub struct Comparison {
     pub diff: String,
     pub commits: Vec<(String, String)>,
@@ -44,7 +73,12 @@ pub struct Comparison {
 
 impl GitHubApp {
     pub fn new(app_id: String, private_key_pem: &[u8]) -> anyhow::Result<Self> {
+        Self::with_api(API, app_id, private_key_pem)
+    }
+
+    fn with_api(api: &str, app_id: String, private_key_pem: &[u8]) -> anyhow::Result<Self> {
         Ok(Self {
+            api: api.to_owned(),
             app_id,
             key: EncodingKey::from_rsa_pem(private_key_pem)
                 .context("parsing the GitHub App private key")?,
@@ -72,7 +106,7 @@ impl GitHubApp {
                 let login = format!("{slug}[bot]");
                 let user: Value = self
                     .http
-                    .get(format!("{API}/users/{login}"))
+                    .get(self.url(&format!("/users/{login}")))
                     .bearer_auth(self.any_token().await?)
                     .header("accept", "application/vnd.github+json")
                     .send()
@@ -90,6 +124,10 @@ impl GitHubApp {
             .cloned()
     }
 
+    fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.api)
+    }
+
     fn jwt(&self) -> anyhow::Result<String> {
         let now = Utc::now().timestamp();
         let claims = json!({"iat": now - 60, "exp": now + 540, "iss": self.app_id});
@@ -103,79 +141,137 @@ impl GitHubApp {
     async fn app_get(&self, path: &str) -> anyhow::Result<reqwest::Response> {
         let response = self
             .http
-            .get(format!("{API}{path}"))
+            .get(self.url(path))
             .bearer_auth(self.jwt()?)
             .header("accept", "application/vnd.github+json")
+            .timeout(AUTHZ_TIMEOUT)
             .send()
             .await?;
         Ok(response)
     }
 
-    async fn installation_for(&self, repo: &str) -> anyhow::Result<u64> {
-        if let Some(id) = self.installations.lock().await.get(repo) {
-            return Ok(*id);
-        }
-        let response = self.app_get(&format!("/repos/{repo}/installation")).await?;
-        if !response.status().is_success() {
-            bail!(
-                "the GitHub App is not installed on {repo} ({})",
-                response.status()
-            );
-        }
-        let id = response.json::<Value>().await?["id"]
-            .as_u64()
-            .context("installation without id")?;
-        self.installations.lock().await.insert(repo.to_owned(), id);
-        Ok(id)
+    fn remember_installation(&self, repo: &str, id: Option<u64>) {
+        self.installations
+            .lock()
+            .unwrap()
+            .insert(repo.to_owned(), (id, Instant::now()));
     }
 
-    async fn installation_token(&self, installation: u64) -> anyhow::Result<String> {
-        let mut tokens = self.tokens.lock().await;
-        if let Some((token, expires)) = tokens.get(&installation)
-            && *expires - Utc::now() > chrono::Duration::minutes(5)
-        {
-            return Ok(token.clone());
+    async fn installation_for(&self, repo: &str) -> anyhow::Result<u64> {
+        let cached = self.installations.lock().unwrap().get(repo).copied();
+        let id = match cached.and_then(|entry| installation_cached(entry, Instant::now())) {
+            Some(id) => id,
+            None => {
+                let response = self
+                    .http
+                    .get(self.url(&format!("/repos/{repo}/installation")))
+                    .bearer_auth(self.jwt()?)
+                    .header("accept", "application/vnd.github+json")
+                    .timeout(AUTHZ_TIMEOUT)
+                    .send()
+                    .await?;
+                let id = match response.status() {
+                    reqwest::StatusCode::NOT_FOUND => None,
+                    status if !status.is_success() => {
+                        bail!(
+                            "looking up the GitHub App's installation on {repo} failed ({status})"
+                        )
+                    }
+                    _ => Some(
+                        response.json::<Value>().await?["id"]
+                            .as_u64()
+                            .context("installation without id")?,
+                    ),
+                };
+                self.remember_installation(repo, id);
+                id
+            }
+        };
+        id.with_context(|| format!("the GitHub App is not installed on {repo}"))
+    }
+
+    /// Drops everything cached about an installation that no longer exists, e.g. after the app was reinstalled.
+    fn forget_installation(&self, installation: u64) {
+        self.installations
+            .lock()
+            .unwrap()
+            .retain(|_, (id, _)| *id != Some(installation));
+        self.tokens.lock().unwrap().remove(&installation);
+    }
+
+    /// A token for `installation`, or `None` if the installation is gone.
+    async fn installation_token(&self, installation: u64) -> anyhow::Result<Option<String>> {
+        let slot = self
+            .tokens
+            .lock()
+            .unwrap()
+            .entry(installation)
+            .or_default()
+            .clone();
+        let mut slot = slot.lock().await;
+        if let Some(token) = slot.as_ref().filter(|t| t.fresh()) {
+            return Ok(Some(token.token.clone()));
         }
         let response = self
             .http
-            .post(format!(
-                "{API}/app/installations/{installation}/access_tokens"
-            ))
+            .post(self.url(&format!("/app/installations/{installation}/access_tokens")))
             .bearer_auth(self.jwt()?)
             .header("accept", "application/vnd.github+json")
+            .timeout(AUTHZ_TIMEOUT)
             .send()
-            .await?
-            .error_for_status()?;
-        let token: AccessToken = response.json().await?;
-        tokens.insert(installation, (token.token.clone(), token.expires_at));
-        Ok(token.token)
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            drop(slot);
+            self.forget_installation(installation);
+            return Ok(None);
+        }
+        let token: AccessToken = response.error_for_status()?.json().await?;
+        let value = token.token.clone();
+        *slot = Some(token);
+        Ok(Some(value))
     }
 
     /// An installation token that can act on `repo`.
     pub async fn token_for(&self, repo: &str) -> anyhow::Result<String> {
-        let installation = self.installation_for(repo).await?;
-        self.installation_token(installation).await
+        // A second try looks the installation up afresh, in case the cached one was removed.
+        for _ in 0..2 {
+            let installation = self.installation_for(repo).await?;
+            if let Some(token) = self.installation_token(installation).await? {
+                return Ok(token);
+            }
+        }
+        bail!("the GitHub App's installation on {repo} keeps disappearing")
     }
 
     /// A token from any of the app's installations, for reads that aren't tied to one repository.
     pub async fn any_token(&self) -> anyhow::Result<String> {
-        let cached = self.installations.lock().await.values().next().copied();
-        let installation = match cached {
-            Some(id) => id,
-            None => {
-                let installations: Vec<Value> = self
-                    .app_get("/app/installations")
-                    .await?
-                    .error_for_status()?
-                    .json()
-                    .await?;
-                installations
-                    .first()
-                    .and_then(|i| i["id"].as_u64())
-                    .context("the GitHub App has no installations")?
+        for _ in 0..2 {
+            let cached = self
+                .installations
+                .lock()
+                .unwrap()
+                .values()
+                .find_map(|(id, _)| *id);
+            let installation = match cached {
+                Some(id) => id,
+                None => {
+                    let installations: Vec<Value> = self
+                        .app_get("/app/installations")
+                        .await?
+                        .error_for_status()?
+                        .json()
+                        .await?;
+                    installations
+                        .first()
+                        .and_then(|i| i["id"].as_u64())
+                        .context("the GitHub App has no installations")?
+                }
+            };
+            if let Some(token) = self.installation_token(installation).await? {
+                return Ok(token);
             }
-        };
-        self.installation_token(installation).await
+        }
+        bail!("the GitHub App's installations keep disappearing")
     }
 
     /// Repositories the app is installed on.
@@ -191,10 +287,12 @@ impl GitHubApp {
             let Some(id) = installation["id"].as_u64() else {
                 continue;
             };
-            let token = self.installation_token(id).await?;
+            let Some(token) = self.installation_token(id).await? else {
+                continue;
+            };
             let page: Value = self
                 .http
-                .get(format!("{API}/installation/repositories?per_page=100"))
+                .get(self.url("/installation/repositories?per_page=100"))
                 .bearer_auth(token)
                 .header("accept", "application/vnd.github+json")
                 .send()
@@ -204,7 +302,7 @@ impl GitHubApp {
                 .await?;
             for repo in page["repositories"].as_array().into_iter().flatten() {
                 if let Some(name) = repo["full_name"].as_str() {
-                    self.installations.lock().await.insert(name.to_owned(), id);
+                    self.remember_installation(name, Some(id));
                     repos.push(name.to_owned());
                 }
             }
@@ -222,7 +320,7 @@ impl GitHubApp {
         let token = self.token_for(repo).await?;
         Ok(self
             .http
-            .get(format!("{API}/repos/{repo}{path}"))
+            .get(self.url(&format!("/repos/{repo}{path}")))
             .bearer_auth(token)
             .header("accept", accept)
             .send()
@@ -316,7 +414,7 @@ impl GitHubApp {
             let token = self.token_for(repo).await?;
             let response: Value = self
                 .http
-                .post(format!("{API}/graphql"))
+                .post(self.url("/graphql"))
                 .bearer_auth(token)
                 .json(&json!({
                     "query": "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }",
@@ -339,7 +437,7 @@ impl GitHubApp {
         let token = self.token_for(repo).await?;
         let response = self
             .http
-            .post(format!("{API}/repos/{repo}{path}"))
+            .post(self.url(&format!("/repos/{repo}{path}")))
             .bearer_auth(token)
             .header("accept", "application/vnd.github+json")
             .json(payload)
@@ -386,7 +484,7 @@ impl GitHubApp {
         let token = self.token_for(repo).await?;
         let response: Value = self
             .http
-            .post(format!("{API}/graphql"))
+            .post(self.url("/graphql"))
             .bearer_auth(token)
             .json(&json!({
                 "query": "mutation($id: ID!, $method: PullRequestMergeMethod!, $head: GitObjectID!) { \
@@ -443,5 +541,119 @@ impl GitHubApp {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    use axum::extract::{Path, State};
+    use axum::http::StatusCode;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+
+    use super::*;
+
+    /// Installation of `o/other`, which never changes.
+    const OTHER: u64 = 10;
+
+    /// A fake GitHub: `o/r` is on the current installation, `o/other` on [`OTHER`], other repositories have none.
+    #[derive(Default)]
+    struct Fake {
+        installation: AtomicU64,
+        lookups: AtomicUsize,
+        mints: AtomicUsize,
+        /// Holds each mint until this many are in flight at once.
+        rendezvous: Option<tokio::sync::Barrier>,
+    }
+
+    async fn installation(
+        State(fake): State<Arc<Fake>>,
+        Path((owner, name)): Path<(String, String)>,
+    ) -> Result<Json<Value>, StatusCode> {
+        fake.lookups.fetch_add(1, Ordering::SeqCst);
+        let id = match (owner.as_str(), name.as_str()) {
+            ("o", "r") => fake.installation.load(Ordering::SeqCst),
+            ("o", "other") => OTHER,
+            _ => return Err(StatusCode::NOT_FOUND),
+        };
+        Ok(Json(json!({"id": id})))
+    }
+
+    async fn mint(
+        State(fake): State<Arc<Fake>>,
+        Path(id): Path<u64>,
+    ) -> Result<Json<Value>, StatusCode> {
+        fake.mints.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Some(rendezvous) = &fake.rendezvous {
+            tokio::time::timeout(Duration::from_secs(2), rendezvous.wait())
+                .await
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        }
+        if id != fake.installation.load(Ordering::SeqCst) && id != OTHER {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        let expires = Utc::now() + chrono::Duration::hours(1);
+        Ok(Json(
+            json!({"token": format!("token-{id}"), "expires_at": expires}),
+        ))
+    }
+
+    async fn fake_github() -> (Arc<Fake>, GitHubApp) {
+        serve(Fake::default()).await
+    }
+
+    async fn serve(fake: Fake) -> (Arc<Fake>, GitHubApp) {
+        let fake = Arc::new(fake);
+        fake.installation.store(1, Ordering::SeqCst);
+        let router = Router::new()
+            .route("/repos/{owner}/{name}/installation", get(installation))
+            .route("/app/installations/{id}/access_tokens", post(mint))
+            .with_state(fake.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).unwrap();
+        let app = GitHubApp::with_api(&api, "1".into(), key.serialize_pem().as_bytes()).unwrap();
+        (fake, app)
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_share_one_mint() {
+        let (fake, app) = fake_github().await;
+        let tokens = futures::future::join_all((0..10).map(|_| app.token_for("o/r"))).await;
+        assert!(tokens.iter().all(|t| t.as_deref().ok() == Some("token-1")));
+        assert_eq!(fake.mints.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn installations_mint_independently() {
+        let (_, app) = serve(Fake {
+            rendezvous: Some(tokio::sync::Barrier::new(2)),
+            ..Fake::default()
+        })
+        .await;
+        let (r, other) = tokio::join!(app.token_for("o/r"), app.token_for("o/other"));
+        assert_eq!(r.unwrap(), "token-1");
+        assert_eq!(other.unwrap(), format!("token-{OTHER}"));
+    }
+
+    #[tokio::test]
+    async fn remembers_repositories_without_an_installation() {
+        let (fake, app) = fake_github().await;
+        assert!(app.token_for("someone/public").await.is_err());
+        assert!(app.token_for("someone/public").await.is_err());
+        assert_eq!(fake.lookups.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn follows_a_reinstall() {
+        let (fake, app) = fake_github().await;
+        assert_eq!(app.token_for("o/r").await.unwrap(), "token-1");
+        fake.installation.store(2, Ordering::SeqCst);
+        app.tokens.lock().unwrap().clear();
+        assert_eq!(app.token_for("o/r").await.unwrap(), "token-2");
     }
 }
