@@ -67,8 +67,8 @@ export class SessionView {
   #replay: Transcript | null = null;
   /** Messages a dropped connection cut off before the runtime confirmed them; the next load settles each. */
   #unconfirmed: { id: string; text: string }[] = [];
-  /** A message that couldn't be delivered, for the composer to put back; it clears this once it has. */
-  undelivered = $state<string | null>(null);
+  /** Messages that couldn't be delivered, kept until the user puts each back or dismisses it. */
+  undelivered = $state<{ id: string; text: string }[]>([]);
 
   constructor(id: string) {
     this.id = id;
@@ -274,7 +274,7 @@ export class SessionView {
       if (this.received(message.id)) continue;
       this.prompt(message.text, message.id).catch((error) => {
         if (error instanceof ConnectionClosedError || this.received(message.id)) return;
-        this.undelivered = message.text;
+        this.undelivered.push(message);
       });
     }
   }

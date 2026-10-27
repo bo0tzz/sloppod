@@ -921,9 +921,10 @@ function handleCall(conn, message) {
       for (const entry of session.log) conn.notify('session/update', entry);
       session.subscribers.add(conn);
       conn.loaded.add(session.data.id);
+      // Like the runtime: the queue before the response.
+      broadcastQueue(session, [conn]);
       conn.respond(id, { configOptions: session.configOptions() });
       for (const pending of session.pending.values()) sendPending(session, pending, conn);
-      broadcastQueue(session, [conn]);
       return;
     }
 
@@ -937,7 +938,13 @@ function handleCall(conn, message) {
         conn.ws.terminate();
         return;
       }
-      if (drop === 'after') setTimeout(() => conn.ws.terminate(), 0);
+      // Dropped as soon as the prompt is taken, so this connection never hears about it, e.g. its queue entry.
+      if (drop === 'after') conn.ws.terminate();
+      if (failNextPrompt && drop === null) {
+        failNextPrompt = false;
+        conn.error(id, -32000, 'the runtime refused it');
+        return;
+      }
       if (session.data.phase === 'parked') session.setPhase('starting');
       if (session.data.phase === 'starting' || session.data.phase === 'disconnected') {
         queuePrompt(
@@ -1451,11 +1458,17 @@ async function seed() {
 
 /** Set by `/_mock/drop-next-prompt`: drop the connection the next prompt arrives on, before or after taking it. */
 let dropNextPrompt = null;
+/** Set by `/_mock/fail-next-prompt`: refuse the next prompt that isn't dropped, without taking it. */
+let failNextPrompt = false;
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   try {
     if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
+    if (url.pathname === '/_mock/fail-next-prompt' && req.method === 'POST') {
+      failNextPrompt = true;
+      return json(res, 200, { failNextPrompt });
+    }
     if (url.pathname === '/_mock/drop-next-prompt' && req.method === 'POST') {
       dropNextPrompt = url.searchParams.get('when') === 'after' ? 'after' : 'before';
       return json(res, 200, { dropNextPrompt });
