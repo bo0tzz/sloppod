@@ -10,6 +10,7 @@ mod github;
 mod link;
 mod mcp;
 mod memini;
+mod memory;
 mod placement;
 mod pods;
 mod policies;
@@ -25,7 +26,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use axum::Router;
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use clap::Parser;
 use k8s_openapi::api::core::v1::Service;
 use kube::api::Api;
@@ -49,6 +50,8 @@ pub struct Inner {
     pub hub: Arc<Hub>,
     pub credentials: Arc<Credentials>,
     pub policies: Policies,
+    /// Decides session requests to memini, which reach it through the runtime rather than the egress listener.
+    pub memory: Arc<MeminiPolicy>,
     pub proposals: ProposalKinds,
     pub placement: Arc<dyn PlacementBackend>,
     pub enforcer: Arc<dyn Enforcer>,
@@ -121,7 +124,6 @@ async fn main() -> anyhow::Result<()> {
     let mut policies = Policies::default();
     policies.register(Arc::new(ModelPolicy::new(credentials.clone())));
     policies.register(Arc::new(GitHubPolicy::new(credentials.clone())));
-    policies.register(Arc::new(MeminiPolicy::new(credentials.clone())));
 
     let mut proposals = ProposalKinds::default();
     proposals.register(Arc::new(proposals::PullRequest::new(credentials.clone())));
@@ -164,6 +166,7 @@ async fn main() -> anyhow::Result<()> {
         db,
         kube,
         pods,
+        memory: Arc::new(MeminiPolicy::new(credentials.clone())),
         credentials,
         policies,
         proposals,
@@ -194,6 +197,8 @@ async fn main() -> anyhow::Result<()> {
     let sessions = Router::new()
         .route(sloppod_protocol::link::PATH, get(link::handler))
         .route("/mcp", post(mcp::handler))
+        .route(memory::PREFIX, any(memory::proxy))
+        .route(&format!("{}/{{*path}}", memory::PREFIX), any(memory::proxy))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(config.listen).await?;

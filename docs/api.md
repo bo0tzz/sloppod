@@ -59,7 +59,7 @@ type Phase =
   | "starting"           // pod being created or agent not connected yet
   | "idle"               // agent connected, no turn running
   | "working"            // a turn is running
-  | "waiting"            // a turn is blocked on a permission request
+  | "waiting"            // a turn is blocked on a permission request or a question
   | "disconnected"       // pod went away; the runtime is bringing it back
   | "stopped";
 ```
@@ -157,18 +157,30 @@ Runtime → UI:
 |---|---|
 | `session/update` | Standard ACP updates: `user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `available_commands_update`, `config_option_update`, and compaction reports. Prompts sent by any UI are echoed as `user_message_chunk` with a `messageId` per prompt, so every viewer sees them; steers carry `_meta.sloppod.steering: true`, and notices to the agent (see Proposals) `_meta.sloppod.notice: true`. |
 | `session/request_permission` (request) | Sent to every UI that has the session loaded, including requests still open when a UI loads the session (after the `session/load` response). The first answer wins. |
-| `_sloppod/permission_resolved` `{sessionId, toolCallId}` | Sent to every UI, including the one that answered, once a request is answered or cancelled. |
+| `elicitation/create` (request) | The agent asks the user something, e.g. Claude Code's `AskUserQuestion`. Delivered like a permission request. Params: `{sessionId, mode: "form", message, requestedSchema, toolCallId?}`; the schema is an object of primitive fields (below). Answer `{action: "accept", content}`, `{action: "decline"}` (skip: the agent is told the user didn't answer) or `{action: "cancel"}`. |
+| `_sloppod/permission_resolved` `{sessionId, toolCallId, requestId}` | Sent to every UI, including the one that answered, once a permission request or question is answered or cancelled. `requestId` is the JSON-RPC id the request had on this connection. |
 | `_sloppod/session` `{session: Session}` | The session's phase, title, repository or grants changed. |
 | `_sloppod/proposal` `{proposal: Proposal}` | A proposal for a loaded session was created or changed. |
 
+### Questions
+
+`AskUserQuestion` arrives as one form with two fields per question, in order: `question_<n>` and `question_<n>_custom`.
+
+- `question_<n>` is `{type: "string", oneOf: [{const, title, description?}]}` for a single choice, or `{type: "array", items: {anyOf: [{const, title, description?}]}}` for several. `title` is the question's short header; `description` holds the question text when there are several questions (with one, it's the `message`). An option's `_meta["_claude/askUserQuestionOption"].preview` may carry a preview (Markdown/code).
+- `question_<n>_custom` is a free-text "Other" answer: for a single choice it's the answer when nothing is picked, or a note on the pick; for several it's added to them.
+- Nothing is required. `content` maps field keys to the picked `const` (or array of them) and the typed text.
+
+Other form elicitations (from MCP servers) use the same primitive field types: `string` (optionally with `oneOf`/`enum`), `number`, `integer`, `boolean`, and arrays of enums.
+
 ## Session pods
 
-Session pods use two more endpoints, on their own port (8081, `sessions`); that port is the only one they can reach, so they can't use the API above. Keep it off public routes.
+Session pods use three more endpoints, on their own port (8081, `sessions`); that port is the only one they can reach, so they can't use the API above. Keep it off public routes.
 
 - `/link/v1`: the supervisor link ([ADR 17](adr/0017-in-pod-supervisor.md)), a WebSocket authenticated with the pod's projected ServiceAccount token. Its types are in `crates/protocol`.
 - `/mcp`: an MCP server (streamable HTTP, JSON responses) registered with the agent at session start. It identifies the session by the pod's IP. Its tools:
   - `propose_pull_request {title, body, repo?, base?, draft?}` creates a `github.pr.create` proposal from the session branch (`repo` is needed when the session can write to more than one).
   - `request_repository {repo, reason}` creates a `sloppod.repo.grant` proposal.
   - `get_proposal {id}` returns a proposal's status and result. The agent is also told when its proposals are decided.
+- `/memini/*`: memini, for sessions with a `memory` grant, identified by the pod's IP. The runtime forwards each request to the owner's memini with the session's own key and namespace, and refuses memini's administration endpoints. The memini plugin's `MEMINI_BASE_URL` points here.
 
 In the pod, the repository is checked out at `/workspace/repo` on the session branch. `/workspace` is the session's own volume, kept across pod restarts.

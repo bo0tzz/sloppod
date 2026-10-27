@@ -14,7 +14,7 @@ use sloppod_contracts::{EgressSpec, Grant, PlacementSpec};
 use sloppod_protocol::api::{Decision, NewCredential, NewSession, Phase};
 use uuid::Uuid;
 
-use crate::credentials::{CLAUDE, MEMINI};
+use crate::credentials::CLAUDE;
 use crate::memini::MeminiAdmin;
 use crate::placement::{TOKEN_DIR, WORKDIR};
 use crate::pods::SESSION_LABEL;
@@ -453,16 +453,8 @@ async fn create_credential(
     User(user): User,
     Json(new): Json<NewCredential>,
 ) -> ApiResult<impl IntoResponse> {
-    let kind = new.kind.clone();
     match state.credentials.create(&user, new).await? {
-        Ok(row) => {
-            if kind == MEMINI
-                && let Err(e) = state.install_listener().await
-            {
-                tracing::error!(error = %e, "updating the egress listener for a new memini host");
-            }
-            Ok((StatusCode::CREATED, Json(row.to_api())))
-        }
+        Ok(row) => Ok((StatusCode::CREATED, Json(row.to_api()))),
         Err(invalid) => Err(bad_request(invalid.0)),
     }
 }

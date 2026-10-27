@@ -346,6 +346,64 @@ test('shows a proposal of an unknown kind generically', async ({ page }) => {
   await expect(page.getByTestId('system-notice')).toContainText('Your proposal was rejected');
 });
 
+const questionCard = (page: Page) => page.getByTestId('question-card');
+const questionField = (page: Page, key: string) => questionCard(page).locator(`[data-key="${key}"]`);
+
+test('answers questions from the agent, in every tab', async ({ page, context }) => {
+  const sent: string[] = [];
+  page.on('websocket', (socket) => socket.on('framesent', ({ payload }) => sent.push(String(payload))));
+  const id = await createSession(page, 'Please ask me how to do it');
+  const other = await context.newPage();
+  await other.goto(`/sessions/${id}`);
+
+  await expect(questionCard(page)).toContainText('Please answer the following questions.');
+  await expect(questionCard(other)).toBeVisible();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'waiting');
+  await expect(page.getByTestId('activity')).toHaveText('Waiting for your answer');
+
+  const backoff = questionField(page, 'question_0');
+  await expect(backoff).toContainText('Backoff');
+  await expect(backoff).toContainText('Which backoff strategy should reconnects use?');
+  await expect(backoff).toContainText('Double the delay after each failure');
+  await backoff.getByRole('radio', { name: /Exponential/ }).check();
+  await expect(backoff.getByTestId('option-preview')).toContainText('Math.min(500 * 2 ** attempt');
+
+  const tests = questionField(page, 'question_1');
+  await tests.getByRole('checkbox', { name: /Unit/ }).check();
+  await tests.getByRole('checkbox', { name: /End-to-end/ }).check();
+  await questionField(page, 'question_1_custom').getByRole('textbox').fill('Load tests');
+  await questionCard(page).getByRole('button', { name: 'Answer' }).click();
+
+  await expect(questionCard(page)).toBeHidden();
+  await expect(questionCard(other)).toBeHidden();
+  await expect(agentMessages(page).filter({ hasText: 'Backoff: Exponential.' })).toContainText(
+    'Tests: Unit, End-to-end, Load tests.',
+  );
+  const answer = sent.find((frame) => frame.includes('"action":"accept"'));
+  expect(JSON.parse(answer!).result).toEqual({
+    action: 'accept',
+    content: { question_0: 'Exponential', question_1: ['Unit', 'End-to-end'], question_1_custom: 'Load tests' },
+  });
+});
+
+test('skips questions from the agent', async ({ page }) => {
+  await createSession(page, 'Ask me first');
+  await questionCard(page).getByRole('button', { name: 'Skip' }).click();
+  await expect(questionCard(page)).toBeHidden();
+  await expect(agentMessages(page).filter({ hasText: 'You skipped the questions' })).toBeVisible();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+});
+
+test('shows an open question again after a reload', async ({ page }) => {
+  await createSession(page, 'Ask me something, then reload');
+  await expect(questionCard(page)).toBeVisible();
+  await page.reload();
+  await expect(questionCard(page)).toBeVisible();
+  await questionField(page, 'question_0_custom').getByRole('textbox').fill('Whatever you think is best');
+  await questionCard(page).getByRole('button', { name: 'Answer' }).click();
+  await expect(agentMessages(page).filter({ hasText: 'Backoff: Whatever you think is best.' })).toBeVisible();
+});
+
 // Last, because it changes the mock's credentials; it puts them back at the end.
 test('manages credentials and nudges when they are missing', async ({ page }) => {
   const section = (kind: string) => page.getByTestId(`credentials-${kind}`);

@@ -46,6 +46,8 @@ Spike, 2026-10-26, claude-agent-acp 0.97.0 with Claude Code 2.1.310 and memini p
 - **Auth:** the MCP connection reached memini without a bearer. The plugin's `headersHelper` ran before the SessionStart hook had written its credentials file, and since Claude Code 2.1.238 plugin header helpers don't inherit credential env vars. memini answered 401, and Claude Code fell into OAuth discovery and gave up. That doesn't matter here, because the authorizer attaches the key, but the authorizer must add `Authorization` when it's missing, not only replace it.
 - **Proxying:** the plugin's hooks use Node's `fetch`, which ignores `HTTPS_PROXY`. Transparent redirection at the pod boundary catches them anyway; an explicit-proxy enforcer would need `NODE_USE_ENV_PROXY=1`.
 
+MVP, 2026-10-27: sessions reach memini through the runtime instead of the egress listener. The plugin's `MEMINI_BASE_URL` is the runtime's sessions port (`/memini`), where the same request policy decides each request and the runtime forwards it to the owner's memini. memini can then live at an in-cluster address, which Cilium's FQDN rules don't match under kube-proxy replacement and the TLS-intercepting listener couldn't serve, and adding a memini doesn't change the listener. The policy is unchanged: the session's own key, the pinned namespace, administration refused.
+
 memini server behaviour (v0.7.37 source), which the decisions above rely on:
 
 - The namespace is `X-Memini-Namespace`, else the key's default namespace, else the server default.

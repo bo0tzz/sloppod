@@ -18,6 +18,7 @@
   import AddRepoModal from './AddRepoModal.svelte';
   import ChatHeader from './ChatHeader.svelte';
   import PermissionCard from './PermissionCard.svelte';
+  import QuestionCard from './QuestionCard.svelte';
   import PhaseBadge from './PhaseBadge.svelte';
   import ProposalCard from './ProposalCard.svelte';
   import ProposalListModal from './ProposalListModal.svelte';
@@ -42,7 +43,7 @@
       case 'disconnected':
         return 'Bringing the agent back…';
       case 'waiting':
-        return 'Waiting for your decision';
+        return view.questions.length > 0 && view.permissions.length === 0 ? 'Waiting for your answer' : 'Waiting for your decision';
       default:
         return view.turnRunning ? 'Working…' : null;
     }
@@ -196,9 +197,12 @@
       {/if}
     </div>
 
-    {#if view.permissions.length > 0 || pendingProposals.length > 0}
+    {#if view.permissions.length > 0 || view.questions.length > 0 || pendingProposals.length > 0}
       <div class="border-light-200 max-h-[55dvh] shrink-0 overflow-y-auto border-t px-3 py-2">
         <div class="mx-auto flex w-full max-w-3xl flex-col gap-2">
+          {#each view.questions as question (question.rpcId)}
+            <QuestionCard request={question} onRespond={(response) => view.answerQuestion(question, response)} />
+          {/each}
           {#each view.permissions as request (request.rpcId)}
             <PermissionCard
               {request}

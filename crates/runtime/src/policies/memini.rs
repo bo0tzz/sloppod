@@ -43,8 +43,9 @@ impl RequestPolicy for MeminiPolicy {
         Manifest::builtin("memory-memini")
     }
 
+    /// None: sessions reach memini through the runtime's `/memini` route, not the egress listener.
     fn hosts(&self) -> Vec<String> {
-        self.credentials.memini_hosts()
+        Vec::new()
     }
 
     async fn decide(&self, session: &SessionContext, request: &HttpRequest) -> Result<Decision> {

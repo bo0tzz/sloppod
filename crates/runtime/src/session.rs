@@ -15,12 +15,11 @@ use crate::link::{AgentConn, RpcError};
 #[derive(Clone, Debug)]
 pub enum UiEvent {
     /// A notification to forward as-is; `seq` is the event-log position for recorded updates.
-    Notification {
-        seq: Option<i64>,
-        message: Value,
-    },
+    Notification { seq: Option<i64>, message: Value },
+    /// A permission request or a question from the agent, for the UIs to answer.
     PermissionRequest {
         id: u64,
+        method: String,
         params: Value,
     },
     PermissionResolved {
@@ -37,6 +36,7 @@ struct Queued {
 
 struct Permission {
     agent_request_id: Value,
+    method: String,
     params: Value,
     agent: Arc<AgentConn>,
 }
@@ -80,7 +80,8 @@ pub fn session_update(session: Uuid, update: &Value) -> Value {
 pub struct Replay {
     pub events: Vec<(i64, Value)>,
     pub agent_state: Value,
-    pub permissions: Vec<(u64, Value)>,
+    /// Open permission requests and questions: id, method, params.
+    pub permissions: Vec<(u64, String, Value)>,
 }
 
 impl Hub {
@@ -289,10 +290,14 @@ impl Hub {
         self.record(id, update).await;
     }
 
-    /// Handles a request from the agent; only permission requests are expected.
+    /// Handles a request from the agent: permission requests and questions, which the UIs answer.
     pub async fn on_agent_request(&self, id: Uuid, agent: &Arc<AgentConn>, message: Value) {
         let request_id = message["id"].clone();
-        if message["method"] != "session/request_permission" {
+        let method = message["method"].as_str().unwrap_or_default().to_owned();
+        if !matches!(
+            method.as_str(),
+            "session/request_permission" | "elicitation/create"
+        ) {
             agent.respond(
                 request_id,
                 Err(RpcError::new(
@@ -313,6 +318,7 @@ impl Hub {
                 pid,
                 Permission {
                     agent_request_id: request_id,
+                    method: method.clone(),
                     params: params.clone(),
                     agent: agent.clone(),
                 },
@@ -320,7 +326,14 @@ impl Hub {
             pid
         };
         self.set_phase(id, Phase::Waiting).await;
-        self.broadcast(id, UiEvent::PermissionRequest { id: pid, params });
+        self.broadcast(
+            id,
+            UiEvent::PermissionRequest {
+                id: pid,
+                method,
+                params,
+            },
+        );
     }
 
     /// The first answer to a permission request wins; later ones are ignored.
@@ -551,19 +564,23 @@ impl Hub {
         if let Ok((agent, agent_session_id)) = self.agent_for(id).await {
             agent.notify("session/cancel", json!({"sessionId": agent_session_id}));
         }
-        // ACP: a client that cancels a turn answers its outstanding permission requests with `cancelled`.
-        let pending: Vec<u64> = self
+        // ACP: a client that cancels a turn answers its outstanding permission requests and questions as cancelled.
+        let pending: Vec<(u64, bool)> = self
             .live(id)
             .state
             .lock()
             .await
             .permissions
-            .keys()
-            .copied()
+            .iter()
+            .map(|(pid, p)| (*pid, p.method == "elicitation/create"))
             .collect();
-        for pid in pending {
-            self.answer_permission(id, pid, Ok(json!({"outcome": {"outcome": "cancelled"}})))
-                .await;
+        for (pid, question) in pending {
+            let answer = if question {
+                json!({"action": "cancel"})
+            } else {
+                json!({"outcome": {"outcome": "cancelled"}})
+            };
+            self.answer_permission(id, pid, Ok(answer)).await;
         }
     }
 
@@ -602,12 +619,12 @@ impl Hub {
         } else {
             state.agent_state.clone()
         };
-        let mut permissions: Vec<(u64, Value)> = state
+        let mut permissions: Vec<(u64, String, Value)> = state
             .permissions
             .iter()
-            .map(|(pid, p)| (*pid, p.params.clone()))
+            .map(|(pid, p)| (*pid, p.method.clone(), p.params.clone()))
             .collect();
-        permissions.sort_by_key(|(pid, _)| *pid);
+        permissions.sort_by_key(|(pid, _, _)| *pid);
         Ok(Replay {
             events,
             agent_state,
@@ -632,5 +649,8 @@ impl Hub {
 }
 
 fn tool_call_id(params: &Value) -> Option<String> {
-    params["toolCall"]["toolCallId"].as_str().map(str::to_owned)
+    params["toolCall"]["toolCallId"]
+        .as_str()
+        .or(params["toolCallId"].as_str())
+        .map(str::to_owned)
 }

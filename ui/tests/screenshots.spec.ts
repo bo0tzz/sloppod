@@ -92,6 +92,18 @@ for (const [form, device] of Object.entries(viewports)) {
         await shot(page, 'notice');
       });
 
+      test('questions from the agent', async ({ page }) => {
+        const response = await page.request.post('/api/v1/sessions', { data: { prompt: 'Ask me how to do it' } });
+        const session: Session = await response.json();
+        await page.goto(`/sessions/${session.id}`);
+        const card = page.getByTestId('question-card');
+        await card.getByRole('radio', { name: /Exponential/ }).check();
+        await card.getByRole('checkbox', { name: /End-to-end/ }).check();
+        await expect(card.getByTestId('option-preview')).toBeVisible();
+        await card.locator('header').scrollIntoViewIfNeeded();
+        await shot(page, 'question');
+      });
+
       test('stopped session with a compaction', async ({ page }) => {
         const session = await seededSession(page, /^Summarise/);
         await page.goto(`/sessions/${session.id}`);

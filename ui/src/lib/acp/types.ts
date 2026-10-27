@@ -100,6 +100,35 @@ export type RequestPermissionRequest = {
   options: PermissionOption[];
 };
 
+export type EnumOption = { const: string; title?: string; description?: string } & Meta;
+
+/** One field of a form elicitation's schema: primitives, and arrays of enums. */
+export type ElicitationField = {
+  type: 'string' | 'number' | 'integer' | 'boolean' | 'array';
+  title?: string;
+  description?: string;
+  oneOf?: EnumOption[];
+  enum?: string[];
+  enumNames?: string[];
+  items?: { type?: string; anyOf?: EnumOption[]; enum?: string[] };
+  default?: unknown;
+  minimum?: number;
+  maximum?: number;
+};
+
+export type ElicitationRequest = {
+  sessionId: string;
+  mode: 'form';
+  message: string;
+  requestedSchema: { type: 'object'; properties: Record<string, ElicitationField>; required?: string[] };
+  toolCallId?: string;
+};
+
+export type ElicitationResponse =
+  | { action: 'accept'; content: Record<string, unknown> }
+  | { action: 'decline' }
+  | { action: 'cancel' };
+
 export type InitializeResponse = {
   protocolVersion: number;
   agentCapabilities?: Record<string, unknown>;

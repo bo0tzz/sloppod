@@ -4,6 +4,8 @@ import type {
   ContentBlock,
   InitializeResponse,
   LoadSessionResponse,
+  ElicitationRequest,
+  ElicitationResponse,
   RequestPermissionRequest,
   SessionConfigOption,
   SessionNotification,
@@ -14,6 +16,7 @@ import { api, ApiError, newerSession, type Proposal, type Session } from './api.
 import { sessions } from './sessions.svelte.ts';
 
 export type PendingPermission = RequestPermissionRequest & { rpcId: RequestId };
+export type PendingQuestion = ElicitationRequest & { rpcId: RequestId };
 
 const textPrompt = (text: string): ContentBlock[] => [{ type: 'text', text }];
 
@@ -35,6 +38,8 @@ export class SessionView {
   steeringSupported = $state(false);
 
   permissions = $state<PendingPermission[]>([]);
+  /** Open questions from the agent (form elicitations), answered like permission requests. */
+  questions = $state<PendingQuestion[]>([]);
   proposals = $state<Proposal[]>([]);
 
   /** Prompts sent from here whose turn hasn't ended. Queued prompts all resolve when their shared turn ends. */
@@ -60,6 +65,7 @@ export class SessionView {
         if (state !== 'open') {
           // Requests from a dropped socket can no longer be answered; a reload re-sends live ones.
           this.permissions = [];
+          this.questions = [];
         }
       },
     });
@@ -142,10 +148,17 @@ export class SessionView {
         break;
       }
       case '_sloppod/permission_resolved': {
-        const { sessionId, toolCallId } = params as { sessionId: string; toolCallId: string };
-        if (sessionId === this.id) {
-          this.permissions = this.permissions.filter((request) => request.toolCall.toolCallId !== toolCallId);
-        }
+        const { sessionId, toolCallId, requestId } = params as {
+          sessionId: string;
+          toolCallId?: string | null;
+          requestId?: RequestId | null;
+        };
+        if (sessionId !== this.id) break;
+        // `requestId` is this connection's id for the request; questions from MCP servers may have no tool call.
+        const resolved = (rpcId: RequestId, callId: string | undefined) =>
+          requestId !== undefined && requestId !== null ? rpcId === requestId : callId === toolCallId;
+        this.permissions = this.permissions.filter((request) => !resolved(request.rpcId, request.toolCall.toolCallId));
+        this.questions = this.questions.filter((question) => !resolved(question.rpcId, question.toolCallId));
         break;
       }
     }
@@ -156,6 +169,17 @@ export class SessionView {
       const request = params as RequestPermissionRequest;
       if (request.sessionId === this.id) {
         this.permissions.push({ ...request, rpcId });
+        return;
+      }
+    }
+    if (method === 'elicitation/create') {
+      const request = params as ElicitationRequest;
+      if (request.sessionId === this.id) {
+        if (request.mode !== 'form') {
+          this.#conn.respondError(rpcId, -32602, `Unsupported elicitation mode: ${request.mode}`);
+          return;
+        }
+        this.questions.push({ ...request, rpcId });
         return;
       }
     }
@@ -214,7 +238,11 @@ export class SessionView {
     for (const request of this.permissions) {
       this.#conn.respond(request.rpcId, { outcome: { outcome: 'cancelled' } });
     }
+    for (const question of this.questions) {
+      this.#conn.respond(question.rpcId, { action: 'cancel' } satisfies ElicitationResponse);
+    }
     this.permissions = [];
+    this.questions = [];
   }
 
   async setConfigOption(configId: string, value: string) {
@@ -234,6 +262,11 @@ export class SessionView {
       this.configOptions = previous;
       throw error;
     }
+  }
+
+  answerQuestion(question: PendingQuestion, response: ElicitationResponse) {
+    this.#conn.respond(question.rpcId, response);
+    this.questions = this.questions.filter((pending) => pending.rpcId !== question.rpcId);
   }
 
   answerPermission(request: PendingPermission, optionId: string) {

@@ -141,6 +141,8 @@ impl AgentAdapter for ClaudeCode {
                 "fs": {"readTextFile": false, "writeTextFile": false},
                 "terminal": false,
                 "session": {"compaction": {}},
+                // Lets the agent ask the user questions (AskUserQuestion) as form elicitations.
+                "elicitation": {"form": {}},
             }),
         }
     }

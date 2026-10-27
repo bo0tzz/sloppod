@@ -38,7 +38,7 @@ enum Cmd {
     Prompt {
         session: Uuid,
         text: String,
-        /// Answer permission requests with the first "allow" option.
+        /// Answer permission requests with the first "allow" option, and questions with each one's first option.
         #[arg(long)]
         allow: bool,
     },
@@ -377,6 +377,43 @@ async fn acp(
                         .or(options.first())
                         .context("permission request without options")?;
                     send_message(json!({"jsonrpc": "2.0", "id": id, "result": {"outcome": {"outcome": "selected", "optionId": pick["optionId"]}}})).await?;
+                }
+            }
+            (Some("elicitation/create"), Some(id)) => {
+                let params = &message["params"];
+                println!(
+                    "\n[question] {}",
+                    params["message"].as_str().unwrap_or_default()
+                );
+                let mut content = serde_json::Map::new();
+                let fields = params["requestedSchema"]["properties"].as_object();
+                for (key, field) in fields.into_iter().flatten() {
+                    let options = field["oneOf"]
+                        .as_array()
+                        .or(field["items"]["anyOf"].as_array());
+                    let Some(options) = options else { continue };
+                    let titles: Vec<&str> =
+                        options.iter().filter_map(|o| o["title"].as_str()).collect();
+                    println!(
+                        "  {}: {}",
+                        field["title"].as_str().unwrap_or(key),
+                        titles.join(" | ")
+                    );
+                    if let Some(first) = options.first() {
+                        let pick = first["const"].clone();
+                        content.insert(
+                            key.clone(),
+                            if field["type"] == "array" {
+                                json!([pick])
+                            } else {
+                                pick
+                            },
+                        );
+                    }
+                }
+                if allow {
+                    println!("  answering: {}", Value::Object(content.clone()));
+                    send_message(json!({"jsonrpc": "2.0", "id": id, "result": {"action": "accept", "content": content}})).await?;
                 }
             }
             (Some("_sloppod/proposal"), _) => {

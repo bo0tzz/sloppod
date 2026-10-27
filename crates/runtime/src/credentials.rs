@@ -1,7 +1,7 @@
 //! Credentials the runtime uses on a user's behalf, stored encrypted (ADR 21).
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -63,7 +63,6 @@ pub struct Credentials {
     db: PgPool,
     vault: Vault,
     github: Mutex<HashMap<Uuid, Arc<GitHubApp>>>,
-    memini_hosts: RwLock<Vec<String>>,
 }
 
 fn host_of(url: &str) -> Option<String> {
@@ -75,14 +74,11 @@ fn host_of(url: &str) -> Option<String> {
 
 impl Credentials {
     pub async fn new(db: PgPool, vault: Vault) -> anyhow::Result<Self> {
-        let credentials = Self {
+        Ok(Self {
             db,
             vault,
             github: Mutex::default(),
-            memini_hosts: RwLock::default(),
-        };
-        credentials.refresh_hosts().await?;
-        Ok(credentials)
+        })
     }
 
     pub fn vault(&self) -> &Vault {
@@ -170,7 +166,6 @@ impl Credentials {
                 new.kind
             ))));
         };
-        self.refresh_hosts().await?;
         Ok(Ok(row))
     }
 
@@ -220,7 +215,6 @@ impl Credentials {
             .await?;
         }
         self.github.lock().await.remove(&id);
-        self.refresh_hosts().await?;
         Ok(true)
     }
 
@@ -274,26 +268,6 @@ impl Credentials {
         };
         let admin = MeminiAdmin::new(row.config("url").unwrap_or_default(), key)?;
         Ok(Some((admin, row)))
-    }
-
-    async fn refresh_hosts(&self) -> sqlx::Result<()> {
-        let urls: Vec<(Value,)> = sqlx::query_as("select config from credentials where kind = $1")
-            .bind(MEMINI)
-            .fetch_all(&self.db)
-            .await?;
-        let mut hosts: Vec<String> = urls
-            .iter()
-            .filter_map(|(config,)| config.get("url").and_then(Value::as_str).and_then(host_of))
-            .collect();
-        hosts.sort();
-        hosts.dedup();
-        *self.memini_hosts.write().expect("hosts lock") = hosts;
-        Ok(())
-    }
-
-    /// Hosts of every configured memini, which session egress must route through the authorizer.
-    pub fn memini_hosts(&self) -> Vec<String> {
-        self.memini_hosts.read().expect("hosts lock").clone()
     }
 
     pub async fn put_session_secret(

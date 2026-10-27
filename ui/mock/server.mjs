@@ -150,6 +150,73 @@ Running 3 tests using 1 worker
 
   3 passed (5.3s)`;
 
+const QUESTIONS = [
+  {
+    question: 'Which backoff strategy should reconnects use?',
+    header: 'Backoff',
+    multiSelect: false,
+    options: [
+      {
+        label: 'Exponential',
+        description: 'Double the delay after each failure, capped at 10 s',
+        preview: 'delay = Math.min(500 * 2 ** attempt, 10_000);',
+      },
+      { label: 'Fixed', description: 'Retry every second' },
+      { label: 'Jittered' },
+    ],
+  },
+  {
+    question: 'Which tests should I add?',
+    header: 'Tests',
+    multiSelect: true,
+    options: [{ label: 'Unit' }, { label: 'End-to-end', description: 'Playwright against the mock runtime' }],
+  },
+];
+
+/** AskUserQuestion as an ACP form elicitation, built the way claude-agent-acp builds it. */
+function questionsToElicitation(questions, sessionId, toolCallId) {
+  const single = questions.length === 1;
+  const properties = {};
+  questions.forEach((question, index) => {
+    const options = question.options.map((option) => ({
+      const: option.label,
+      title: option.label,
+      ...(option.description ? { description: option.description } : {}),
+      ...(option.preview ? { _meta: { '_claude/askUserQuestionOption': { preview: option.preview } } } : {}),
+    }));
+    const title = question.header || undefined;
+    const description = single ? undefined : question.question;
+    properties[`question_${index}`] = question.multiSelect
+      ? { type: 'array', title, description, items: { anyOf: options } }
+      : { type: 'string', title, description, oneOf: options };
+    properties[`question_${index}_custom`] = {
+      type: 'string',
+      title: 'Other',
+      description: question.multiSelect
+        ? 'Type your own answer to add to your selection above (optional).'
+        : 'Type your own answer, or add a note to the option you chose above (optional).',
+    };
+  });
+  return {
+    mode: 'form',
+    sessionId,
+    toolCallId,
+    message: single ? questions[0].question : 'Please answer the following questions.',
+    requestedSchema: { type: 'object', properties },
+  };
+}
+
+function summariseAnswers(questions, content) {
+  return questions.flatMap((question, index) => {
+    const value = content[`question_${index}`];
+    const picks = Array.isArray(value) ? value : value ? [value] : [];
+    const custom = typeof content[`question_${index}_custom`] === 'string' ? content[`question_${index}_custom`].trim() : '';
+    const answer = question.multiSelect || !picks.length ? [...picks, ...(custom ? [custom] : [])].join(', ') : picks[0];
+    const note = !question.multiSelect && picks.length && custom ? ` (note: ${custom})` : '';
+    return answer ? [`${question.header}: ${answer}${note}.`] : [];
+  });
+}
+
 function chunks(text) {
   const words = text.match(/\S+\s*/g) ?? [text];
   const out = [];
@@ -215,38 +282,47 @@ function grantRepo(session, repo) {
   session.broadcast();
 }
 
-function requestPermission(session, toolCall, options) {
+/**
+ * A request the agent is blocked on until someone answers: a permission request or a question (form
+ * elicitation). Sent to every viewer, re-sent to UIs that load the session while it's open; first answer wins.
+ */
+function requestFromUser(session, { method, params, toolCallId, cancelled }) {
   return new Promise((resolve) => {
-    const pending = { toolCall, options, resolve, requests: new Map() };
-    session.pending.set(toolCall.toolCallId, pending);
+    const pending = { method, params, toolCallId, cancelled, resolve, requests: new Map() };
+    session.pending.set(pending, pending);
     session.setPhase('waiting');
-    for (const conn of session.subscribers) sendPermission(session, pending, conn);
+    for (const conn of session.subscribers) sendPending(session, pending, conn);
   });
 }
 
-function sendPermission(session, pending, conn) {
-  const toolCallId = pending.toolCall.toolCallId;
-  const rpcId = conn.request(
-    'session/request_permission',
-    { sessionId: session.data.id, toolCall: pending.toolCall, options: pending.options },
-    (message) => {
-      pending.requests.delete(conn);
-      if (session.pending.get(toolCallId) !== pending) return;
-      resolvePermission(session, pending, message.result?.outcome ?? { outcome: 'cancelled' }, conn);
-    },
-  );
+const requestPermission = (session, toolCall, options) =>
+  requestFromUser(session, {
+    method: 'session/request_permission',
+    params: { sessionId: session.data.id, toolCall, options },
+    toolCallId: toolCall.toolCallId,
+    cancelled: { outcome: { outcome: 'cancelled' } },
+  }).then((result) => result.outcome);
+
+function sendPending(session, pending, conn) {
+  const rpcId = conn.request(pending.method, pending.params, (message) => {
+    if (!session.pending.has(pending)) return;
+    resolvePending(session, pending, message.result ?? pending.cancelled);
+  });
   pending.requests.set(conn, rpcId);
 }
 
-function resolvePermission(session, pending, outcome, answeredBy) {
-  const toolCallId = pending.toolCall.toolCallId;
-  session.pending.delete(toolCallId);
-  for (const conn of [...pending.requests.keys(), ...(answeredBy ? [answeredBy] : [])]) {
-    conn.notify('_sloppod/permission_resolved', { sessionId: session.data.id, toolCallId });
+function resolvePending(session, pending, result) {
+  session.pending.delete(pending);
+  for (const [conn, requestId] of pending.requests) {
+    conn.notify('_sloppod/permission_resolved', {
+      sessionId: session.data.id,
+      toolCallId: pending.toolCallId ?? null,
+      requestId,
+    });
   }
   pending.requests.clear();
-  if (session.data.phase === 'waiting') session.setPhase('working');
-  pending.resolve(outcome);
+  if (session.data.phase === 'waiting' && session.pending.size === 0) session.setPhase('working');
+  pending.resolve(result);
 }
 
 async function runTurn(session, text, { echo = true } = {}) {
@@ -322,6 +398,32 @@ async function agentScript(session, turn, prompt) {
         { content: 'Push and propose a pull request', priority: 'low', status: statuses[3] },
       ],
     });
+
+  if (/ask me/i.test(prompt)) {
+    await step(2);
+    await say('Before I start, a couple of questions.');
+    const askId = randomUUID();
+    tool({ toolCallId: askId, title: 'AskUserQuestion', kind: 'other', status: 'pending', rawInput: { questions: QUESTIONS } });
+    const response = await requestFromUser(session, {
+      method: 'elicitation/create',
+      params: questionsToElicitation(QUESTIONS, session.data.id, askId),
+      toolCallId: askId,
+      cancelled: { action: 'cancel' },
+    });
+    if (response.action === 'cancel') {
+      update(askId, { status: 'failed' });
+      throw CANCELLED;
+    }
+    update(askId, { status: 'completed' });
+    await step(1);
+    if (response.action === 'decline') {
+      await say("You skipped the questions, so I'll go with my own judgement.");
+      return;
+    }
+    const answers = summariseAnswers(QUESTIONS, response.content ?? {});
+    await say(answers.length ? `Thanks! ${answers.join(' ')}` : "Thanks, though you didn't pick anything.");
+    return;
+  }
 
   if (!session.data.repo && /request a repository/i.test(prompt)) {
     const repo = availableRepos().at(-1) ?? REPOS.at(-1);
@@ -608,9 +710,7 @@ const startupDelay = (prompt) => (/slow start/i.test(prompt) ? 3000 : DELAY * 8)
 
 function cancelTurn(session) {
   if (session.turn) session.turn.cancelled = true;
-  for (const pending of [...session.pending.values()]) {
-    resolvePermission(session, pending, { outcome: 'cancelled' }, null);
-  }
+  for (const pending of [...session.pending.values()]) resolvePending(session, pending, pending.cancelled);
 }
 
 // --- ACP over WebSocket ---------------------------------------------------------------------
@@ -646,7 +746,7 @@ function handleCall(conn, message) {
       session.subscribers.add(conn);
       conn.loaded.add(session.data.id);
       conn.respond(id, { configOptions: session.configOptions() });
-      for (const pending of session.pending.values()) sendPermission(session, pending, conn);
+      for (const pending of session.pending.values()) sendPending(session, pending, conn);
       return;
     }
 

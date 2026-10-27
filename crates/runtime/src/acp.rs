@@ -50,12 +50,12 @@ impl Conn {
         });
     }
 
-    async fn send_permission(&self, session: Uuid, pid: u64, params: Value) {
+    async fn send_permission(&self, session: Uuid, pid: u64, method: String, params: Value) {
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.permissions.lock().await.insert(id, (session, pid));
-        self.send(json!({"jsonrpc": "2.0", "id": id, "method": "session/request_permission", "params": params}));
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
     }
 
     async fn forward(
@@ -72,18 +72,23 @@ impl Conn {
                     }
                     self.send(message);
                 }
-                Ok(UiEvent::PermissionRequest { id, params }) => {
-                    self.send_permission(session, id, params).await
+                Ok(UiEvent::PermissionRequest { id, method, params }) => {
+                    self.send_permission(session, id, method, params).await
                 }
                 Ok(UiEvent::PermissionResolved { id, tool_call_id }) => {
-                    self.permissions
-                        .lock()
-                        .await
-                        .retain(|_, (s, p)| !(*s == session && *p == id));
+                    let request_id = {
+                        let mut permissions = self.permissions.lock().await;
+                        let request_id = permissions
+                            .iter()
+                            .find(|(_, (s, p))| *s == session && *p == id)
+                            .map(|(request_id, _)| *request_id);
+                        permissions.retain(|_, (s, p)| !(*s == session && *p == id));
+                        request_id
+                    };
                     self.send(json!({
                         "jsonrpc": "2.0",
                         "method": "_sloppod/permission_resolved",
-                        "params": {"sessionId": session, "toolCallId": tool_call_id},
+                        "params": {"sessionId": session, "toolCallId": tool_call_id, "requestId": request_id},
                     }));
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -95,7 +100,10 @@ impl Conn {
     }
 
     /// Replays a session; returns the load response and the permission requests still open, which go out after it.
-    async fn load(self: &Arc<Self>, session: Uuid) -> Result<(Value, Vec<(u64, Value)>), RpcError> {
+    async fn load(
+        self: &Arc<Self>,
+        session: Uuid,
+    ) -> Result<(Value, Vec<(u64, String, Value)>), RpcError> {
         if db::owned_session(&self.state.db, session, &self.user)
             .await
             .map_err(internal)?
@@ -126,8 +134,8 @@ impl Conn {
             match self.load(session).await {
                 Ok((state, permissions)) => {
                     self.reply(id, Ok(state));
-                    for (pid, params) in permissions {
-                        self.send_permission(session, pid, params).await;
+                    for (pid, method, params) in permissions {
+                        self.send_permission(session, pid, method, params).await;
                     }
                 }
                 Err(e) => self.reply(id, Err(e)),
@@ -204,7 +212,7 @@ impl Conn {
         let Some(id) = message["id"].as_i64() else {
             return;
         };
-        let Some((session, pid)) = self.permissions.lock().await.remove(&id) else {
+        let Some((session, pid)) = self.permissions.lock().await.get(&id).copied() else {
             return;
         };
         let result = match message.get("error") {

@@ -288,8 +288,8 @@ pub async fn agent_context(state: &AppState, session: &db::SessionRow) -> AgentC
         .map(str::to_owned);
     let memory = match namespace {
         Some(namespace) => match state.credentials.memini(&session.owner).await {
-            Ok(Some((_, credential))) => credential.config("url").map(|url| MemoryContext {
-                base_url: url.to_owned(),
+            Ok(Some(_)) => Some(MemoryContext {
+                base_url: format!("{}{}", state.config.runtime_url(), crate::memory::PREFIX),
                 namespace,
             }),
             _ => None,
