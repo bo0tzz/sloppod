@@ -16,7 +16,6 @@
     Textarea,
   } from '@immich/ui';
   import { mdiChevronRight, mdiOpenInNew } from '@mdi/js';
-  import { onMount } from 'svelte';
   import {
     api,
     type IssueDraft,
@@ -74,17 +73,35 @@
   const stack = $derived(detail?.kind === 'github.stack.create' ? (detail.payload as StackPayload) : null);
   const pending = $derived(detail?.status === 'pending');
 
-  onMount(async () => {
+  // The proposal changes while the modal is open: it's decided in another tab, passes review, or a review round
+  // re-pins it to a new head. Fetch the detail (with its diff) again then, and put the form back to the new payload.
+  const version = $derived(`${proposal.status}\n${JSON.stringify(proposal.payload)}`);
+  let loaded = '';
+  let loads = 0;
+  $effect(() => {
+    if (version === loaded) return;
+    const payloadChanged = !detail || JSON.stringify(detail.payload) !== JSON.stringify(proposal.payload);
+    loaded = version;
+    void load(payloadChanged);
+  });
+
+  async function load(resetForm: boolean) {
+    const load = ++loads;
     try {
-      detail = await api.getProposal(proposal.id);
+      const fetched = await api.getProposal(proposal.id);
+      if (load !== loads) return;
+      detail = fetched;
+      loadError = null;
+      if (!resetForm) return;
+      editing = false;
       autoMerge =
-        (detail.kind === 'github.pr.create' || detail.kind === 'github.stack.create') &&
-        (detail.payload as { auto_merge?: boolean }).auto_merge === true;
+        (fetched.kind === 'github.pr.create' || fetched.kind === 'github.stack.create') &&
+        (fetched.payload as { auto_merge?: boolean }).auto_merge === true;
       resetDrafts();
     } catch (error) {
-      loadError = error instanceof Error ? error.message : String(error);
+      if (load === loads) loadError = error instanceof Error ? error.message : String(error);
     }
-  });
+  }
 
   function diffCounts(diff: string) {
     const files = parseUnifiedDiff(diff) ?? [];
