@@ -35,6 +35,7 @@ Approach:
 - [20. Inference accounts can be switched under a running session](docs/adr/0020-switchable-inference-accounts.md)
 - [21. Credentials live in the runtime](docs/adr/0021-credentials-live-in-the-runtime.md)
 - [22. memini keys per session](docs/adr/0022-memini-keys-per-session.md)
+- [24. Proposals are reviewed by another model before a human sees them](docs/adr/0024-automated-review-before-human-review.md)
 
 Implementation:
 
