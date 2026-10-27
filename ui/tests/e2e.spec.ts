@@ -829,6 +829,9 @@ test('a deleted session can be restored from Settings', async ({ page }) => {
   await expect(page).toHaveURL(/\/$/);
   await expect(page.getByTestId('session-row').filter({ hasText: 'Delete me' })).toHaveCount(0);
 
+  // Deleted, it stays parked until it's restored.
+  expect((await page.request.post(`/api/v1/sessions/${id}/wake`)).status()).toBe(409);
+
   await page.goto('/settings');
   const deleted = page.getByTestId('deleted-sessions').getByTestId('deleted-session');
   await expect(deleted.filter({ hasText: 'Delete me' })).toBeVisible();

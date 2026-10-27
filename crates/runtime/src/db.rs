@@ -185,34 +185,52 @@ pub async fn list_sessions(db: &PgPool, owner: &str) -> sqlx::Result<Vec<Session
 pub async fn deleted_sessions(db: &PgPool, owner: &str) -> sqlx::Result<Vec<SessionRow>> {
     sqlx::query_as(AssertSqlSafe(format!(
         "select {SESSION_COLUMNS} from sessions where owner = $1 and kind = 'work' and deleted_at is not null \
-         and phase <> 'stopped' order by deleted_at desc"
+         and purge_started_at is null order by deleted_at desc"
     )))
     .bind(owner)
     .fetch_all(db)
     .await
 }
 
-/// Marks a session deleted, or restores it.
-pub async fn set_deleted(db: &PgPool, id: Uuid, deleted: bool) -> sqlx::Result<()> {
-    sqlx::query("update sessions set deleted_at = case when $2 then now() end where id = $1")
+/// Marks a session deleted.
+pub async fn mark_deleted(db: &PgPool, id: Uuid) -> sqlx::Result<()> {
+    sqlx::query("update sessions set deleted_at = now() where id = $1 and deleted_at is null")
         .bind(id)
-        .bind(deleted)
         .execute(db)
         .await
         .map(|_| ())
 }
 
-/// Sessions deleted longer than `age` ago and not purged yet.
-pub async fn purgeable_sessions(
-    db: &PgPool,
-    age: chrono::Duration,
-) -> sqlx::Result<Vec<SessionRow>> {
+/// Restores a deleted session, unless a purge has claimed it; returns whether it did.
+pub async fn restore(db: &PgPool, id: Uuid) -> sqlx::Result<bool> {
+    let result = sqlx::query(
+        "update sessions set deleted_at = null where id = $1 and deleted_at is not null and purge_started_at is null",
+    )
+    .bind(id)
+    .execute(db)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Claims the sessions deleted longer than `age` ago for purging, including ones an earlier purge didn't finish.
+/// A claimed session can no longer be restored.
+pub async fn claim_purges(db: &PgPool, age: chrono::Duration) -> sqlx::Result<Vec<SessionRow>> {
     sqlx::query_as(AssertSqlSafe(format!(
-        "select {SESSION_COLUMNS} from sessions where deleted_at < $1 and phase <> 'stopped'"
+        "update sessions set purge_started_at = coalesce(purge_started_at, now()) \
+         where deleted_at < $1 and purged_at is null returning {SESSION_COLUMNS}"
     )))
     .bind(Utc::now() - age)
     .fetch_all(db)
     .await
+}
+
+/// Records that a purge removed everything of the session.
+pub async fn finish_purge(db: &PgPool, id: Uuid) -> sqlx::Result<()> {
+    sqlx::query("update sessions set purged_at = now() where id = $1")
+        .bind(id)
+        .execute(db)
+        .await
+        .map(|_| ())
 }
 
 pub async fn active_sessions(db: &PgPool) -> sqlx::Result<Vec<SessionRow>> {

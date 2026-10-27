@@ -1120,6 +1120,9 @@ async function handleApi(req, res, url) {
       session.setPhase('parked');
       return json(res, 200, session.data);
     }
+    if (parts.length === 3 && parts[2] === 'wake' && method === 'POST' && session.data.deleted_at) {
+      return json(res, 409, { error: 'the session is deleted; restore it first' });
+    }
     if (parts.length === 3 && parts[2] === 'wake' && method === 'POST') {
       if (session.data.phase === 'parked') {
         session.setPhase('starting');
