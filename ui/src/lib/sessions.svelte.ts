@@ -12,11 +12,17 @@ class SessionStore {
   /** How many sessions were removed so far, and which, with the count when each was. */
   #removals = 0;
   #removed = new Map<string, number>();
+  /** Refreshes started, and the latest one whose list was applied: an older list never replaces a newer one. */
+  #refreshes = 0;
+  #applied = 0;
 
   async refresh() {
+    const refresh = ++this.#refreshes;
     const removals = this.#removals;
     try {
       const fetched = await api.listSessions();
+      if (refresh < this.#applied) return;
+      this.#applied = refresh;
       const current = new Map(this.list.map((session) => [session.id, session]));
       // A list fetched before a removal may still have the session.
       this.list = fetched
