@@ -48,3 +48,7 @@ Extension points so far:
 
 - Good: extracting plugins later is mostly packaging, and third parties can extend sloppod without forking it.
 - Bad: we design interfaces before we've learned their shape. Versioned contracts will need care when we change them.
+
+## More Information
+
+2026-10-27: the `CredentialProvider` trait was removed from `sloppod-contracts` because nothing implemented it. GitHub installation tokens are minted by the GitHub client, which the GitHub request policy calls when it decides to attach a credential. Credential provider stays an extension point in the design; its contract comes back when there's a second provider to shape it against.
