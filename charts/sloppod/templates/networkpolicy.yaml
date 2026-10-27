@@ -24,4 +24,10 @@ spec:
         - ports:
             - port: "8080"
               protocol: TCP
+    # Session pods, through their own egress policy, which only allows this port.
+    - fromEntities: [cluster]
+      toPorts:
+        - ports:
+            - port: "8081"
+              protocol: TCP
 {{- end }}

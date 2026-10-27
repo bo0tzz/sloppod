@@ -11,6 +11,10 @@ spec:
     - name: http
       port: 8080
       targetPort: http
+    # The supervisor link and the MCP endpoint; the only port session pods may reach.
+    - name: sessions
+      port: 8081
+      targetPort: sessions
     # Envoy's ext_authz calls the authorizer here (ADR 11).
     - name: authz
       port: 9001

@@ -1,17 +1,27 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
-use sloppod_contracts::{Decision, HttpRequest, Manifest, RequestPolicy, Result, SessionContext};
+use sloppod_contracts::{
+    Decision, Error, HttpRequest, Manifest, RequestPolicy, Result, SessionContext,
+};
+
+use crate::credentials::{CLAUDE, Credentials};
 
 const INFERENCE: &[&str] = &["/v1/messages", "/v1/messages/count_tokens"];
 
-/// The Anthropic API: inference only, with the runtime's OAuth token (ADR 11 spike results).
+/// The Anthropic API: inference only, with the owner's Claude account (ADR 11 spike results).
 pub struct ModelPolicy {
-    oauth_token: String,
+    credentials: Arc<Credentials>,
 }
 
 impl ModelPolicy {
-    pub fn new(oauth_token: String) -> Self {
-        Self { oauth_token }
+    pub fn new(credentials: Arc<Credentials>) -> Self {
+        Self { credentials }
     }
+}
+
+fn is_inference(request: &HttpRequest) -> bool {
+    request.method == "POST" && INFERENCE.contains(&request.path_only())
 }
 
 #[async_trait]
@@ -24,21 +34,34 @@ impl RequestPolicy for ModelPolicy {
         vec!["api.anthropic.com".into()]
     }
 
-    async fn decide(&self, _session: &SessionContext, request: &HttpRequest) -> Result<Decision> {
-        if request.method == "POST" && INFERENCE.contains(&request.path_only()) {
-            return Ok(Decision::allow_with(
-                vec![(
-                    "authorization".into(),
-                    format!("Bearer {}", self.oauth_token),
-                )],
-                vec!["x-api-key".into()],
+    async fn decide(&self, session: &SessionContext, request: &HttpRequest) -> Result<Decision> {
+        if !session.has("model") {
+            return Ok(Decision::deny(
+                "sloppod: this session has no model access.\n",
             ));
         }
-        Ok(Decision::deny(format!(
-            "sloppod: sessions may only call the model API's inference endpoint (POST /v1/messages); {} {} was refused.\n",
-            request.method,
-            request.path_only()
-        )))
+        if !is_inference(request) {
+            return Ok(Decision::deny(format!(
+                "sloppod: sessions may only call the model API's inference endpoint (POST /v1/messages); {} {} was refused.\n",
+                request.method,
+                request.path_only()
+            )));
+        }
+        let account = self
+            .credentials
+            .secret(&session.owner, CLAUDE)
+            .await
+            .map_err(|e| Error::new(e.to_string()))?;
+        let Some((_, token)) = account else {
+            return Ok(Decision::deny(format!(
+                "sloppod: {} has no Claude account configured; add one in sloppod's settings.\n",
+                session.owner
+            )));
+        };
+        Ok(Decision::allow_with(
+            vec![("authorization".into(), format!("Bearer {token}"))],
+            vec!["x-api-key".into()],
+        ))
     }
 }
 
@@ -58,47 +81,16 @@ mod tests {
         }
     }
 
-    fn session() -> SessionContext {
-        SessionContext {
-            session_id: "s".into(),
-            repo: "o/r".into(),
-            branch: "sloppod/s".into(),
-            memory_namespace: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn inference_gets_the_token() {
-        let policy = ModelPolicy::new("real".into());
-        let decision = policy
-            .decide(&session(), &request("POST", "/v1/messages?beta=true"))
-            .await
-            .unwrap();
-        assert_eq!(
-            decision,
-            Decision::allow_with(
-                vec![("authorization".into(), "Bearer real".into())],
-                vec!["x-api-key".into()]
-            )
-        );
-    }
-
-    #[tokio::test]
-    async fn everything_else_is_refused() {
-        let policy = ModelPolicy::new("real".into());
+    #[test]
+    fn only_inference_is_allowed() {
+        assert!(is_inference(&request("POST", "/v1/messages?beta=true")));
+        assert!(is_inference(&request("POST", "/v1/messages/count_tokens")));
         for (method, path) in [
             ("GET", "/api/claude_code/settings"),
             ("POST", "/api/event_logging/v2/batch"),
             ("GET", "/v1/messages"),
         ] {
-            let decision = policy
-                .decide(&session(), &request(method, path))
-                .await
-                .unwrap();
-            assert!(
-                matches!(decision, Decision::Deny { status: 403, .. }),
-                "{method} {path}"
-            );
+            assert!(!is_inference(&request(method, path)), "{method} {path}");
         }
     }
 }

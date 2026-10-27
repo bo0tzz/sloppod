@@ -9,6 +9,7 @@ use sloppod_contracts::{Error, Manifest, ProposalKind, Result, SessionContext, T
 use sloppod_protocol::api::Proposal;
 use uuid::Uuid;
 
+use crate::credentials::Credentials;
 use crate::github::GitHubApp;
 use crate::{AppState, db};
 
@@ -38,12 +39,17 @@ impl ProposalKinds {
 }
 
 pub struct PullRequest {
-    app: Arc<GitHubApp>,
+    credentials: Arc<Credentials>,
 }
 
 impl PullRequest {
-    pub fn new(app: Arc<GitHubApp>) -> Self {
-        Self { app }
+    pub fn new(credentials: Arc<Credentials>) -> Self {
+        Self { credentials }
+    }
+
+    /// The session owner's GitHub App, which both reads the comparison and opens the PR.
+    async fn app(&self, session: &SessionContext) -> Result<Arc<GitHubApp>> {
+        self.credentials.github(&session.owner).await.map_err(err)
     }
 }
 
@@ -82,29 +88,32 @@ impl ProposalKind for PullRequest {
     }
 
     async fn prepare(&self, session: &SessionContext, arguments: Value) -> Result<Value> {
+        let Some(grant) = session.writable_repo() else {
+            return Err(Error::new(
+                "this session has no repository, so there's nothing to open a pull request from",
+            ));
+        };
+        let (repo, branch) = (grant.repo, grant.branch);
+        let app = self.app(session).await?;
         let title = arguments["title"].as_str().filter(|t| !t.trim().is_empty());
         let Some(title) = title else {
             return Err(Error::new("a title is required"));
         };
         let base = match arguments["base"].as_str() {
             Some(base) => base.to_owned(),
-            None => self.app.default_branch(&session.repo).await.map_err(err)?,
+            None => app.default_branch(repo).await.map_err(err)?,
         };
-        let comparison = self
-            .app
-            .compare(&session.repo, &base, &session.branch)
-            .await
-            .map_err(err)?;
+        let comparison = app.compare(repo, &base, branch).await.map_err(err)?;
         if comparison.ahead_by == 0 {
             return Err(Error::new(format!(
                 "`{}` has no commits that aren't on `{base}`; commit and `git push origin HEAD:{}` first",
-                session.branch, session.branch
+                branch, branch
             )));
         }
         Ok(json!({
-            "repo": session.repo,
+            "repo": repo,
             "base": base,
-            "head": session.branch,
+            "head": branch,
             "title": title,
             "body": arguments["body"].as_str().unwrap_or_default(),
             "draft": arguments["draft"].as_bool().unwrap_or(false),
@@ -113,10 +122,11 @@ impl ProposalKind for PullRequest {
 
     async fn detail(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
         let base = payload["base"].as_str().unwrap_or("main");
-        let head = payload["head"].as_str().unwrap_or(&session.branch);
+        let head = payload["head"].as_str().unwrap_or_default();
         let comparison = self
-            .app
-            .compare(&session.repo, base, head)
+            .app(session)
+            .await?
+            .compare(payload["repo"].as_str().unwrap_or_default(), base, head)
             .await
             .map_err(err)?;
         Ok(json!({
@@ -133,8 +143,9 @@ impl ProposalKind for PullRequest {
             "base": payload["base"],
             "draft": payload["draft"],
         });
-        self.app
-            .create_pull(&session.repo, &request)
+        self.app(session)
+            .await?
+            .create_pull(payload["repo"].as_str().unwrap_or_default(), &request)
             .await
             .map_err(err)
     }
@@ -155,7 +166,7 @@ pub async fn propose(
         .await
         .map_err(|e| e.to_string())?
         .ok_or("unknown session")?;
-    let context = state.session_context(&session);
+    let context = session.context();
     let payload = kind.prepare(&context, arguments).await.map_err(|e| e.0)?;
     let row = db::insert_proposal(&state.db, session_id, &kind.kind(), &payload)
         .await
@@ -176,12 +187,27 @@ pub enum Verdict {
 }
 
 /// Applies a human's decision; approving executes immediately (ADR 3).
+/// A proposal, if its session belongs to `owner`.
+async fn owned_proposal(
+    state: &AppState,
+    id: Uuid,
+    owner: &str,
+) -> anyhow::Result<Option<db::ProposalRow>> {
+    let Some(row) = db::get_proposal(&state.db, id).await? else {
+        return Ok(None);
+    };
+    Ok(db::owned_session(&state.db, row.session_id, owner)
+        .await?
+        .map(|_| row))
+}
+
 pub async fn decide(
     state: &AppState,
     id: Uuid,
     verdict: Verdict,
+    owner: &str,
 ) -> anyhow::Result<Option<Proposal>> {
-    let Some(row) = db::get_proposal(&state.db, id).await? else {
+    let Some(row) = owned_proposal(state, id, owner).await? else {
         return Ok(None);
     };
     let mut payload = row.payload.clone();
@@ -197,7 +223,8 @@ pub async fn decide(
         }
         Verdict::Reject { reason } => ("rejected", reason),
     };
-    let Some(row) = db::decide_proposal(&state.db, id, status, &payload, reason.as_deref()).await?
+    let Some(row) =
+        db::decide_proposal(&state.db, id, status, &payload, reason.as_deref(), owner).await?
     else {
         anyhow::bail!("proposal {id} was already decided");
     };
@@ -212,10 +239,7 @@ pub async fn decide(
     let session = db::get_session(&state.db, row.session_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("session gone"))?;
-    let finished = match kind
-        .execute(&state.session_context(&session), &payload)
-        .await
-    {
+    let finished = match kind.execute(&session.context(), &payload).await {
         Ok(result) => db::finish_proposal(&state.db, id, "executed", Some(&result), None).await?,
         Err(e) => db::finish_proposal(&state.db, id, "failed", None, Some(&e.0)).await?,
     };
@@ -224,8 +248,8 @@ pub async fn decide(
     Ok(Some(proposal))
 }
 
-pub async fn detail(state: &AppState, id: Uuid) -> anyhow::Result<Option<Value>> {
-    let Some(row) = db::get_proposal(&state.db, id).await? else {
+pub async fn detail(state: &AppState, id: Uuid, owner: &str) -> anyhow::Result<Option<Value>> {
+    let Some(row) = owned_proposal(state, id, owner).await? else {
         return Ok(None);
     };
     let mut proposal = serde_json::to_value(row.to_api())?;
@@ -236,10 +260,7 @@ pub async fn detail(state: &AppState, id: Uuid) -> anyhow::Result<Option<Value>>
     let session = db::get_session(&state.db, row.session_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("session gone"))?;
-    match kind
-        .detail(&state.session_context(&session), &row.payload)
-        .await
-    {
+    match kind.detail(&session.context(), &row.payload).await {
         Ok(Value::Object(extra)) => {
             for (k, v) in extra {
                 proposal[k] = v;

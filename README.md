@@ -21,6 +21,7 @@ Concepts:
 - [5. Sessions can be parked and woken](docs/adr/0005-park-and-wake.md)
 - [6. The runtime is self-referential](docs/adr/0006-self-reference.md)
 - [7. Extension points have plugin-shaped boundaries](docs/adr/0007-extension-points.md)
+- [23. Users and ownership](docs/adr/0023-users-and-ownership.md)
 
 Approach:
 
@@ -32,6 +33,8 @@ Approach:
 - [13. Container workloads run inside or beside the session pod](docs/adr/0013-container-workloads.md)
 - [19. Repositories come from runtime-managed mirrors](docs/adr/0019-repositories-from-runtime-mirrors.md)
 - [20. Inference accounts can be switched under a running session](docs/adr/0020-switchable-inference-accounts.md)
+- [21. Credentials live in the runtime](docs/adr/0021-credentials-live-in-the-runtime.md)
+- [22. memini keys per session](docs/adr/0022-memini-keys-per-session.md)
 
 Implementation:
 

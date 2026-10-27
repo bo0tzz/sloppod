@@ -17,7 +17,7 @@ import {
 } from '@mdi/js';
 import type { Color } from '@immich/ui';
 import type { PlanEntry, ToolCallStatus, ToolKind } from './acp/types.ts';
-import type { Phase, ProposalStatus } from './api.ts';
+import type { CredentialKind, Phase, ProposalStatus } from './api.ts';
 
 export const phases: Record<Phase, { label: string; color: Color; description: string }> = {
   starting: { label: 'Starting', color: 'info', description: 'The pod is starting or the agent has not connected yet' },
@@ -73,3 +73,48 @@ export function hasInput(rawInput: unknown): boolean {
   if (rawInput === undefined || rawInput === null) return false;
   return typeof rawInput !== 'object' || Object.keys(rawInput).length > 0;
 }
+
+export type CredentialKindSpec = {
+  kind: CredentialKind;
+  title: string;
+  noun: string;
+  description: string;
+  empty: string;
+  fields: { key: string; label: string; type?: string; placeholder?: string }[];
+  secret: { label: string; description?: string; multiline?: boolean; placeholder?: string };
+};
+
+export const credentialKinds: CredentialKindSpec[] = [
+  {
+    kind: 'claude',
+    title: 'Claude accounts',
+    noun: 'Claude account',
+    description: 'Model access for your sessions.',
+    empty: "No Claude account yet. Sessions can't start without one.",
+    fields: [],
+    secret: { label: 'Token', description: 'Run `claude setup-token` and paste the token it prints.' },
+  },
+  {
+    kind: 'github-app',
+    title: 'GitHub Apps',
+    noun: 'GitHub App',
+    description: 'Repository access: sessions can work on the repositories the app is installed on.',
+    empty: "No GitHub App yet. Sessions can't work on repositories without one.",
+    fields: [{ key: 'app_id', label: 'App ID', placeholder: '123456' }],
+    secret: {
+      label: 'Private key',
+      description: 'The PEM file GitHub generated for the app.',
+      multiline: true,
+      placeholder: 'Paste the .pem file here',
+    },
+  },
+  {
+    kind: 'memini',
+    title: 'memini',
+    noun: 'memini server',
+    description: 'Shared memory across sessions.',
+    empty: 'No memini server yet.',
+    fields: [{ key: 'url', label: 'URL', type: 'url', placeholder: 'https://memini.example.com' }],
+    secret: { label: 'Admin key' },
+  },
+];

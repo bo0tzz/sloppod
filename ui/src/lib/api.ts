@@ -3,18 +3,22 @@ export type Phase = 'starting' | 'idle' | 'working' | 'waiting' | 'disconnected'
 export type Session = {
   id: string;
   title: string;
-  repo: string;
-  branch: string;
+  repo: string | null;
+  branch: string | null;
+  grants: Grant[];
   phase: Phase;
   created_at: string;
   updated_at: string;
 };
 
 export type NewSession = {
-  repo: string;
+  /** The first message. The runtime records it right away and derives the repository from it. */
+  prompt: string;
+  repo?: string;
   title?: string;
-  prompt?: string;
 };
+
+export type Grant = { capability: string; params: Record<string, unknown> };
 
 export type ProposalStatus = 'pending' | 'approved' | 'rejected' | 'executed' | 'failed';
 
@@ -34,6 +38,24 @@ export type Proposal = {
 export type ProposalDetail = Proposal & {
   diff: string;
   commits: { sha: string; message: string }[];
+};
+
+export type CredentialKind = 'claude' | 'github-app' | 'memini';
+
+export type Credential = {
+  id: string;
+  kind: CredentialKind;
+  name: string;
+  config: Record<string, string>;
+  default: boolean;
+  created_at: string;
+};
+
+export type NewCredential = {
+  kind: CredentialKind;
+  name: string;
+  config: Record<string, string>;
+  secret: string;
 };
 
 export class ApiError extends Error {
@@ -75,6 +97,11 @@ export const api = {
   createSession: (body: NewSession) => call<Session>('POST', '/sessions', body),
   deleteSession: (id: string) => call<void>('DELETE', `/sessions/${encodeURIComponent(id)}`),
   listRepos: () => call<string[]>('GET', '/repos'),
+  me: () => call<{ user: string }>('GET', '/me'),
+  listCredentials: () => call<Credential[]>('GET', '/credentials'),
+  createCredential: (body: NewCredential) => call<Credential>('POST', '/credentials', body),
+  makeDefaultCredential: (id: string) => call<Credential>('POST', `/credentials/${encodeURIComponent(id)}/default`, {}),
+  deleteCredential: (id: string) => call<void>('DELETE', `/credentials/${encodeURIComponent(id)}`),
   listProposals: (query: { session?: string; status?: ProposalStatus }) => {
     const params = new URLSearchParams();
     if (query.session) params.set('session', query.session);

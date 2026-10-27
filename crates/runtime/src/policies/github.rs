@@ -7,23 +7,27 @@ use sloppod_contracts::{
     Decision, Error, HttpRequest, Manifest, RequestPolicy, Result, SessionContext,
 };
 
+use crate::credentials::Credentials;
 use crate::github::GitHubApp;
 
-/// GitHub: reads with the app's token, pushes only to the session branch, all other writes through proposals.
+/// GitHub: reads with the owner's GitHub App, pushes only to the session branch, all other writes through
+/// proposals.
 pub struct GitHubPolicy {
-    app: Arc<GitHubApp>,
+    credentials: Arc<Credentials>,
+}
+
+fn err(e: impl std::fmt::Display) -> Error {
+    Error::new(e.to_string())
 }
 
 impl GitHubPolicy {
-    pub fn new(app: Arc<GitHubApp>) -> Self {
-        Self { app }
+    pub fn new(credentials: Arc<Credentials>) -> Self {
+        Self { credentials }
     }
 
-    async fn token(&self, repo: &str) -> Result<String> {
-        self.app
-            .token_for(repo)
-            .await
-            .map_err(|e| Error::new(e.to_string()))
+    /// The owner's GitHub App, if they configured one.
+    async fn app(&self, session: &SessionContext) -> Option<Arc<GitHubApp>> {
+        self.credentials.github(&session.owner).await.ok()
     }
 
     async fn git(
@@ -34,53 +38,64 @@ impl GitHubPolicy {
     ) -> Result<Decision> {
         match git.service {
             Service::UploadPack => {
-                // Public repositories outside the app's installations are still readable without a token.
-                let headers = match self.token(&git.repo).await {
-                    Ok(token) => vec![("authorization".into(), basic(&token))],
-                    Err(_) => Vec::new(),
+                // Repositories outside the app's installations may still be public, so read those without a token.
+                let token = match self.app(session).await {
+                    Some(app) => app.token_for(&git.repo).await.ok(),
+                    None => None,
                 };
+                let headers = token
+                    .map(|t| vec![("authorization".into(), basic(&t))])
+                    .unwrap_or_default();
                 Ok(Decision::allow_with(headers, vec!["authorization".into()]))
             }
             Service::ReceivePack => {
-                if !git.repo.eq_ignore_ascii_case(&session.repo) {
+                let Some(grant) = session.writable_repo() else {
+                    return Ok(Decision::deny(
+                        "sloppod: this session has no repository to push to.\n",
+                    ));
+                };
+                let (repo, branch) = (grant.repo, grant.branch);
+                if !git.repo.eq_ignore_ascii_case(repo) {
                     return Ok(Decision::deny(format!(
-                        "sloppod: this session can only push to {}, not {}.\n",
-                        session.repo, git.repo
+                        "sloppod: this session can only push to {repo}, not {}.\n",
+                        git.repo
                     )));
                 }
-                if git.advertisement {
-                    let token = self.token(&session.repo).await?;
-                    return Ok(Decision::allow_with(
-                        vec![("authorization".into(), basic(&token))],
-                        Vec::new(),
-                    ));
-                }
-                match pushed_refs(&request.body) {
-                    Some(push) if !push.refs.is_empty() => {
-                        let allowed = format!("refs/heads/{}", session.branch);
-                        if let Some(bad) = push
-                            .refs
-                            .iter()
-                            .find(|r| **r != allowed && !r.starts_with(&format!("{allowed}/")))
-                        {
-                            let message = format!(
-                                "sloppod: pushes may only update your session branch `{}`, so `{bad}` was refused. \
-                                 Push with `git push origin HEAD:{}`. To get changes into another branch, \
-                                 propose a pull request with the propose_pull_request tool.",
-                                session.branch, session.branch
-                            );
-                            return Ok(push.reject(&message));
+                let Some(app) = self.app(session).await else {
+                    return Ok(Decision::deny(format!(
+                        "sloppod: {} has no GitHub App configured.\n",
+                        session.owner
+                    )));
+                };
+                if !git.advertisement {
+                    match pushed_refs(&request.body) {
+                        Some(push) if !push.refs.is_empty() => {
+                            let allowed = format!("refs/heads/{branch}");
+                            if let Some(bad) = push
+                                .refs
+                                .iter()
+                                .find(|r| **r != allowed && !r.starts_with(&format!("{allowed}/")))
+                            {
+                                let message = format!(
+                                    "sloppod: pushes may only update your session branch `{branch}`, so `{bad}` was refused. \
+                                     Push with `git push origin HEAD:{branch}`. To get changes into another branch, \
+                                     propose a pull request with the propose_pull_request tool."
+                                );
+                                return Ok(push.reject(&message));
+                            }
                         }
-                        let token = self.token(&session.repo).await?;
-                        Ok(Decision::allow_with(
-                            vec![("authorization".into(), basic(&token))],
-                            Vec::new(),
-                        ))
+                        _ => {
+                            return Ok(Decision::deny(
+                                "sloppod: could not read which refs this push updates.\n",
+                            ));
+                        }
                     }
-                    _ => Ok(Decision::deny(
-                        "sloppod: could not read which refs this push updates.\n",
-                    )),
                 }
+                let token = app.token_for(repo).await.map_err(err)?;
+                Ok(Decision::allow_with(
+                    vec![("authorization".into(), basic(&token))],
+                    Vec::new(),
+                ))
             }
         }
     }
@@ -122,11 +137,17 @@ impl GitHubPolicy {
                 session,
             )));
         }
-        let token = self.token(&session.repo).await?;
-        Ok(Decision::allow_with(
-            vec![("authorization".into(), format!("token {token}"))],
-            Vec::new(),
-        ))
+        // Reads use the session repository's installation, or any installation for sessions without one. Without
+        // a GitHub App they go out unauthenticated.
+        let token = match (self.app(session).await, session.writable_repo()) {
+            (Some(app), Some(grant)) => Some(app.token_for(grant.repo).await.map_err(err)?),
+            (Some(app), None) => Some(app.any_token().await.map_err(err)?),
+            (None, _) => None,
+        };
+        let headers = token
+            .map(|t| vec![("authorization".into(), format!("token {t}"))])
+            .unwrap_or_default();
+        Ok(Decision::allow_with(headers, vec!["authorization".into()]))
     }
 }
 
@@ -141,6 +162,11 @@ impl RequestPolicy for GitHubPolicy {
     }
 
     async fn decide(&self, session: &SessionContext, request: &HttpRequest) -> Result<Decision> {
+        if !session.has("github") {
+            return Ok(Decision::deny(
+                "sloppod: this session has no GitHub access.\n",
+            ));
+        }
         match request.host.as_str() {
             "api.github.com" => self.api(session, request).await,
             _ => {
@@ -167,11 +193,16 @@ impl RequestPolicy for GitHubPolicy {
 }
 
 fn proposal_hint(what: &str, session: &SessionContext) -> String {
+    let pull_request = match session.writable_repo() {
+        Some(grant) => format!(
+            "to open a pull request, push to your session branch `{}` and call the propose_pull_request tool",
+            grant.branch
+        ),
+        None => "this session has no repository, so it can't propose pull requests".to_owned(),
+    };
     format!(
-        "sloppod: {what}. Outward actions go through human review: to open a pull request, push to your \
-         session branch `{}` and call the propose_pull_request tool. Other GitHub writes (comments, issues, \
-         reviews, releases) aren't available to sessions yet.\n",
-        session.branch
+        "sloppod: {what}. Outward actions go through human review: {pull_request}. Other GitHub writes \
+         (comments, issues, reviews, releases) aren't available to sessions yet.\n"
     )
 }
 

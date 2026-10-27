@@ -4,7 +4,8 @@
 //   node mock/server.mjs [--port 8080] [--static build] [--delay 40] [--no-seed]
 //
 // --static serves a built UI with SPA fallback, like the runtime does. --delay is the pause between
-// streamed chunks in milliseconds; turn steps are multiples of it.
+// streamed chunks in milliseconds; turn steps are multiples of it. A new session's agent takes eight
+// steps to start, or three seconds when its first message contains "slow start" (for testing the queue).
 
 import { randomBytes, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
@@ -37,6 +38,7 @@ const CANCELLED = Symbol('cancelled');
 const sessions = new Map();
 const proposals = new Map();
 const connections = new Set();
+const credentials = [];
 
 const now = () => new Date().toISOString();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -53,6 +55,9 @@ class MockSession {
     this.pending = new Map();
     this.turn = null;
     this.modeId = 'default';
+    /** Prompts sent before the agent was up: {text, done(stopReason), fail(error)}. */
+    this.queue = [];
+    this.startTimer = null;
   }
 
   emit(update) {
@@ -63,6 +68,10 @@ class MockSession {
 
   setPhase(phase) {
     this.data.phase = phase;
+    this.broadcast();
+  }
+
+  broadcast() {
     this.data.updated_at = now();
     for (const conn of this.subscribers) conn.notify('_sloppod/session', { session: this.data });
   }
@@ -174,8 +183,8 @@ function sendPermission(session, pending, conn) {
 function resolvePermission(session, pending, outcome, answeredBy) {
   const toolCallId = pending.toolCall.toolCallId;
   session.pending.delete(toolCallId);
-  for (const conn of pending.requests.keys()) {
-    if (conn !== answeredBy) conn.notify('_sloppod/permission_resolved', { sessionId: session.data.id, toolCallId });
+  for (const conn of [...pending.requests.keys(), ...(answeredBy ? [answeredBy] : [])]) {
+    conn.notify('_sloppod/permission_resolved', { sessionId: session.data.id, toolCallId });
   }
   pending.requests.clear();
   if (session.data.phase === 'waiting') session.setPhase('working');
@@ -187,6 +196,12 @@ async function runTurn(session, text, { echo = true } = {}) {
   session.turn = turn;
   session.setPhase('working');
   if (echo) echoUser(session, text);
+  if (!session.data.title) {
+    const title = text.split('\n')[0].slice(0, 60);
+    session.emit({ sessionUpdate: 'session_info_update', title, updatedAt: now() });
+    session.data.title = title;
+    session.broadcast();
+  }
   try {
     await agentScript(session, turn, text);
     return 'end_turn';
@@ -338,6 +353,12 @@ async function agentScript(session, turn, prompt) {
   plan(['completed', 'completed', 'completed', 'in_progress']);
   await step(2);
 
+  if (!session.data.repo) {
+    plan(['completed', 'completed', 'completed', 'completed']);
+    await say("Done. The tests pass. This session has no repository, so there's nothing to push or propose.");
+    return;
+  }
+
   const pushId = randomUUID();
   tool({
     toolCallId: pushId,
@@ -424,21 +445,70 @@ function broadcastProposal(proposal) {
   for (const conn of session?.subscribers ?? []) conn.notify('_sloppod/proposal', { proposal: publicProposal(proposal) });
 }
 
-function createSession({ repo, title, prompt }) {
+const availableRepos = () => (credentials.some((c) => c.kind === 'github-app') ? REPOS : []);
+
+/** An `owner/name` the user can access, or a bare name that matches exactly one of them. */
+function deriveRepo(prompt) {
+  const repos = availableRepos();
+  const full = repos.find((repo) => prompt.includes(repo));
+  if (full) return full;
+  const bare = repos.filter((repo) => new RegExp(`\\b${repo.split('/')[1]}\\b`, 'i').test(prompt));
+  return bare.length === 1 ? bare[0] : null;
+}
+
+/** Creates a session from its first message, which is recorded right away and queued for the agent. */
+function createSession({ prompt, repo, title }) {
   const id = randomUUID();
   const created = now();
+  const sessionRepo = repo ?? deriveRepo(prompt);
+  const branch = sessionRepo ? `sloppod/${id.slice(0, 8)}` : null;
   const session = new MockSession({
     id,
-    title: title || prompt?.split('\n')[0].slice(0, 60) || 'Untitled session',
-    repo,
-    branch: `sloppod/${id.slice(0, 8)}`,
+    title: title ?? '',
+    repo: sessionRepo,
+    branch,
+    grants: [
+      { capability: 'model', params: {} },
+      { capability: 'github', params: {} },
+      { capability: 'packages', params: {} },
+      ...(sessionRepo ? [{ capability: 'repo', params: { repo: sessionRepo, access: 'rw', branch } }] : []),
+      { capability: 'memory', params: { namespace: sessionRepo ?? 'bo0tzz', access: 'rw' } },
+    ],
     phase: 'starting',
     created_at: created,
     updated_at: created,
   });
   sessions.set(id, session);
+  queuePrompt(session, prompt);
   return session;
 }
+
+function queuePrompt(session, text, done = () => {}, fail = () => {}) {
+  echoUser(session, text);
+  session.queue.push({ text, done, fail });
+}
+
+/** Brings the agent up after `ms`, then runs everything queued so far as one turn. */
+function startAgent(session, ms) {
+  if (session.startTimer) return;
+  session.startTimer = setTimeout(() => {
+    session.startTimer = null;
+    if (!sessions.has(session.data.id)) return;
+    session.setPhase('idle');
+    const items = session.queue.splice(0);
+    if (items.length === 0) return;
+    runTurn(
+      session,
+      items.map((item) => item.text).join('\n\n'),
+      { echo: false },
+    ).then(
+      (stopReason) => items.forEach((item) => item.done(stopReason)),
+      (error) => items.forEach((item) => item.fail(error)),
+    );
+  }, ms);
+}
+
+const startupDelay = (prompt) => (/slow start/i.test(prompt) ? 3000 : DELAY * 8);
 
 function cancelTurn(session) {
   if (session.turn) session.turn.cancelled = true;
@@ -486,6 +556,16 @@ function handleCall(conn, message) {
 
     case 'session/prompt': {
       if (!needLoaded()) return;
+      if (session.data.phase === 'starting' || session.data.phase === 'disconnected') {
+        queuePrompt(
+          session,
+          promptText(params.prompt),
+          (stopReason) => conn.respond(id, { stopReason }),
+          (error) => conn.error(id, -32603, String(error)),
+        );
+        startAgent(session, DELAY * 8);
+        return;
+      }
       if (session.turn) {
         conn.error(id, -32000, 'A turn is already running; use _session/steering');
         return;
@@ -508,6 +588,12 @@ function handleCall(conn, message) {
     case '_session/steering': {
       if (!needLoaded()) return;
       const text = promptText(params.prompt);
+      if (session.data.phase === 'starting' || session.data.phase === 'disconnected') {
+        queuePrompt(session, text);
+        startAgent(session, DELAY * 8);
+        conn.respond(id, { outcome: 'startedNewTurn' });
+        return;
+      }
       if (!session.turn) {
         if (session.data.phase !== 'idle') {
           conn.error(id, -32000, `The session is ${session.data.phase}`);
@@ -561,19 +647,26 @@ async function handleApi(req, res, url) {
   const parts = url.pathname.replace(/^\/api\/v1\/?/, '').split('/').filter(Boolean);
   const method = req.method;
 
-  if (parts[0] === 'repos' && parts.length === 1 && method === 'GET') return json(res, 200, REPOS);
+  if (parts[0] === 'repos' && parts.length === 1 && method === 'GET') return json(res, 200, availableRepos());
+  if (parts[0] === 'me' && parts.length === 1 && method === 'GET') {
+    return json(res, 200, { user: req.headers['x-forwarded-user'] ?? 'bo0tzz' });
+  }
+
+  if (parts[0] === 'credentials') return handleCredentials(req, res, parts);
 
   if (parts[0] === 'sessions') {
     if (parts.length === 1 && method === 'GET') return json(res, 200, sortedSessions());
     if (parts.length === 1 && method === 'POST') {
       const body = await readBody(req);
-      if (!REPOS.includes(body.repo)) return json(res, 400, { error: `unknown repository ${body.repo}` });
+      if (typeof body.prompt !== 'string' || !body.prompt.trim()) return json(res, 400, { error: 'prompt is required' });
+      if (body.repo !== undefined && !availableRepos().includes(body.repo)) {
+        return json(res, 400, { error: `unknown repository ${body.repo}` });
+      }
+      if (!credentials.some((c) => c.kind === 'claude')) {
+        return json(res, 409, { error: 'no Claude account configured' });
+      }
       const session = createSession(body);
-      setTimeout(() => {
-        if (!sessions.has(session.data.id)) return;
-        session.setPhase('idle');
-        if (body.prompt) void runTurn(session, body.prompt);
-      }, DELAY * 8);
+      startAgent(session, startupDelay(body.prompt));
       return json(res, 201, session.data);
     }
     const session = sessions.get(parts[1]);
@@ -622,6 +715,51 @@ async function handleApi(req, res, url) {
   return json(res, 404, { error: 'not found' });
 }
 
+const CREDENTIAL_CONFIG = { claude: [], 'github-app': ['app_id'], memini: ['url'] };
+
+function addCredential({ kind, name, config }) {
+  const credential = {
+    id: randomUUID(),
+    kind,
+    name,
+    config,
+    default: !credentials.some((c) => c.kind === kind),
+    created_at: now(),
+  };
+  credentials.push(credential);
+  return credential;
+}
+
+async function handleCredentials(req, res, parts) {
+  const method = req.method;
+  if (parts.length === 1 && method === 'GET') return json(res, 200, credentials);
+  if (parts.length === 1 && method === 'POST') {
+    const body = await readBody(req);
+    const keys = CREDENTIAL_CONFIG[body.kind];
+    if (!keys) return json(res, 400, { error: `unknown credential kind ${body.kind}` });
+    if (!body.name?.trim() || !body.secret?.trim()) return json(res, 400, { error: 'name and secret are required' });
+    const missing = keys.filter((key) => !body.config?.[key]);
+    if (missing.length) return json(res, 400, { error: `missing config: ${missing.join(', ')}` });
+    const config = Object.fromEntries(keys.map((key) => [key, String(body.config[key])]));
+    return json(res, 201, addCredential({ kind: body.kind, name: body.name.trim(), config }));
+  }
+  const credential = credentials.find((c) => c.id === parts[1]);
+  if (!credential) return json(res, 404, { error: 'credential not found' });
+  if (parts.length === 3 && parts[2] === 'default' && method === 'POST') {
+    for (const c of credentials) if (c.kind === credential.kind) c.default = c === credential;
+    return json(res, 200, credential);
+  }
+  if (parts.length === 2 && method === 'DELETE') {
+    credentials.splice(credentials.indexOf(credential), 1);
+    // Assumed: deleting the default promotes the oldest remaining credential of that kind.
+    const next = credentials.find((c) => c.kind === credential.kind);
+    if (credential.default && next) next.default = true;
+    res.writeHead(204).end();
+    return;
+  }
+  return json(res, 404, { error: 'not found' });
+}
+
 // --- static files ---------------------------------------------------------------------------
 
 const TYPES = {
@@ -648,22 +786,35 @@ function serveStatic(res, url) {
 
 async function seed() {
   const ago = (minutes) => new Date(Date.now() - minutes * 60_000).toISOString();
+  addCredential({ kind: 'claude', name: 'Personal', config: {} });
+  addCredential({ kind: 'github-app', name: 'sloppod-dev', config: { app_id: '1234567' } });
 
-  const first = createSession({
-    repo: 'bo0tzz/sloppod',
-    prompt: 'Reconnects hammer the runtime when it restarts. Add backoff to the ACP socket.',
-  });
+  // Seeded sessions skip the startup queue: their history is written directly.
+  const seeded = (fields) => {
+    const session = createSession(fields);
+    session.queue = [];
+    return session;
+  };
+  const reply = (session, text) =>
+    session.emit({ sessionUpdate: 'agent_message_chunk', messageId: randomUUID(), content: { type: 'text', text } });
+
+  const prompt = 'Reconnects hammer the runtime when it restarts. Add backoff to the ACP socket in sloppod.';
+  const first = createSession({ prompt });
+  first.queue = [];
   first.fast = true;
   first.modeId = 'acceptEdits';
-  await runTurn(first, 'Reconnects hammer the runtime when it restarts. Add backoff to the ACP socket.');
+  await runTurn(first, prompt, { echo: false });
   first.fast = false;
   first.modeId = 'default';
   first.data.created_at = ago(95);
   first.data.updated_at = ago(12);
   for (const proposal of proposals.values()) proposal.created_at = ago(13);
 
-  const second = createSession({ repo: 'bo0tzz/memini', title: 'Summarise the namespace resolution rules' });
-  echoUser(second, 'How does memini decide which namespace to read from?');
+  const second = seeded({
+    prompt: 'How does memini decide which namespace to read from?',
+    repo: 'bo0tzz/memini',
+    title: 'Summarise the namespace resolution rules',
+  });
   second.emit({ sessionUpdate: 'compaction_update', compactionId: 'c1', status: 'in_progress' });
   second.emit({
     sessionUpdate: 'compaction_update',
@@ -676,28 +827,28 @@ async function seed() {
       },
     ],
   });
-  second.emit({
-    sessionUpdate: 'agent_message_chunk',
-    messageId: randomUUID(),
-    content: {
-      type: 'text',
-      text: 'It checks three things, in order:\n\n1. An explicit **pin** in the project config\n2. The `MEMINI_NAMESPACE` environment variable\n3. The `owner/repo` of the git remote\n\n| Source | Wins over |\n|---|---|\n| pin | everything |\n| env | git remote |',
-    },
-  });
+  reply(
+    second,
+    'It checks three things, in order:\n\n1. An explicit **pin** in the project config\n2. The `MEMINI_NAMESPACE` environment variable\n3. The `owner/repo` of the git remote\n\n| Source | Wins over |\n|---|---|\n| pin | everything |\n| env | git remote |',
+  );
   second.data.phase = 'stopped';
   second.data.created_at = ago(60 * 26);
   second.data.updated_at = ago(60 * 24);
 
-  const third = createSession({ repo: 'bo0tzz/sloppod', title: 'Bump kopium to 0.24' });
-  echoUser(third, 'Bump kopium to 0.24 and regenerate the CRDs.');
-  third.emit({
-    sessionUpdate: 'agent_message_chunk',
-    messageId: randomUUID(),
-    content: { type: 'text', text: 'On it. Updating `mise.toml` first.' },
-  });
+  const third = seeded({ prompt: 'Bump kopium to 0.24 and regenerate the CRDs.', repo: 'bo0tzz/sloppod', title: 'Bump kopium to 0.24' });
+  reply(third, 'On it. Updating `mise.toml` first.');
   third.data.phase = 'disconnected';
   third.data.created_at = ago(40);
   third.data.updated_at = ago(3);
+
+  const fourth = seeded({ prompt: 'What does park and wake mean for a session?', title: 'Park and wake' });
+  reply(
+    fourth,
+    'A **parked** session has no pod: its state lives in the runtime until something wakes it, like a reply, a schedule or a webhook.',
+  );
+  fourth.data.phase = 'idle';
+  fourth.data.created_at = ago(60 * 3);
+  fourth.data.updated_at = ago(60 * 2);
 }
 
 // --- server ---------------------------------------------------------------------------------

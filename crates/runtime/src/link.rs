@@ -28,6 +28,16 @@ use crate::pods::SESSION_LABEL;
 use crate::{AppState, db};
 
 pub const REPO_DIR: &str = "/workspace/repo";
+/// Where sessions without a repository work.
+pub const WORK_DIR: &str = "/workspace/work";
+
+fn work_dir(session: &db::SessionRow) -> &'static str {
+    if session.context().writable_repo().is_some() {
+        REPO_DIR
+    } else {
+        WORK_DIR
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RpcError {
@@ -241,32 +251,44 @@ async fn launch_for(
             .collect(),
         transcript_dir: agent.transcript_dir.clone(),
         transcript,
-        ca_pem: Some(state.ca_pem.clone()),
-        repo: Some(Repo {
-            clone_url: format!("https://github.com/{}.git", session.repo),
-            branch: session.branch.clone(),
+        ca_pem: Some(state.ca.cert_pem.clone()),
+        repo: context.session.writable_repo().map(|grant| Repo {
+            clone_url: format!("https://github.com/{}.git", grant.repo),
+            branch: grant.branch.to_owned(),
             path: REPO_DIR.to_owned(),
         }),
-        install_tools: true,
+        install_tools: context.session.writable_repo().is_some(),
         command: agent.command.clone(),
         env,
-        cwd: REPO_DIR.to_owned(),
+        cwd: work_dir(session).to_owned(),
     };
     Ok((launch, agent))
 }
 
-pub fn agent_context(state: &AppState, session: &db::SessionRow) -> AgentContext {
+pub async fn agent_context(state: &AppState, session: &db::SessionRow) -> AgentContext {
+    let context = session.context();
+    let namespace = context
+        .grant("memory")
+        .and_then(|g| g.param("namespace"))
+        .map(str::to_owned);
+    let memory = match namespace {
+        Some(namespace) => match state.credentials.memini(&session.owner).await {
+            Ok(Some((_, credential))) => credential.config("url").map(|url| MemoryContext {
+                base_url: url.to_owned(),
+                namespace,
+            }),
+            _ => None,
+        },
+        None => None,
+    };
     AgentContext {
-        session: state.session_context(session),
+        session: context,
         workdir: WORKDIR.to_owned(),
-        repo_dir: REPO_DIR.to_owned(),
+        repo_dir: work_dir(session).to_owned(),
         tools_url: format!("{}/mcp", state.config.runtime_url()),
         instructions: state.instructions.clone(),
         model: state.config.agent_model.clone(),
-        memory: state.memini_url.as_ref().map(|url| MemoryContext {
-            base_url: url.clone(),
-            namespace: state.memory_namespace(session),
-        }),
+        memory,
     }
 }
 
@@ -303,7 +325,7 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
         .set_phase(session_id, sloppod_protocol::api::Phase::Starting)
         .await;
 
-    let context = agent_context(&state, &session);
+    let context = agent_context(&state, &session).await;
     let (launch, agent_launch) = match launch_for(&state, &session, &context).await {
         Ok(launch) => launch,
         Err(e) => {
@@ -417,7 +439,7 @@ async fn start_agent_session(
         Some(existing) => {
             let mut params = launch.load_session.clone();
             params["sessionId"] = json!(existing);
-            params["cwd"] = json!(REPO_DIR);
+            params["cwd"] = json!(work_dir(&session));
             state.hub.set_loading(session.id, true).await;
             let response = agent.request("session/load", params).await;
             state.hub.set_loading(session.id, false).await;
@@ -433,21 +455,11 @@ async fn start_agent_session(
     };
     let agent_state = adapter::agent_state(&response);
     db::set_agent_session(&state.db, session.id, &agent_session_id, &agent_state).await?;
+    let pending = db::take_pending_prompt(&state.db, session.id).await?;
     state
         .hub
-        .agent_ready(session.id, agent, agent_session_id, agent_state)
+        .agent_ready(session.id, agent, agent_session_id, agent_state, pending)
         .await;
-
-    if let Some(prompt) = db::take_pending_prompt(&state.db, session.id).await? {
-        let hub = state.hub.clone();
-        let id = session.id;
-        tokio::spawn(async move {
-            let params = json!({"prompt": [{"type": "text", "text": prompt}]});
-            if let Err(e) = hub.prompt(id, params).await {
-                tracing::warn!(session = %id, error = %e, "initial prompt failed");
-            }
-        });
-    }
     Ok(())
 }
 
@@ -458,7 +470,7 @@ async fn new_agent_session(
     launch: &sloppod_contracts::AgentLaunch,
 ) -> anyhow::Result<(String, Value)> {
     let mut params = launch.new_session.clone();
-    params["cwd"] = json!(REPO_DIR);
+    params["cwd"] = json!(work_dir(session));
     let mut response = agent
         .request("session/new", params)
         .await

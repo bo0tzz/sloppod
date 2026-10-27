@@ -14,16 +14,23 @@ use uuid::Uuid;
 
 use crate::link::RpcError;
 use crate::session::{UiEvent, session_update};
+use crate::users::User;
 use crate::{AppState, db};
 
-pub async fn handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
+pub async fn handler(
+    State(state): State<AppState>,
+    User(user): User,
+    ws: WebSocketUpgrade,
+) -> Response {
     ws.max_message_size(64 << 20)
-        .on_upgrade(move |socket| run(state, socket))
+        .on_upgrade(move |socket| run(state, user, socket))
 }
 
 /// One UI connection.
 struct Conn {
     state: AppState,
+    /// Every session this connection touches must be theirs (ADR 23).
+    user: String,
     out: mpsc::UnboundedSender<Value>,
     /// Our outgoing permission requests: UI request id -> (session, permission).
     permissions: Mutex<HashMap<i64, (Uuid, u64)>>,
@@ -89,7 +96,7 @@ impl Conn {
 
     /// Replays a session; returns the load response and the permission requests still open, which go out after it.
     async fn load(self: &Arc<Self>, session: Uuid) -> Result<(Value, Vec<(u64, Value)>), RpcError> {
-        if db::get_session(&self.state.db, session)
+        if db::owned_session(&self.state.db, session, &self.user)
             .await
             .map_err(internal)?
             .is_none()
@@ -125,6 +132,13 @@ impl Conn {
                 }
                 Err(e) => self.reply(id, Err(e)),
             }
+            return;
+        }
+        // Loading checks ownership, so sessions a connection loaded are the ones it may act on.
+        if let Some(session) = session
+            && !self.loaded.lock().await.contains_key(&session)
+        {
+            self.reply(id, Err(RpcError::new(-32602, "load the session first")));
             return;
         }
         let result = match (method.as_str(), session) {
@@ -172,7 +186,9 @@ impl Conn {
     }
 
     async fn list(&self) -> Result<Value, RpcError> {
-        let sessions = db::list_sessions(&self.state.db).await.map_err(internal)?;
+        let sessions = db::list_sessions(&self.state.db, &self.user)
+            .await
+            .map_err(internal)?;
         Ok(json!({"sessions": sessions.iter().map(|s| json!({
             "sessionId": s.id,
             "cwd": "/",
@@ -204,7 +220,7 @@ fn internal(e: impl std::fmt::Display) -> RpcError {
     RpcError::new(-32603, e.to_string())
 }
 
-async fn run(state: AppState, socket: WebSocket) {
+async fn run(state: AppState, user: String, socket: WebSocket) {
     let (mut sink, mut stream) = socket.split();
     let (out, mut rx) = mpsc::unbounded_channel::<Value>();
     let writer = tokio::spawn(async move {
@@ -220,6 +236,7 @@ async fn run(state: AppState, socket: WebSocket) {
     });
     let conn = Arc::new(Conn {
         state,
+        user,
         out,
         permissions: Mutex::default(),
         next_id: std::sync::atomic::AtomicI64::new(1),
@@ -250,6 +267,7 @@ async fn run(state: AppState, socket: WebSocket) {
                 if let Some(session) = message["params"]["sessionId"]
                     .as_str()
                     .and_then(|s| s.parse().ok())
+                    && conn.loaded.lock().await.contains_key(&session)
                 {
                     conn.state.hub.cancel(session).await;
                 }

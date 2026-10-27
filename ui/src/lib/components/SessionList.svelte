@@ -34,14 +34,16 @@
       >
         <div class="flex items-center gap-2">
           <span class="min-w-0 grow truncate font-medium {compact ? 'text-sm' : ''}">
-            {session.title || 'Untitled session'}
+            {session.title || 'New session'}
           </span>
           <PhaseBadge phase={session.phase} />
         </div>
         <div class="text-muted flex min-w-0 items-center gap-1.5 text-xs">
-          <Icon icon={mdiSourceBranch} size="1.1em" class="shrink-0" aria-hidden />
-          <span class="truncate">{session.repo}</span>
-          <span aria-hidden="true">·</span>
+          {#if session.repo}
+            <Icon icon={mdiSourceBranch} size="1.1em" class="shrink-0" aria-hidden />
+            <span class="truncate" title={session.branch ?? undefined}>{session.repo}</span>
+            <span aria-hidden="true">·</span>
+          {/if}
           <time class="shrink-0" datetime={session.updated_at} title={absoluteTime(session.updated_at)}>
             {timeAgo(session.updated_at, now)}
           </time>

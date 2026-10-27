@@ -6,7 +6,7 @@ The first milestone is moving sloppod's own development into sloppod. The MVP is
 
 A sloppod session can take a change to this repository from prompt to reviewed PR:
 
-1. Start a session from the UI with access to `bo0tzz/sloppod`.
+1. Start a session from the UI by sending a first message that mentions `bo0tzz/sloppod`.
 2. Chat with the agent while it works, including sending messages mid-turn.
 3. The agent edits, builds and tests in its pod, using tools from the repository's `mise.toml`.
 4. The agent pushes to a session branch and proposes a PR. The PR is opened only after approval in the UI.
@@ -16,8 +16,8 @@ A sloppod session can take a change to this repository from prompt to reviewed P
 
 | Area | MVP version | Later |
 |---|---|---|
-| Sessions ([1](adr/0001-sessions-decoupled-from-directories.md)) | Runtime-owned session object, event log and transcript blob. Resume after pod loss. One repository grant per session | Projects, sessions with no or several repository grants, sub-sessions, messaging |
-| Capabilities ([2](adr/0002-capabilities.md)) | A fixed set per session: `repo:<remote>:rw` (session branches only), GitHub read, model access | Requests, approvals with TTL, standing approvals, profiles, starting-set suggestion |
+| Sessions ([1](adr/0001-sessions-decoupled-from-directories.md)) | Runtime-owned session object, event log and transcript blob. Resume after pod loss. A session starts from its first message, which decides its repository grant: zero or one per session. Messages sent before the agent is up are queued | Projects, sessions with no or several repository grants, sub-sessions, messaging |
+| Capabilities ([2](adr/0002-capabilities.md)) | Grants stored per session, from a fixed set: `model`, `github` (read), `packages`, `repo` (`rw`, session branch only) when the first message names one, `memory` when memini is configured | Requests, approvals with TTL, standing approvals, profiles, starting-set suggestion |
 | Proposals ([3](adr/0003-proposals-and-trusted-executor.md)) | One kind, `github.pr.create`: review title, body and diff; approve or reject | Editing fields, more kinds, a reviewer model |
 | Async ([4](adr/0004-asynchronous-interaction.md)) | Prompts and steering through the adapter; proposals return a pending ID | Inbox urgency levels, delivery of grant changes |
 | Park/wake ([5](adr/0005-park-and-wake.md)) | Not in the MVP | Everything |
@@ -30,6 +30,8 @@ A sloppod session can take a change to this repository from prompt to reviewed P
 | Repositories | Fresh clone into the session's volume, through the authorizer | Runtime-managed mirrors that sessions clone from, work-in-progress snapshots |
 | Containers ([13](adr/0013-container-workloads.md)) | Not in the MVP | Everything |
 | UI ([18](adr/0018-ui.md)) | Session list, chat (streaming, tool calls, permission requests, steering), PR proposal review | Board, approval queue, grants, config |
+| Credentials ([21](adr/0021-credentials-live-in-the-runtime.md)) | Claude accounts, GitHub Apps and memini in the database, encrypted, added in the UI; the owner's default is used | Choosing per grant, switching under a running session |
+| Users ([23](adr/0023-users-and-ownership.md)) | A user per request from the proxy's header; owners on sessions and credentials; users see only their own | Sharing, teams, roles |
 | Storage ([15](adr/0015-postgres.md)) | Postgres with migrations | — |
 
 ## Milestones

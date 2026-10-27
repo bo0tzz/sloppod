@@ -2,14 +2,15 @@ import { expect, test, type Page } from '@playwright/test';
 
 const FINAL = /Done\. The tests pass/;
 
+/** Starts a session from the empty chat. Prompts that mention "sloppod" get that repository. */
 async function createSession(page: Page, prompt: string) {
   await page.goto('/');
   await page.getByRole('link', { name: 'New session' }).click();
   await expect(page).toHaveURL(/\/new$/);
-  await page.getByRole('combobox').click();
-  await page.getByRole('option', { name: 'bo0tzz/sloppod' }).click();
-  await page.getByRole('textbox', { name: 'Prompt' }).fill(prompt);
-  await page.getByRole('button', { name: 'Start session' }).click();
+  await expect(page.getByTestId('session-title')).toHaveText('New session');
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill(prompt);
+  await box.press('Enter');
   await expect(page).toHaveURL(/\/sessions\/[0-9a-f-]+$/);
   return page.url().split('/').pop()!;
 }
@@ -33,10 +34,11 @@ test('creates a session and streams the agent output', async ({ page }) => {
     }),
   );
 
-  const prompt = 'Add backoff to the reconnect logic';
+  const prompt = 'Add backoff to the reconnect logic in sloppod';
   await createSession(page, prompt);
 
   await expect(page.getByTestId('session-title')).toHaveText(prompt);
+  await expect(page.getByTestId('session-subtitle')).toHaveText('bo0tzz/sloppod');
   await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(1);
 
   // The first agent message arrives as several chunks and renders as one message.
@@ -57,7 +59,7 @@ test('creates a session and streams the agent output', async ({ page }) => {
 });
 
 test('answers a permission request', async ({ page }) => {
-  await createSession(page, 'Answer my permission request');
+  await createSession(page, 'Answer my permission request in sloppod');
 
   const card = permissionCard(page);
   await expect(card).toBeVisible();
@@ -82,7 +84,7 @@ test('answers a permission request', async ({ page }) => {
 });
 
 test('a permission answered elsewhere disappears', async ({ page, context }) => {
-  const id = await createSession(page, 'Two viewers');
+  const id = await createSession(page, 'Two viewers on sloppod');
   const other = await context.newPage();
   await other.goto(`/sessions/${id}`);
 
@@ -95,7 +97,7 @@ test('a permission answered elsewhere disappears', async ({ page, context }) => 
 });
 
 test('steers the agent during a turn', async ({ page }) => {
-  await createSession(page, 'Steer me');
+  await createSession(page, 'Steer me in sloppod');
   await expect(permissionCard(page)).toBeVisible();
 
   const steer = 'Use 250 ms as the base delay';
@@ -115,7 +117,7 @@ test('steers the agent during a turn', async ({ page }) => {
 });
 
 test('stops a running turn', async ({ page }) => {
-  await createSession(page, 'Stop me');
+  await createSession(page, 'Stop me in sloppod');
   await expect(permissionCard(page)).toBeVisible();
   await page.getByRole('button', { name: 'Stop' }).click();
   await expect(permissionCard(page)).toBeHidden();
@@ -127,7 +129,7 @@ test('stops a running turn', async ({ page }) => {
 });
 
 test('approves a proposal with an edited title', async ({ page }) => {
-  await createSession(page, 'Propose a PR');
+  await createSession(page, 'Propose a PR for sloppod');
   await finishTurn(page);
 
   const card = page.getByTestId('proposal-card');
@@ -153,7 +155,7 @@ test('approves a proposal with an edited title', async ({ page }) => {
 });
 
 test('rejects a proposal with a reason', async ({ page }) => {
-  await createSession(page, 'Propose something I will reject');
+  await createSession(page, 'Propose something for sloppod I will reject');
   await finishTurn(page);
 
   await page.getByTestId('proposal-card').getByRole('button', { name: 'Review' }).click();
@@ -175,7 +177,7 @@ async function expectTranscriptOnce(page: Page, prompt: string) {
 }
 
 test('replays the history once after a page reload', async ({ page }) => {
-  const prompt = 'Reload me';
+  const prompt = 'Reload me in sloppod';
   await createSession(page, prompt);
   await finishTurn(page);
   await expectTranscriptOnce(page, prompt);
@@ -186,7 +188,7 @@ test('replays the history once after a page reload', async ({ page }) => {
 });
 
 test('reconnects after the socket drops without duplicating history', async ({ page }) => {
-  const prompt = 'Reconnect me';
+  const prompt = 'Reconnect me in sloppod';
   await createSession(page, prompt);
   await finishTurn(page);
   await expectTranscriptOnce(page, prompt);
@@ -206,7 +208,7 @@ test('reconnects after the socket drops without duplicating history', async ({ p
 });
 
 test('switches the permission mode', async ({ page }) => {
-  await createSession(page, 'Switch modes');
+  await createSession(page, 'Switch modes in sloppod');
   await expect(permissionCard(page)).toBeVisible();
   await permissionCard(page).getByRole('button', { name: 'Always allow edits' }).click();
   await expect(page.getByTestId('mode-select')).toContainText('Accept edits');
@@ -217,4 +219,108 @@ test('switches the permission mode', async ({ page }) => {
   await expect(page.getByTestId('mode-select')).toContainText('Default');
   await page.reload();
   await expect(page.getByTestId('mode-select')).toContainText('Default');
+});
+
+test('queues messages while the agent starts', async ({ page }) => {
+  const first = 'slow start: add backoff in sloppod';
+  await createSession(page, first);
+
+  // The first message is recorded straight away, before the agent is up.
+  await expect(userMessages(page).filter({ hasText: first })).toHaveCount(1);
+  await expect(phase(page)).toHaveAttribute('data-phase', 'starting');
+  await expect(page.getByTestId('activity')).toHaveText('Starting the agent…');
+  await expect(page.getByTestId('composer-hint')).toHaveText('The agent is starting; messages are queued.');
+
+  const second = 'Also add a test for it';
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill(second);
+  await page.getByRole('button', { name: 'Send' }).click();
+  await expect(userMessages(page).filter({ hasText: second })).toHaveCount(1);
+  await expect(box).toHaveValue('');
+
+  // Both run as one turn once the agent is up.
+  await expect(permissionCard(page)).toBeVisible({ timeout: 20_000 });
+  await finishTurn(page);
+  await expect(page.getByTestId('composer-hint')).toBeHidden();
+});
+
+test('runs a session without a repository', async ({ page }) => {
+  const prompt = 'Explain what the runtime does';
+  await createSession(page, prompt);
+  await expect(page.getByTestId('session-subtitle')).toHaveText('No repository');
+  await permissionCard(page).getByRole('button', { name: 'Allow', exact: true }).click();
+  await expect(agentMessages(page).filter({ hasText: 'This session has no repository' })).toBeVisible();
+  await expect(page.getByTestId('proposal-card')).toHaveCount(0);
+
+  const row = page.getByTestId('session-row').filter({ hasText: prompt });
+  await expect(row).toBeVisible();
+  await expect(row).not.toContainText('bo0tzz/');
+});
+
+// Last, because it changes the mock's credentials; it puts them back at the end.
+test('manages credentials and nudges when they are missing', async ({ page }) => {
+  const section = (kind: string) => page.getByTestId(`credentials-${kind}`);
+  const row = (kind: string, name: string) => section(kind).getByTestId('credential').filter({ hasText: name });
+  const confirmDelete = async (kind: string, name: string) => {
+    await row(kind, name).getByRole('button', { name: `Delete ${name}` }).click();
+    await page.getByRole('button', { name: 'Delete', exact: true }).click();
+    await expect(row(kind, name)).toHaveCount(0);
+  };
+  async function add(kind: string, noun: string, fields: Record<string, string>) {
+    await section(kind).getByRole('button', { name: `Add ${noun}` }).click();
+    for (const [label, value] of Object.entries(fields)) {
+      await section(kind).getByLabel(label, { exact: true }).fill(value);
+    }
+    await section(kind).getByRole('button', { name: 'Save' }).click();
+    await expect(row(kind, fields.Name)).toBeVisible();
+  }
+
+  await page.goto('/settings');
+  await expect(page.getByTestId('session-subtitle')).toHaveText('Signed in as bo0tzz');
+  await expect(page.getByTestId('current-user')).toHaveText('Signed in as bo0tzz');
+  await expect(row('claude', 'Personal').getByTestId('default-badge')).toBeVisible();
+  await expect(row('github-app', 'sloppod-dev')).toContainText('App ID: 1234567');
+
+  // A new kind's first credential becomes its default; secrets are never shown.
+  await add('memini', 'memini server', { Name: 'Home', URL: 'https://memini.example.com', 'Admin key': 'top-secret-key' });
+  await expect(row('memini', 'Home')).toContainText('URL: https://memini.example.com');
+  await expect(row('memini', 'Home').getByTestId('default-badge')).toBeVisible();
+  await expect(page.getByText('top-secret-key')).toHaveCount(0);
+
+  await add('claude', 'Claude account', { Name: 'Work', Token: 'sk-ant-oat-work' });
+  await expect(row('claude', 'Work').getByTestId('default-badge')).toHaveCount(0);
+  await row('claude', 'Work').getByRole('button', { name: 'Make default' }).click();
+  await expect(row('claude', 'Work').getByTestId('default-badge')).toBeVisible();
+  await expect(row('claude', 'Personal').getByTestId('default-badge')).toHaveCount(0);
+
+  await confirmDelete('memini', 'Home');
+  await confirmDelete('claude', 'Personal');
+  await confirmDelete('claude', 'Work');
+  await confirmDelete('github-app', 'sloppod-dev');
+  await expect(section('claude')).toContainText('No Claude account yet');
+
+  await page.goto('/');
+  await expect(page.getByTestId('nudge-claude')).toBeVisible();
+  await expect(page.getByTestId('nudge-repos')).toBeVisible();
+
+  // Without a Claude account the runtime refuses to start a session; the message stays.
+  await page.goto('/new');
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('This should not start');
+  await box.press('Enter');
+  await expect(page.getByTestId('composer-error')).toContainText('No Claude account is configured');
+  await expect(box).toHaveValue('This should not start');
+  await page.getByTestId('composer-error').getByRole('link', { name: 'Add one in settings' }).click();
+  await expect(page).toHaveURL(/\/settings$/);
+
+  await add('claude', 'Claude account', { Name: 'Personal', Token: 'sk-ant-oat-personal' });
+  await add('github-app', 'GitHub App', {
+    Name: 'sloppod-dev',
+    'App ID': '1234567',
+    'Private key': '-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----',
+  });
+  await page.goto('/');
+  await expect(page.getByTestId('session-row').first()).toBeVisible();
+  await expect(page.getByTestId('nudge-claude')).toHaveCount(0);
+  await expect(page.getByTestId('nudge-repos')).toHaveCount(0);
 });

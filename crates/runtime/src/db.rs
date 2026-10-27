@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sloppod_protocol::api::{Phase, Proposal, Session};
+use sloppod_contracts::{Grant, SessionContext};
+use sloppod_protocol::api::{self, Phase, Proposal, Session};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::{AssertSqlSafe, FromRow, Row};
 use uuid::Uuid;
@@ -19,23 +20,45 @@ pub async fn connect(url: &str) -> anyhow::Result<PgPool> {
 #[derive(Debug, Clone, FromRow)]
 pub struct SessionRow {
     pub id: Uuid,
+    pub owner: String,
     pub title: String,
-    pub repo: String,
-    pub branch: String,
     pub phase: String,
     pub agent_session_id: Option<String>,
     pub agent_state: Option<Value>,
+    grants: Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 impl SessionRow {
+    pub fn grants(&self) -> Vec<Grant> {
+        serde_json::from_value(self.grants.clone()).unwrap_or_default()
+    }
+
+    pub fn context(&self) -> SessionContext {
+        SessionContext {
+            session_id: self.id.to_string(),
+            owner: self.owner.clone(),
+            grants: self.grants(),
+        }
+    }
+
     pub fn to_api(&self) -> Session {
+        let context = self.context();
+        let repo = context.writable_repo();
         Session {
             id: self.id,
             title: self.title.clone(),
-            repo: self.repo.clone(),
-            branch: self.branch.clone(),
+            repo: repo.as_ref().map(|r| r.repo.to_owned()),
+            branch: repo.as_ref().map(|r| r.branch.to_owned()),
+            grants: context
+                .grants
+                .iter()
+                .map(|g| api::Grant {
+                    capability: g.capability.clone(),
+                    params: g.params.clone(),
+                })
+                .collect(),
             phase: Phase::parse(&self.phase),
             created_at: self.created_at.to_rfc3339(),
             updated_at: self.updated_at.to_rfc3339(),
@@ -47,35 +70,50 @@ impl SessionRow {
     }
 }
 
-const SESSION_COLUMNS: &str =
-    "id, title, repo, branch, phase, agent_session_id, agent_state, created_at, updated_at";
+const SESSION_COLUMNS: &str = "id, owner, title, phase, agent_session_id, agent_state, created_at, updated_at, \
+     coalesce((select jsonb_agg(jsonb_build_object('capability', g.capability, 'params', g.params) order by g.created_at) \
+     from session_grants g where g.session_id = sessions.id), '[]'::jsonb) as grants";
 
-pub async fn insert_session(
-    db: &PgPool,
-    id: Uuid,
-    title: &str,
-    repo: &str,
-    branch: &str,
-    custom_title: bool,
-    pending_prompt: Option<&str>,
-) -> sqlx::Result<SessionRow> {
-    sqlx::query_as(AssertSqlSafe(format!(
-        "insert into sessions (id, title, repo, branch, pending_prompt, custom_title) values ($1, $2, $3, $4, $5, $6) returning {SESSION_COLUMNS}"
-    )))
-    .bind(id)
-    .bind(title)
-    .bind(repo)
-    .bind(branch)
-    .bind(pending_prompt)
-    .bind(custom_title)
-    .fetch_one(db)
-    .await
+pub struct NewSessionRow<'a> {
+    pub id: Uuid,
+    pub owner: &'a str,
+    pub title: &'a str,
+    pub custom_title: bool,
+    pub pending_prompt: &'a str,
+    pub grants: &'a [Grant],
 }
 
-pub async fn list_sessions(db: &PgPool) -> sqlx::Result<Vec<SessionRow>> {
+pub async fn insert_session(db: &PgPool, new: NewSessionRow<'_>) -> sqlx::Result<SessionRow> {
+    let mut tx = db.begin().await?;
+    sqlx::query("insert into sessions (id, owner, title, custom_title, pending_prompt) values ($1, $2, $3, $4, $5)")
+        .bind(new.id)
+        .bind(new.owner)
+        .bind(new.title)
+        .bind(new.custom_title)
+        .bind(new.pending_prompt)
+        .execute(&mut *tx)
+        .await?;
+    for grant in new.grants {
+        sqlx::query(
+            "insert into session_grants (session_id, capability, params) values ($1, $2, $3)",
+        )
+        .bind(new.id)
+        .bind(&grant.capability)
+        .bind(&grant.params)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(get_session(db, new.id)
+        .await?
+        .expect("session just inserted"))
+}
+
+pub async fn list_sessions(db: &PgPool, owner: &str) -> sqlx::Result<Vec<SessionRow>> {
     sqlx::query_as(AssertSqlSafe(format!(
-        "select {SESSION_COLUMNS} from sessions order by updated_at desc"
+        "select {SESSION_COLUMNS} from sessions where owner = $1 order by updated_at desc"
     )))
+    .bind(owner)
     .fetch_all(db)
     .await
 }
@@ -95,6 +133,11 @@ pub async fn get_session(db: &PgPool, id: Uuid) -> sqlx::Result<Option<SessionRo
     .bind(id)
     .fetch_optional(db)
     .await
+}
+
+/// A session, if it belongs to `owner`.
+pub async fn owned_session(db: &PgPool, id: Uuid, owner: &str) -> sqlx::Result<Option<SessionRow>> {
+    Ok(get_session(db, id).await?.filter(|s| s.owner == owner))
 }
 
 pub async fn set_phase(db: &PgPool, id: Uuid, phase: Phase) -> sqlx::Result<Option<SessionRow>> {
@@ -262,13 +305,15 @@ pub async fn get_proposal(db: &PgPool, id: Uuid) -> sqlx::Result<Option<Proposal
 
 pub async fn list_proposals(
     db: &PgPool,
+    owner: &str,
     session: Option<Uuid>,
     status: Option<&str>,
 ) -> sqlx::Result<Vec<ProposalRow>> {
     sqlx::query_as(AssertSqlSafe(format!(
-        "select {PROPOSAL_COLUMNS} from proposals where ($1::uuid is null or session_id = $1) \
-         and ($2::text is null or status = $2) order by created_at"
+        "select {PROPOSAL_COLUMNS} from proposals where session_id in (select id from sessions where owner = $1) \
+         and ($2::uuid is null or session_id = $2) and ($3::text is null or status = $3) order by created_at"
     )))
+    .bind(owner)
     .bind(session)
     .bind(status)
     .fetch_all(db)
@@ -282,15 +327,17 @@ pub async fn decide_proposal(
     status: &str,
     payload: &Value,
     reason: Option<&str>,
+    decided_by: &str,
 ) -> sqlx::Result<Option<ProposalRow>> {
     sqlx::query_as(AssertSqlSafe(format!(
-        "update proposals set status = $2, payload = $3, reason = $4, decided_at = now() \
+        "update proposals set status = $2, payload = $3, reason = $4, decided_by = $5, decided_at = now() \
          where id = $1 and status = 'pending' returning {PROPOSAL_COLUMNS}"
     )))
     .bind(id)
     .bind(status)
     .bind(payload)
     .bind(reason)
+    .bind(decided_by)
     .fetch_optional(db)
     .await
 }
@@ -311,4 +358,14 @@ pub async fn finish_proposal(
     .bind(error)
     .fetch_one(db)
     .await
+}
+
+pub async fn add_grant(db: &PgPool, session: Uuid, grant: &Grant) -> sqlx::Result<()> {
+    sqlx::query("insert into session_grants (session_id, capability, params) values ($1, $2, $3)")
+        .bind(session)
+        .bind(&grant.capability)
+        .bind(&grant.params)
+        .execute(db)
+        .await
+        .map(|_| ())
 }

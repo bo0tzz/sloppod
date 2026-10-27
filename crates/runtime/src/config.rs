@@ -14,6 +14,11 @@ pub struct Config {
     #[arg(long, env = "SLOPPOD_LISTEN", default_value = "0.0.0.0:8080")]
     pub listen: SocketAddr,
 
+    /// The supervisor link and the MCP endpoint, the only things session pods may reach. Kept off the API's port
+    /// so an agent can't use the API, e.g. to approve its own proposals.
+    #[arg(long, env = "SLOPPOD_SESSIONS_LISTEN", default_value = "0.0.0.0:8081")]
+    pub sessions_listen: SocketAddr,
+
     /// Envoy `ext_authz` gRPC listener.
     #[arg(long, env = "SLOPPOD_AUTHZ_LISTEN", default_value = "0.0.0.0:9001")]
     pub authz_listen: SocketAddr,
@@ -74,21 +79,17 @@ pub struct Config {
     #[arg(long, env = "SLOPPOD_SESSION_MEMORY", default_value = "4Gi")]
     pub session_memory: Option<String>,
 
-    /// Long-lived Claude OAuth token (`claude setup-token`). Never enters session pods.
-    #[arg(long, env = "SLOPPOD_CLAUDE_OAUTH_TOKEN", hide_env_values = true)]
-    pub claude_oauth_token: String,
+    /// 32 bytes, base64: encrypts stored credentials (ADR 21). Losing it makes them unreadable.
+    #[arg(long, env = "SLOPPOD_SECRET_KEY", hide_env_values = true)]
+    pub secret_key: String,
 
-    #[arg(long, env = "SLOPPOD_GITHUB_APP_ID")]
-    pub github_app_id: String,
+    /// Header the authenticating proxy puts the user's name in (ADR 23).
+    #[arg(long, env = "SLOPPOD_USER_HEADER", default_value = "x-forwarded-user")]
+    pub user_header: String,
 
-    #[arg(long, env = "SLOPPOD_GITHUB_APP_PRIVATE_KEY_FILE")]
-    pub github_app_private_key_file: PathBuf,
-
-    #[arg(long, env = "SLOPPOD_MEMINI_URL")]
-    pub memini_url: Option<String>,
-
-    #[arg(long, env = "SLOPPOD_MEMINI_API_KEY", hide_env_values = true)]
-    pub memini_api_key: Option<String>,
+    /// User for requests without the header; unset, such requests are refused.
+    #[arg(long, env = "SLOPPOD_DEFAULT_USER")]
+    pub default_user: Option<String>,
 
     /// Prefix for every memory namespace, e.g. `dev/` to keep a test install's memories apart.
     #[arg(long, env = "SLOPPOD_MEMINI_NAMESPACE_PREFIX", default_value = "")]
@@ -133,12 +134,13 @@ pub struct Config {
 }
 
 impl Config {
+    /// How session pods reach the runtime.
     pub fn runtime_url(&self) -> String {
         format!(
             "http://{}.{}.svc:{}",
             self.service,
             self.namespace,
-            self.listen.port()
+            self.sessions_listen.port()
         )
     }
 

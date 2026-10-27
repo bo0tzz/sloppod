@@ -2,36 +2,35 @@ mod github;
 mod memini;
 mod model;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use sloppod_contracts::RequestPolicy;
 
 pub use github::GitHubPolicy;
-pub use memini::MeminiPolicy;
+pub use memini::{MeminiPolicy, SESSION_KEY};
 pub use model::ModelPolicy;
 
-/// Request policies by the host they decide for.
+/// Request policies. Their hosts can change at runtime, e.g. when a memini credential is added.
 #[derive(Default, Clone)]
 pub struct Policies {
-    by_host: HashMap<String, Arc<dyn RequestPolicy>>,
+    policies: Vec<Arc<dyn RequestPolicy>>,
 }
 
 impl Policies {
     pub fn register(&mut self, policy: Arc<dyn RequestPolicy>) {
-        for host in policy.hosts() {
-            self.by_host
-                .insert(host.to_ascii_lowercase(), policy.clone());
-        }
+        self.policies.push(policy);
     }
 
     pub fn for_host(&self, host: &str) -> Option<&Arc<dyn RequestPolicy>> {
-        self.by_host.get(&host.to_ascii_lowercase())
+        self.policies
+            .iter()
+            .find(|p| p.hosts().iter().any(|h| h.eq_ignore_ascii_case(host)))
     }
 
     pub fn hosts(&self) -> Vec<String> {
-        let mut hosts: Vec<String> = self.by_host.keys().cloned().collect();
+        let mut hosts: Vec<String> = self.policies.iter().flat_map(|p| p.hosts()).collect();
         hosts.sort();
+        hosts.dedup();
         hosts
     }
 }

@@ -1,9 +1,20 @@
 <script lang="ts">
-  import { Alert, Button, Heading, LoadingSpinner } from '@immich/ui';
-  import { mdiPlus } from '@mdi/js';
+  import { Alert, Button, Heading, IconButton, LoadingSpinner } from '@immich/ui';
+  import { mdiCogOutline, mdiPlus } from '@mdi/js';
+  import { onMount } from 'svelte';
+  import { api } from '#lib/api.ts';
   import AppIcon from '#lib/components/AppIcon.svelte';
   import SessionList from '#lib/components/SessionList.svelte';
   import { sessions } from '#lib/sessions.svelte.ts';
+
+  let noClaude = $state(false);
+  let noRepos = $state(false);
+
+  onMount(async () => {
+    const [credentials, repos] = await Promise.allSettled([api.listCredentials(), api.listRepos()]);
+    noClaude = credentials.status === 'fulfilled' && !credentials.value.some((credential) => credential.kind === 'claude');
+    noRepos = repos.status === 'fulfilled' && repos.value.length === 0;
+  });
 </script>
 
 <svelte:head>
@@ -15,7 +26,23 @@
     <AppIcon class="size-8" />
     <Heading tag="h1" size="small" class="grow">Sessions</Heading>
     <Button href="/new" leadingIcon={mdiPlus} shape="round" size="small">New session</Button>
+    <IconButton href="/settings" icon={mdiCogOutline} aria-label="Settings" variant="ghost" shape="round" color="secondary" />
   </header>
+
+  {#if noClaude}
+    <div data-testid="nudge-claude">
+      <Alert color="warning" size="small" title="No Claude account">
+        Sessions need one to start. <a href="/settings" class="underline">Add it in settings</a>.
+      </Alert>
+    </div>
+  {/if}
+  {#if noRepos}
+    <div data-testid="nudge-repos">
+      <Alert color="info" size="small" title="No repositories available">
+        Sessions can still chat, but can't work on code. <a href="/settings" class="underline">Add a GitHub App in settings</a>.
+      </Alert>
+    </div>
+  {/if}
 
   {#if sessions.error}
     <Alert color="danger" title="Couldn't load sessions" size="small">{sessions.error}</Alert>

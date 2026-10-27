@@ -1,6 +1,8 @@
 # Runtime API
 
-The runtime serves everything on one HTTP port (default 8080): the REST API under `/api/v1`, ACP over WebSocket at `/acp`, and the UI's static files at `/`. It has no authentication of its own; deploy it behind an authenticating proxy.
+The runtime serves everything on one HTTP port (default 8080): the REST API under `/api/v1`, ACP over WebSocket at `/acp`, and the UI's static files at `/`.
+
+It has no authentication of its own; deploy it behind an authenticating proxy that sets the user's name in a header (default `X-Forwarded-User`). Every request acts as that user, and users only see their own sessions, proposals and credentials. Without the header, requests act as the configured default user, or are refused if there is none.
 
 ## REST
 
@@ -14,24 +16,32 @@ POST   /api/v1/sessions             -> Session     body: NewSession
 GET    /api/v1/sessions/{id}        -> Session
 DELETE /api/v1/sessions/{id}        -> 204         stops the session and deletes its pod and volume
 GET    /api/v1/repos                -> string[]    repositories sessions can be granted, e.g. ["bo0tzz/sloppod"]
+GET    /api/v1/me                   -> {user: string}
 ```
+
+A session starts from its first message: the UI opens an empty chat, and sending the first message creates the session. The runtime derives the session's repository from that message: an `owner/name` the user's GitHub App can access, or a bare repository name that matches exactly one of them. Without one, the session has no repository ([ADR 1](adr/0001-sessions-decoupled-from-directories.md)). Messages sent before the agent is up are queued and shown immediately.
 
 ```ts
 type NewSession = {
-  repo: string;          // "owner/name"
+  prompt: string;        // the first message; recorded right away and sent once the agent is up
+  repo?: string;         // "owner/name"; derived from the prompt when absent
   title?: string;        // kept as given; without one, the agent's automatic title is used
-  prompt?: string;       // sent as the first prompt once the agent is up
 };
 
 type Session = {
   id: string;            // UUID; also the ACP sessionId
   title: string;
-  repo: string;
-  branch: string;        // the session branch, e.g. "sloppod/3f2a…"
+  repo: string | null;   // from the session's repo grant, if any
+  branch: string | null; // the session branch, e.g. "sloppod/3f2a…"
+  grants: Grant[];
   phase: Phase;
   created_at: string;    // RFC 3339
   updated_at: string;
 };
+
+// What the session may do (ADR 2). Capabilities so far: "model", "github" (read), "packages" (package
+// registries), "repo" {repo, access: "rw", branch}, "memory" {namespace, access: "rw"}.
+type Grant = { capability: string; params: Record<string, unknown> };
 
 type Phase =
   | "starting"           // pod being created or agent not connected yet
@@ -40,6 +50,37 @@ type Phase =
   | "waiting"            // a turn is blocked on a permission request
   | "disconnected"       // pod went away; the runtime is bringing it back
   | "stopped";
+```
+
+`POST /api/v1/sessions` derives the repository and grants before it returns; they don't change afterwards. Until the agent names the session, its title is the first line of the first message. It returns `409` when the user has no Claude account configured, and `400` with `{error}` when a given `repo` isn't accessible.
+
+### Credentials
+
+Accounts and keys the runtime uses on a user's behalf ([ADR 21](adr/0021-credentials-live-in-the-runtime.md)). Secrets are write-only: the API never returns them. The first credential of a kind becomes the default for it; deleting the default promotes the oldest remaining one. Running sessions use whichever is the default when they make a request. An invalid credential (unknown kind, a private key that doesn't parse, a URL without a host) gets `400` with `{error}`.
+
+```
+GET    /api/v1/credentials                -> Credential[]
+POST   /api/v1/credentials                -> Credential   body: NewCredential
+POST   /api/v1/credentials/{id}/default   -> Credential   makes it the default for its kind
+DELETE /api/v1/credentials/{id}           -> 204
+```
+
+```ts
+type CredentialKind =
+  | "claude"             // secret: a token from `claude setup-token`; config: {}
+  | "github-app"         // secret: the app's private key (PEM); config: {app_id: string}
+  | "memini";            // secret: a memini admin key; config: {url: string, home?: string} (home: your personal namespace)
+
+type NewCredential = { kind: CredentialKind; name: string; config: Record<string, string>; secret: string };
+
+type Credential = {
+  id: string;
+  kind: CredentialKind;
+  name: string;
+  config: Record<string, string>;
+  default: boolean;
+  created_at: string;
+};
 ```
 
 ### Proposals
@@ -85,9 +126,9 @@ UI → runtime:
 |---|---|
 | `initialize` | Returns the agent's capabilities, including `_meta.steering`. |
 | `session/load` `{sessionId, cwd: "/", mcpServers: []}` | Replays the session's history as `session/update` notifications, then responds. From then on the connection receives that session's live updates. Several sessions can be loaded on one connection. |
-| `session/prompt` `{sessionId, prompt: ContentBlock[]}` | Starts a turn. Responds `{stopReason}` when the turn ends. |
-| `session/cancel` `{sessionId}` (notification) | Cancels the running turn. |
-| `_session/steering` `{sessionId, prompt: ContentBlock[]}` | Delivers a message into the running turn. |
+| `session/prompt` `{sessionId, prompt: ContentBlock[]}` | Starts a turn. Responds `{stopReason}` when the turn ends. While the agent isn't up (`starting`, `disconnected`) the prompt is queued: it's echoed right away, everything queued runs as one turn once the agent is ready, and each queued request responds when that turn ends. |
+| `session/cancel` `{sessionId}` (notification) | Cancels the running turn. Messages still queued for an agent that isn't up stay queued. |
+| `_session/steering` `{sessionId, prompt: ContentBlock[]}` | Delivers a message into the running turn. Before the agent is up it joins the queue like a prompt and returns `{outcome: "queued"}`. |
 | `session/set_mode` `{sessionId, modeId}` | Switches the permission mode. |
 
 Runtime → UI:
@@ -102,7 +143,7 @@ Runtime → UI:
 
 ## Session pods
 
-Session pods use two more endpoints on the same port. Neither is for UIs; keep them off public routes.
+Session pods use two more endpoints, on their own port (8081, `sessions`); that port is the only one they can reach, so they can't use the API above. Keep it off public routes.
 
 - `/link/v1`: the supervisor link ([ADR 17](adr/0017-in-pod-supervisor.md)), a WebSocket authenticated with the pod's projected ServiceAccount token. Its types are in `crates/protocol`.
 - `/mcp`: an MCP server (streamable HTTP, JSON responses) registered with the agent at session start. It identifies the session by the pod's IP. Its tools:

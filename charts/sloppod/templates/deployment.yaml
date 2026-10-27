@@ -1,6 +1,5 @@
-{{- $required := list .Values.database.existingSecret .Values.claude.existingSecret .Values.github.appId .Values.github.existingSecret -}}
-{{- if has "" $required }}
-{{- fail "database.existingSecret, claude.existingSecret, github.appId and github.existingSecret are required" }}
+{{- if or (not .Values.database.existingSecret) (not .Values.masterKey.existingSecret) }}
+{{- fail "database.existingSecret and masterKey.existingSecret are required" }}
 {{- end }}
 apiVersion: apps/v1
 kind: Deployment
@@ -87,27 +86,20 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.database.existingSecret }}
                   key: {{ .Values.database.secretKey }}
-            - name: SLOPPOD_CLAUDE_OAUTH_TOKEN
+            - name: SLOPPOD_SECRET_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.claude.existingSecret }}
-                  key: {{ .Values.claude.secretKey }}
-            - name: SLOPPOD_GITHUB_APP_ID
-              value: {{ .Values.github.appId | quote }}
-            - name: SLOPPOD_GITHUB_APP_PRIVATE_KEY_FILE
-              value: /etc/sloppod/github/private-key
-            {{- if .Values.memini.url }}
-            - name: SLOPPOD_MEMINI_URL
-              value: {{ .Values.memini.url | quote }}
-            - name: SLOPPOD_MEMINI_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ required "memini.existingSecret is required with memini.url" .Values.memini.existingSecret }}
-                  key: {{ .Values.memini.secretKey }}
-            {{- with .Values.memini.namespacePrefix }}
-            - name: SLOPPOD_MEMINI_NAMESPACE_PREFIX
+                  name: {{ .Values.masterKey.existingSecret }}
+                  key: {{ .Values.masterKey.secretKey }}
+            - name: SLOPPOD_USER_HEADER
+              value: {{ .Values.auth.userHeader | quote }}
+            {{- with .Values.auth.defaultUser }}
+            - name: SLOPPOD_DEFAULT_USER
               value: {{ . | quote }}
             {{- end }}
+            {{- with .Values.memory.namespacePrefix }}
+            - name: SLOPPOD_MEMINI_NAMESPACE_PREFIX
+              value: {{ . | quote }}
             {{- end }}
             - name: SLOPPOD_GIT_NAME
               value: {{ .Values.git.name | quote }}
@@ -122,6 +114,8 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+            - name: sessions
+              containerPort: 8081
             - name: authz
               containerPort: 9001
           readinessProbe:
@@ -141,19 +135,10 @@ spec:
             capabilities:
               drop: [ALL]
           volumeMounts:
-            - name: github
-              mountPath: /etc/sloppod/github
-              readOnly: true
             - name: config
               mountPath: /etc/sloppod/config
               readOnly: true
       volumes:
-        - name: github
-          secret:
-            secretName: {{ .Values.github.existingSecret }}
-            items:
-              - key: {{ .Values.github.secretKey }}
-                path: private-key
         - name: config
           configMap:
             name: {{ include "sloppod.fullname" . }}

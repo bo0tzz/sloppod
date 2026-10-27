@@ -9,11 +9,12 @@ pub mod api {
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct NewSession {
-        pub repo: String,
+        pub prompt: String,
+        /// Derived from the prompt when absent; a session may have no repository at all.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub repo: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub title: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub prompt: Option<String>,
     }
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -55,11 +56,40 @@ pub mod api {
     pub struct Session {
         pub id: Uuid,
         pub title: String,
-        pub repo: String,
-        pub branch: String,
+        /// From the session's writable repository grant, if any.
+        pub repo: Option<String>,
+        pub branch: Option<String>,
+        pub grants: Vec<Grant>,
         pub phase: Phase,
         pub created_at: String,
         pub updated_at: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct Grant {
+        pub capability: String,
+        #[serde(default)]
+        pub params: Value,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct NewCredential {
+        pub kind: String,
+        pub name: String,
+        #[serde(default)]
+        pub config: serde_json::Map<String, Value>,
+        pub secret: String,
+    }
+
+    /// A credential as the API shows it; the secret is write-only.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct Credential {
+        pub id: Uuid,
+        pub kind: String,
+        pub name: String,
+        pub config: Value,
+        pub default: bool,
+        pub created_at: String,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]

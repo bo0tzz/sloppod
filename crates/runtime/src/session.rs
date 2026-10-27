@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use serde_json::{Value, json};
 use sloppod_protocol::api::{Phase, Proposal};
 use sqlx::PgPool;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, broadcast, oneshot};
 use uuid::Uuid;
 
 use crate::db;
@@ -29,6 +29,12 @@ pub enum UiEvent {
     },
 }
 
+/// A prompt sent before the agent was ready; it runs with the rest of the queue once it is.
+struct Queued {
+    blocks: Vec<Value>,
+    reply: Option<oneshot::Sender<Result<Value, RpcError>>>,
+}
+
 struct Permission {
     agent_request_id: Value,
     params: Value,
@@ -45,6 +51,7 @@ struct LiveState {
     turn_running: bool,
     permissions: HashMap<u64, Permission>,
     next_permission: u64,
+    queue: Vec<Queued>,
 }
 
 pub struct Live {
@@ -175,14 +182,16 @@ impl Hub {
         state.turn_running = false;
     }
 
+    /// The agent is up; anything sent while it wasn't runs now, as one turn.
     pub async fn agent_ready(
-        &self,
+        self: &Arc<Self>,
         id: Uuid,
         agent: &Arc<AgentConn>,
         agent_session_id: String,
         agent_state: Value,
+        pending: Option<String>,
     ) {
-        {
+        let queued = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
             if !state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
@@ -191,8 +200,31 @@ impl Hub {
             state.agent_session_id = Some(agent_session_id);
             state.agent_state = agent_state;
             state.loading = false;
+            let queued = std::mem::take(&mut state.queue);
+            if pending.is_some() || !queued.is_empty() {
+                state.turn_running = true;
+            }
+            queued
+        };
+        if pending.is_none() && queued.is_empty() {
+            self.set_phase(id, Phase::Idle).await;
+            return;
         }
-        self.set_phase(id, Phase::Idle).await;
+        let hub = self.clone();
+        tokio::spawn(async move {
+            let mut blocks: Vec<Value> = pending
+                .into_iter()
+                .map(|text| json!({"type": "text", "text": text}))
+                .collect();
+            blocks.extend(queued.iter().flat_map(|q| q.blocks.iter().cloned()));
+            let result = hub.run_turn(id, blocks).await;
+            if let Err(e) = &result {
+                tracing::warn!(session = %id, error = %e, "queued prompt failed");
+            }
+            for reply in queued.into_iter().filter_map(|q| q.reply) {
+                let _ = reply.send(result.clone());
+            }
+        });
     }
 
     pub async fn set_loading(&self, id: Uuid, loading: bool) {
@@ -340,7 +372,7 @@ impl Hub {
         }
     }
 
-    async fn record_user_message(&self, id: Uuid, prompt: &Value, steering: bool) {
+    pub async fn record_user_message(&self, id: Uuid, prompt: &Value, steering: bool) {
         let message_id = Uuid::new_v4();
         for block in prompt.as_array().into_iter().flatten() {
             let mut update = json!({"sessionUpdate": "user_message_chunk", "messageId": message_id, "content": block});
@@ -351,28 +383,59 @@ impl Hub {
         }
     }
 
-    pub async fn prompt(&self, id: Uuid, mut params: Value) -> Result<Value, RpcError> {
-        let (agent, agent_session_id) = self.agent_for(id).await?;
-        {
+    /// Starts a turn, or queues the prompt until the agent is up; resolves when its turn ends.
+    pub async fn prompt(&self, id: Uuid, params: Value) -> Result<Value, RpcError> {
+        let blocks = params["prompt"].as_array().cloned().unwrap_or_default();
+        let queued = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
-            if state.turn_running {
-                return Err(RpcError::new(
-                    -32002,
-                    "a turn is already running; steer it instead",
-                ));
+            if state.agent.is_some() && state.agent_session_id.is_some() {
+                if state.turn_running {
+                    return Err(RpcError::new(
+                        -32002,
+                        "a turn is already running; steer it instead",
+                    ));
+                }
+                state.turn_running = true;
+                None
+            } else {
+                let (reply, receiver) = oneshot::channel();
+                state.queue.push(Queued {
+                    blocks: blocks.clone(),
+                    reply: Some(reply),
+                });
+                Some(receiver)
             }
-            state.turn_running = true;
-        }
+        };
         self.record_user_message(id, &params["prompt"], false).await;
-        self.set_phase(id, Phase::Working).await;
-        params["sessionId"] = json!(agent_session_id);
-        let result = agent.request("session/prompt", params).await;
-        {
-            let live = self.live(id);
-            let mut state = live.state.lock().await;
-            state.turn_running = false;
+        match queued {
+            Some(receiver) => receiver.await.unwrap_or_else(|_| {
+                Err(RpcError::new(
+                    -32002,
+                    "the session stopped before the prompt ran",
+                ))
+            }),
+            None => self.run_turn(id, blocks).await,
         }
+    }
+
+    /// Runs one turn; the caller has set `turn_running`.
+    async fn run_turn(&self, id: Uuid, blocks: Vec<Value>) -> Result<Value, RpcError> {
+        let (agent, agent_session_id) = match self.agent_for(id).await {
+            Ok(agent) => agent,
+            Err(e) => {
+                self.live(id).state.lock().await.turn_running = false;
+                return Err(e);
+            }
+        };
+        self.set_phase(id, Phase::Working).await;
+        let result = agent
+            .request(
+                "session/prompt",
+                json!({"sessionId": agent_session_id, "prompt": blocks}),
+            )
+            .await;
+        self.live(id).state.lock().await.turn_running = false;
         if self.agent_for(id).await.is_ok() {
             self.set_phase(id, Phase::Idle).await;
             agent.sync_transcript();
@@ -380,8 +443,18 @@ impl Hub {
         result
     }
 
+    /// Delivers a message into the running turn; before the agent is up it joins the queue instead.
     pub async fn steer(&self, id: Uuid, mut params: Value) -> Result<Value, RpcError> {
-        let (agent, agent_session_id) = self.agent_for(id).await?;
+        let ready = self.agent_for(id).await;
+        let Ok((agent, agent_session_id)) = ready else {
+            let blocks = params["prompt"].as_array().cloned().unwrap_or_default();
+            self.live(id).state.lock().await.queue.push(Queued {
+                blocks,
+                reply: None,
+            });
+            self.record_user_message(id, &params["prompt"], false).await;
+            return Ok(json!({"outcome": "queued"}));
+        };
         self.record_user_message(id, &params["prompt"], true).await;
         params["sessionId"] = json!(agent_session_id);
         agent.request("_session/steering", params).await
@@ -440,7 +513,14 @@ impl Hub {
     }
 
     pub async fn stop(&self, id: Uuid) {
-        let agent = self.live(id).state.lock().await.agent.take();
+        let (agent, queued) = {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            (state.agent.take(), std::mem::take(&mut state.queue))
+        };
+        for reply in queued.into_iter().filter_map(|q| q.reply) {
+            let _ = reply.send(Err(RpcError::new(-32002, "the session was stopped")));
+        }
         if let Some(agent) = agent {
             agent.close();
         }

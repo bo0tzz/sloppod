@@ -37,15 +37,64 @@ impl Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// One capability granted to a session (ADR 2), e.g. `repo` with `{repo, access, branch}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Grant {
+    pub capability: String,
+    #[serde(default)]
+    pub params: Value,
+}
+
+impl Grant {
+    pub fn new(capability: &str, params: Value) -> Self {
+        Self {
+            capability: capability.to_owned(),
+            params,
+        }
+    }
+
+    pub fn param(&self, name: &str) -> Option<&str> {
+        self.params.get(name).and_then(Value::as_str)
+    }
+}
+
 /// What extension points know about the session they act for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionContext {
     pub session_id: String,
-    /// The repository the session may write to, as `owner/name`.
-    pub repo: String,
-    /// The session's own branch; the only ref it may push.
-    pub branch: String,
-    pub memory_namespace: Option<String>,
+    /// The user the session belongs to; credentials are theirs (ADR 23).
+    pub owner: String,
+    pub grants: Vec<Grant>,
+}
+
+/// A writable repository grant: the repository and the session branch, the only ref it may push.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoGrant<'a> {
+    pub repo: &'a str,
+    pub branch: &'a str,
+}
+
+impl SessionContext {
+    pub fn grant(&self, capability: &str) -> Option<&Grant> {
+        self.grants.iter().find(|g| g.capability == capability)
+    }
+
+    pub fn has(&self, capability: &str) -> bool {
+        self.grant(capability).is_some()
+    }
+
+    /// The repository the session may push to, if it has one.
+    pub fn writable_repo(&self) -> Option<RepoGrant<'_>> {
+        self.grants
+            .iter()
+            .filter(|g| g.capability == "repo" && g.param("access") == Some("rw"))
+            .find_map(|g| {
+                Some(RepoGrant {
+                    repo: g.param("repo")?,
+                    branch: g.param("branch")?,
+                })
+            })
+    }
 }
 
 /// One HTTP request leaving a session pod, as seen by the egress listener.
@@ -194,6 +243,7 @@ pub struct AgentFile {
 pub struct AgentContext {
     pub session: SessionContext,
     pub workdir: String,
+    /// Where the agent works: the checkout, or an empty directory for sessions without a repository.
     pub repo_dir: String,
     /// The runtime's MCP endpoint for this session's tools.
     pub tools_url: String,

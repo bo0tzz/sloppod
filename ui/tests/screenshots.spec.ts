@@ -29,10 +29,24 @@ for (const [form, device] of Object.entries(viewports)) {
         await shot(page, 'sessions');
 
         await page.goto('/new');
-        await page.getByRole('combobox').click();
-        await page.getByRole('option', { name: 'bo0tzz/sloppod' }).click();
-        await page.getByRole('textbox', { name: 'Prompt' }).fill('Add backoff to the ACP reconnect logic, and a test for it.');
+        await page.getByRole('textbox', { name: 'Prompt' }).fill('Add backoff to the ACP reconnect logic in sloppod, and a test for it.');
         await shot(page, 'new-session');
+
+        await page.goto('/settings');
+        await expect(page.getByTestId('credential').first()).toBeVisible();
+        await page.getByTestId('credentials-github-app').getByRole('button', { name: 'Add GitHub App' }).click();
+        await shot(page, 'settings');
+      });
+
+      test('queued messages while the agent starts', async ({ page }) => {
+        const response = await page.request.post('/api/v1/sessions', {
+          data: { prompt: 'slow start: what can you tell me about this runtime?' },
+        });
+        const session: Session = await response.json();
+        await page.goto(`/sessions/${session.id}`);
+        await expect(page.getByTestId('activity')).toBeVisible();
+        await page.getByRole('textbox', { name: 'Prompt' }).fill('Keep it short');
+        await shot(page, 'starting');
       });
 
       test('finished session with a proposal', async ({ page }) => {
@@ -54,7 +68,7 @@ for (const [form, device] of Object.entries(viewports)) {
 
       test('live turn waiting on a permission', async ({ page }) => {
         const response = await page.request.post('/api/v1/sessions', {
-          data: { repo: 'bo0tzz/sloppod', prompt: 'Make the reconnect delay back off exponentially' },
+          data: { prompt: 'Make the reconnect delay in sloppod back off exponentially' },
         });
         const session: Session = await response.json();
         await page.goto(`/sessions/${session.id}`);

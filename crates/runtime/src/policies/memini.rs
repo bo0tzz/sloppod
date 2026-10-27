@@ -1,15 +1,23 @@
-use async_trait::async_trait;
-use sloppod_contracts::{Decision, HttpRequest, Manifest, RequestPolicy, Result, SessionContext};
+use std::sync::Arc;
 
-/// memini: the runtime's key, and the namespace the runtime chose for the session (ADR 8).
+use async_trait::async_trait;
+use sloppod_contracts::{
+    Decision, Error, HttpRequest, Manifest, RequestPolicy, Result, SessionContext,
+};
+
+use crate::credentials::Credentials;
+
+/// Name of the session secret holding the session's own memini key (ADR 22).
+pub const SESSION_KEY: &str = "memini-key";
+
+/// memini: the session's own key, and the namespace the runtime chose for it (ADR 8).
 pub struct MeminiPolicy {
-    host: String,
-    api_key: String,
+    credentials: Arc<Credentials>,
 }
 
 impl MeminiPolicy {
-    pub fn new(host: String, api_key: String) -> Self {
-        Self { host, api_key }
+    pub fn new(credentials: Arc<Credentials>) -> Self {
+        Self { credentials }
     }
 }
 
@@ -36,7 +44,7 @@ impl RequestPolicy for MeminiPolicy {
     }
 
     fn hosts(&self) -> Vec<String> {
-        vec![self.host.clone()]
+        self.credentials.memini_hosts()
     }
 
     async fn decide(&self, session: &SessionContext, request: &HttpRequest) -> Result<Decision> {
@@ -48,15 +56,27 @@ impl RequestPolicy for MeminiPolicy {
                 request.method
             )));
         }
-        let Some(namespace) = &session.memory_namespace else {
+        let Some(namespace) = session.grant("memory").and_then(|g| g.param("namespace")) else {
             return Ok(Decision::deny(
-                "sloppod: this session has no memory namespace.\n",
+                "sloppod: this session has no memory access.\n",
             ));
+        };
+        let session_id = session
+            .session_id
+            .parse()
+            .map_err(|_| Error::new("bad session id"))?;
+        let key = self
+            .credentials
+            .session_secret(session_id, SESSION_KEY)
+            .await
+            .map_err(|e| Error::new(e.to_string()))?;
+        let Some(key) = key else {
+            return Ok(Decision::deny("sloppod: this session has no memini key.\n"));
         };
         Ok(Decision::allow_with(
             vec![
-                ("authorization".into(), format!("Bearer {}", self.api_key)),
-                ("x-memini-namespace".into(), namespace.clone()),
+                ("authorization".into(), format!("Bearer {key}")),
+                ("x-memini-namespace".into(), namespace.to_owned()),
             ],
             vec!["x-memini-home".into()],
         ))

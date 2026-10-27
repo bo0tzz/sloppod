@@ -7,23 +7,34 @@ use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use serde::Deserialize;
 use serde_json::json;
-use sloppod_contracts::{EgressSpec, PlacementSpec};
-use sloppod_protocol::api::{Decision, NewSession, Phase};
+use sloppod_contracts::{EgressSpec, Grant, PlacementSpec};
+use sloppod_protocol::api::{Decision, NewCredential, NewSession, Phase};
 use uuid::Uuid;
 
+use crate::credentials::{CLAUDE, MEMINI};
+use crate::memini::MeminiAdmin;
 use crate::placement::{TOKEN_DIR, WORKDIR};
 use crate::pods::SESSION_LABEL;
+use crate::policies::SESSION_KEY;
 use crate::proposals::{self, Verdict};
+use crate::users::User;
 use crate::{AppState, db};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/me", get(me))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}", get(get_session).delete(delete_session))
         .route("/repos", get(repos))
+        .route(
+            "/credentials",
+            get(list_credentials).post(create_credential),
+        )
+        .route("/credentials/{id}", delete(delete_credential))
+        .route("/credentials/{id}/default", post(default_credential))
         .route("/proposals", get(list_proposals))
         .route("/proposals/{id}", get(get_proposal))
         .route("/proposals/{id}/approve", post(approve))
@@ -49,10 +60,21 @@ fn not_found() -> ApiError {
     ApiError(StatusCode::NOT_FOUND, "not found".into())
 }
 
+fn bad_request(message: impl Into<String>) -> ApiError {
+    ApiError(StatusCode::BAD_REQUEST, message.into())
+}
+
 type ApiResult<T> = Result<T, ApiError>;
 
-async fn list_sessions(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
-    let sessions: Vec<_> = db::list_sessions(&state.db)
+async fn me(User(user): User) -> impl IntoResponse {
+    Json(json!({"user": user}))
+}
+
+async fn list_sessions(
+    State(state): State<AppState>,
+    User(user): User,
+) -> ApiResult<impl IntoResponse> {
+    let sessions: Vec<_> = db::list_sessions(&state.db, &user)
         .await?
         .iter()
         .map(|s| s.to_api())
@@ -62,61 +84,169 @@ async fn list_sessions(State(state): State<AppState>) -> ApiResult<impl IntoResp
 
 async fn get_session(
     State(state): State<AppState>,
+    User(user): User,
     Path(id): Path<Uuid>,
 ) -> ApiResult<impl IntoResponse> {
-    let session = db::get_session(&state.db, id)
+    let session = db::owned_session(&state.db, id, &user)
         .await?
         .ok_or_else(not_found)?;
     Ok(Json(session.to_api()))
 }
 
-async fn repos(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
-    Ok(Json(state.github.repos().await?))
+/// Repositories the user's GitHub App can act on; none without one.
+async fn accessible_repos(state: &AppState, user: &str) -> Vec<String> {
+    let Ok(app) = state.credentials.github(user).await else {
+        return Vec::new();
+    };
+    app.repos().await.unwrap_or_else(|e| {
+        tracing::warn!(%user, error = %e, "listing the GitHub App's repositories");
+        Vec::new()
+    })
 }
 
-fn default_title(new: &NewSession) -> String {
-    let from_prompt = new
-        .prompt
-        .as_deref()
-        .and_then(|p| p.lines().find(|l| !l.trim().is_empty()))
-        .map(|l| {
-            let l = l.trim();
-            match l.char_indices().nth(80) {
-                Some((i, _)) => format!("{}…", &l[..i]),
-                None => l.to_owned(),
-            }
-        });
-    from_prompt.unwrap_or_else(|| new.repo.clone())
+async fn repos(State(state): State<AppState>, User(user): User) -> impl IntoResponse {
+    Json(accessible_repos(&state, &user).await)
+}
+
+fn default_title(prompt: &str) -> String {
+    let line = prompt
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("New session")
+        .trim();
+    match line.char_indices().nth(80) {
+        Some((i, _)) => format!("{}…", &line[..i]),
+        None => line.to_owned(),
+    }
+}
+
+/// The repository a first message is about: one named as `owner/name`, or a bare name that matches exactly
+/// one accessible repository. Sessions don't need one (ADR 1).
+fn derive_repo(prompt: &str, repos: &[String]) -> Option<String> {
+    let text = prompt.to_lowercase();
+    let words: Vec<&str> = text
+        .split(|c: char| !(c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/')))
+        .map(|w| w.trim_matches(|c: char| matches!(c, '.' | '/')))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let named = |repo: &&String| {
+        let repo = repo.to_lowercase();
+        words.iter().any(|w| {
+            w.trim_end_matches(".git") == repo
+                || w.contains(&format!("/{repo}/"))
+                || w.ends_with(&format!("/{repo}"))
+        })
+    };
+    let full: Vec<&String> = repos.iter().filter(named).collect();
+    if let [repo] = full.as_slice() {
+        return Some((*repo).clone());
+    }
+    let bare: Vec<&String> = repos
+        .iter()
+        .filter(|repo| {
+            let name = repo.rsplit('/').next().unwrap_or_default().to_lowercase();
+            words.iter().any(|w| w.trim_end_matches("'s") == name)
+        })
+        .collect();
+    match bare.as_slice() {
+        [repo] => Some((*repo).clone()),
+        _ => None,
+    }
 }
 
 async fn create_session(
     State(state): State<AppState>,
+    User(user): User,
     Json(new): Json<NewSession>,
 ) -> ApiResult<impl IntoResponse> {
-    let repo = new.repo.trim().to_owned();
-    if repo.split('/').count() != 2 {
+    let prompt = new.prompt.trim();
+    if prompt.is_empty() {
+        return Err(bad_request("a session starts from a message"));
+    }
+    if state.credentials.secret(&user, CLAUDE).await?.is_none() {
         return Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            "repo must be owner/name".into(),
+            StatusCode::CONFLICT,
+            "add a Claude account in settings before starting a session".into(),
         ));
     }
-    if let Err(e) = state.github.token_for(&repo).await {
-        return Err(ApiError(StatusCode::BAD_REQUEST, e.to_string()));
-    }
+    let repos = accessible_repos(&state, &user).await;
+    let repo = match &new.repo {
+        Some(wanted) => Some(
+            repos
+                .iter()
+                .find(|r| r.eq_ignore_ascii_case(wanted.trim()))
+                .cloned()
+                .ok_or_else(|| {
+                    bad_request(format!("{wanted} isn't accessible to your GitHub App"))
+                })?,
+        ),
+        None => derive_repo(prompt, &repos),
+    };
+
     let id = Uuid::new_v4();
-    let branch = format!("sloppod/{}", &id.simple().to_string()[..8]);
-    let custom = new.title.as_ref().filter(|t| !t.trim().is_empty());
-    let title = custom.cloned().unwrap_or_else(|| default_title(&new));
-    let row = db::insert_session(
+    let mut grants = vec![
+        Grant::new("model", json!({})),
+        Grant::new("github", json!({})),
+        Grant::new("packages", json!({})),
+    ];
+    if let Some(repo) = &repo {
+        let branch = format!("sloppod/{}", &id.simple().to_string()[..8]);
+        grants.push(Grant::new(
+            "repo",
+            json!({"repo": repo, "access": "rw", "branch": branch}),
+        ));
+    }
+    let custom = new
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    let title = custom
+        .map(str::to_owned)
+        .unwrap_or_else(|| default_title(prompt));
+    db::insert_session(
         &state.db,
-        id,
-        &title,
-        &repo,
-        &branch,
-        custom.is_some(),
-        new.prompt.as_deref(),
+        db::NewSessionRow {
+            id,
+            owner: &user,
+            title: &title,
+            custom_title: custom.is_some(),
+            pending_prompt: prompt,
+            grants: &grants,
+        },
     )
     .await?;
+
+    if let Some((admin, memini)) = state.credentials.memini(&user).await? {
+        let namespace = state.memory_namespace(repo.as_deref());
+        match admin
+            .create_session_key(&id.to_string(), memini.config("home"), &namespace, false)
+            .await
+        {
+            Ok(key) => {
+                state
+                    .credentials
+                    .put_session_secret(id, SESSION_KEY, &key.secret)
+                    .await?;
+                let grant = Grant::new(
+                    "memory",
+                    json!({"namespace": namespace, "access": "rw", "key": key.name}),
+                );
+                db::add_grant(&state.db, id, &grant).await?;
+            }
+            Err(e) => {
+                tracing::warn!(session = %id, error = %e, "minting the session's memini key; no memory")
+            }
+        }
+    }
+
+    state
+        .hub
+        .record_user_message(id, &json!([{"type": "text", "text": prompt}]), false)
+        .await;
+    let row = db::get_session(&state.db, id)
+        .await?
+        .ok_or_else(not_found)?;
     if let Err(e) = place(&state, &row).await {
         state.hub.set_phase(id, Phase::Stopped).await;
         return Err(ApiError(
@@ -130,6 +260,7 @@ async fn create_session(
 /// Makes sure a session's pod and egress policy exist.
 pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
     let id = session.id.to_string();
+    let context = session.context();
     let labels = BTreeMap::from([
         (SESSION_LABEL.to_owned(), id.clone()),
         ("app.kubernetes.io/part-of".to_owned(), "sloppod".to_owned()),
@@ -144,7 +275,11 @@ pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result
             session_id: id.clone(),
             pod_labels: BTreeMap::from([(SESSION_LABEL.to_owned(), id.clone())]),
             intercepted_hosts: state.policies.hosts(),
-            direct_hosts: state.config.direct_hosts.clone(),
+            direct_hosts: if context.has("packages") {
+                state.config.direct_hosts.clone()
+            } else {
+                Vec::new()
+            },
         })
         .await?;
     state
@@ -169,15 +304,86 @@ pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result
 
 async fn delete_session(
     State(state): State<AppState>,
+    User(user): User,
     Path(id): Path<Uuid>,
 ) -> ApiResult<impl IntoResponse> {
-    db::get_session(&state.db, id)
+    let session = db::owned_session(&state.db, id, &user)
         .await?
         .ok_or_else(not_found)?;
     state.hub.stop(id).await;
     state.placement.delete(&id.to_string()).await?;
     state.enforcer.remove(&id.to_string()).await?;
+    if session.context().has("memory")
+        && let Some((admin, _)) = state.credentials.memini(&user).await?
+        && let Err(e) = admin
+            .delete_key(&MeminiAdmin::key_name(&id.to_string()))
+            .await
+    {
+        tracing::warn!(session = %id, error = %e, "deleting the session's memini key");
+    }
+    state
+        .credentials
+        .delete_session_secret(id, SESSION_KEY)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_credentials(
+    State(state): State<AppState>,
+    User(user): User,
+) -> ApiResult<impl IntoResponse> {
+    let credentials: Vec<_> = state
+        .credentials
+        .list(&user)
+        .await?
+        .iter()
+        .map(|c| c.to_api())
+        .collect();
+    Ok(Json(credentials))
+}
+
+async fn create_credential(
+    State(state): State<AppState>,
+    User(user): User,
+    Json(new): Json<NewCredential>,
+) -> ApiResult<impl IntoResponse> {
+    let kind = new.kind.clone();
+    match state.credentials.create(&user, new).await? {
+        Ok(row) => {
+            if kind == MEMINI
+                && let Err(e) = state.install_listener().await
+            {
+                tracing::error!(error = %e, "updating the egress listener for a new memini host");
+            }
+            Ok((StatusCode::CREATED, Json(row.to_api())))
+        }
+        Err(invalid) => Err(bad_request(invalid.0)),
+    }
+}
+
+async fn delete_credential(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    if state.credentials.delete(&user, id).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(not_found())
+    }
+}
+
+async fn default_credential(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    let row = state
+        .credentials
+        .set_default(&user, id)
+        .await?
+        .ok_or_else(not_found)?;
+    Ok(Json(row.to_api()))
 }
 
 #[derive(Deserialize)]
@@ -188,27 +394,33 @@ struct ProposalFilter {
 
 async fn list_proposals(
     State(state): State<AppState>,
+    User(user): User,
     Query(filter): Query<ProposalFilter>,
 ) -> ApiResult<impl IntoResponse> {
-    let proposals: Vec<_> = db::list_proposals(&state.db, filter.session, filter.status.as_deref())
-        .await?
-        .iter()
-        .map(|p| p.to_api())
-        .collect();
+    let proposals: Vec<_> =
+        db::list_proposals(&state.db, &user, filter.session, filter.status.as_deref())
+            .await?
+            .iter()
+            .map(|p| p.to_api())
+            .collect();
     Ok(Json(proposals))
 }
 
 async fn get_proposal(
     State(state): State<AppState>,
+    User(user): User,
     Path(id): Path<Uuid>,
 ) -> ApiResult<impl IntoResponse> {
     Ok(Json(
-        proposals::detail(&state, id).await?.ok_or_else(not_found)?,
+        proposals::detail(&state, id, &user)
+            .await?
+            .ok_or_else(not_found)?,
     ))
 }
 
 async fn approve(
     State(state): State<AppState>,
+    User(user): User,
     Path(id): Path<Uuid>,
     body: Option<Json<Decision>>,
 ) -> ApiResult<impl IntoResponse> {
@@ -217,7 +429,7 @@ async fn approve(
         title: decision.title,
         body: decision.body,
     };
-    match proposals::decide(&state, id, verdict).await {
+    match proposals::decide(&state, id, verdict, &user).await {
         Ok(Some(proposal)) => Ok(Json(proposal)),
         Ok(None) => Err(not_found()),
         Err(e) => Err(ApiError(StatusCode::CONFLICT, e.to_string())),
@@ -226,6 +438,7 @@ async fn approve(
 
 async fn reject(
     State(state): State<AppState>,
+    User(user): User,
     Path(id): Path<Uuid>,
     body: Option<Json<Decision>>,
 ) -> ApiResult<impl IntoResponse> {
@@ -236,11 +449,51 @@ async fn reject(
         Verdict::Reject {
             reason: decision.reason,
         },
+        &user,
     )
     .await
     {
         Ok(Some(proposal)) => Ok(Json(proposal)),
         Ok(None) => Err(not_found()),
         Err(e) => Err(ApiError(StatusCode::CONFLICT, e.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn repos() -> Vec<String> {
+        [
+            "bo0tzz/sloppod",
+            "bo0tzz/memini",
+            "immich-app/immich",
+            "bo0tzz/immich",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    #[test]
+    fn derives_the_repository_from_the_first_message() {
+        let repos = repos();
+        let derive = |p: &str| derive_repo(p, &repos);
+        assert_eq!(
+            derive("In sloppod, make the UI start sessions from a message."),
+            Some("bo0tzz/sloppod".into())
+        );
+        assert_eq!(
+            derive("Fix the flaky test in immich-app/immich."),
+            Some("immich-app/immich".into())
+        );
+        assert_eq!(
+            derive("see https://github.com/bo0tzz/memini/pull/3"),
+            Some("bo0tzz/memini".into())
+        );
+        // Two repositories are called immich, so the bare name is ambiguous.
+        assert_eq!(derive("Look at immich's release process"), None);
+        assert_eq!(derive("What's the weather like?"), None);
+        assert_eq!(derive("Explain memoization to me"), None);
     }
 }

@@ -36,9 +36,12 @@ export class SessionView {
   permissions = $state<PendingPermission[]>([]);
   proposals = $state<Proposal[]>([]);
 
-  promptInFlight = $state(false);
+  /** Prompts sent from here whose turn hasn't ended. Queued prompts all resolve when their shared turn ends. */
+  promptsInFlight = $state(0);
 
-  turnRunning = $derived(this.promptInFlight || this.session?.phase === 'working' || this.session?.phase === 'waiting');
+  turnRunning = $derived(
+    this.promptsInFlight > 0 || this.session?.phase === 'working' || this.session?.phase === 'waiting',
+  );
 
   #conn: AcpConnection;
   /** Receives the history replay of a (re)load, and replaces `transcript` once the load completes. */
@@ -191,7 +194,7 @@ export class SessionView {
 
   /** Starts a turn. The returned promise settles with the stop reason when the turn ends. */
   async prompt(text: string): Promise<StopReason | undefined> {
-    this.promptInFlight = true;
+    this.promptsInFlight++;
     try {
       const result = await this.#conn.request<{ stopReason: StopReason }>('session/prompt', {
         sessionId: this.id,
@@ -199,7 +202,7 @@ export class SessionView {
       });
       return result?.stopReason;
     } finally {
-      this.promptInFlight = false;
+      this.promptsInFlight--;
     }
   }
 

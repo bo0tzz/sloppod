@@ -10,17 +10,18 @@
     modalManager,
     toastManager,
   } from '@immich/ui';
-  import { mdiArrowDown, mdiArrowLeft, mdiSourcePull, mdiTrashCanOutline } from '@mdi/js';
+  import { mdiArrowDown, mdiCogOutline, mdiSourcePull, mdiTrashCanOutline } from '@mdi/js';
   import { onMount } from 'svelte';
   import { api } from '#lib/api.ts';
   import { SessionView } from '#lib/session.svelte.ts';
   import { sessions } from '#lib/sessions.svelte.ts';
-  import Composer from './Composer.svelte';
+  import ChatHeader from './ChatHeader.svelte';
   import PermissionCard from './PermissionCard.svelte';
   import PhaseBadge from './PhaseBadge.svelte';
   import ProposalCard from './ProposalCard.svelte';
   import ProposalListModal from './ProposalListModal.svelte';
   import ProposalModal from './ProposalModal.svelte';
+  import SessionComposer from './SessionComposer.svelte';
   import TranscriptView from './TranscriptView.svelte';
 
   let { id }: { id: string } = $props();
@@ -30,9 +31,21 @@
   const view = new SessionView(id);
 
   const session = $derived(view.session);
-  const title = $derived(session?.title || 'Untitled session');
+  const title = $derived(session?.title || 'New session');
   const pendingProposals = $derived(view.proposals.filter((proposal) => proposal.status === 'pending'));
   const showReconnecting = $derived(view.loaded && view.connection !== 'open');
+  const activity = $derived.by(() => {
+    switch (session?.phase) {
+      case 'starting':
+        return 'Starting the agent…';
+      case 'disconnected':
+        return 'Bringing the agent back…';
+      case 'waiting':
+        return 'Waiting for your decision';
+      default:
+        return view.turnRunning ? 'Working…' : null;
+    }
+  });
 
   let openProposalId = $state<string | null>(null);
   let showProposalList = $state(false);
@@ -99,39 +112,29 @@
   </div>
 {:else}
   <div class="flex h-full min-h-0 flex-col" data-testid="session-screen">
-    <header class="border-light-200 flex h-14 shrink-0 items-center gap-1 border-b ps-1 pe-2 md:gap-2 md:ps-4">
-      <IconButton
-        href="/"
-        icon={mdiArrowLeft}
-        aria-label="All sessions"
-        variant="ghost"
-        shape="round"
-        color="secondary"
-        class="md:hidden"
-      />
-      <div class="flex min-w-0 grow flex-col">
-        <h1 class="truncate text-sm leading-tight font-semibold md:text-base" data-testid="session-title">{title}</h1>
+    <ChatHeader {title} subtitle={session ? (session.repo ?? 'No repository') : undefined} mono={Boolean(session?.repo)}>
+      {#snippet actions()}
         {#if session}
-          <span class="text-muted truncate font-mono text-xs" title={session.branch}>{session.repo}</span>
+          <PhaseBadge phase={session.phase} />
         {/if}
-      </div>
-      {#if session}
-        <PhaseBadge phase={session.phase} />
-      {/if}
-      <IconButton
-        icon={mdiSourcePull}
-        aria-label="Proposals"
-        variant="ghost"
-        shape="round"
-        color="secondary"
-        indicator={pendingProposals.length > 0 ? 'warning' : undefined}
-        onclick={() => (showProposalList = true)}
-      />
-      <ContextMenuButton
-        aria-label="Session actions"
-        items={[{ title: 'Delete session', icon: mdiTrashCanOutline, color: 'danger', onAction: deleteSession }]}
-      />
-    </header>
+        <IconButton
+          icon={mdiSourcePull}
+          aria-label="Proposals"
+          variant="ghost"
+          shape="round"
+          color="secondary"
+          indicator={pendingProposals.length > 0 ? 'warning' : undefined}
+          onclick={() => (showProposalList = true)}
+        />
+        <ContextMenuButton
+          aria-label="Session actions"
+          items={[
+            { title: 'Settings', icon: mdiCogOutline, href: '/settings' },
+            { title: 'Delete session', icon: mdiTrashCanOutline, color: 'danger', onAction: deleteSession },
+          ]}
+        />
+      {/snippet}
+    </ChatHeader>
 
     {#if showReconnecting}
       <div
@@ -156,16 +159,14 @@
               {/if}
             </div>
           {:else}
-            {#if view.transcript.items.length === 0}
-              <Text color="muted" class="py-16 text-center">
-                {session?.phase === 'starting' ? 'Starting the agent…' : 'Nothing here yet. Send a prompt to get going.'}
-              </Text>
+            {#if view.transcript.items.length === 0 && session?.phase !== 'starting'}
+              <Text color="muted" class="py-16 text-center">Nothing here yet. Send a message to get going.</Text>
             {/if}
             <TranscriptView items={view.transcript.items} running={view.turnRunning} />
-            {#if view.turnRunning}
-              <div class="text-muted flex items-center gap-2 py-1 text-sm" data-testid="working">
+            {#if activity}
+              <div class="text-muted flex items-center gap-2 py-1 text-sm" data-testid="activity">
                 <LoadingSpinner size="tiny" />
-                {session?.phase === 'waiting' ? 'Waiting for your decision' : 'Working…'}
+                {activity}
               </div>
             {/if}
           {/if}
@@ -203,7 +204,7 @@
       </div>
     {/if}
 
-    <Composer {view} />
+    <SessionComposer {view} />
   </div>
 {/if}
 

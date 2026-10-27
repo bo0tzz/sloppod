@@ -13,21 +13,29 @@ pub struct ClaudeCode;
 impl ClaudeCode {
     fn session_prompt(context: &AgentContext) -> String {
         let session = &context.session;
+        let workspace = match session.writable_repo() {
+            Some(sloppod_contracts::RepoGrant { repo, branch }) => format!(
+                "- Your working copy of {repo} is at {dir}, on your session branch `{branch}`. Commit there and push \
+                 with `git push origin HEAD:{branch}`; that is the only ref you can push.\n\
+                 - Outward actions are proposals that a human reviews. To open a pull request, push your branch and \
+                 call the `propose_pull_request` tool; sloppod opens the PR once it's approved. Direct writes to \
+                 GitHub (gh pr create, comments, API POSTs) are refused.\n",
+                dir = context.repo_dir,
+            ),
+            _ => format!(
+                "- This session has no repository; your working directory {dir} is empty and kept across restarts. \
+                 You can read GitHub and clone repositories to look at them, but there is nothing you can push to, \
+                 and GitHub writes are refused.\n",
+                dir = context.repo_dir,
+            ),
+        };
         format!(
             "You are running in a sloppod session: a sandboxed Kubernetes pod.\n\
-             - Your working copy of {repo} is at {dir}, on your session branch `{branch}`. Commit there and push with \
-             `git push origin HEAD:{branch}`; that is the only ref you can push.\n\
-             - Outward actions are proposals that a human reviews. To open a pull request, push your branch and \
-             call the `propose_pull_request` tool; sloppod opens the PR once it's approved. Direct writes to GitHub \
-             (gh pr create, comments, API POSTs) are refused.\n\
+             {workspace}\
              - Network access is limited to the model API, GitHub, memory and package registries. Credentials are \
              attached outside the pod, so the tokens you see in the environment are placeholders; don't try to use \
              or replace them.\n\
-             - Install tools through the repository's mise config (`mise install`, `mise exec`) rather than apt or \
-             curl-to-shell.",
-            repo = session.repo,
-            dir = context.repo_dir,
-            branch = session.branch,
+             - Install tools through mise (`mise use`, `mise install`, `mise exec`) rather than apt or curl-to-shell."
         )
     }
 }

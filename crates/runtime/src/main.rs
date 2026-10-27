@@ -3,17 +3,21 @@ mod adapter;
 mod api;
 mod authz;
 mod config;
+mod credentials;
 mod db;
 mod enforcer;
 mod github;
 mod link;
 mod mcp;
+mod memini;
 mod placement;
 mod pods;
 mod policies;
 mod proposals;
 mod session;
 mod tls;
+mod users;
+mod vault;
 
 use std::net::SocketAddr;
 use std::ops::Deref;
@@ -25,13 +29,13 @@ use axum::routing::{get, post};
 use clap::Parser;
 use k8s_openapi::api::core::v1::Service;
 use kube::api::Api;
-use sloppod_contracts::{AgentAdapter, Enforcer, PlacementBackend, SessionContext};
+use sloppod_contracts::{AgentAdapter, Enforcer, PlacementBackend};
 use sqlx::PgPool;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::config::Config;
+use crate::credentials::Credentials;
 use crate::enforcer::Cilium;
-use crate::github::GitHubApp;
 use crate::pods::PodIndex;
 use crate::policies::{GitHubPolicy, MeminiPolicy, ModelPolicy, Policies};
 use crate::proposals::ProposalKinds;
@@ -43,14 +47,15 @@ pub struct Inner {
     pub kube: kube::Client,
     pub pods: PodIndex,
     pub hub: Arc<Hub>,
-    pub github: Arc<GitHubApp>,
+    pub credentials: Arc<Credentials>,
     pub policies: Policies,
     pub proposals: ProposalKinds,
     pub placement: Arc<dyn PlacementBackend>,
     pub enforcer: Arc<dyn Enforcer>,
+    pub cilium: Arc<Cilium>,
+    pub ca: tls::Ca,
+    pub authz_addr: SocketAddr,
     pub adapter: Arc<dyn AgentAdapter>,
-    pub ca_pem: String,
-    pub memini_url: Option<String>,
     pub instructions: Option<String>,
 }
 
@@ -66,20 +71,25 @@ impl Deref for AppState {
 }
 
 impl Inner {
-    pub fn memory_namespace(&self, session: &db::SessionRow) -> String {
-        format!("{}{}", self.config.memini_namespace_prefix, session.repo)
+    /// The memory namespace for a session about `repo`; sessions without a project get a holding namespace (ADR 8).
+    pub fn memory_namespace(&self, repo: Option<&str>) -> String {
+        format!(
+            "{}{}",
+            self.config.memini_namespace_prefix,
+            repo.unwrap_or("unsorted")
+        )
     }
 
-    pub fn session_context(&self, session: &db::SessionRow) -> SessionContext {
-        SessionContext {
-            session_id: session.id.to_string(),
-            repo: session.repo.clone(),
-            branch: session.branch.clone(),
-            memory_namespace: self
-                .memini_url
-                .as_ref()
-                .map(|_| self.memory_namespace(session)),
-        }
+    /// (Re)writes the egress listener; its certificate has to cover every intercepted host.
+    pub async fn install_listener(&self) -> anyhow::Result<()> {
+        self.cilium
+            .install_listener(
+                &self.ca,
+                &self.policies.hosts(),
+                self.authz_addr,
+                &self.config.envoy_trusted_ca,
+            )
+            .await
     }
 }
 
@@ -104,29 +114,16 @@ async fn main() -> anyhow::Result<()> {
         .context("connecting to Kubernetes")?;
     let pods = PodIndex::start(kube.clone(), &config.namespace);
 
-    let key = std::fs::read(&config.github_app_private_key_file)
-        .context("reading the GitHub App private key")?;
-    let github = Arc::new(GitHubApp::new(config.github_app_id.clone(), &key)?);
+    let vault = vault::Vault::from_base64(&config.secret_key).context("loading the master key")?;
+    let credentials = Arc::new(Credentials::new(db.clone(), vault).await?);
 
     let mut policies = Policies::default();
-    policies.register(Arc::new(ModelPolicy::new(
-        config.claude_oauth_token.clone(),
-    )));
-    policies.register(Arc::new(GitHubPolicy::new(github.clone())));
-    let memini_url = match (&config.memini_url, &config.memini_api_key) {
-        (Some(url), Some(key)) => {
-            let host = reqwest::Url::parse(url)?
-                .host_str()
-                .context("memini URL without host")?
-                .to_owned();
-            policies.register(Arc::new(MeminiPolicy::new(host, key.clone())));
-            Some(url.clone())
-        }
-        _ => None,
-    };
+    policies.register(Arc::new(ModelPolicy::new(credentials.clone())));
+    policies.register(Arc::new(GitHubPolicy::new(credentials.clone())));
+    policies.register(Arc::new(MeminiPolicy::new(credentials.clone())));
 
     let mut proposals = ProposalKinds::default();
-    proposals.register(Arc::new(proposals::PullRequest::new(github.clone())));
+    proposals.register(Arc::new(proposals::PullRequest::new(credentials.clone())));
 
     let ca = tls::Ca::load_or_create(kube.clone(), &config.namespace, &config.ca_secret).await?;
     let service: Service = Api::namespaced(kube.clone(), &config.namespace)
@@ -141,17 +138,9 @@ async fn main() -> anyhow::Result<()> {
         &kube,
         &config.namespace,
         config.runtime_labels(),
-        config.listen.port(),
+        config.sessions_listen.port(),
     ));
-    cilium
-        .install_listener(
-            &ca,
-            &policies.hosts(),
-            SocketAddr::new(cluster_ip.parse()?, config.authz_listen.port()),
-            &config.envoy_trusted_ca,
-        )
-        .await
-        .context("installing the egress listener")?;
+    let authz_addr = SocketAddr::new(cluster_ip.parse()?, config.authz_listen.port());
 
     let placement = Arc::new(placement::AgentSandbox::new(
         kube.clone(),
@@ -170,16 +159,21 @@ async fn main() -> anyhow::Result<()> {
         db,
         kube,
         pods,
-        github,
+        credentials,
         policies,
         proposals,
         placement,
-        enforcer: cilium,
+        enforcer: cilium.clone(),
+        cilium,
+        ca,
+        authz_addr,
         adapter: Arc::new(adapter::ClaudeCode),
-        ca_pem: ca.cert_pem.clone(),
-        memini_url,
         instructions,
     }));
+    state
+        .install_listener()
+        .await
+        .context("installing the egress listener")?;
 
     reconcile(&state).await;
 
@@ -189,19 +183,33 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .nest("/api/v1", api::routes())
         .route("/acp", get(acp::handler))
+        .route("/healthz", get(|| async { "ok" }))
+        .fallback_service(ui)
+        .with_state(state.clone());
+    let sessions = Router::new()
         .route(sloppod_protocol::link::PATH, get(link::handler))
         .route("/mcp", post(mcp::handler))
         .route("/healthz", get(|| async { "ok" }))
-        .fallback_service(ui)
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
-    tracing::info!(listen = %config.listen, authz = %config.authz_listen, "sloppod runtime up");
+    let sessions_listener = tokio::net::TcpListener::bind(config.sessions_listen).await?;
+    tracing::info!(
+        listen = %config.listen,
+        sessions = %config.sessions_listen,
+        authz = %config.authz_listen,
+        "sloppod runtime up"
+    );
     let http = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     );
+    let sessions = axum::serve(
+        sessions_listener,
+        sessions.into_make_service_with_connect_info::<SocketAddr>(),
+    );
     tokio::select! {
         result = http => result?,
+        result = sessions => result?,
         result = authz => result??,
     }
     Ok(())

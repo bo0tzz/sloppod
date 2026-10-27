@@ -106,7 +106,7 @@ impl Authorizer {
             body,
             body_truncated,
         };
-        let context = self.state.session_context(&session);
+        let context = session.context();
         let decision = match policy.decide(&context, &request).await {
             Ok(decision) => decision,
             Err(e) => {

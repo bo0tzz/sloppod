@@ -22,25 +22,18 @@ Published chart versions are `0.1.0-main.<run>`, with `appVersion` set to the co
 
 ## Secrets
 
-All are referenced by name from values; the chart creates none.
+The chart needs two existing Secrets; it creates none.
 
 | Value | Key | Contents |
 |---|---|---|
-| `claude.existingSecret` | `oauth-token` | A long-lived token from `claude setup-token`. It stays in the runtime; session pods only see a placeholder. |
-| `github.existingSecret` | `private-key` | The GitHub App's private key (PEM). Set `github.appId` too. |
 | `database.existingSecret` | `uri` | Postgres URI. |
-| `memini.existingSecret` | `api-key` | Optional. A memini key for the runtime, e.g. `memini key add sloppod --home personal/bo0tzz`, so sessions read your personal memory. Set `memini.url` too. |
+| `masterKey.existingSecret` | `master-key` | 32 random bytes, base64 (`openssl rand -base64 32`). It encrypts the credentials sloppod stores ([ADR 21](adr/0021-credentials-live-in-the-runtime.md)); losing it makes them unreadable. |
 
-For example:
+Everything else is added in the UI, under Settings, after the first login:
 
-```sh
-k="kubectl --context <cluster> -n sloppod"
-$k create secret generic sloppod-claude --from-literal=oauth-token=<token from claude setup-token>
-$k create secret generic sloppod-github --from-file=private-key=./app.private-key.pem
-$k create secret generic sloppod-memini --from-literal=api-key=<memini key>
-```
-
-The GitHub App is what sessions act through, and what opens approved pull requests. It needs **Contents: read & write**, **Pull requests: read & write** and **Metadata: read**, and must be installed on every repository sessions may work on. The repositories offered in the UI are the app's installations. (`sl0pz`, the app sloppod itself is developed with, already has these on `bo0tzz/sloppod`.)
+- **A Claude account:** a long-lived token from `claude setup-token`. It stays in the runtime; session pods only see a placeholder.
+- **A GitHub App:** its app ID and private key (PEM). Sessions act through it and it opens approved pull requests, so it needs **Contents: read & write**, **Pull requests: read & write** and **Metadata: read**, installed on every repository sessions may work on. The repositories a first message can pick from are its installations. (`sl0pz`, the app sloppod itself is developed with, has these on `bo0tzz/sloppod`.)
+- **memini, optionally:** its URL, an admin key, and your personal namespace (e.g. `personal/bo0tzz`). The runtime uses the admin key only to mint one key per session ([ADR 22](adr/0022-memini-keys-per-session.md)).
 
 ## HelmRelease (Flux)
 
@@ -67,14 +60,8 @@ spec:
   values:
     database:
       existingSecret: sloppod-db-app
-    claude:
-      existingSecret: sloppod-claude
-    github:
-      appId: "5484236"
-      existingSecret: sloppod-github
-    memini:
-      url: https://memini.bo0tzz.me
-      existingSecret: sloppod-memini
+    masterKey:
+      existingSecret: sloppod-secret
     session:
       model: claude-opus-5-5
       memory: 8Gi
@@ -89,13 +76,13 @@ The release name decides resource names. With release `sloppod`, the runtime Ser
 
 ## Exposing the UI
 
-The runtime has **no authentication of its own**: anyone who can reach port 8080 can start sessions with your Claude subscription and your GitHub App. Expose it only behind an authenticating proxy, e.g. an HTTPRoute on the internal gateway with Authentik forward auth. The UI needs WebSockets (`/acp`).
+The runtime has **no authentication of its own**. Every request acts as the user named in the `X-Forwarded-User` header (`auth.userHeader`), so put sloppod behind an authenticating proxy that sets it and strips it from client requests; with Envoy Gateway, an OIDC `SecurityPolicy` whose `jwt.claimToHeaders` maps `preferred_username` to that header. Users only see their own sessions and credentials ([ADR 23](adr/0023-users-and-ownership.md)). The UI needs WebSockets (`/acp`).
 
-Never expose `/link/v1`, `/mcp` or port 9001 publicly. They authenticate session pods by ServiceAccount token or pod IP, but they're internal endpoints.
+Route only port 8080 (`http`). Port 8081 (`sessions`) serves the supervisor link and the MCP endpoint for session pods, which can reach nothing else on the runtime; port 9001 is Envoy's authorizer. The chart's network policy enforces this inside the cluster.
 
 ## Checking it works
 
 1. The runtime logs `sloppod runtime up`. It creates the `<release>-egress-ca` Secret and the `sloppod-egress` CiliumEnvoyConfig on first start.
-2. In the UI, start a session on a repository with a small prompt. Within a minute or two the session goes `starting` → `idle`/`working`. The first start of a repository with a `mise.toml` takes longer, while tools install into the session's volume.
+2. In the UI, add a Claude account and a GitHub App under Settings, then start a session with a small first message that names a repository. Within a minute or two the session goes `starting` → `idle`/`working`. The first start of a repository with a `mise.toml` takes longer, while tools install into the session's volume.
 3. If it stays `starting`, the session pod's log (the `session` container) shows the supervisor: link errors, clone or mise failures, and the agent's stderr.
 4. Denied egress shows up in the runtime log as `deny` lines with the session, host and path.

@@ -114,6 +114,27 @@ impl GitHubApp {
         self.installation_token(installation).await
     }
 
+    /// A token from any of the app's installations, for reads that aren't tied to one repository.
+    pub async fn any_token(&self) -> anyhow::Result<String> {
+        let cached = self.installations.lock().await.values().next().copied();
+        let installation = match cached {
+            Some(id) => id,
+            None => {
+                let installations: Vec<Value> = self
+                    .app_get("/app/installations")
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                installations
+                    .first()
+                    .and_then(|i| i["id"].as_u64())
+                    .context("the GitHub App has no installations")?
+            }
+        };
+        self.installation_token(installation).await
+    }
+
     /// Repositories the app is installed on.
     pub async fn repos(&self) -> anyhow::Result<Vec<String>> {
         let installations: Vec<Value> = self

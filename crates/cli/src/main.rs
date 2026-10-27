@@ -26,14 +26,13 @@ enum Cmd {
     /// List sessions.
     Sessions,
     /// Create a session.
+    /// Start a session from its first message; the repository is derived from it unless given.
     Create {
+        prompt: String,
         #[arg(long)]
-        repo: String,
+        repo: Option<String>,
         #[arg(long)]
         title: Option<String>,
-        /// First prompt, sent once the agent is up.
-        #[arg(long)]
-        prompt: Option<String>,
     },
     /// Send a prompt and stream the turn.
     Prompt {
@@ -68,6 +67,27 @@ enum Cmd {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// List credentials.
+    Credentials,
+    /// Add a credential; the secret is read from a file, or stdin with `-`.
+    AddCredential {
+        /// claude, github-app or memini
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        name: String,
+        /// Non-secret config as key=value, e.g. app_id=123 or url=https://memini.example
+        #[arg(long = "config", value_parser = parse_key_value)]
+        config: Vec<(String, String)>,
+        #[arg(long)]
+        secret_file: String,
+    },
+}
+
+fn parse_key_value(s: &str) -> Result<(String, String), String> {
+    s.split_once('=')
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .ok_or_else(|| format!("expected key=value, got {s}"))
 }
 
 fn http() -> reqwest::Client {
@@ -103,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
                     "{}  {:<12}  {:<24}  {}",
                     s.id,
                     s.phase.as_str(),
-                    s.repo,
+                    s.repo.as_deref().unwrap_or("-"),
                     s.title
                 );
             }
@@ -227,6 +247,49 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Cmd::Credentials => {
+            let credentials = check(http().get(format!("{api}/credentials")).send().await?).await?;
+            for c in credentials.as_array().into_iter().flatten() {
+                println!(
+                    "{}  {:<10}  {:<20}  {}{}",
+                    c["id"].as_str().unwrap_or_default(),
+                    c["kind"].as_str().unwrap_or_default(),
+                    c["name"].as_str().unwrap_or_default(),
+                    c["config"],
+                    if c["default"].as_bool() == Some(true) {
+                        "  (default)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+        Cmd::AddCredential {
+            kind,
+            name,
+            config,
+            secret_file,
+        } => {
+            let secret = if secret_file == "-" {
+                std::io::read_to_string(std::io::stdin())?
+            } else {
+                std::fs::read_to_string(&secret_file)?
+            };
+            let config: serde_json::Map<String, Value> = config
+                .into_iter()
+                .map(|(k, v)| (k, Value::from(v)))
+                .collect();
+            let body = json!({"kind": kind, "name": name, "config": config, "secret": secret});
+            let created = check(
+                http()
+                    .post(format!("{api}/credentials"))
+                    .json(&body)
+                    .send()
+                    .await?,
+            )
+            .await?;
+            println!("{}", created["id"].as_str().unwrap_or_default());
         }
     }
     Ok(())

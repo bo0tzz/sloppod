@@ -27,22 +27,20 @@ database:
   existingSecret: ""
   secretKey: uri
 
-# Long-lived Claude OAuth token from `claude setup-token`. It stays in the runtime; sessions only get a placeholder.
-claude:
+# 32 random bytes, base64 (e.g. `openssl rand -base64 32`), encrypting the credentials sloppod stores (ADR 21).
+# Losing it makes them unreadable. Claude accounts, GitHub Apps and memini are added in the UI.
+masterKey:
   existingSecret: ""
-  secretKey: oauth-token
+  secretKey: master-key
 
-# GitHub App that sessions act through. Install it on the repositories sessions may work on.
-github:
-  appId: ""
-  existingSecret: ""
-  secretKey: private-key
+# Users come from the authenticating proxy in front of sloppod (ADR 23).
+auth:
+  # Header carrying the user's name.
+  userHeader: x-forwarded-user
+  # User for requests without that header; leave empty to refuse them.
+  defaultUser: ""
 
-# Optional memory service (ADR 8).
-memini:
-  url: ""
-  existingSecret: ""
-  secretKey: api-key
+memory:
   # Prepended to every memory namespace, e.g. `dev/` for a test install.
   namespacePrefix: ""
 

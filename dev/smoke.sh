@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end smoke test against a running runtime (e.g. the kind cluster from up.sh + deploy.sh, port-forwarded).
+# Needs a Claude account and a GitHub App for $REPO configured for the dev user (`sloppodctl add-credential`).
 # Creates a session on $REPO, chats, steers, pushes, proposes and rejects a PR, replaces the pod and resumes.
 # It pushes a `sloppod/<id>` branch to $REPO and leaves it there; it never approves a proposal.
 set -euo pipefail
@@ -11,15 +12,14 @@ ctl() { "${SLOPPODCTL:-target/debug/sloppodctl}" "$@"; }
 step() { printf '\n== %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
-step "create a session on $REPO"
-id=$(ctl create --repo "$REPO" --title "smoke test $(date +%H:%M)")
+step "create a session from a first message naming $REPO"
+id=$(ctl create "This is a smoke test of $REPO's runtime. Reply with only the word pong.")
 echo "$id"
 ctl wait "$id" --timeout 900
-
-step "prompt with a tool call"
-out=$(ctl prompt "$id" "Run 'git branch --show-current' and reply with only its output." --allow)
+out=$(ctl log "$id")
 echo "$out" | tail -3
-grep -q "sloppod/" <<<"$out" || fail "agent didn't report its session branch"
+grep -qi "pong" <<<"$out" || fail "the first message wasn't answered"
+curl -fsS "$SLOPPOD_URL/api/v1/sessions/$id" | grep -q "\"repo\":\"$REPO\"" || fail "the session didn't get $REPO"
 
 step "steer a running turn"
 ctl prompt "$id" "Use the Bash tool to run exactly this in the foreground: node -e \"setTimeout(() => console.log('waited'), 25000)\" . Then summarise in one line." --allow >"${TMPDIR:-/tmp}/smoke-steer.$$" 2>&1 &

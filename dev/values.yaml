@@ -13,8 +13,9 @@ session:
   model: claude-haiku-5-5
 database:
   existingSecret: sloppod-db
-claude:
-  existingSecret: sloppod-claude
-github:
-  appId: "5484236"
-  existingSecret: sloppod-github
+masterKey:
+  existingSecret: sloppod-master-key
+auth:
+  defaultUser: dev
+memory:
+  namespacePrefix: dev/
