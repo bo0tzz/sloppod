@@ -965,9 +965,18 @@ async function handleApi(req, res, url) {
         notice = `Your ${proposal.kind} proposal was approved.`;
         ack = 'Thanks.';
       }
-      broadcastProposal(proposal);
-      if (session) void notifyAgent(session, notice, ack);
-      return json(res, 200, publicProposal(proposal));
+      if (parts[2] === 'reject') {
+        broadcastProposal(proposal);
+        if (session) void notifyAgent(session, notice, ack);
+        return json(res, 200, publicProposal(proposal));
+      }
+      // Like the runtime, approving answers right away and the outcome follows as a proposal update.
+      const approved = { ...publicProposal(proposal), status: 'approved', result: undefined };
+      setTimeout(() => {
+        broadcastProposal(proposal);
+        if (session) void notifyAgent(session, notice, ack);
+      }, DELAY * 4);
+      return json(res, 200, approved);
     }
   }
 

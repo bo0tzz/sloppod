@@ -461,16 +461,35 @@ pub async fn decide(
             .await;
         return Ok(Some(row.to_api()));
     }
-    let session = db::get_session(&state.db, row.session_id)
+    // Carrying it out can take a while (GitHub calls), so the approval returns now and the outcome follows as a
+    // proposal update.
+    let (state, kind, session_id) = (state.clone(), kind.clone(), row.session_id);
+    tokio::spawn(async move {
+        if let Err(e) = carry_out(&state, id, session_id, kind.as_ref(), &payload, &summary).await {
+            tracing::error!(proposal = %id, error = %e, "carrying out a proposal");
+        }
+    });
+    Ok(Some(row.to_api()))
+}
+
+async fn carry_out(
+    state: &AppState,
+    id: Uuid,
+    session_id: Uuid,
+    kind: &dyn ProposalKind,
+    payload: &Value,
+    summary: &str,
+) -> anyhow::Result<()> {
+    let session = db::get_session(&state.db, session_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("session gone"))?;
-    let finished = match kind.execute(&session.context(), &payload).await {
+    let finished = match kind.execute(&session.context(), payload).await {
         Ok(result) => db::finish_proposal(&state.db, id, "executed", Some(&result), None).await?,
         Err(e) => db::finish_proposal(&state.db, id, "failed", None, Some(&e.0)).await?,
     };
     let proposal = finished.to_api();
     state.hub.broadcast_proposal(&proposal);
-    state.hub.broadcast_session(row.session_id).await;
+    state.hub.broadcast_session(session_id).await;
     let outcome = match (&proposal.result, &proposal.error) {
         (Some(result), _) => match (result["message"].as_str(), result["url"].as_str()) {
             (Some(message), _) => format!("approved and done. {message}"),
@@ -483,11 +502,11 @@ pub async fn decide(
     state
         .hub
         .notify(
-            row.session_id,
+            session_id,
             format!("sloppod: your proposal ({summary}) was {outcome}"),
         )
         .await;
-    Ok(Some(proposal))
+    Ok(())
 }
 
 pub async fn detail(state: &AppState, id: Uuid, owner: &str) -> anyhow::Result<Option<Value>> {

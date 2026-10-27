@@ -132,7 +132,7 @@ type ProposalDetail = Proposal & {
 };
 ```
 
-Approving executes the proposal immediately; the response carries the final status (`executed` or `failed`).
+Approving returns as soon as the decision is recorded, with status `approved`; the proposal is carried out in the background and its outcome (`executed` or `failed`) follows as a `_sloppod/proposal` update, and in `GET /api/v1/proposals/{id}`.
 
 ## ACP at `/acp`
 
