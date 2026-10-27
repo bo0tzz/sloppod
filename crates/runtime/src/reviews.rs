@@ -54,10 +54,9 @@ pub async fn start(
     };
     if let Some(session) = proposal.review_session_id {
         db::set_repo_commit(&state.db, session, &subject.repo, &subject.head_sha).await?;
-        if let Some(row) = db::get_session(&state.db, session).await? {
-            api::wake(state, &row).await?;
-        }
+        // Queued first, so the round reaches the reviewer however long waking it takes.
         state.hub.notify(session, prompt).await;
+        wake_for_round(state, session);
         return Ok(());
     }
     let author = db::get_session(&state.db, proposal.session_id)
@@ -140,6 +139,27 @@ const CATEGORIES: &[&str] = &[
     "maintainability",
     "tests",
 ];
+
+/// Wakes a parked review session for its next round, retrying with backoff: the round is already queued for it.
+fn wake_for_round(state: &AppState, session: Uuid) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        for attempt in 1..=6 {
+            let woken = match db::get_session(&state.db, session).await {
+                Ok(Some(row)) => api::wake(&state, &row).await,
+                Ok(None) => return,
+                Err(e) => Err(e.into()),
+            };
+            match woken {
+                Ok(()) => return,
+                Err(e) => {
+                    tracing::warn!(%session, attempt, error = %e, "waking a review session for its next round");
+                    tokio::time::sleep(Duration::from_secs(10 * attempt)).await;
+                }
+            }
+        }
+    });
+}
 
 fn first_round_prompt(subject: &ReviewSubject) -> String {
     let ReviewSubject {
