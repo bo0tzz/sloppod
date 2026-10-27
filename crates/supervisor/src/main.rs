@@ -14,7 +14,6 @@ use futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use sloppod_protocol::link::{
     AgentReady, FromSupervisor, Launch, PATH, RUNTIME_INFO, RunningAgent, ToSupervisor,
-    TranscriptFile,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::TcpStream;
@@ -93,6 +92,8 @@ struct Agent {
     waiting: HashMap<String, Value>,
     /// A message from the agent that the last link failed to send.
     unsent: Option<Value>,
+    /// How much of each transcript file the runtime has, so syncs send only what was appended.
+    synced: HashMap<String, u64>,
 }
 
 impl Agent {
@@ -301,7 +302,11 @@ async fn run(
                             track(&mut a.open, &mut a.waiting, &message);
                         }
                         Ok(ToSupervisor::AgentReady(ready)) => a.ready = Some(ready),
-                        Ok(ToSupervisor::SyncTranscript) => sync_transcript(&a.transcript_dir, &mut sink).await,
+                        Ok(ToSupervisor::SyncTranscript) => sync_transcript(&a.transcript_dir, &mut a.synced, &mut sink).await,
+                        Ok(ToSupervisor::ResyncTranscript { name }) => {
+                            a.synced.remove(&name);
+                            sync_transcript(&a.transcript_dir, &mut a.synced, &mut sink).await;
+                        }
                         Ok(ToSupervisor::Launch(_) | ToSupervisor::Attach { .. }) => {}
                         Err(e) => tracing::warn!(error = %e, "bad message from runtime"),
                     },
@@ -333,14 +338,14 @@ async fn run(
                 },
             )
             .await;
-            sync_transcript(&a.transcript_dir, &mut sink).await;
+            sync_transcript(&a.transcript_dir, &mut a.synced, &mut sink).await;
             Ending::Reconnect
         }
         Event::Terminate => {
             tracing::info!("terminating");
             let mut a = agent.take().expect("an agent is running");
             stop(&mut a.child).await;
-            sync_transcript(&a.transcript_dir, &mut sink).await;
+            sync_transcript(&a.transcript_dir, &mut a.synced, &mut sink).await;
             Ending::Terminate
         }
     };
@@ -397,6 +402,7 @@ async fn launch_agent(
         open: HashMap::new(),
         waiting: HashMap::new(),
         unsent: None,
+        synced: HashMap::new(),
     })
 }
 
@@ -417,25 +423,45 @@ async fn stop(child: &mut Child) {
     let _ = child.kill().await;
 }
 
-async fn sync_transcript(dir: &str, sink: &mut Sink) {
+/// Where to sync a transcript file of `len` bytes from, given how much the runtime has; `None` when it's up to date.
+/// A file that shrank (or one the runtime has none of) is sent whole.
+fn sync_from(len: u64, synced: Option<u64>) -> Option<u64> {
+    match synced {
+        Some(have) if have == len => None,
+        Some(have) if have < len => Some(have),
+        _ => Some(0),
+    }
+}
+
+/// Sends the runtime what was appended to each transcript file since the last sync (ADR 1).
+async fn sync_transcript(dir: &str, synced: &mut HashMap<String, u64>, sink: &mut Sink) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let files: Vec<TranscriptFile> = entries
-        .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
-        .filter_map(|e| {
-            let content = std::fs::read(e.path()).ok()?;
-            Some(TranscriptFile {
-                name: e.file_name().to_string_lossy().into_owned(),
-                content_b64: base64::engine::general_purpose::STANDARD.encode(content),
-            })
-        })
-        .collect();
-    if !files.is_empty()
-        && let Err(e) = send(sink, &FromSupervisor::Transcript { files }).await
-    {
-        tracing::warn!(error = %e, "syncing the transcript failed");
+    for entry in entries.flatten() {
+        if entry.path().extension().is_none_or(|x| x != "jsonl") {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Ok(content) = std::fs::read(entry.path()) else {
+            continue;
+        };
+        let len = content.len() as u64;
+        let Some(offset) = sync_from(len, synced.get(&name).copied()) else {
+            continue;
+        };
+        let message = FromSupervisor::TranscriptAppend {
+            name: name.clone(),
+            offset,
+            content_b64: base64::engine::general_purpose::STANDARD
+                .encode(&content[offset as usize..]),
+        };
+        match send(sink, &message).await {
+            Ok(()) => {
+                synced.insert(name, len);
+            }
+            Err(e) => tracing::warn!(error = %e, file = %name, "syncing the transcript failed"),
+        }
     }
 }
 
@@ -678,5 +704,19 @@ mod tests {
             &json!({"jsonrpc": "2.0", "id": 7, "result": {}}),
         );
         assert!(open.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::sync_from;
+
+    #[test]
+    fn syncs_only_what_was_appended() {
+        assert_eq!(sync_from(100, None), Some(0));
+        assert_eq!(sync_from(100, Some(100)), None);
+        assert_eq!(sync_from(150, Some(100)), Some(100));
+        assert_eq!(sync_from(80, Some(100)), Some(0));
+        assert_eq!(sync_from(0, Some(0)), None);
     }
 }
