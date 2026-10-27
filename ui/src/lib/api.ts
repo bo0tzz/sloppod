@@ -54,7 +54,23 @@ export type Proposal = {
   reason?: string;
   created_at: string;
   decided_at?: string;
+  /** The user who decided, or `standing-approval:<id>`. */
+  decided_by?: string;
 };
+
+/** A pre-approved proposal pattern: matching proposals are approved as they're made. */
+export type StandingApproval = {
+  id: string;
+  kind: string;
+  /** A repository as owner/name; absent matches any. */
+  target?: string;
+  session_id?: string;
+  edits: { auto_merge?: boolean };
+  expires_at?: string;
+  created_at: string;
+};
+
+export type NewStandingApproval = Omit<StandingApproval, 'id' | 'created_at'>;
 
 /** Pull requests add their diff and commits; other kinds add nothing. */
 export type ProposalDetail = Proposal & {
@@ -131,6 +147,10 @@ export const api = {
   getSettings: () => call<Settings>('GET', '/settings'),
   updateSettings: (body: { model: string | null }) => call<Settings>('PUT', '/settings', body),
   listCredentials: () => call<Credential[]>('GET', '/credentials'),
+  listStandingApprovals: () => call<StandingApproval[]>('GET', '/standing-approvals'),
+  createStandingApproval: (approval: NewStandingApproval) =>
+    call<StandingApproval>('POST', '/standing-approvals', approval),
+  revokeStandingApproval: (id: string) => call<void>('DELETE', `/standing-approvals/${encodeURIComponent(id)}`),
   createCredential: (body: NewCredential) => call<Credential>('POST', '/credentials', body),
   makeDefaultCredential: (id: string) => call<Credential>('POST', `/credentials/${encodeURIComponent(id)}/default`, {}),
   deleteCredential: (id: string) => call<void>('DELETE', `/credentials/${encodeURIComponent(id)}`),

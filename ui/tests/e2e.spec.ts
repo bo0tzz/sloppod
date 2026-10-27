@@ -524,3 +524,23 @@ test('manages credentials and nudges when they are missing', async ({ page }) =>
   await expect(page.getByTestId('nudge-claude')).toHaveCount(0);
   await expect(page.getByTestId('nudge-repos')).toHaveCount(0);
 });
+
+test('a standing approval approves matching proposals as they are made', async ({ page }) => {
+  await page.goto('/settings');
+  const section = page.getByTestId('standing-approvals');
+  // The defaults: pull requests on any repository, until revoked, merged when checks pass.
+  await section.getByRole('button', { name: 'Add' }).click();
+  await expect(section.getByTestId('standing-approval')).toContainText('Pull requests on any repository');
+
+  const id = await createSession(page, 'Propose a PR for sloppod');
+  await finishTurn(page);
+  await expect(page.getByTestId('system-notice')).toContainText(/github\.com\/bo0tzz\/sloppod\/pull\/\d+/);
+  const proposals: Proposal[] = await (await page.request.get(`/api/v1/proposals?session=${id}`)).json();
+  expect(proposals[0].decided_by).toMatch(/^standing-approval:/);
+  expect(proposals[0].payload.auto_merge).toBe(true);
+
+  // Revoked, so later proposals wait for review again.
+  await page.goto('/settings');
+  await section.getByRole('button', { name: 'Revoke' }).click();
+  await expect(section.getByTestId('standing-approval')).toHaveCount(0);
+});

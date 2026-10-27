@@ -639,6 +639,7 @@ function createProposal(session) {
   };
   proposals.set(id, proposal);
   broadcastProposal(proposal);
+  applyStandingApproval(proposal);
   return proposal;
 }
 
@@ -653,6 +654,7 @@ function createRepoGrant(session, repo, reason) {
   };
   proposals.set(proposal.id, proposal);
   broadcastProposal(proposal);
+  applyStandingApproval(proposal);
   return proposal;
 }
 
@@ -674,6 +676,7 @@ function createIssues(session) {
   };
   proposals.set(proposal.id, proposal);
   broadcastProposal(proposal);
+  applyStandingApproval(proposal);
   return proposal;
 }
 
@@ -951,6 +954,7 @@ async function handleApi(req, res, url) {
   }
 
   if (parts[0] === 'credentials') return handleCredentials(req, res, parts);
+  if (parts[0] === 'standing-approvals') return handleStandingApprovals(req, res, parts);
 
   if (parts[0] === 'settings' && parts.length === 1) {
     if (method === 'GET') return json(res, 200, settings);
@@ -1029,50 +1033,93 @@ async function handleApi(req, res, url) {
         if (body.reason) proposal.reason = body.reason;
         notice = `Your proposal was rejected${body.reason ? `: ${body.reason}` : '.'}`;
         ack = "Understood, I'll leave that be.";
-      } else if (proposal.kind === 'github.pr.create') {
-        if (typeof body.title === 'string') proposal.payload.title = body.title;
-        if (typeof body.body === 'string') proposal.payload.body = body.body;
-        if (typeof body.auto_merge === 'boolean') proposal.payload.auto_merge = body.auto_merge;
-        const number = 100 + proposals.size;
-        proposal.status = 'executed';
-        proposal.result = { url: `https://github.com/${proposal.payload.repo}/pull/${number}`, number };
-        notice = `Your pull request was approved and opened: ${proposal.result.url}`;
-        ack = 'Great, the pull request is open.';
-      } else if (proposal.kind === 'github.issue.create') {
-        if (Array.isArray(body.issues)) proposal.payload.issues = body.issues;
-        const filed = proposal.payload.issues.map((issue, index) => {
-          const number = 200 + proposals.size * 10 + index;
-          return { title: issue.title, url: `https://github.com/${proposal.payload.repo}/issues/${number}`, number };
-        });
-        proposal.status = 'executed';
-        proposal.result = { issues: filed, failed: [], message: `Filed ${filed.map((i) => `#${i.number}`).join(', ')}.` };
-        notice = `Your issues were approved and filed: ${filed.map((i) => i.url).join(', ')}`;
-        ack = 'Thanks, the issues are filed.';
-      } else if (proposal.kind === 'sloppod.repo.grant') {
-        proposal.status = 'executed';
-        if (session) grantRepo(session, proposal.payload.repo);
-        notice = `You now have write access to ${proposal.payload.repo} on ${proposal.payload.branch}.`;
-        ack = `Thanks, I can push to ${proposal.payload.repo} now.`;
       } else {
-        proposal.status = 'executed';
-        notice = `Your ${proposal.kind} proposal was approved.`;
-        ack = 'Thanks.';
+        return json(res, 200, approve(proposal, body, 'dev'));
       }
-      if (parts[2] === 'reject') {
-        broadcastProposal(proposal);
-        if (session) void notifyAgent(session, notice, ack);
-        return json(res, 200, publicProposal(proposal));
-      }
-      // Like the runtime, approving answers right away and the outcome follows as a proposal update.
-      const approved = { ...publicProposal(proposal), status: 'approved', result: undefined };
-      setTimeout(() => {
-        broadcastProposal(proposal);
-        if (session) void notifyAgent(session, notice, ack);
-      }, DELAY * 4);
-      return json(res, 200, approved);
+      broadcastProposal(proposal);
+      if (session) void notifyAgent(session, notice, ack);
+      return json(res, 200, publicProposal(proposal));
     }
   }
 
+  return json(res, 404, { error: 'not found' });
+}
+
+/** Approves a proposal; like the runtime, it answers right away and the outcome follows as a proposal update. */
+function approve(proposal, body, decidedBy) {
+  const session = sessions.get(proposal.session_id);
+  proposal.decided_at = now();
+  proposal.decided_by = decidedBy;
+  let notice;
+  let ack;
+  if (proposal.kind === 'github.pr.create') {
+    if (typeof body.title === 'string') proposal.payload.title = body.title;
+    if (typeof body.body === 'string') proposal.payload.body = body.body;
+    if (typeof body.auto_merge === 'boolean') proposal.payload.auto_merge = body.auto_merge;
+    const number = 100 + proposals.size;
+    proposal.status = 'executed';
+    proposal.result = { url: `https://github.com/${proposal.payload.repo}/pull/${number}`, number };
+    notice = `Your pull request was approved and opened: ${proposal.result.url}`;
+    ack = 'Great, the pull request is open.';
+  } else if (proposal.kind === 'github.issue.create') {
+    if (Array.isArray(body.issues)) proposal.payload.issues = body.issues;
+    const filed = proposal.payload.issues.map((issue, index) => {
+      const number = 200 + proposals.size * 10 + index;
+      return { title: issue.title, url: `https://github.com/${proposal.payload.repo}/issues/${number}`, number };
+    });
+    proposal.status = 'executed';
+    proposal.result = { issues: filed, failed: [], message: `Filed ${filed.map((i) => `#${i.number}`).join(', ')}.` };
+    notice = `Your issues were approved and filed: ${filed.map((i) => i.url).join(', ')}`;
+    ack = 'Thanks, the issues are filed.';
+  } else if (proposal.kind === 'sloppod.repo.grant') {
+    proposal.status = 'executed';
+    if (session) grantRepo(session, proposal.payload.repo);
+    notice = `You now have write access to ${proposal.payload.repo} on ${proposal.payload.branch}.`;
+    ack = `Thanks, I can push to ${proposal.payload.repo} now.`;
+  } else {
+    proposal.status = 'executed';
+    notice = `Your ${proposal.kind} proposal was approved.`;
+    ack = 'Thanks.';
+  }
+  // Like the runtime, approving answers right away and the outcome follows as a proposal update.
+  const approved = { ...publicProposal(proposal), status: 'approved', result: undefined };
+  setTimeout(() => {
+    broadcastProposal(proposal);
+    if (session) void notifyAgent(session, notice, ack);
+  }, DELAY * 4);
+  return approved;
+}
+
+/** Standing approvals (`{ id, kind, target, edits, expires_at }`); matching proposals are approved as they're made. */
+const standingApprovals = [];
+
+function applyStandingApproval(proposal) {
+  const match = standingApprovals.find(
+    (a) =>
+      a.kind === proposal.kind &&
+      (!a.target || a.target.toLowerCase() === String(proposal.payload.repo ?? '').toLowerCase()) &&
+      (!a.expires_at || Date.parse(a.expires_at) > Date.now()),
+  );
+  if (match) broadcastProposal(approve(proposal, match.edits ?? {}, `standing-approval:${match.id}`));
+}
+
+function handleStandingApprovals(req, res, parts) {
+  const method = req.method;
+  if (parts.length === 1 && method === 'GET') return json(res, 200, standingApprovals);
+  if (parts.length === 1 && method === 'POST') {
+    return readBody(req).then((body) => {
+      const approval = { id: randomUUID(), kind: body.kind, target: body.target, edits: body.edits ?? {}, expires_at: body.expires_at, created_at: now() };
+      standingApprovals.push(approval);
+      return json(res, 201, approval);
+    });
+  }
+  if (parts.length === 2 && method === 'DELETE') {
+    const index = standingApprovals.findIndex((a) => a.id === parts[1]);
+    if (index < 0) return json(res, 404, { error: 'not found' });
+    standingApprovals.splice(index, 1);
+    res.writeHead(204).end();
+    return;
+  }
   return json(res, 404, { error: 'not found' });
 }
 

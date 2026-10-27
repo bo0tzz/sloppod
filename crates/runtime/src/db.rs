@@ -272,6 +272,7 @@ pub struct ProposalRow {
     pub reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub decided_at: Option<DateTime<Utc>>,
+    pub decided_by: Option<String>,
 }
 
 impl ProposalRow {
@@ -287,12 +288,112 @@ impl ProposalRow {
             reason: self.reason.clone(),
             created_at: self.created_at.to_rfc3339(),
             decided_at: self.decided_at.map(|d| d.to_rfc3339()),
+            decided_by: self.decided_by.clone(),
         }
     }
 }
 
-const PROPOSAL_COLUMNS: &str =
-    "id, session_id, kind, status, payload, result, error, reason, created_at, decided_at";
+#[derive(Debug, Clone, FromRow)]
+pub struct StandingApprovalRow {
+    pub id: Uuid,
+    pub kind: String,
+    pub target: Option<String>,
+    pub session_id: Option<Uuid>,
+    pub edits: Value,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl StandingApprovalRow {
+    pub fn to_api(&self) -> sloppod_protocol::api::StandingApproval {
+        sloppod_protocol::api::StandingApproval {
+            id: self.id,
+            kind: self.kind.clone(),
+            target: self.target.clone(),
+            session_id: self.session_id,
+            edits: self.edits.clone(),
+            expires_at: self.expires_at.map(|d| d.to_rfc3339()),
+            created_at: self.created_at.to_rfc3339(),
+        }
+    }
+}
+
+const STANDING_APPROVAL_COLUMNS: &str =
+    "id, kind, target, session_id, edits, expires_at, created_at";
+
+/// The owner's standing approvals that are neither revoked nor expired.
+pub async fn standing_approvals(
+    db: &PgPool,
+    owner: &str,
+) -> sqlx::Result<Vec<StandingApprovalRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "select {STANDING_APPROVAL_COLUMNS} from standing_approvals \
+         where owner = $1 and revoked_at is null and (expires_at is null or expires_at > now()) order by created_at"
+    )))
+    .bind(owner)
+    .fetch_all(db)
+    .await
+}
+
+pub async fn insert_standing_approval(
+    db: &PgPool,
+    owner: &str,
+    kind: &str,
+    target: Option<&str>,
+    session_id: Option<Uuid>,
+    edits: &Value,
+    expires_at: Option<DateTime<Utc>>,
+) -> sqlx::Result<StandingApprovalRow> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "insert into standing_approvals (id, owner, kind, target, session_id, edits, expires_at) \
+         values ($1, $2, $3, $4, $5, $6, $7) returning {STANDING_APPROVAL_COLUMNS}"
+    )))
+    .bind(Uuid::now_v7())
+    .bind(owner)
+    .bind(kind)
+    .bind(target)
+    .bind(session_id)
+    .bind(edits)
+    .bind(expires_at)
+    .fetch_one(db)
+    .await
+}
+
+/// Revokes one of the owner's standing approvals; returns whether there was one to revoke.
+pub async fn revoke_standing_approval(db: &PgPool, owner: &str, id: Uuid) -> sqlx::Result<bool> {
+    let result = sqlx::query(
+        "update standing_approvals set revoked_at = now() where id = $1 and owner = $2 and revoked_at is null",
+    )
+    .bind(id)
+    .bind(owner)
+    .execute(db)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// The oldest live standing approval of `owner` that covers a proposal of `kind` on `target` from `session_id`.
+pub async fn matching_standing_approval(
+    db: &PgPool,
+    owner: &str,
+    kind: &str,
+    target: Option<&str>,
+    session_id: Uuid,
+) -> sqlx::Result<Option<StandingApprovalRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "select {STANDING_APPROVAL_COLUMNS} from standing_approvals \
+         where owner = $1 and kind = $2 and revoked_at is null and (expires_at is null or expires_at > now()) \
+         and (target is null or lower(target) = lower($3)) and (session_id is null or session_id = $4) \
+         order by created_at limit 1"
+    )))
+    .bind(owner)
+    .bind(kind)
+    .bind(target)
+    .bind(session_id)
+    .fetch_optional(db)
+    .await
+}
+
+const PROPOSAL_COLUMNS: &str = "id, session_id, kind, status, payload, result, error, reason, created_at, decided_at, decided_by";
 
 pub async fn insert_proposal(
     db: &PgPool,

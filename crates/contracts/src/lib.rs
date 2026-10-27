@@ -313,6 +313,10 @@ pub trait ProposalKind: Send + Sync {
     async fn prepare(&self, session: &SessionContext, arguments: Value) -> Result<Value>;
     /// Extra material for review, e.g. a diff.
     async fn detail(&self, session: &SessionContext, payload: &Value) -> Result<Value>;
+    /// What a proposal acts on, for matching standing approvals against it, e.g. a repository as `owner/name`.
+    fn target(&self, _payload: &Value) -> Option<String> {
+        None
+    }
     /// Applies the reviewer's edits, sent along with the approval, to the payload.
     fn edit(&self, payload: &Value, edits: &Value) -> Result<Value> {
         match edits.as_object() {

@@ -124,6 +124,10 @@ impl ProposalKind for PullRequest {
         }
     }
 
+    fn target(&self, payload: &Value) -> Option<String> {
+        payload["repo"].as_str().map(str::to_owned)
+    }
+
     fn summary(&self, payload: &Value) -> String {
         format!(
             "pull request \"{}\" on {}",
@@ -413,6 +417,10 @@ impl ProposalKind for Issues {
         }
     }
 
+    fn target(&self, payload: &Value) -> Option<String> {
+        payload["repo"].as_str().map(str::to_owned)
+    }
+
     fn summary(&self, payload: &Value) -> String {
         let repo = payload["repo"].as_str().unwrap_or_default();
         match payload["issues"].as_array().map(Vec::as_slice) {
@@ -508,6 +516,10 @@ impl ProposalKind for RepoAccess {
         "sloppod.repo.grant".into()
     }
 
+    fn target(&self, payload: &Value) -> Option<String> {
+        payload["repo"].as_str().map(str::to_owned)
+    }
+
     fn summary(&self, payload: &Value) -> String {
         format!(
             "write access to {}",
@@ -598,7 +610,34 @@ pub async fn propose(
         .map_err(|e| e.to_string())?;
     let proposal = row.to_api();
     state.hub.broadcast_proposal(&proposal);
-    Ok(proposal)
+    let standing = db::matching_standing_approval(
+        &state.db,
+        &session.owner,
+        &kind.kind(),
+        kind.target(&payload).as_deref(),
+        session_id,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let Some(standing) = standing else {
+        return Ok(proposal);
+    };
+    let decided_by = format!("standing-approval:{}", standing.id);
+    match decide(
+        state,
+        proposal.id,
+        Verdict::Approve {
+            edits: standing.edits,
+        },
+        &session.owner,
+        &decided_by,
+    )
+    .await
+    {
+        Ok(Some(approved)) => Ok(approved),
+        // Left for a human to review, like any other proposal.
+        Ok(None) | Err(_) => Ok(proposal),
+    }
 }
 
 pub enum Verdict {
@@ -621,11 +660,13 @@ async fn owned_proposal(
         .map(|_| row))
 }
 
+/// Records a decision on one of `owner`'s proposals, made by `decided_by` (the user, or a standing approval).
 pub async fn decide(
     state: &AppState,
     id: Uuid,
     verdict: Verdict,
     owner: &str,
+    decided_by: &str,
 ) -> anyhow::Result<Option<Proposal>> {
     let Some(row) = owned_proposal(state, id, owner).await? else {
         return Ok(None);
@@ -643,8 +684,15 @@ pub async fn decide(
         ),
         Verdict::Reject { reason } => ("rejected", row.payload.clone(), reason),
     };
-    let Some(row) =
-        db::decide_proposal(&state.db, id, status, &payload, reason.as_deref(), owner).await?
+    let Some(row) = db::decide_proposal(
+        &state.db,
+        id,
+        status,
+        &payload,
+        reason.as_deref(),
+        decided_by,
+    )
+    .await?
     else {
         anyhow::bail!("proposal {id} was already decided");
     };

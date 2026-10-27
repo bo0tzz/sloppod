@@ -11,7 +11,7 @@ use axum::routing::{delete, get, post};
 use serde::Deserialize;
 use serde_json::json;
 use sloppod_contracts::{EgressSpec, Grant, PlacementSpec};
-use sloppod_protocol::api::{Decision, NewCredential, NewSession, Phase};
+use sloppod_protocol::api::{Decision, NewCredential, NewSession, NewStandingApproval, Phase};
 use uuid::Uuid;
 
 use crate::credentials::CLAUDE;
@@ -37,6 +37,11 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/default", post(default_credential))
+        .route(
+            "/standing-approvals",
+            get(list_standing_approvals).post(create_standing_approval),
+        )
+        .route("/standing-approvals/{id}", delete(revoke_standing_approval))
         .route("/proposals", get(list_proposals))
         .route("/proposals/{id}", get(get_proposal))
         .route("/proposals/{id}/approve", post(approve))
@@ -459,6 +464,83 @@ async fn create_credential(
     }
 }
 
+async fn list_standing_approvals(
+    State(state): State<AppState>,
+    User(user): User,
+) -> ApiResult<impl IntoResponse> {
+    let rows = db::standing_approvals(&state.db, &user).await?;
+    Ok(Json(rows.iter().map(|r| r.to_api()).collect::<Vec<_>>()))
+}
+
+async fn create_standing_approval(
+    State(state): State<AppState>,
+    User(user): User,
+    Json(new): Json<NewStandingApproval>,
+) -> ApiResult<impl IntoResponse> {
+    if state.proposals.get(&new.kind).is_none() {
+        return Err(bad_request(format!("unknown proposal kind {}", new.kind)));
+    }
+    let target = new
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    if target.is_some_and(|t| t.split('/').count() != 2) {
+        return Err(bad_request("give the target repository as owner/name"));
+    }
+    if let Some(session) = new.session_id
+        && db::owned_session(&state.db, session, &user)
+            .await?
+            .is_none()
+    {
+        return Err(bad_request("unknown session"));
+    }
+    // Only edits that make sense for every matching proposal; per-proposal edits stay with a human.
+    let edits = new.edits.unwrap_or_else(|| json!({}));
+    let Some(fields) = edits.as_object() else {
+        return Err(bad_request("edits must be an object"));
+    };
+    if fields
+        .iter()
+        .any(|(k, v)| k != "auto_merge" || !v.is_boolean())
+    {
+        return Err(bad_request(
+            "the only edit a standing approval can make is auto_merge: true or false",
+        ));
+    }
+    let expires_at = match new.expires_at.as_deref() {
+        Some(at) => Some(
+            chrono::DateTime::parse_from_rfc3339(at)
+                .map_err(|_| bad_request("expires_at must be an RFC 3339 time"))?
+                .with_timezone(&chrono::Utc),
+        ),
+        None => None,
+    };
+    let row = db::insert_standing_approval(
+        &state.db,
+        &user,
+        &new.kind,
+        target,
+        new.session_id,
+        &edits,
+        expires_at,
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(row.to_api())))
+}
+
+async fn revoke_standing_approval(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    if db::revoke_standing_approval(&state.db, &user, id).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(not_found())
+    }
+}
+
 async fn delete_credential(
     State(state): State<AppState>,
     User(user): User,
@@ -525,7 +607,7 @@ async fn approve(
     let verdict = Verdict::Approve {
         edits: body.map(|Json(edits)| edits).unwrap_or_default(),
     };
-    match proposals::decide(&state, id, verdict, &user).await {
+    match proposals::decide(&state, id, verdict, &user, &user).await {
         Ok(Some(proposal)) => Ok(Json(proposal)),
         Ok(None) => Err(not_found()),
         Err(e) => Err(ApiError(StatusCode::CONFLICT, e.to_string())),
@@ -545,6 +627,7 @@ async fn reject(
         Verdict::Reject {
             reason: decision.reason,
         },
+        &user,
         &user,
     )
     .await
