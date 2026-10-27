@@ -59,6 +59,13 @@ RUN curl -fsSL -o /usr/local/bin/mise \
         https://github.com/jdx/mise/releases/download/v${MISE_VERSION}/mise-v${MISE_VERSION}-linux-x64 \
     && echo "${MISE_SHA256}  /usr/local/bin/mise" | sha256sum -c - \
     && chmod +x /usr/local/bin/mise
+ARG GH_STACK_VERSION=0.3.0
+ARG GH_STACK_SHA256=957e822cfa7e435cd84a297cd96c419b58e51e3ac58be249762c24bd9e45099b
+# gh stack (github/gh-stack), for stacked pull requests; the supervisor links it as a gh extension.
+RUN curl -fsSL -o /usr/local/bin/gh-stack \
+        https://github.com/github/gh-stack/releases/download/v${GH_STACK_VERSION}/linux-amd64 \
+    && echo "${GH_STACK_SHA256}  /usr/local/bin/gh-stack" | sha256sum -c - \
+    && chmod +x /usr/local/bin/gh-stack
 RUN npm install -g @agentclientprotocol/claude-agent-acp@${ADAPTER_VERSION} && npm cache clean --force
 COPY --from=memini /memini/plugin /opt/sloppod/plugins/memini
 COPY --from=build /out/sloppod-supervisor /usr/local/bin/sloppod-supervisor
