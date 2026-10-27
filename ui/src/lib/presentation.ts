@@ -198,11 +198,17 @@ export function grantLabel(grant: Grant): string {
   }
 }
 
+/** An option's name. The agent describes its `default` model with the model that currently is, so say which. */
+function configOptionName(option: ConfigSelectOption): string {
+  if (option.value !== 'default' || !option.description) return option.name;
+  return `${option.name.replace(/\s*\(.*\)$/, '')} · ${option.description}`;
+}
+
 /** Flattens a config select's options for a plain select; grouped options get their group's name. */
 export function configSelectOptions(options: ConfigSelectOption[] | ConfigSelectGroup[]): { value: string; label: string }[] {
   return options.flatMap((entry) =>
     'group' in entry
-      ? entry.options.map((option) => ({ value: option.value, label: `${entry.name}: ${option.name}` }))
-      : [{ value: entry.value, label: entry.name }],
+      ? entry.options.map((option) => ({ value: option.value, label: `${entry.name}: ${configOptionName(option)}` }))
+      : [{ value: entry.value, label: configOptionName(entry) }],
   );
 }
