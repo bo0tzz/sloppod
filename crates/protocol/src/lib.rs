@@ -143,8 +143,11 @@ pub mod api {
         pub verdict: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub summary: Option<String>,
-        /// `{path?, line?, severity?, comment}`
+        /// `{id, severity, category, title, explanation, path?, line?, end_line?, suggested_fix?}`; an id carried
+        /// over from an earlier round marks the same finding.
         pub findings: Value,
+        /// Ids of the previous round's findings that no longer hold.
+        pub resolved: Value,
         pub created_at: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub finished_at: Option<String>,

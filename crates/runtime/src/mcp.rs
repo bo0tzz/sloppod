@@ -64,26 +64,32 @@ fn review_tools() -> Vec<Value> {
     vec![
         json!({
             "name": "submit_review",
-            "description": "Submit your review of the proposal you were asked to review. This is how the review ends; nobody reads chat replies.",
+            "description": "Submit your review of the change you were asked to review. This is how each round ends; nobody reads chat replies.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "verdict": {"type": "string", "enum": ["pass", "changes"], "description": "`pass` if it's ready for a human, `changes` if the author should fix something first"},
-                    "summary": {"type": "string", "description": "Your overall assessment in a few sentences"},
+                    "verdict": {"type": "string", "enum": ["pass", "changes"], "description": "`changes` when the author should fix something before a human looks, `pass` otherwise; never `pass` with a p0"},
+                    "summary": {"type": "string", "description": "Two to four sentences on what the change does and how, and what merging it sets off where you read evidence of it. No verdict, and not a list of the findings"},
                     "findings": {
                         "type": "array",
-                        "description": "What should change; required with `changes`",
+                        "description": "What should change, one point each; required with `changes`, empty when nothing is worth flagging",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "path": {"type": "string", "description": "File the finding is about, relative to the repository root"},
-                                "line": {"type": "integer"},
-                                "severity": {"type": "string", "enum": ["high", "medium", "low"]},
-                                "comment": {"type": "string", "description": "What's wrong and why it matters"},
+                                "severity": {"type": "string", "enum": ["p0", "p1", "p2"], "description": "p0: must be fixed before this merges. p1: should be fixed. p2: optional polish"},
+                                "category": {"type": "string", "enum": ["correctness", "security", "performance", "reliability", "maintainability", "tests"], "description": "What the fix is really about. correctness: wrong behaviour or a broken contract. security: exposure, injection, secrets, unsafe defaults, data loss. performance: cost in time, memory or calls. reliability: error handling, retries, timeouts, concurrency, leaks. maintainability: structure, naming, clarity, stale docs. tests: a test the change needs or one that's wrong"},
+                                "title": {"type": "string", "description": "One line, under 80 characters"},
+                                "explanation": {"type": "string", "description": "Under what inputs or state it bites, and why it matters"},
+                                "path": {"type": "string", "description": "File it's about, relative to the repository root"},
+                                "line": {"type": "integer", "description": "Line in the file at the reviewed commit"},
+                                "end_line": {"type": "integer", "description": "Last line of the range, when it covers more than one"},
+                                "suggested_fix": {"type": "string", "description": "The concrete change to make"},
+                                "prior": {"type": "string", "description": "In a later round: the id of the earlier finding this one reports again. Omit for a new finding"},
                             },
-                            "required": ["comment"],
+                            "required": ["severity", "category", "title", "explanation"],
                         },
                     },
+                    "resolved": {"type": "array", "items": {"type": "string"}, "description": "In a later round: ids of the earlier findings that no longer hold"},
                 },
                 "required": ["verdict", "summary"],
             },
@@ -127,6 +133,7 @@ fn tools(state: &AppState, kind: &str) -> Vec<Value> {
             "type": "object",
             "properties": {
                 "id": {"type": "string"},
+                "update": {"type": "object", "description": "A new title or description when they no longer describe the change: {title?, body?} for a pull request, {pull_requests: [{title?, body?}]} by position for a stack. What's proposed (repository, branches) can't change; withdraw and propose again for that"},
                 "replies": {"type": "string", "description": "Your replies to findings you think don't apply, or that you addressed differently"},
             },
             "required": ["id"],

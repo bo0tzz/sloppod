@@ -336,7 +336,11 @@ pub async fn agent_context(state: &AppState, session: &db::SessionRow) -> AgentC
         repo_dir: work_dir(session).to_owned(),
         repos_dir: REPOS_DIR.to_owned(),
         tools_url: format!("{}/mcp", state.config.runtime_url()),
-        instructions: state.instructions.clone(),
+        // A review session's instructions are the reviewer's own, not the ones the owner's sessions work by.
+        instructions: match session.kind.as_str() {
+            "review" => Some(crate::reviews::INSTRUCTIONS.to_owned()),
+            _ => state.instructions.clone(),
+        },
         model: session.model.clone(),
         memory,
     }

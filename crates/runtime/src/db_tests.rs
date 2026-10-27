@@ -184,13 +184,20 @@ async fn review_rounds_track_a_proposal(db: PgPool) {
         1
     );
     assert!(
-        db::finish_review_round(&db, p, "changes", "Fix it.", &json!([{"comment": "x"}]))
-            .await
-            .unwrap()
-            .is_some()
+        db::finish_review_round(
+            &db,
+            p,
+            "changes",
+            "Fix it.",
+            &json!([{"id": "1.1"}]),
+            &json!([])
+        )
+        .await
+        .unwrap()
+        .is_some()
     );
     assert!(
-        db::finish_review_round(&db, p, "pass", "Again.", &json!([]))
+        db::finish_review_round(&db, p, "pass", "Again.", &json!([]), &json!([]))
             .await
             .unwrap()
             .is_none()
@@ -254,4 +261,43 @@ async fn review_policy_defaults_to_off(db: PgPool) {
     db::set_session_review(&db, s, "required").await.unwrap();
     let row = db::get_session(&db, s).await.unwrap().unwrap();
     assert_eq!(row.review, "required");
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn findings_from_before_severities_still_read(db: PgPool) {
+    let s = session(&db, "dev").await;
+    let p = db::insert_proposal(&db, s, "github.pr.create", "changes_requested", &json!({}))
+        .await
+        .unwrap()
+        .id;
+    db::start_review_round(&db, p, "aaa", None).await.unwrap();
+    sqlx::query("update reviews set verdict = 'changes', findings = $2 where proposal_id = $1")
+        .bind(p)
+        .bind(json!([
+            {"path": "src/a.rs", "line": 3, "severity": "high", "comment": "Off by one.\nThe last item is skipped."},
+            {"severity": "low", "comment": "No test."},
+        ]))
+        .execute(&db)
+        .await
+        .unwrap();
+
+    sqlx::raw_sql(
+        include_str!("../migrations/0011_review_findings.sql")
+            .split_once(";\n")
+            .unwrap()
+            .1,
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+
+    let findings = db::reviews(&db, p).await.unwrap().remove(0).findings;
+    assert_eq!(
+        findings,
+        json!([
+            {"id": "1.1", "severity": "p1", "category": "correctness", "title": "Off by one.",
+             "explanation": "Off by one.\nThe last item is skipped.", "path": "src/a.rs", "line": 3},
+            {"id": "1.2", "severity": "p2", "category": "correctness", "title": "No test.", "explanation": "No test."},
+        ])
+    );
 }
