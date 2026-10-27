@@ -215,6 +215,16 @@ async fn main() -> anyhow::Result<()> {
         .context("installing the egress listener")?;
 
     reconcile(&state).await;
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                every.tick().await;
+                api::purge_deleted(&state).await;
+            }
+        });
+    }
 
     let authz = tokio::spawn(authz::serve(config.authz_listen, state.clone()));
     let ui =

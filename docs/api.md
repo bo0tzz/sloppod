@@ -14,7 +14,9 @@ All bodies are JSON. Errors are `{"error": "<message>"}` with a 4xx/5xx status.
 GET    /api/v1/sessions             -> Session[]   (most recently updated first)
 POST   /api/v1/sessions             -> Session     body: NewSession
 GET    /api/v1/sessions/{id}        -> Session
-DELETE /api/v1/sessions/{id}        -> 204         stops the session and deletes its pod and volume
+DELETE /api/v1/sessions/{id}        -> 204         parks the session (cancelling its turn) and marks it deleted; restorable for 7 days, then purged with its pod, volume and keys
+GET    /api/v1/sessions/deleted     -> Session[]   deleted sessions not purged yet, most recently deleted first
+POST   /api/v1/sessions/{id}/restore -> Session    brings a deleted session back, parked
 POST   /api/v1/sessions/{id}/park   -> Session     ends its pod and keeps its volume, transcript, branch, grants and keys; 409 during a turn
 POST   /api/v1/sessions/{id}/wake   -> Session     brings a parked session back (no-op otherwise); a message sent to it does too
 POST   /api/v1/sessions/{id}/repos  -> Session     body: {repo: string}; grants write access to another repository and tells the agent (no-op if it has it)
@@ -58,6 +60,7 @@ type Session = {
   created_at: string;    // RFC 3339
   updated_at: string;
   active_at: string;   // when something last happened (an event was recorded); `GET /sessions` is ordered by it, newest first
+  deleted_at?: string;   // when it was deleted; `GET /sessions` leaves deleted sessions out
 };
 
 // What the session may do (ADR 2). Capabilities so far: "model", "github" (read: public data, plus the "repo"

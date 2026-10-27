@@ -77,6 +77,9 @@ pub mod api {
         pub updated_at: String,
         /// When something last happened in the session; the session list is ordered by it.
         pub active_at: String,
+        /// When it was deleted; it can be restored until it's purged a week later.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub deleted_at: Option<String>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

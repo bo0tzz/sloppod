@@ -31,6 +31,8 @@ pub fn routes() -> Router<AppState> {
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}", get(get_session).delete(delete_session))
         .route("/sessions/{id}/repos", post(add_repo))
+        .route("/sessions/deleted", get(list_deleted_sessions))
+        .route("/sessions/{id}/restore", post(restore_session))
         .route("/sessions/{id}/park", post(park_session))
         .route("/sessions/{id}/wake", post(wake_session))
         .route("/sessions/{id}/review", put(set_review))
@@ -523,8 +525,79 @@ async fn delete_session(
         .await?
         .ok_or_else(not_found)?;
     reviews::abandon(&state, id).await?;
-    remove_session(&state, &session).await?;
+    park_ending_turn(&state, &session).await?;
+    db::set_deleted(&state.db, id, true).await?;
+    state.hub.broadcast_session(id).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// How long a deleted session can be restored before it's purged for good.
+pub const RESTORABLE_FOR: chrono::Duration = chrono::Duration::days(7);
+
+async fn list_deleted_sessions(
+    State(state): State<AppState>,
+    User(user): User,
+) -> ApiResult<impl IntoResponse> {
+    let sessions: Vec<_> = db::deleted_sessions(&state.db, &user)
+        .await?
+        .iter()
+        .map(db::SessionRow::to_api)
+        .collect();
+    Ok(Json(sessions))
+}
+
+/// Brings a deleted session back, parked; waking it is a separate step.
+async fn restore_session(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    let session = db::owned_session(&state.db, id, &user)
+        .await?
+        .filter(|s| s.deleted_at.is_some() && s.phase() != Phase::Stopped)
+        .ok_or_else(not_found)?;
+    db::set_deleted(&state.db, session.id, false).await?;
+    state.hub.broadcast_session(id).await;
+    let session = db::get_session(&state.db, id)
+        .await?
+        .ok_or_else(not_found)?;
+    Ok(Json(session.to_api()))
+}
+
+/// Parks a session for deletion, cancelling its turn first if it's in one.
+async fn park_ending_turn(state: &AppState, session: &db::SessionRow) -> ApiResult<()> {
+    for attempt in 0..30 {
+        match park(state, session).await {
+            Ok(()) => return Ok(()),
+            Err(ParkError::InTurn) => {
+                if attempt == 0 {
+                    state.hub.cancel(session.id).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            Err(e) => return Err(park_error(e)),
+        }
+    }
+    Err(ApiError(
+        StatusCode::CONFLICT,
+        "the session's turn didn't stop; try again".into(),
+    ))
+}
+
+/// Purges sessions deleted longer ago than [`RESTORABLE_FOR`]: their pod, volume, egress policy and keys go.
+pub async fn purge_deleted(state: &AppState) {
+    let sessions = match db::purgeable_sessions(&state.db, RESTORABLE_FOR).await {
+        Ok(sessions) => sessions,
+        Err(e) => {
+            tracing::error!(error = %e, "listing deleted sessions to purge");
+            return;
+        }
+    };
+    for session in sessions {
+        if let Err(e) = remove_session(state, &session).await {
+            tracing::warn!(session = %session.id, error = %e, "purging a deleted session");
+        }
+    }
 }
 
 async fn park_session(

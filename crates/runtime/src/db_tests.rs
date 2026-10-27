@@ -344,3 +344,40 @@ async fn finds_proposals_still_with_their_reviewer(db: PgPool) {
         .collect();
     assert_eq!(found, &ids[..2]);
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn deleted_sessions_stay_restorable_until_purged(db: PgPool) {
+    use sloppod_protocol::api::Phase;
+
+    let kept = session(&db, "dev").await;
+    let deleted = session(&db, "dev").await;
+    db::set_deleted(&db, deleted, true).await.unwrap();
+    let listed = |rows: Vec<db::SessionRow>| rows.iter().map(|s| s.id).collect::<Vec<_>>();
+    assert_eq!(listed(db::list_sessions(&db, "dev").await.unwrap()), [kept]);
+    assert_eq!(
+        listed(db::deleted_sessions(&db, "dev").await.unwrap()),
+        [deleted]
+    );
+    assert!(
+        db::purgeable_sessions(&db, chrono::Duration::days(7))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        listed(
+            db::purgeable_sessions(&db, chrono::Duration::zero())
+                .await
+                .unwrap()
+        ),
+        [deleted]
+    );
+
+    // Purged sessions are gone from the restorable list.
+    db::set_phase(&db, deleted, Phase::Stopped).await.unwrap();
+    assert!(db::deleted_sessions(&db, "dev").await.unwrap().is_empty());
+
+    db::set_deleted(&db, kept, true).await.unwrap();
+    db::set_deleted(&db, kept, false).await.unwrap();
+    assert_eq!(listed(db::list_sessions(&db, "dev").await.unwrap()), [kept]);
+}

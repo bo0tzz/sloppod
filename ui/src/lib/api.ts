@@ -15,6 +15,8 @@ export type Session = {
   updated_at: string;
   /** When something last happened in the session; the session list is ordered by it. */
   active_at: string;
+  /** When it was deleted; it can be restored until it's purged a week later. */
+  deleted_at?: string;
 };
 
 export type NewSession = {
@@ -201,6 +203,8 @@ export const api = {
   getSession: (id: string) => call<Session>('GET', `/sessions/${encodeURIComponent(id)}`),
   createSession: (body: NewSession) => call<Session>('POST', '/sessions', body),
   deleteSession: (id: string) => call<void>('DELETE', `/sessions/${encodeURIComponent(id)}`),
+  listDeletedSessions: () => call<Session[]>('GET', '/sessions/deleted'),
+  restoreSession: (id: string) => call<Session>('POST', `/sessions/${encodeURIComponent(id)}/restore`, {}),
   parkSession: (id: string) => call<Session>('POST', `/sessions/${encodeURIComponent(id)}/park`, {}),
   wakeSession: (id: string) => call<Session>('POST', `/sessions/${encodeURIComponent(id)}/wake`, {}),
   addSessionRepo: (id: string, repo: string) =>
