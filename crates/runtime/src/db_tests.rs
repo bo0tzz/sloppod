@@ -299,5 +299,24 @@ async fn findings_from_before_severities_still_read(db: PgPool) {
              "explanation": "Off by one.\nThe last item is skipped.", "path": "src/a.rs", "line": 3},
             {"id": "1.2", "severity": "p2", "category": "correctness", "title": "No test.", "explanation": "No test."},
         ])
+
+async fn parked_sessions_are_left_alone_on_startup(db: PgPool) {
+    use sloppod_protocol::api::Phase;
+
+    let running = session(&db, "dev").await;
+    let parked = session(&db, "dev").await;
+    let deleted = session(&db, "dev").await;
+    db::set_phase(&db, parked, Phase::Parked).await.unwrap();
+    db::set_phase(&db, deleted, Phase::Stopped).await.unwrap();
+    let active: Vec<Uuid> = db::active_sessions(&db)
+        .await
+        .unwrap()
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(active, [running]);
+    assert_eq!(
+        db::get_session(&db, parked).await.unwrap().unwrap().phase(),
+        Phase::Parked
     );
 }

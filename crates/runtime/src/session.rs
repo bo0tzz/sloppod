@@ -800,6 +800,20 @@ impl Hub {
         self.live(id).state.lock().await.turn_running
     }
 
+    /// Lets go of a parked session's agent, whose pod is ending; messages waiting for it stay queued for its wake.
+    pub async fn park(&self, id: Uuid) {
+        let agent = {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            state.agent_session_id = None;
+            state.agent.take()
+        };
+        if let Some(agent) = agent {
+            agent.close();
+        }
+        self.set_phase(id, Phase::Parked).await;
+    }
+
     pub async fn stop(&self, id: Uuid) {
         let (agent, queued) = {
             let live = self.live(id);

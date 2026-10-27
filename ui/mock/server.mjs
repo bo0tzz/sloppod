@@ -929,6 +929,7 @@ function handleCall(conn, message) {
 
     case 'session/prompt': {
       if (!needLoaded()) return;
+      if (session.data.phase === 'parked') session.setPhase('starting');
       if (session.data.phase === 'starting' || session.data.phase === 'disconnected') {
         queuePrompt(
           session,
@@ -1104,6 +1105,20 @@ async function handleApi(req, res, url) {
       if (!['off', 'required'].includes(body.review)) return json(res, 400, { error: 'review must be one of off, required' });
       session.data.review = body.review;
       session.broadcast();
+      return json(res, 200, session.data);
+    }
+    if (parts.length === 3 && parts[2] === 'park' && method === 'POST') {
+      if (session.data.phase === 'working' || session.data.phase === 'waiting') {
+        return json(res, 409, { error: 'the session is in a turn; stop it or let it finish before parking' });
+      }
+      session.setPhase('parked');
+      return json(res, 200, session.data);
+    }
+    if (parts.length === 3 && parts[2] === 'wake' && method === 'POST') {
+      if (session.data.phase === 'parked') {
+        session.setPhase('starting');
+        startAgent(session, DELAY * 8);
+      }
       return json(res, 200, session.data);
     }
     if (parts.length === 3 && parts[2] === 'repos' && method === 'POST') {

@@ -28,6 +28,8 @@ pub mod api {
         Working,
         Waiting,
         Disconnected,
+        /// No pod; the session keeps everything else and wakes on request (ADR 5).
+        Parked,
         Stopped,
     }
 
@@ -39,6 +41,7 @@ pub mod api {
                 Phase::Working => "working",
                 Phase::Waiting => "waiting",
                 Phase::Disconnected => "disconnected",
+                Phase::Parked => "parked",
                 Phase::Stopped => "stopped",
             }
         }
@@ -49,6 +52,7 @@ pub mod api {
                 "working" => Phase::Working,
                 "waiting" => Phase::Waiting,
                 "disconnected" => Phase::Disconnected,
+                "parked" => Phase::Parked,
                 "stopped" => Phase::Stopped,
                 _ => Phase::Starting,
             }

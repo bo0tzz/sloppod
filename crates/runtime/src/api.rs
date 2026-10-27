@@ -30,6 +30,8 @@ pub fn routes() -> Router<AppState> {
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}", get(get_session).delete(delete_session))
         .route("/sessions/{id}/repos", post(add_repo))
+        .route("/sessions/{id}/park", post(park_session))
+        .route("/sessions/{id}/wake", post(wake_session))
         .route("/sessions/{id}/review", put(set_review))
         .route("/repos", get(repos))
         .route(
@@ -513,6 +515,67 @@ async fn delete_session(
         .ok_or_else(not_found)?;
     remove_session(&state, &session).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn park_session(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    let session = db::owned_session(&state.db, id, &user)
+        .await?
+        .ok_or_else(not_found)?;
+    match session.phase() {
+        Phase::Working | Phase::Waiting => {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "the session is in a turn; stop it or let it finish before parking".into(),
+            ));
+        }
+        Phase::Stopped => {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "the session is deleted".into(),
+            ));
+        }
+        _ => park(&state, &session).await?,
+    }
+    let session = db::get_session(&state.db, id)
+        .await?
+        .ok_or_else(not_found)?;
+    Ok(Json(session.to_api()))
+}
+
+async fn wake_session(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    let session = db::owned_session(&state.db, id, &user)
+        .await?
+        .ok_or_else(not_found)?;
+    wake(&state, &session).await?;
+    let session = db::get_session(&state.db, id)
+        .await?
+        .ok_or_else(not_found)?;
+    Ok(Json(session.to_api()))
+}
+
+/// Parks a session (ADR 5): its pod ends, and its volume, transcript, branch, grants and keys stay.
+pub async fn park(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
+    state.hub.park(session.id).await;
+    state.placement.suspend(&session.id.to_string()).await?;
+    Ok(())
+}
+
+/// Brings a parked session back: its pod starts again and the agent resumes its conversation. Other sessions are
+/// left as they are.
+pub async fn wake(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
+    if session.phase() != Phase::Parked {
+        return Ok(());
+    }
+    state.hub.set_phase(session.id, Phase::Starting).await;
+    place(state, session).await
 }
 
 /// Stops a session and deletes its pod, volume, egress policy and keys.

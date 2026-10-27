@@ -239,8 +239,11 @@ pub struct PlacementStatus {
 #[async_trait]
 pub trait PlacementBackend: Send + Sync {
     fn manifest(&self) -> Manifest;
+    /// Creates or updates the session's pod and volume, and runs the pod if it was suspended.
     async fn ensure(&self, spec: &PlacementSpec) -> Result<()>;
     async fn status(&self, session_id: &str) -> Result<PlacementStatus>;
+    /// Ends the session's pod and keeps its volume, for a parked session (ADR 5); `ensure` brings it back.
+    async fn suspend(&self, session_id: &str) -> Result<()>;
     async fn delete(&self, session_id: &str) -> Result<()>;
 }
 
