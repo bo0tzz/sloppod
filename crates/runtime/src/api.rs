@@ -68,6 +68,14 @@ impl<E: std::fmt::Display> From<E> for ApiError {
     }
 }
 
+/// A session that's in a turn or deleted can't be parked: a conflict, not a failure.
+fn park_error(e: ParkError) -> ApiError {
+    match e {
+        ParkError::InTurn | ParkError::Stopped => ApiError(StatusCode::CONFLICT, e.to_string()),
+        ParkError::Failed(e) => e.into(),
+    }
+}
+
 fn not_found() -> ApiError {
     ApiError(StatusCode::NOT_FOUND, "not found".into())
 }
@@ -526,21 +534,7 @@ async fn park_session(
     let session = db::owned_session(&state.db, id, &user)
         .await?
         .ok_or_else(not_found)?;
-    match session.phase() {
-        Phase::Working | Phase::Waiting => {
-            return Err(ApiError(
-                StatusCode::CONFLICT,
-                "the session is in a turn; stop it or let it finish before parking".into(),
-            ));
-        }
-        Phase::Stopped => {
-            return Err(ApiError(
-                StatusCode::CONFLICT,
-                "the session is deleted".into(),
-            ));
-        }
-        _ => park(&state, &session).await?,
-    }
+    park(&state, &session).await.map_err(park_error)?;
     let session = db::get_session(&state.db, id)
         .await?
         .ok_or_else(not_found)?;
@@ -827,6 +821,16 @@ async fn reject(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parking_conflicts_are_409s() {
+        assert_eq!(park_error(ParkError::InTurn).0, StatusCode::CONFLICT);
+        assert_eq!(park_error(ParkError::Stopped).0, StatusCode::CONFLICT);
+        assert_eq!(
+            park_error(ParkError::Failed(anyhow::anyhow!("no"))).0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 
     fn repos() -> Vec<String> {
         [

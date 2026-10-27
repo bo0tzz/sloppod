@@ -441,3 +441,81 @@ async fn a_wake_during_parking_runs_after_it() {
     assert_eq!(*steps.lock().unwrap(), ["suspended", "placed"]);
     assert_eq!(h.phase().await, "starting");
 }
+
+#[tokio::test]
+async fn a_failed_suspend_gives_the_session_its_agent_back() {
+    let mut h = Harness::ready().await;
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let park = {
+        let hub = h.hub.clone();
+        let id = h.id;
+        tokio::spawn(async move {
+            hub.park(id, || async move {
+                released.await.unwrap();
+                Err(anyhow::anyhow!("the API server is down"))
+            })
+            .await
+        })
+    };
+    while h.phase().await != "parked" {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Sent while parking, so it waits for the agent.
+    let turn = h.prompt("Carry on");
+    while h.user_messages().is_empty() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    release.send(()).unwrap();
+    assert!(park.await.unwrap().is_err());
+
+    let request = h.next().await;
+    assert_eq!(prompt_text(&request), ["Carry on"]);
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+    assert_eq!(h.phase().await, "idle");
+}
+
+#[tokio::test]
+async fn a_message_queued_while_parking_wakes_the_session() {
+    let h = Harness::ready().await;
+    let woken = Arc::new(std::sync::Mutex::new(0));
+    {
+        let (hub, woken) = (Arc::downgrade(&h.hub), woken.clone());
+        h.hub.set_waker(Arc::new(move |id| {
+            let (hub, woken) = (hub.clone(), woken.clone());
+            Box::pin(async move {
+                let hub = hub.upgrade().expect("hub");
+                hub.wake(id, || async move {
+                    *woken.lock().unwrap() += 1;
+                    Ok(())
+                })
+                .await
+            })
+        }));
+    }
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let park = {
+        let (hub, id) = (h.hub.clone(), h.id);
+        tokio::spawn(async move {
+            hub.park(id, || async move {
+                released.await.unwrap();
+                Ok(())
+            })
+            .await
+        })
+    };
+    while h.phase().await != "parked" {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let _turn = h.prompt("Carry on");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The wake waits for the park to finish rather than missing it.
+    assert_eq!(*woken.lock().unwrap(), 0);
+
+    release.send(()).unwrap();
+    park.await.unwrap().unwrap();
+    while *woken.lock().unwrap() == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(h.phase().await, "starting");
+}

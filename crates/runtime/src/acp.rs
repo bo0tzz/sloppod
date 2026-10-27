@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::link::RpcError;
 use crate::session::{UiEvent, session_update};
 use crate::users::User;
-use crate::{AppState, api, db};
+use crate::{AppState, db};
 
 pub async fn handler(
     State(state): State<AppState>,
@@ -148,21 +148,6 @@ impl Conn {
             && !self.loaded.lock().await.contains_key(&session)
         {
             self.reply(id, Err(RpcError::new(-32602, "load the session first")));
-            return;
-        }
-        // A message to a parked session wakes it, and waits in its queue until the agent is back.
-        if let ("session/prompt" | "_session/steering", Some(session)) = (method.as_str(), session)
-            && let Ok(Some(row)) = db::get_session(&self.state.db, session).await
-            && let Err(e) = api::wake(&self.state, &row).await
-        {
-            tracing::warn!(%session, error = %e, "waking a parked session");
-            self.reply(
-                id,
-                Err(RpcError::new(
-                    -32603,
-                    format!("couldn't wake the session: {e}"),
-                )),
-            );
             return;
         }
         let result = match (method.as_str(), session) {
