@@ -11,6 +11,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::OnceCell;
 
+use crate::enforcer::PUSH_TIME_LIMIT;
+
 const API: &str = "https://api.github.com";
 
 /// Lookups the authorizer makes while deciding a request, which Envoy gives 10 s in all.
@@ -65,8 +67,9 @@ impl PushLog {
     }
 }
 
-/// How long a push the authorizer let through may take to land, for work that needs branches to hold still.
-const PUSH_SETTLE: Duration = Duration::from_secs(10 * 60);
+/// How long after the authorizer let a push through it may still land: the listener ends pushes at
+/// [`PUSH_TIME_LIMIT`], and GitHub gets a minute more to apply one whose upload finished just in time.
+const PUSH_SETTLE: Duration = PUSH_TIME_LIMIT.saturating_add(Duration::from_secs(60));
 
 /// A linked stack to merge: its number, its pull requests and each layer's branch and proposed commit, bottom to
 /// top, and the top pull request's node id.

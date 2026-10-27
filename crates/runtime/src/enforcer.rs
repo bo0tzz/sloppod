@@ -14,6 +14,10 @@ use crate::tls::Ca;
 
 const LISTENER: &str = "sloppod-egress";
 
+/// The longest a git push through the listener may take, start to end. Work that needs a branch to hold still can
+/// count on a push the authorizer let through having landed or failed once this has passed.
+pub const PUSH_TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 pub struct Cilium {
     namespace: String,
     policies: Api<DynamicObject>,
@@ -126,10 +130,22 @@ fn envoy_config(
                                 "virtual_hosts": [{
                                     "name": "all",
                                     "domains": ["*"],
-                                    "routes": [{
-                                        "match": {"prefix": "/"},
-                                        "route": {"cluster": "sloppod-upstream", "timeout": "0s"},
-                                    }],
+                                    "routes": [
+                                        {
+                                            "match": {"safe_regex": {"regex": ".*/git-receive-pack"}},
+                                            "route": {
+                                                "cluster": "sloppod-upstream",
+                                                "timeout": "0s",
+                                                "max_stream_duration": {
+                                                    "max_stream_duration": format!("{}s", PUSH_TIME_LIMIT.as_secs()),
+                                                },
+                                            },
+                                        },
+                                        {
+                                            "match": {"prefix": "/"},
+                                            "route": {"cluster": "sloppod-upstream", "timeout": "0s"},
+                                        },
+                                    ],
                                 }],
                             },
                             "http_filters": [
@@ -371,5 +387,33 @@ mod tests {
             upstream["transport_socket"]["typed_config"]["max_session_keys"],
             0
         );
+    }
+    #[test]
+    fn pushes_have_a_time_limit_and_nothing_else_does() {
+        let config = envoy_config(
+            "slop",
+            "cert",
+            "key",
+            "127.0.0.1:9001".parse().unwrap(),
+            "/ca.crt",
+        );
+        let listener = config["spec"]["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == LISTENER)
+            .unwrap();
+        let routes = &listener["filter_chains"][0]["filters"][0]["typed_config"]["route_config"]["virtual_hosts"]
+            [0]["routes"];
+        assert_eq!(
+            routes[0]["match"]["safe_regex"]["regex"],
+            ".*/git-receive-pack"
+        );
+        assert_eq!(
+            routes[0]["route"]["max_stream_duration"]["max_stream_duration"],
+            "300s"
+        );
+        assert_eq!(routes[1]["match"]["prefix"], "/");
+        assert!(routes[1]["route"].get("max_stream_duration").is_none());
     }
 }
