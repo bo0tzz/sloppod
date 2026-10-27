@@ -677,6 +677,24 @@ test('a session whose pull requests are approved automatically', async ({ page }
   await expect(section.getByTestId('standing-approval')).toHaveCount(0);
 });
 
+test('a stale Stop never turns automatic approval on', async ({ page }) => {
+  const id = await createSession(page, 'Propose a PR for sloppod, stale menu');
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await page.getByRole('menuitem', { name: 'Approve its pull requests automatically' }).click();
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await expect(page.getByRole('menuitem', { name: 'Stop approving its pull requests' })).toBeVisible();
+  // Another tab revokes it while this menu still says Stop.
+  const approvals: { id: string; session_id?: string }[] = await (await page.request.get('/api/v1/standing-approvals')).json();
+  for (const approval of approvals.filter((a) => a.session_id === id)) {
+    await page.request.delete(`/api/v1/standing-approvals/${approval.id}`);
+  }
+  await page.getByRole('menuitem', { name: 'Stop approving its pull requests' }).click();
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await expect(page.getByRole('menuitem', { name: 'Approve its pull requests automatically' })).toBeVisible();
+  const after: { session_id?: string }[] = await (await page.request.get('/api/v1/standing-approvals')).json();
+  expect(after.filter((a) => a.session_id === id)).toHaveLength(0);
+});
+
 test('stopping automatic approval revokes every approval of the session', async ({ page }) => {
   const id = await createSession(page, 'Propose a PR for sloppod twice approved');
   for (const target of [undefined, 'bo0tzz/sloppod']) {

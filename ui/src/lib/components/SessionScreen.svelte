@@ -126,15 +126,16 @@
     }
   }
 
-  async function toggleAutoApproval() {
+  /** Turns automatic approval on or off as chosen, whatever another tab did since the menu was drawn. */
+  async function setAutoApproval(on: boolean) {
     if (togglingApproval) return;
     togglingApproval = true;
     try {
       // Fresh, so another tab's changes count: any live approval keeps approving until all are revoked.
       await loadAutoApprovals();
-      if (autoApprovals.length > 0) {
+      if (!on) {
         await Promise.all(autoApprovals.map((approval) => api.revokeStandingApproval(approval)));
-      } else {
+      } else if (autoApprovals.length === 0) {
         await api.createStandingApproval({ kind: 'github.pr.create', session_id: id, edits: { auto_merge: true } });
       }
       await loadAutoApprovals();
@@ -266,7 +267,7 @@
               title: autoApprovals.length > 0 ? 'Stop approving its pull requests' : 'Approve its pull requests automatically',
               icon: mdiCheckDecagramOutline,
               $if: () => session?.kind === 'work',
-              onAction: toggleAutoApproval,
+              onAction: () => setAutoApproval(autoApprovals.length === 0),
             },
             { title: 'Settings', icon: mdiCogOutline, href: '/settings' },
             { title: 'Delete session', icon: mdiTrashCanOutline, color: 'danger', onAction: deleteSession },
