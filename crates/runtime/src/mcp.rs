@@ -50,6 +50,11 @@ fn tools(state: &AppState) -> Vec<Value> {
         .map(|t| json!({"name": t.name, "description": t.description, "inputSchema": t.input_schema}))
         .collect();
     tools.push(json!({
+        "name": "list_grants",
+        "description": "List what this session is granted: the repositories it can read and push to, the APIs it can call and the hosts it can reach.",
+        "inputSchema": {"type": "object", "properties": {}},
+    }));
+    tools.push(json!({
         "name": "get_proposal",
         "description": "Check the status of a proposal you made: pending, approved, rejected (with the reviewer's reason), executed (with the result, e.g. the PR URL) or failed.",
         "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
@@ -76,6 +81,12 @@ fn text(text: String, is_error: bool) -> Value {
 async fn call(state: &AppState, session: Uuid, params: &Value) -> Value {
     let name = params["name"].as_str().unwrap_or_default();
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+    if name == "list_grants" {
+        return match db::get_session(&state.db, session).await {
+            Ok(Some(row)) => text(grant_list(&row.context().grants), false),
+            _ => text("couldn't load the session".into(), true),
+        };
+    }
     if name == "get_proposal" {
         let id = arguments["id"]
             .as_str()
@@ -135,4 +146,15 @@ async fn call(state: &AppState, session: Uuid, params: &Value) -> Value {
         ),
         Err(e) => text(format!("Proposal refused: {e}"), true),
     }
+}
+
+fn grant_list(grants: &[sloppod_contracts::Grant]) -> String {
+    let mut lines: Vec<String> = grants
+        .iter()
+        .map(|g| format!("- {}: {}", g.capability, crate::grants::describe(g)))
+        .collect();
+    lines.push(
+        "Anything else is refused. Ask for write access to another repository with request_repository.".into(),
+    );
+    lines.join("\n")
 }

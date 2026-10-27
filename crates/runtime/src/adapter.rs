@@ -63,7 +63,7 @@ impl ClaudeCode {
         format!(
             "You are running in a sloppod session: a sandboxed Kubernetes pod.\n\
              {workspace}\
-             - Network access is limited to the model API, GitHub, memory and package registries. Other hosts don't \
+             - Network access is limited to what this session is granted; the `list_grants` tool lists it. Other hosts don't \
              resolve, so a DNS lookup failure (e.g. `EAI_FAIL`, `ENOTFOUND`) means the host is blocked, not down; \
              don't retry it. Credentials are \
              attached outside the pod, so the tokens you see in the environment are placeholders; don't try to use \

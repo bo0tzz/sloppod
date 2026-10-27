@@ -273,7 +273,11 @@ const hasRepoGrant = (session, repo) =>
 /** Gives the session write access to another repository; the first one also becomes its `repo`. */
 function grantRepo(session, repo) {
   if (!hasRepoGrant(session, repo)) {
-    session.data.grants.push({ capability: 'repo', params: { repo, access: 'rw', branch: sessionBranch(session) } });
+    session.data.grants.push({
+      capability: 'repo',
+      params: { repo, access: 'rw', branch: sessionBranch(session) },
+      description: `${repo}: read, and push the session branch \`${sessionBranch(session)}\` and branches named after it.`,
+    });
   }
   if (!session.data.repo) {
     session.data.repo = repo;
@@ -713,11 +717,23 @@ function createSession({ prompt, repo, title }) {
     repo: sessionRepo,
     branch,
     grants: [
-      { capability: 'model', params: {} },
-      { capability: 'github', params: {} },
-      { capability: 'packages', params: {} },
-      ...(sessionRepo ? [{ capability: 'repo', params: { repo: sessionRepo, access: 'rw', branch } }] : []),
-      { capability: 'memory', params: { namespace: sessionRepo ?? 'bo0tzz', access: 'rw' } },
+      { capability: 'model', params: {}, description: "Claude's API, with the owner's Claude account." },
+      { capability: 'github', params: {}, description: "GitHub's API and git." },
+      { capability: 'packages', params: {}, description: 'Package registries and tool downloads.' },
+      ...(sessionRepo
+        ? [
+            {
+              capability: 'repo',
+              params: { repo: sessionRepo, access: 'rw', branch },
+              description: `${sessionRepo}: read, and push the session branch \`${branch}\` and branches named after it.`,
+            },
+          ]
+        : []),
+      {
+        capability: 'memory',
+        params: { namespace: sessionRepo ?? 'bo0tzz', access: 'rw' },
+        description: `Long-term memory (memini), in the namespace ${sessionRepo ?? 'bo0tzz'}.`,
+      },
     ],
     phase: 'starting',
     created_at: created,
