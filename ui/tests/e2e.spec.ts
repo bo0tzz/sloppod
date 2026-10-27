@@ -262,6 +262,9 @@ test('shows the review a proposal went through on request', async ({ page }) => 
   await expect(rounds.first()).toContainText('Changes requested');
   await expect(rounds.first().getByTestId('review-finding')).toHaveCount(2);
   await expect(rounds.first()).toContainText('ui/src/lib/acp/connection.ts:12');
+  await expect(rounds.first()).toContainText('The backoff never resets');
+  await expect(rounds.first()).toContainText('Fix: Reset the attempt counter');
+  await expect(rounds.last()).toContainText('Resolved since the last round: 1.1, 1.2');
   await expect(rounds.last()).toContainText('Passed');
   await expect(rounds.last()).toContainText('Reset it after a successful session/load.');
   await expect(history.getByRole('link', { name: 'Open the review session' })).toHaveAttribute('href', /^\/sessions\/[0-9a-f-]+$/);

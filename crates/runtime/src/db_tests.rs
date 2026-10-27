@@ -184,13 +184,20 @@ async fn review_rounds_track_a_proposal(db: PgPool) {
         1
     );
     assert!(
-        db::finish_review_round(&db, p, "changes", "Fix it.", &json!([{"comment": "x"}]))
-            .await
-            .unwrap()
-            .is_some()
+        db::finish_review_round(
+            &db,
+            p,
+            "changes",
+            "Fix it.",
+            &json!([{"id": "1.1"}]),
+            &json!([])
+        )
+        .await
+        .unwrap()
+        .is_some()
     );
     assert!(
-        db::finish_review_round(&db, p, "pass", "Again.", &json!([]))
+        db::finish_review_round(&db, p, "pass", "Again.", &json!([]), &json!([]))
             .await
             .unwrap()
             .is_none()

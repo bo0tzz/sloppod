@@ -14,7 +14,7 @@
     pass: { label: 'Passed', color: 'success' },
     changes: { label: 'Changes requested', color: 'warning' },
   } as const;
-  const severityColors = { high: 'danger', medium: 'warning', low: 'secondary' } as const;
+  const severityColors = { p0: 'danger', p1: 'warning', p2: 'secondary' } as const;
 
   $effect(() => {
     if (!open || reviews || loadError) return;
@@ -56,19 +56,25 @@
           {#if review.summary}
             <p class="text-sm whitespace-pre-wrap">{review.summary}</p>
           {/if}
+          {#if review.resolved.length > 0}
+            <Text size="tiny" color="muted">Resolved since the last round: {review.resolved.join(', ')}</Text>
+          {/if}
           {#if review.findings.length > 0}
             <ul class="flex flex-col gap-2">
               {#each review.findings as finding, index (index)}
                 <li class="bg-light-100 flex flex-col gap-1 rounded-lg p-2 text-sm" data-testid="review-finding">
                   <div class="flex flex-wrap items-center gap-2">
-                    {#if finding.severity}
-                      <Badge color={severityColors[finding.severity]} shape="round" size="tiny">{finding.severity}</Badge>
-                    {/if}
-                    {#if finding.path}
-                      <span class="font-mono text-xs break-all">{finding.path}{finding.line ? `:${finding.line}` : ''}</span>
-                    {/if}
+                    <Badge color={severityColors[finding.severity]} shape="round" size="tiny">{finding.severity}</Badge>
+                    <span class="text-muted text-xs">{finding.category}</span>
+                    <span class="font-medium">{finding.title}</span>
                   </div>
-                  <p class="whitespace-pre-wrap">{finding.comment}</p>
+                  {#if finding.path}
+                    <span class="font-mono text-xs break-all">{finding.path}{finding.line ? `:${finding.line}` : ''}</span>
+                  {/if}
+                  <p class="whitespace-pre-wrap">{finding.explanation}</p>
+                  {#if finding.suggested_fix}
+                    <p class="whitespace-pre-wrap"><span class="text-muted">Fix:</span> {finding.suggested_fix}</p>
+                  {/if}
                 </li>
               {/each}
             </ul>

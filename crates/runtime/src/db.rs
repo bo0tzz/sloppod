@@ -703,6 +703,7 @@ pub struct ReviewRow {
     pub verdict: Option<String>,
     pub summary: Option<String>,
     pub findings: Value,
+    pub resolved: Value,
     pub created_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
 }
@@ -716,6 +717,7 @@ impl ReviewRow {
             verdict: self.verdict.clone(),
             summary: self.summary.clone(),
             findings: self.findings.clone(),
+            resolved: self.resolved.clone(),
             created_at: self.created_at.to_rfc3339(),
             finished_at: self.finished_at.map(|d| d.to_rfc3339()),
         }
@@ -723,7 +725,7 @@ impl ReviewRow {
 }
 
 const REVIEW_COLUMNS: &str =
-    "round, head_sha, replies, verdict, summary, findings, created_at, finished_at";
+    "round, head_sha, replies, verdict, summary, findings, resolved, created_at, finished_at";
 
 /// A proposal's review rounds, first to last.
 pub async fn reviews(db: &PgPool, proposal: Uuid) -> sqlx::Result<Vec<ReviewRow>> {
@@ -761,15 +763,17 @@ pub async fn finish_review_round(
     verdict: &str,
     summary: &str,
     findings: &Value,
+    resolved: &Value,
 ) -> sqlx::Result<Option<ReviewRow>> {
     sqlx::query_as(AssertSqlSafe(format!(
-        "update reviews set verdict = $2, summary = $3, findings = $4, finished_at = now() \
+        "update reviews set verdict = $2, summary = $3, findings = $4, resolved = $5, finished_at = now() \
          where proposal_id = $1 and verdict is null returning {REVIEW_COLUMNS}"
     )))
     .bind(proposal)
     .bind(verdict)
     .bind(summary)
     .bind(findings)
+    .bind(resolved)
     .fetch_optional(db)
     .await
 }

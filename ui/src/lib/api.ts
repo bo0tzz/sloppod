@@ -90,6 +90,19 @@ export type StandingApproval = {
 
 export type NewStandingApproval = Omit<StandingApproval, 'id' | 'created_at'>;
 
+/** A reviewer's finding; an id carried over from an earlier round marks the same finding. */
+export type ReviewFinding = {
+  id: string;
+  severity: 'p0' | 'p1' | 'p2';
+  category: string;
+  title: string;
+  explanation: string;
+  path?: string;
+  line?: number;
+  end_line?: number;
+  suggested_fix?: string;
+};
+
 /** One round of a proposal's review by another model (ADR 24). */
 export type Review = {
   round: number;
@@ -99,7 +112,9 @@ export type Review = {
   /** Absent while the round runs. */
   verdict?: 'pass' | 'changes';
   summary?: string;
-  findings: { path?: string; line?: number; severity?: 'high' | 'medium' | 'low'; comment: string }[];
+  findings: ReviewFinding[];
+  /** Ids of the previous round's findings that no longer hold. */
+  resolved: string[];
   created_at: string;
   finished_at?: string;
 };
