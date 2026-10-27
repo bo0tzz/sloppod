@@ -68,6 +68,7 @@ class MockSession {
   emit(update) {
     const params = { sessionId: this.data.id, update };
     this.log.push(params);
+    this.data.active_at = now();
     for (const conn of this.subscribers) conn.notify('session/update', params);
   }
 
@@ -738,6 +739,7 @@ function createSession({ prompt, repo, title }) {
     phase: 'starting',
     created_at: created,
     updated_at: created,
+    active_at: created,
   });
   sessions.set(id, session);
   queuePrompt(session, prompt);
@@ -958,7 +960,7 @@ async function readBody(req) {
 }
 
 const sortedSessions = () =>
-  [...sessions.values()].map((s) => s.data).sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
+  [...sessions.values()].map((s) => s.data).sort((a, b) => Date.parse(b.active_at) - Date.parse(a.active_at));
 
 async function handleApi(req, res, url) {
   const parts = url.pathname.replace(/^\/api\/v1\/?/, '').split('/').filter(Boolean);
@@ -1233,6 +1235,7 @@ async function seed() {
   first.alwaysAllow = false;
   first.data.created_at = ago(95);
   first.data.updated_at = ago(12);
+  first.data.active_at = ago(12);
   for (const proposal of proposals.values()) proposal.created_at = ago(13);
 
   const second = seeded({
@@ -1259,12 +1262,14 @@ async function seed() {
   second.data.phase = 'stopped';
   second.data.created_at = ago(60 * 26);
   second.data.updated_at = ago(60 * 24);
+  second.data.active_at = ago(60 * 24);
 
   const third = seeded({ prompt: 'Bump kopium to 0.24 and regenerate the CRDs.', repo: 'bo0tzz/sloppod', title: 'Bump kopium to 0.24' });
   reply(third, 'On it. Updating `mise.toml` first.');
   third.data.phase = 'disconnected';
   third.data.created_at = ago(40);
   third.data.updated_at = ago(3);
+  third.data.active_at = ago(3);
 
   const fourth = seeded({ prompt: 'What does park and wake mean for a session?', title: 'Park and wake' });
   reply(
@@ -1283,6 +1288,7 @@ async function seed() {
   proposals.set(unknown.id, unknown);
   fourth.data.created_at = ago(60 * 3);
   fourth.data.updated_at = ago(60 * 2);
+  fourth.data.active_at = ago(60 * 2);
 }
 
 // --- server ---------------------------------------------------------------------------------

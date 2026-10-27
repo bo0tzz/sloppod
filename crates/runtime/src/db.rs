@@ -32,6 +32,8 @@ pub struct SessionRow {
     grants: Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// When an event was last recorded; the session list is ordered by it.
+    pub active_at: DateTime<Utc>,
 }
 
 impl SessionRow {
@@ -50,6 +52,7 @@ impl SessionRow {
             grants: Value::Array(Vec::new()),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            active_at: Utc::now(),
         }
     }
 
@@ -91,6 +94,7 @@ impl SessionRow {
             phase: Phase::parse(&self.phase),
             created_at: self.created_at.to_rfc3339(),
             updated_at: self.updated_at.to_rfc3339(),
+            active_at: self.active_at.to_rfc3339(),
         }
     }
 
@@ -99,7 +103,7 @@ impl SessionRow {
     }
 }
 
-const SESSION_COLUMNS: &str = "id, owner, title, phase, agent_session_id, agent_state, model, repo, created_at, updated_at, \
+const SESSION_COLUMNS: &str = "id, owner, title, phase, agent_session_id, agent_state, model, repo, created_at, updated_at, active_at, \
      coalesce((select jsonb_agg(jsonb_build_object('capability', g.capability, 'params', g.params) order by g.created_at) \
      from session_grants g where g.session_id = sessions.id), '[]'::jsonb) as grants";
 
@@ -147,7 +151,7 @@ pub async fn insert_session(db: &PgPool, new: NewSessionRow<'_>) -> sqlx::Result
 
 pub async fn list_sessions(db: &PgPool, owner: &str) -> sqlx::Result<Vec<SessionRow>> {
     sqlx::query_as(AssertSqlSafe(format!(
-        "select {SESSION_COLUMNS} from sessions where owner = $1 order by updated_at desc"
+        "select {SESSION_COLUMNS} from sessions where owner = $1 order by active_at desc"
     )))
     .bind(owner)
     .fetch_all(db)
@@ -237,7 +241,7 @@ pub async fn append_event(db: &PgPool, id: Uuid, payload: &Value) -> sqlx::Resul
     .fetch_one(db)
     .await?
     .get(0);
-    sqlx::query("update sessions set updated_at = now() where id = $1")
+    sqlx::query("update sessions set updated_at = now(), active_at = now() where id = $1")
         .bind(id)
         .execute(db)
         .await?;

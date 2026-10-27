@@ -9,6 +9,8 @@ export type Session = {
   phase: Phase;
   created_at: string;
   updated_at: string;
+  /** When something last happened in the session; the session list is ordered by it. */
+  active_at: string;
 };
 
 export type NewSession = {
@@ -187,5 +189,5 @@ export function newerProposal(current: Proposal | undefined, incoming: Proposal)
 }
 
 export function sortSessions(sessions: Session[]): Session[] {
-  return [...sessions].sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
+  return [...sessions].sort((a, b) => Date.parse(b.active_at) - Date.parse(a.active_at));
 }

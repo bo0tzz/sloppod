@@ -49,6 +49,7 @@ type Session = {
   phase: Phase;
   created_at: string;    // RFC 3339
   updated_at: string;
+  active_at: string;   // when something last happened (an event was recorded); `GET /sessions` is ordered by it, newest first
 };
 
 // What the session may do (ADR 2). Capabilities so far: "model", "github" (read: public data, plus the "repo"
