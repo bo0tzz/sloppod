@@ -900,24 +900,29 @@ pub async fn propose(
         .await
         .map_err(|e| e.to_string())?
         .ok_or("unknown session")?;
-    let review = arguments["review"].as_bool() == Some(true);
+    // The session's policy covers every kind that can be reviewed; asking for a review of one that can't is an
+    // error, as is asking when the owner has no login for the reviewer. Under the policy those just skip review.
+    let asked = arguments["review"].as_bool() == Some(true);
+    let required = session.review == "required";
     let context = session.context();
     let payload = kind.prepare(&context, arguments).await.map_err(|e| e.0)?;
-    let subject = match review {
-        true => Some(
-            kind.review_subject(&payload)
-                .ok_or("proposals of this kind aren't reviewed; propose it without review")?,
-        ),
-        false => None,
-    };
+    let mut subject = kind.review_subject(&payload).filter(|_| asked || required);
+    if asked && subject.is_none() {
+        return Err("proposals of this kind aren't reviewed; propose it without review".into());
+    }
     if subject.is_some()
         && !reviews::available(state, &session.owner)
             .await
             .map_err(|e| e.to_string())?
     {
-        return Err("reviews need a ChatGPT login in sloppod's settings, which the user hasn't added; propose it \
-                    without review"
-            .into());
+        if asked {
+            return Err(
+                "reviews need a ChatGPT login in sloppod's settings, which the user hasn't added; \
+                        propose it without review"
+                    .into(),
+            );
+        }
+        subject = None;
     }
     let status = if subject.is_some() {
         "in_review"

@@ -347,7 +347,7 @@ test('saves the default model for new sessions', async ({ page }) => {
   const defaults = page.getByTestId('session-defaults');
   async function choose(name: string) {
     await page.goto('/settings');
-    await defaults.getByRole('combobox').click();
+    await defaults.getByRole('combobox', { name: 'Model' }).click();
     await page.getByRole('option', { name, exact: true }).click();
     await defaults.getByRole('button', { name: 'Save' }).click();
     await expect(defaults.getByRole('button', { name: 'Save' })).toBeDisabled();
@@ -355,14 +355,42 @@ test('saves the default model for new sessions', async ({ page }) => {
 
   await choose('Haiku');
   await page.reload();
-  await expect(defaults.getByRole('combobox')).toContainText('Haiku');
+  await expect(defaults.getByRole('combobox', { name: 'Model' })).toContainText('Haiku');
 
   await createSession(page, 'Use my default model in sloppod');
   await expect(page.getByTestId('model-select')).toContainText('Haiku');
 
   await choose('Agent default');
   await page.reload();
-  await expect(defaults.getByRole('combobox')).toContainText('Agent default');
+  await expect(defaults.getByRole('combobox', { name: 'Model' })).toContainText('Agent default');
+});
+
+test('requires review by default, or per session', async ({ page }) => {
+  const defaults = page.getByTestId('session-defaults');
+  const policy = defaults.getByRole('combobox', { name: 'Review by Codex' });
+  async function choose(name: string) {
+    await page.goto('/settings');
+    await policy.click();
+    await page.getByRole('option', { name, exact: true }).click();
+    await defaults.getByRole('button', { name: 'Save' }).click();
+    await expect(defaults.getByRole('button', { name: 'Save' })).toBeDisabled();
+  }
+
+  await choose('Always, for pull requests');
+  await page.reload();
+  await expect(policy).toContainText('Always, for pull requests');
+  const id = await createSession(page, 'Get my changes reviewed in sloppod');
+  const review = async () => (await (await page.request.get(`/api/v1/sessions/${id}`)).json()).review;
+  expect(await review()).toBe('required');
+
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await page.getByRole('menuitem', { name: 'Stop requiring review' }).click();
+  await expect.poll(review).toBe('off');
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await expect(page.getByRole('menuitem', { name: 'Require review by Codex' })).toBeVisible();
+  await page.keyboard.press('Escape');
+
+  await choose('Only when the agent asks');
 });
 
 test('queues messages while the agent starts', async ({ page }) => {

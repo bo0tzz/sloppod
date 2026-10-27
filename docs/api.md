@@ -16,18 +16,20 @@ POST   /api/v1/sessions             -> Session     body: NewSession
 GET    /api/v1/sessions/{id}        -> Session
 DELETE /api/v1/sessions/{id}        -> 204         stops the session and deletes its pod and volume
 POST   /api/v1/sessions/{id}/repos  -> Session     body: {repo: string}; grants write access to another repository and tells the agent (no-op if it has it)
+PUT    /api/v1/sessions/{id}/review -> Session     body: {review: "off" | "required"}
 GET    /api/v1/repos                -> string[]    repositories sessions can be granted, e.g. ["bo0tzz/sloppod"]
 GET    /api/v1/me                   -> {user: string}
 GET    /api/v1/settings             -> Settings
-PUT    /api/v1/settings             -> Settings    body: {model?: string | null}
+PUT    /api/v1/settings             -> Settings    body: {model?: string | null, review?: "off" | "required"}; fields left out stay as they are
 ```
 
 ```ts
 // The user's defaults for new sessions. `models` is what the agent offered in the user's most recent session
-// (empty before the first one); `model` null means the agent's default.
+// (empty before the first one); `model` null means the agent's default. `review` is new sessions' review policy.
 type Settings = {
   model: string | null;
   models: { value: string; name: string }[];
+  review: "off" | "required";
 };
 ```
 
@@ -50,6 +52,7 @@ type Session = {
   phase: Phase;
   agent: string;         // "claude-code" or "codex"
   kind: "work" | "review"; // "review": a session reviewing a proposal (ADR 24); `GET /sessions` leaves these out
+  review: "off" | "required"; // whether its pull requests are reviewed by another model first; from the user's settings
   created_at: string;    // RFC 3339
   updated_at: string;
   active_at: string;   // when something last happened (an event was recorded); `GET /sessions` is ordered by it, newest first
@@ -111,7 +114,7 @@ Outward actions and access the agent asked for ([ADR 3](adr/0003-proposals-and-t
 - `sloppod.repo.grant`: write access to a repository; payload `{repo, reason, branch}`; the detail adds nothing.
 - `github.issue.create`: issues to file in a repository the session can push to; payload `{repo, issues: {title, body, labels}[]}`; the detail adds nothing. Labels that don't exist yet are created. The result lists the issues filed, and any that failed.
 
-**Review first** ([ADR 24](adr/0024-automated-review-before-human-review.md)): when the agent proposes a pull request or a stack with `review: true` and the user has a ChatGPT login, the proposal starts `in_review` rather than `pending`. The runtime starts a review session (`kind: "review"`, running Codex, with read-only access to the repository and the head branch checked out), which ends each round by calling its `submit_review` tool. A pass moves the proposal to `pending`, where the user sees it and standing approvals can match it. Changes requested move it to `changes_requested` and the findings go to the agent, not the user; the agent pushes fixes and calls `request_review` (with replies to findings it disputes), which re-pins the proposal to its branch's new head and runs the next round in the same review session. After three rounds with changes requested, the proposal goes to `pending` anyway, with the open findings in its reviews. The review session is deleted once the proposal passes, reaches that cap or is withdrawn. `GET /api/v1/proposals/{id}/reviews` lists the rounds.
+**Review first** ([ADR 24](adr/0024-automated-review-before-human-review.md)): when the session's `review` is `required`, or the agent proposes a pull request or a stack with `review: true`, and the user has a ChatGPT login, the proposal starts `in_review` rather than `pending`. Without the login, a required review is skipped, and asking for one is an error. The runtime starts a review session (`kind: "review"`, running Codex, with read-only access to the repository and the head branch checked out), which ends each round by calling its `submit_review` tool. A pass moves the proposal to `pending`, where the user sees it and standing approvals can match it. Changes requested move it to `changes_requested` and the findings go to the agent, not the user; the agent pushes fixes and calls `request_review` (with replies to findings it disputes), which re-pins the proposal to its branch's new head and runs the next round in the same review session. After three rounds with changes requested, the proposal goes to `pending` anyway, with the open findings in its reviews. The review session is deleted once the proposal passes, reaches that cap or is withdrawn. `GET /api/v1/proposals/{id}/reviews` lists the rounds.
 
 When a proposal is decided or carried out, the runtime tells the agent: the notice is recorded as a `user_message_chunk` with `_meta.sloppod.notice: true` and delivered as a new turn when the agent is idle, steered into a running turn, or queued until the agent is up. Sessions whose turn a runtime restart cut off get a notice of the same kind once their agent is back, naming the build now running (`SLOPPOD_BUILD`, the chart's app version).
 

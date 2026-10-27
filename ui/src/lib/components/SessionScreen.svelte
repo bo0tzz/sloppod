@@ -13,6 +13,7 @@
   import {
     mdiArrowDown,
     mdiCogOutline,
+    mdiMagnifyScan,
     mdiShieldKeyOutline,
     mdiSourcePull,
     mdiSourceRepository,
@@ -102,6 +103,18 @@
     observer.observe(scroller);
     return () => observer.disconnect();
   });
+
+  async function toggleReview() {
+    if (!session) return;
+    try {
+      view.setSession(await api.setSessionReview(id, session.review === 'required' ? 'off' : 'required'));
+    } catch (error) {
+      toastManager.danger({
+        title: "Couldn't change the review setting",
+        description: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
 
   async function deleteSession() {
     const confirmed = await modalManager.showDialog({
@@ -210,6 +223,12 @@
               icon: mdiSourceRepository,
               $if: () => Boolean(session) && session?.phase !== 'stopped',
               onAction: () => (showAddRepo = true),
+            },
+            {
+              title: session?.review === 'required' ? 'Stop requiring review' : 'Require review by Codex',
+              icon: mdiMagnifyScan,
+              $if: () => session?.kind === 'work',
+              onAction: toggleReview,
             },
             { title: 'Settings', icon: mdiCogOutline, href: '/settings' },
             { title: 'Delete session', icon: mdiTrashCanOutline, color: 'danger', onAction: deleteSession },

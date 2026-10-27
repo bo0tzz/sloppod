@@ -23,6 +23,7 @@ async fn session_of_kind(db: &PgPool, owner: &str, kind: &str) -> Uuid {
             pending_prompt: "",
             agent: "claude-code",
             kind,
+            review: "off",
             model: None,
             repo: None,
             grants: &[],
@@ -236,4 +237,21 @@ async fn review_rounds_track_a_proposal(db: PgPool) {
             .unwrap()
             .is_some()
     );
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn review_policy_defaults_to_off(db: PgPool) {
+    assert_eq!(db::user_review(&db, "dev").await.unwrap(), "off");
+    db::set_user_model(&db, "dev", Some("haiku")).await.unwrap();
+    db::set_user_review(&db, "dev", "required").await.unwrap();
+    assert_eq!(db::user_review(&db, "dev").await.unwrap(), "required");
+    assert_eq!(
+        db::user_model(&db, "dev").await.unwrap().as_deref(),
+        Some("haiku")
+    );
+
+    let s = session(&db, "dev").await;
+    db::set_session_review(&db, s, "required").await.unwrap();
+    let row = db::get_session(&db, s).await.unwrap().unwrap();
+    assert_eq!(row.review, "required");
 }

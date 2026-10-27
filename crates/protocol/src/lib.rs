@@ -67,6 +67,8 @@ pub mod api {
         pub agent: String,
         /// `work`, or `review` for a session that reviews a proposal.
         pub kind: String,
+        /// Whether its proposals are reviewed by another model before a human sees them: `off` or `required`.
+        pub review: String,
         pub created_at: String,
         pub updated_at: String,
         /// When something last happened in the session; the session list is ordered by it.

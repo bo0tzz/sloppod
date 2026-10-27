@@ -27,6 +27,8 @@ pub struct SessionRow {
     pub agent: String,
     /// `work`, or `review` for a session that reviews a proposal (ADR 24).
     pub kind: String,
+    /// Whether its proposals are reviewed by another model first: `off` or `required` (ADR 24).
+    pub review: String,
     pub agent_session_id: Option<String>,
     pub agent_state: Option<Value>,
     /// The session's current model, used whenever its agent starts.
@@ -51,6 +53,7 @@ impl SessionRow {
             phase: "starting".to_owned(),
             agent: "claude-code".to_owned(),
             kind: "work".to_owned(),
+            review: "off".to_owned(),
             agent_session_id: None,
             agent_state: None,
             model: None,
@@ -100,6 +103,7 @@ impl SessionRow {
             phase: Phase::parse(&self.phase),
             agent: self.agent.clone(),
             kind: self.kind.clone(),
+            review: self.review.clone(),
             created_at: self.created_at.to_rfc3339(),
             updated_at: self.updated_at.to_rfc3339(),
             active_at: self.active_at.to_rfc3339(),
@@ -111,7 +115,7 @@ impl SessionRow {
     }
 }
 
-const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, agent_session_id, agent_state, model, repo, created_at, updated_at, active_at, \
+const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, repo, created_at, updated_at, active_at, \
      coalesce((select jsonb_agg(jsonb_build_object('capability', g.capability, 'params', g.params) order by g.created_at) \
      from session_grants g where g.session_id = sessions.id), '[]'::jsonb) as grants";
 
@@ -123,6 +127,7 @@ pub struct NewSessionRow<'a> {
     pub pending_prompt: &'a str,
     pub agent: &'a str,
     pub kind: &'a str,
+    pub review: &'a str,
     pub model: Option<&'a str>,
     pub repo: Option<&'a str>,
     pub grants: &'a [Grant],
@@ -131,8 +136,8 @@ pub struct NewSessionRow<'a> {
 pub async fn insert_session(db: &PgPool, new: NewSessionRow<'_>) -> sqlx::Result<SessionRow> {
     let mut tx = db.begin().await?;
     sqlx::query(
-        "insert into sessions (id, owner, title, custom_title, pending_prompt, model, repo, agent, kind) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        "insert into sessions (id, owner, title, custom_title, pending_prompt, model, repo, agent, kind, review) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(new.id)
     .bind(new.owner)
@@ -143,6 +148,7 @@ pub async fn insert_session(db: &PgPool, new: NewSessionRow<'_>) -> sqlx::Result
     .bind(new.repo)
     .bind(new.agent)
     .bind(new.kind)
+    .bind(new.review)
     .execute(&mut *tx)
     .await?;
     for grant in new.grants {
@@ -585,6 +591,37 @@ pub async fn set_session_model(db: &PgPool, id: Uuid, model: &str) -> sqlx::Resu
         .execute(db)
         .await
         .map(|_| ())
+}
+
+pub async fn set_session_review(db: &PgPool, id: Uuid, review: &str) -> sqlx::Result<()> {
+    sqlx::query("update sessions set review = $2 where id = $1")
+        .bind(id)
+        .bind(review)
+        .execute(db)
+        .await
+        .map(|_| ())
+}
+
+/// The owner's review policy for new sessions (ADR 24).
+pub async fn user_review(db: &PgPool, owner: &str) -> sqlx::Result<String> {
+    let row: Option<(String,)> =
+        sqlx::query_as("select review from user_settings where owner = $1")
+            .bind(owner)
+            .fetch_optional(db)
+            .await?;
+    Ok(row.map_or_else(|| "off".to_owned(), |(review,)| review))
+}
+
+pub async fn set_user_review(db: &PgPool, owner: &str, review: &str) -> sqlx::Result<()> {
+    sqlx::query(
+        "insert into user_settings (owner, review) values ($1, $2) \
+         on conflict (owner) do update set review = excluded.review, updated_at = now()",
+    )
+    .bind(owner)
+    .bind(review)
+    .execute(db)
+    .await
+    .map(|_| ())
 }
 
 pub async fn user_model(db: &PgPool, owner: &str) -> sqlx::Result<Option<String>> {

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { Alert, Button, Field, Heading, Input, LoadingSpinner, Select, Text, toastManager } from '@immich/ui';
   import { onMount } from 'svelte';
-  import { api, type Settings } from '#lib/api.ts';
+  import { api, type ReviewPolicy, type Settings } from '#lib/api.ts';
 
   // The select needs a string for "no model set"; null means the agent's default.
   const AGENT_DEFAULT = '__agent_default__';
@@ -10,8 +10,14 @@
   let loadError = $state<string | null>(null);
   let saving = $state(false);
   let model = $state('');
+  let review = $state<ReviewPolicy>('off');
 
   const saved = $derived(settings?.model ?? '');
+  const changed = $derived(model.trim() !== saved || review !== (settings?.review ?? 'off'));
+  const reviewOptions = [
+    { value: 'off', label: 'Only when the agent asks' },
+    { value: 'required', label: 'Always, for pull requests' },
+  ];
   const options = $derived.by(() => {
     if (!settings) return [];
     const models = settings.models.map((entry) => ({ value: entry.value, label: entry.name }));
@@ -26,6 +32,7 @@
     try {
       settings = await api.getSettings();
       model = settings.model ?? '';
+      review = settings.review;
     } catch (e) {
       loadError = e instanceof Error ? e.message : String(e);
     }
@@ -35,9 +42,10 @@
     event.preventDefault();
     saving = true;
     try {
-      settings = await api.updateSettings({ model: model.trim() || null });
+      settings = await api.updateSettings({ model: model.trim() || null, review });
       model = settings.model ?? '';
-      toastManager.success('Saved the default model');
+      review = settings.review;
+      toastManager.success('Saved your defaults');
     } catch (e) {
       toastManager.danger({ title: "Couldn't save", description: e instanceof Error ? e.message : String(e) });
     } finally {
@@ -73,7 +81,12 @@
           </Field>
         {/if}
       </div>
-      <Button type="submit" shape="round" loading={saving} disabled={model.trim() === saved}>Save</Button>
+      <div class="min-w-48 grow">
+        <Field label="Review by Codex" description="Another model reviews proposals before you see them; needs a ChatGPT login.">
+          <Select options={reviewOptions} value={review} onChange={(value) => (review = value as ReviewPolicy)} />
+        </Field>
+      </div>
+      <Button type="submit" shape="round" loading={saving} disabled={!changed}>Save</Button>
     </form>
   {/if}
 </section>

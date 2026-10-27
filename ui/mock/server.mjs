@@ -34,7 +34,7 @@ const MODELS = [
   { value: 'haiku', name: 'Haiku' },
 ];
 /** The user's defaults for new sessions. `models` fills in once a session has offered them. */
-const settings = { model: null, models: [] };
+const settings = { model: null, models: [], review: 'off' };
 const CANCELLED = Symbol('cancelled');
 
 /** @type {Map<string, MockSession>} */
@@ -784,6 +784,7 @@ function createSession({ prompt, repo, title }) {
     phase: 'starting',
     agent: 'claude-code',
     kind: 'work',
+    review: settings.review,
     created_at: created,
     updated_at: created,
     active_at: created,
@@ -1029,6 +1030,10 @@ async function handleApi(req, res, url) {
         if (body.model !== null && typeof body.model !== 'string') return json(res, 400, { error: 'model must be a string or null' });
         settings.model = body.model || null;
       }
+      if ('review' in body) {
+        if (!['off', 'required'].includes(body.review)) return json(res, 400, { error: 'review must be one of off, required' });
+        settings.review = body.review;
+      }
       return json(res, 200, settings);
     }
   }
@@ -1051,6 +1056,13 @@ async function handleApi(req, res, url) {
     const session = sessions.get(parts[1]);
     if (!session) return json(res, 404, { error: 'session not found' });
     if (parts.length === 2 && method === 'GET') return json(res, 200, session.data);
+    if (parts.length === 3 && parts[2] === 'review' && method === 'PUT') {
+      const body = await readBody(req);
+      if (!['off', 'required'].includes(body.review)) return json(res, 400, { error: 'review must be one of off, required' });
+      session.data.review = body.review;
+      session.broadcast();
+      return json(res, 200, session.data);
+    }
     if (parts.length === 3 && parts[2] === 'repos' && method === 'POST') {
       const body = await readBody(req);
       if (!availableRepos().includes(body.repo)) return json(res, 400, { error: `unknown repository ${body.repo}` });

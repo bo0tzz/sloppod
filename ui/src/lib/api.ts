@@ -10,6 +10,7 @@ export type Session = {
   agent: string;
   /** 'work', or 'review' for a session that reviews a proposal. */
   kind: string;
+  review: ReviewPolicy;
   created_at: string;
   updated_at: string;
   /** When something last happened in the session; the session list is ordered by it. */
@@ -124,7 +125,11 @@ export type NewCredential = {
 export type Settings = {
   model: string | null;
   models: { value: string; name: string }[];
+  review: ReviewPolicy;
 };
+
+/** Whether proposals are reviewed by another model before a human sees them. */
+export type ReviewPolicy = 'off' | 'required';
 
 export class ApiError extends Error {
   constructor(
@@ -169,7 +174,9 @@ export const api = {
   listRepos: () => call<string[]>('GET', '/repos'),
   me: () => call<{ user: string }>('GET', '/me'),
   getSettings: () => call<Settings>('GET', '/settings'),
-  updateSettings: (body: { model: string | null }) => call<Settings>('PUT', '/settings', body),
+  updateSettings: (body: { model?: string | null; review?: ReviewPolicy }) => call<Settings>('PUT', '/settings', body),
+  setSessionReview: (id: string, review: ReviewPolicy) =>
+    call<Session>('PUT', `/sessions/${encodeURIComponent(id)}/review`, { review }),
   listCredentials: () => call<Credential[]>('GET', '/credentials'),
   listStandingApprovals: () => call<StandingApproval[]>('GET', '/standing-approvals'),
   createStandingApproval: (approval: NewStandingApproval) =>
