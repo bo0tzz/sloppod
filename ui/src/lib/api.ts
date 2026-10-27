@@ -175,6 +175,17 @@ export function newerSession(current: Session | null | undefined, incoming: Sess
   return incoming;
 }
 
+/** How far along a proposal is; it only ever moves forward. */
+const proposalStage: Record<ProposalStatus, number> = { pending: 0, approved: 1, rejected: 2, executed: 2, failed: 2 };
+
+/** Keeps whichever copy of a proposal is further along, so a stale copy (e.g. a slow refetch) can't undo a decision. */
+export function newerProposal(current: Proposal | undefined, incoming: Proposal): Proposal {
+  if (current && proposalStage[current.status] > proposalStage[incoming.status]) {
+    return current;
+  }
+  return incoming;
+}
+
 export function sortSessions(sessions: Session[]): Session[] {
   return [...sessions].sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
 }

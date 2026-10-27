@@ -564,3 +564,35 @@ test('a standing approval approves matching proposals as they are made', async (
   await section.getByRole('button', { name: 'Revoke' }).click();
   await expect(section.getByTestId('standing-approval')).toHaveCount(0);
 });
+
+test('a stale copy of a proposal does not undo its approval', async ({ page }) => {
+  const id = await createSession(page, 'Propose a PR for sloppod');
+  await finishTurn(page);
+  const pr = page.getByTestId('proposal-card').and(page.locator('[data-kind="github.pr.create"]'));
+  await expect(pr).toHaveAttribute('data-status', 'pending');
+
+  // From now on, listing proposals returns what it did before the approval, like a refetch that was slower than
+  // the approval. A marker proposal shows when that list has been applied.
+  const stale: Proposal[] = await (await page.request.get(`/api/v1/proposals?session=${id}`)).json();
+  const marker: Proposal = {
+    id: 'stale-list-marker',
+    session_id: id,
+    kind: 'kube.apply',
+    status: 'pending',
+    payload: {},
+    created_at: new Date().toISOString(),
+  };
+  await page.route(
+    (url) => url.pathname === '/api/v1/proposals',
+    (route) => route.fulfill({ json: [...stale, marker] }),
+  );
+
+  await pr.getByRole('button', { name: 'Review' }).click();
+  await page.getByRole('button', { name: 'Approve', exact: true }).click();
+  await expect(pr).toBeHidden();
+
+  // A reconnect refetches proposals.
+  await page.request.post('/_mock/drop');
+  await expect(page.getByTestId('proposal-card').and(page.locator('[data-kind="kube.apply"]'))).toBeVisible();
+  await expect(pr).toBeHidden();
+});
