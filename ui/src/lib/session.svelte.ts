@@ -42,6 +42,11 @@ export class SessionView {
   loaded = $state(false);
   connection = $state<ConnectionState>('connecting');
   connectionError = $state<string | null>(null);
+  /** Why the session's REST side (the session and its proposals) didn't load; it's retried meanwhile. */
+  loadError = $state<string | null>(null);
+  #loadFailures = 0;
+  #loadRetry: ReturnType<typeof setTimeout> | undefined;
+  #stopped = false;
 
   configOptions = $state<SessionConfigOption[]>([]);
   /** The agent's model picker, if it offers one. */
@@ -89,6 +94,7 @@ export class SessionView {
   }
 
   start() {
+    this.#stopped = false;
     void this.refresh();
     this.#conn.connect();
     document.addEventListener('visibilitychange', this.#onVisible);
@@ -96,6 +102,8 @@ export class SessionView {
   }
 
   stop() {
+    this.#stopped = true;
+    clearTimeout(this.#loadRetry);
     document.removeEventListener('visibilitychange', this.#onVisible);
     window.removeEventListener('online', this.#onVisible);
     this.#conn.close();
@@ -105,8 +113,12 @@ export class SessionView {
     if (document.visibilityState === 'visible') this.#conn.reconnectNow();
   };
 
-  /** Refetches the REST side: the session itself and its proposals. */
+  /**
+   * Refetches the REST side: the session itself and its proposals. A failure is retried with backoff, since nothing
+   * else would fetch them again until a reconnect.
+   */
   async refresh() {
+    clearTimeout(this.#loadRetry);
     try {
       const [session, proposals] = await Promise.all([
         api.getSession(this.id),
@@ -114,11 +126,18 @@ export class SessionView {
       ]);
       this.setSession(session);
       for (const proposal of proposals) this.upsertProposal(proposal);
+      this.loadError = null;
+      this.#loadFailures = 0;
     } catch (error) {
       if (error instanceof ApiError && error.status === 404) {
         this.notFound = true;
         this.stop();
+        return;
       }
+      if (this.#stopped) return;
+      this.loadError = error instanceof Error ? error.message : String(error);
+      const delay = Math.min(30_000, 1000 * 2 ** this.#loadFailures++);
+      this.#loadRetry = setTimeout(() => void this.refresh(), delay);
     }
   }
 

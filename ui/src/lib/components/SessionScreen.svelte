@@ -319,6 +319,13 @@
         <div class="relative min-h-0 grow">
           <div bind:this={scroller} onscroll={onScroll} class="immich-scrollbar h-full overflow-y-auto">
             <div bind:this={content} class="mx-auto flex w-full max-w-3xl flex-col gap-3 px-3 py-4 md:px-4">
+              {#if view.loadError}
+                <div data-testid="load-error">
+                  <Alert color="warning" size="small" title="Couldn't load the session's details">
+                    {view.loadError}. Trying again…
+                  </Alert>
+                </div>
+              {/if}
               {#if !view.loaded}
                 <div class="flex justify-center py-16">
                   {#if view.connectionError}
