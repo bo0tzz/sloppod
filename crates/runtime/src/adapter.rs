@@ -51,8 +51,9 @@ impl ClaudeCode {
             ));
         }
         workspace.push_str(
-            "- In each repository, your session branch is the only ref you can push. For write access to another \
-             repository, call the `request_repository` tool.\n\
+            "- In each repository, you can push only your session branch and branches named after it \
+             (`<session branch>-<name>`, e.g. for a second pull request). For write access to another repository, \
+             call the `request_repository` tool.\n\
              - Outward actions are proposals that a human reviews. To open a pull request, push your branch and call \
              the `propose_pull_request` tool; sloppod opens the PR once it's approved. You're told when your \
              proposals are decided. Direct writes to GitHub (gh pr create, comments, API POSTs) are refused.\n",

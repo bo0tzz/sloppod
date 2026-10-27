@@ -9,6 +9,7 @@ use sloppod_contracts::{
 
 use crate::credentials::Credentials;
 use crate::github::GitHubApp;
+use crate::proposals::is_session_branch;
 
 /// GitHub: reads with the owner's GitHub App, pushes only to the session branch, all other writes through
 /// proposals.
@@ -72,16 +73,15 @@ impl GitHubPolicy {
                 if !git.advertisement {
                     match pushed_refs(&request.body) {
                         Some(push) if !push.refs.is_empty() => {
-                            let allowed = format!("refs/heads/{branch}");
-                            if let Some(bad) = push
-                                .refs
-                                .iter()
-                                .find(|r| **r != allowed && !r.starts_with(&format!("{allowed}/")))
-                            {
+                            if let Some(bad) = push.refs.iter().find(|r| {
+                                !r.strip_prefix("refs/heads/")
+                                    .is_some_and(|b| is_session_branch(branch, b))
+                            }) {
                                 let message = format!(
-                                    "sloppod: pushes may only update your session branch `{branch}`, so `{bad}` was refused. \
-                                     Push with `git push origin HEAD:{branch}`. To get changes into another branch, \
-                                     propose a pull request with the propose_pull_request tool."
+                                    "sloppod: pushes may only update your session branch `{branch}` or branches \
+                                     named after it (`{branch}-<name>`), so `{bad}` was refused. Push with \
+                                     `git push origin HEAD:{branch}`. To get changes into another branch, propose a \
+                                     pull request with the propose_pull_request tool."
                                 );
                                 return Ok(push.reject(&message));
                             }
