@@ -63,6 +63,8 @@ pub mod api {
         pub phase: Phase,
         pub created_at: String,
         pub updated_at: String,
+        /// When something last happened in the session; the session list is ordered by it.
+        pub active_at: String,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -44,8 +44,8 @@
             <span class="truncate" title={session.branch ?? undefined}>{session.repo}</span>
             <span aria-hidden="true">·</span>
           {/if}
-          <time class="shrink-0" datetime={session.updated_at} title={absoluteTime(session.updated_at)}>
-            {timeAgo(session.updated_at, now)}
+          <time class="shrink-0" datetime={session.active_at} title={absoluteTime(session.active_at)}>
+            {timeAgo(session.active_at, now)}
           </time>
         </div>
       </a>
