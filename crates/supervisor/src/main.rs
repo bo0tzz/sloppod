@@ -479,6 +479,24 @@ fn write_file(path: &Path, content: &[u8]) -> anyhow::Result<()> {
     std::fs::write(path, content).with_context(|| format!("writing {}", path.display()))
 }
 
+/// gh extensions that come with the image; gh only finds extensions in its data directory, which is on the volume.
+const GH_EXTENSIONS: &[&str] = &["/usr/local/bin/gh-stack"];
+
+fn link_gh_extensions(home: &Path, extensions: &[&str]) -> anyhow::Result<()> {
+    for binary in extensions.iter().map(Path::new).filter(|b| b.exists()) {
+        let Some(name) = binary.file_name() else {
+            continue;
+        };
+        let dir = home.join(".local/share/gh/extensions").join(name);
+        let link = dir.join(name);
+        if link.symlink_metadata().is_err() {
+            std::fs::create_dir_all(&dir)?;
+            std::os::unix::fs::symlink(binary, &link)?;
+        }
+    }
+    Ok(())
+}
+
 /// Prepares the pod for the agent and returns its environment.
 async fn prepare(
     args: &Args,
@@ -488,6 +506,7 @@ async fn prepare(
     let home =
         std::env::var("HOME").unwrap_or_else(|_| args.workdir.join("home").display().to_string());
     std::fs::create_dir_all(&home)?;
+    link_gh_extensions(Path::new(&home), GH_EXTENSIONS)?;
     let mut env: Vec<(String, String)> = Vec::new();
     let path = std::env::var("PATH").unwrap_or_default();
     env.push((
@@ -495,6 +514,7 @@ async fn prepare(
         format!("{home}/.local/share/mise/shims:{home}/.local/bin:{path}"),
     ));
     env.push(("MISE_YES".into(), "1".into()));
+    env.push(("GH_STACK_NO_UPDATE_NOTIFIER".into(), "1".into()));
     env.push(("GIT_CONFIG_COUNT".into(), "2".into()));
     env.push(("GIT_CONFIG_KEY_0".into(), "credential.helper".into()));
     env.push((
@@ -704,6 +724,30 @@ mod tests {
             &json!({"jsonrpc": "2.0", "id": 7, "result": {}}),
         );
         assert!(open.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod gh_extension_tests {
+    use super::*;
+
+    #[test]
+    fn links_extensions_that_exist() {
+        let root = std::env::temp_dir().join(format!("gh-ext-{}", std::process::id()));
+        let binary = root.join("gh-stack");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&binary, "").unwrap();
+        let home = root.join("home");
+        let extensions = [binary.to_str().unwrap(), "/nonexistent/gh-other"];
+
+        link_gh_extensions(&home, &extensions).unwrap();
+        // A second start finds the link already there.
+        link_gh_extensions(&home, &extensions).unwrap();
+
+        let link = home.join(".local/share/gh/extensions/gh-stack/gh-stack");
+        assert_eq!(std::fs::read_link(&link).unwrap(), binary);
+        assert!(!home.join(".local/share/gh/extensions/gh-other").exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
 
