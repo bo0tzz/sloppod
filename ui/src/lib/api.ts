@@ -78,7 +78,7 @@ export type ProposalDetail = Proposal & {
   commits?: { sha: string; message: string }[];
 };
 
-export type CredentialKind = 'claude' | 'github-app' | 'memini';
+export type CredentialKind = 'claude' | 'github-app' | 'memini' | 'chatgpt';
 
 export type Credential = {
   id: string;

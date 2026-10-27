@@ -14,7 +14,7 @@ use sloppod_contracts::{EgressSpec, Grant, PlacementSpec};
 use sloppod_protocol::api::{Decision, NewCredential, NewSession, NewStandingApproval, Phase};
 use uuid::Uuid;
 
-use crate::credentials::CLAUDE;
+use crate::credentials::{CHATGPT, CLAUDE};
 use crate::memini::MeminiAdmin;
 use crate::placement::{TOKEN_DIR, WORKDIR};
 use crate::pods::SESSION_LABEL;
@@ -293,6 +293,9 @@ async fn create_session(
         Grant::new("github", json!({})),
         Grant::new("packages", json!({})),
     ];
+    if state.credentials.secret(&user, CHATGPT).await?.is_some() {
+        grants.push(Grant::new("codex", json!({})));
+    }
     if let Some(repo) = &repo {
         let branch = proposals::session_branch(id);
         grants.push(Grant::new(

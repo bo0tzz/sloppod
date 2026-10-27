@@ -18,7 +18,61 @@ use crate::vault::Vault;
 pub const CLAUDE: &str = "claude";
 pub const GITHUB_APP: &str = "github-app";
 pub const MEMINI: &str = "memini";
-const KINDS: &[&str] = &[CLAUDE, GITHUB_APP, MEMINI];
+/// A ChatGPT subscription's Codex login, for review sessions (ADR 24).
+pub const CHATGPT: &str = "chatgpt";
+const KINDS: &[&str] = &[CLAUDE, GITHUB_APP, MEMINI, CHATGPT];
+
+/// Codex's OAuth client and token endpoint, which refresh a ChatGPT login.
+const CHATGPT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CHATGPT_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+
+/// A ChatGPT login's tokens, as stored. Refresh tokens are single-use, so the runtime is their only holder.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ChatGptTokens {
+    pub access_token: String,
+    refresh_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id_token: Option<String>,
+    pub account_id: String,
+}
+
+impl ChatGptTokens {
+    /// The tokens from the `auth.json` that `codex login` writes.
+    fn from_auth_json(text: &str) -> Option<Self> {
+        let auth: Value = serde_json::from_str(text).ok()?;
+        let tokens = &auth["tokens"];
+        let field = |name: &str| {
+            tokens[name]
+                .as_str()
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        };
+        Some(Self {
+            access_token: field("access_token")?,
+            refresh_token: field("refresh_token")?,
+            id_token: field("id_token"),
+            account_id: field("account_id")?,
+        })
+    }
+
+    /// Whether the access token expires within five minutes, judging by its JWT `exp`; tokens that don't say
+    /// are left alone.
+    fn expires_soon(&self) -> bool {
+        use base64::Engine;
+        let exp = self
+            .access_token
+            .split('.')
+            .nth(1)
+            .and_then(|payload| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(payload)
+                    .ok()
+            })
+            .and_then(|json| serde_json::from_slice::<Value>(&json).ok())
+            .and_then(|claims| claims["exp"].as_i64());
+        exp.is_some_and(|exp| exp - Utc::now().timestamp() < 300)
+    }
+}
 
 #[derive(Debug, Clone, FromRow)]
 pub struct CredentialRow {
@@ -63,6 +117,9 @@ pub struct Credentials {
     db: PgPool,
     vault: Vault,
     github: Mutex<HashMap<Uuid, Arc<GitHubApp>>>,
+    /// Held while refreshing a ChatGPT login, so a single-use refresh token is only ever spent once.
+    chatgpt_refresh: Mutex<()>,
+    http: reqwest::Client,
 }
 
 fn host_of(url: &str) -> Option<String> {
@@ -78,6 +135,8 @@ impl Credentials {
             db,
             vault,
             github: Mutex::default(),
+            chatgpt_refresh: Mutex::default(),
+            http: reqwest::Client::new(),
         })
     }
 
@@ -100,7 +159,7 @@ impl Credentials {
         new: NewCredential,
     ) -> anyhow::Result<Result<CredentialRow, Invalid>> {
         let name = new.name.trim().to_owned();
-        let secret = new.secret.trim().to_owned();
+        let mut secret = new.secret.trim().to_owned();
         let config = |key: &str| {
             new.config
                 .get(key)
@@ -143,6 +202,15 @@ impl Credentials {
                     stored["home"] = Value::from(config("home"));
                 }
                 stored
+            }
+            CHATGPT => {
+                let Some(tokens) = ChatGptTokens::from_auth_json(&secret) else {
+                    return Ok(Err(Invalid(
+                        "paste the whole ~/.codex/auth.json from a `codex login` made just for sloppod".into(),
+                    )));
+                };
+                secret = serde_json::to_string(&tokens)?;
+                serde_json::json!({"account_id": tokens.account_id})
             }
             _ => serde_json::json!({}),
         };
@@ -239,6 +307,62 @@ impl Credentials {
         };
         let secret = self.vault.decrypt_string(&row.secret)?;
         Ok(Some((row, secret)))
+    }
+
+    /// The owner's ChatGPT access token and account id, refreshed first when it's about to expire.
+    pub async fn chatgpt(&self, owner: &str) -> anyhow::Result<Option<ChatGptTokens>> {
+        let Some((_, secret)) = self.secret(owner, CHATGPT).await? else {
+            return Ok(None);
+        };
+        let tokens: ChatGptTokens = serde_json::from_str(&secret)?;
+        if !tokens.expires_soon() {
+            return Ok(Some(tokens));
+        }
+        let _refreshing = self.chatgpt_refresh.lock().await;
+        // Someone may have refreshed it while this waited for the lock.
+        let Some((row, secret)) = self.secret(owner, CHATGPT).await? else {
+            return Ok(None);
+        };
+        let mut tokens: ChatGptTokens = serde_json::from_str(&secret)?;
+        if !tokens.expires_soon() {
+            return Ok(Some(tokens));
+        }
+        let response = self
+            .http
+            .post(CHATGPT_TOKEN_URL)
+            .json(&serde_json::json!({
+                "grant_type": "refresh_token",
+                "client_id": CHATGPT_CLIENT_ID,
+                "refresh_token": tokens.refresh_token,
+            }))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            anyhow::bail!(
+                "refreshing the ChatGPT login failed ({}); sign in again with `codex login` and replace the credential",
+                response.status()
+            );
+        }
+        let refreshed: Value = response.json().await?;
+        let field = |name: &str| refreshed[name].as_str().map(str::to_owned);
+        if let Some(access) = field("access_token") {
+            tokens.access_token = access;
+        }
+        if let Some(refresh) = field("refresh_token") {
+            tokens.refresh_token = refresh;
+        }
+        if let Some(id) = field("id_token") {
+            tokens.id_token = Some(id);
+        }
+        let sealed = self
+            .vault
+            .encrypt(serde_json::to_string(&tokens)?.as_bytes())?;
+        sqlx::query("update credentials set secret = $2 where id = $1")
+            .bind(row.id)
+            .bind(&sealed)
+            .execute(&self.db)
+            .await?;
+        Ok(Some(tokens))
     }
 
     pub async fn github(&self, owner: &str) -> anyhow::Result<Arc<GitHubApp>> {

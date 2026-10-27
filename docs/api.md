@@ -81,7 +81,8 @@ DELETE /api/v1/credentials/{id}           -> 204
 type CredentialKind =
   | "claude"             // secret: a token from `claude setup-token`; config: {}
   | "github-app"         // secret: the app's private key (PEM); config: {app_id: string}
-  | "memini";            // secret: a memini admin key; config: {url: string, home?: string} (home: your personal namespace)
+  | "memini"             // secret: a memini admin key; config: {url: string, home?: string} (home: your personal namespace)
+  | "chatgpt";           // secret: the auth.json of a `codex login` only sloppod uses; config: {account_id} (derived)
 
 type NewCredential = { kind: CredentialKind; name: string; config: Record<string, string>; secret: string };
 
