@@ -83,6 +83,14 @@ impl SessionContext {
         self.grant(capability).is_some()
     }
 
+    /// Every repository the session holds a grant for, at any access level.
+    pub fn repos(&self) -> impl Iterator<Item = &str> {
+        self.grants
+            .iter()
+            .filter(|g| g.capability == "repo")
+            .filter_map(|g| g.param("repo"))
+    }
+
     /// Repositories the session may push to, each with its session branch.
     pub fn writable_repos(&self) -> impl Iterator<Item = RepoGrant<'_>> {
         self.grants

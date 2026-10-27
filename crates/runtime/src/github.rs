@@ -1,6 +1,6 @@
 //! GitHub App client: installation tokens for the authorizer, and the API calls proposals need.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,17 +20,72 @@ const INSTALLATION_TTL: Duration = Duration::from_secs(600);
 /// How long "not installed" is trusted, so reads of public repositories don't ask GitHub every time.
 const NOT_INSTALLED_TTL: Duration = Duration::from_secs(60);
 
+/// What a session's read token may have, as far as the installation has them. A fixed list rather than
+/// every installation permission at `read`, because some (`workflows`) have no read level.
+const READ_PERMISSIONS: &[&str] = &[
+    "actions",
+    "checks",
+    "contents",
+    "issues",
+    "metadata",
+    "pull_requests",
+    "statuses",
+];
+
 /// One cached token, minted by whichever caller gets the slot first; the others wait for it.
 type TokenSlot = Arc<tokio::sync::Mutex<Option<AccessToken>>>;
+
+/// What a token is minted for. `None` is everything the installation has.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TokenScope {
+    installation: u64,
+    /// Repository names without the owner, lowercase and sorted.
+    repositories: Option<Vec<String>>,
+    permissions: Option<BTreeMap<String, String>>,
+}
+
+impl TokenScope {
+    fn body(&self) -> Value {
+        let mut body = json!({});
+        if let Some(repositories) = &self.repositories {
+            body["repositories"] = json!(repositories);
+        }
+        if let Some(permissions) = &self.permissions {
+            body["permissions"] = json!(permissions);
+        }
+        body
+    }
+}
+
+/// Repository names for a token's `repositories`, which are relative to the installation's account.
+fn repository_names<'a>(repos: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut names: Vec<String> = repos
+        .into_iter()
+        .map(|r| r.rsplit('/').next().unwrap_or(r).to_lowercase())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn read_permissions(installation: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    READ_PERMISSIONS
+        .iter()
+        .filter(|p| installation.contains_key(**p))
+        .map(|p| (p.to_string(), "read".to_owned()))
+        .collect()
+}
 
 pub struct GitHubApp {
     api: String,
     app_id: String,
     key: EncodingKey,
     http: reqwest::Client,
-    /// Repository to installation, or `None` for not installed, with when it was looked up.
+    /// Repository (lowercase) to installation, or `None` for not installed, with when it was looked up.
     installations: Mutex<HashMap<String, (Option<u64>, Instant)>>,
-    tokens: Mutex<HashMap<u64, TokenSlot>>,
+    /// What each installation was granted, as `permission: level`.
+    permissions: Mutex<HashMap<u64, BTreeMap<String, String>>>,
+    tokens: Mutex<HashMap<TokenScope, TokenSlot>>,
     identity: OnceCell<GitIdentity>,
 }
 
@@ -87,6 +142,7 @@ impl GitHubApp {
                 .timeout(Duration::from_secs(60))
                 .build()?,
             installations: Mutex::default(),
+            permissions: Mutex::default(),
             tokens: Mutex::default(),
             identity: OnceCell::new(),
         })
@@ -150,15 +206,28 @@ impl GitHubApp {
         Ok(response)
     }
 
-    fn remember_installation(&self, repo: &str, id: Option<u64>) {
+    fn remember_installation(&self, repo: &str, installation: &Value) {
+        let id = installation["id"].as_u64();
+        if let (Some(id), Some(permissions)) = (id, installation["permissions"].as_object()) {
+            let permissions = permissions
+                .iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+                .collect();
+            self.permissions.lock().unwrap().insert(id, permissions);
+        }
         self.installations
             .lock()
             .unwrap()
-            .insert(repo.to_owned(), (id, Instant::now()));
+            .insert(repo.to_lowercase(), (id, Instant::now()));
     }
 
     async fn installation_for(&self, repo: &str) -> anyhow::Result<u64> {
-        let cached = self.installations.lock().unwrap().get(repo).copied();
+        let cached = self
+            .installations
+            .lock()
+            .unwrap()
+            .get(&repo.to_lowercase())
+            .copied();
         let id = match cached.and_then(|entry| installation_cached(entry, Instant::now())) {
             Some(id) => id,
             None => {
@@ -170,24 +239,49 @@ impl GitHubApp {
                     .timeout(AUTHZ_TIMEOUT)
                     .send()
                     .await?;
-                let id = match response.status() {
-                    reqwest::StatusCode::NOT_FOUND => None,
+                let installation = match response.status() {
+                    reqwest::StatusCode::NOT_FOUND => Value::Null,
                     status if !status.is_success() => {
                         bail!(
                             "looking up the GitHub App's installation on {repo} failed ({status})"
                         )
                     }
-                    _ => Some(
-                        response.json::<Value>().await?["id"]
-                            .as_u64()
-                            .context("installation without id")?,
-                    ),
+                    _ => response.json::<Value>().await?,
                 };
-                self.remember_installation(repo, id);
-                id
+                self.remember_installation(repo, &installation);
+                installation["id"].as_u64()
             }
         };
         id.with_context(|| format!("the GitHub App is not installed on {repo}"))
+    }
+
+    /// What `installation` was granted, or `None` if it's gone.
+    async fn installation_permissions(
+        &self,
+        installation: u64,
+    ) -> anyhow::Result<Option<BTreeMap<String, String>>> {
+        if let Some(permissions) = self.permissions.lock().unwrap().get(&installation) {
+            return Ok(Some(permissions.clone()));
+        }
+        let response = self
+            .app_get(&format!("/app/installations/{installation}"))
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            self.forget_installation(installation);
+            return Ok(None);
+        }
+        let info: Value = response.error_for_status()?.json().await?;
+        let permissions: BTreeMap<String, String> = info["permissions"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+            .collect();
+        self.permissions
+            .lock()
+            .unwrap()
+            .insert(installation, permissions.clone());
+        Ok(Some(permissions))
     }
 
     /// Drops everything cached about an installation that no longer exists, e.g. after the app was reinstalled.
@@ -196,54 +290,122 @@ impl GitHubApp {
             .lock()
             .unwrap()
             .retain(|_, (id, _)| *id != Some(installation));
-        self.tokens.lock().unwrap().remove(&installation);
+        self.permissions.lock().unwrap().remove(&installation);
+        self.tokens
+            .lock()
+            .unwrap()
+            .retain(|scope, _| scope.installation != installation);
     }
 
-    /// A token for `installation`, or `None` if the installation is gone.
-    async fn installation_token(&self, installation: u64) -> anyhow::Result<Option<String>> {
+    /// A token for `scope`, or `None` if its installation is gone.
+    async fn mint(&self, scope: TokenScope) -> anyhow::Result<Option<String>> {
         let slot = self
             .tokens
             .lock()
             .unwrap()
-            .entry(installation)
+            .entry(scope.clone())
             .or_default()
             .clone();
         let mut slot = slot.lock().await;
         if let Some(token) = slot.as_ref().filter(|t| t.fresh()) {
             return Ok(Some(token.token.clone()));
         }
+        let installation = scope.installation;
         let response = self
             .http
             .post(self.url(&format!("/app/installations/{installation}/access_tokens")))
             .bearer_auth(self.jwt()?)
             .header("accept", "application/vnd.github+json")
             .timeout(AUTHZ_TIMEOUT)
+            .json(&scope.body())
             .send()
             .await?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            drop(slot);
-            self.forget_installation(installation);
-            return Ok(None);
+        match response.status() {
+            reqwest::StatusCode::NOT_FOUND => {
+                drop(slot);
+                self.forget_installation(installation);
+                return Ok(None);
+            }
+            status if !status.is_success() => {
+                let body: Value = response.json().await.unwrap_or(Value::Null);
+                bail!(
+                    "GitHub refused a token for installation {installation} ({status}): {}",
+                    body["message"].as_str().unwrap_or("no message")
+                );
+            }
+            _ => {}
         }
-        let token: AccessToken = response.error_for_status()?.json().await?;
+        let token: AccessToken = response.json().await?;
         let value = token.token.clone();
         *slot = Some(token);
         Ok(Some(value))
     }
 
-    /// An installation token that can act on `repo`.
+    /// A token with everything the installation on `repo` has. Only for the runtime's own calls, never sessions.
     pub async fn token_for(&self, repo: &str) -> anyhow::Result<String> {
         // A second try looks the installation up afresh, in case the cached one was removed.
         for _ in 0..2 {
             let installation = self.installation_for(repo).await?;
-            if let Some(token) = self.installation_token(installation).await? {
+            let scope = TokenScope {
+                installation,
+                repositories: None,
+                permissions: None,
+            };
+            if let Some(token) = self.mint(scope).await? {
                 return Ok(token);
             }
         }
         bail!("the GitHub App's installation on {repo} keeps disappearing")
     }
 
-    /// A token from any of the app's installations, for reads that aren't tied to one repository.
+    /// A session's read-only token, through the installation on `repo`: it covers the repositories in `granted`
+    /// that share that installation (`repo` among them), with [`READ_PERMISSIONS`].
+    pub async fn read_token(&self, repo: &str, granted: &[&str]) -> anyhow::Result<String> {
+        for _ in 0..2 {
+            let installation = self.installation_for(repo).await?;
+            let mut covered = vec![repo];
+            for other in granted {
+                if !other.eq_ignore_ascii_case(repo)
+                    && self.installation_for(other).await.ok() == Some(installation)
+                {
+                    covered.push(other);
+                }
+            }
+            let Some(permissions) = self.installation_permissions(installation).await? else {
+                continue;
+            };
+            let scope = TokenScope {
+                installation,
+                repositories: Some(repository_names(covered)),
+                permissions: Some(read_permissions(&permissions)),
+            };
+            if let Some(token) = self.mint(scope).await? {
+                return Ok(token);
+            }
+        }
+        bail!("the GitHub App's installation on {repo} keeps disappearing")
+    }
+
+    /// A session's token for pushing to `repo`: that repository only, with `contents: write`.
+    pub async fn push_token(&self, repo: &str) -> anyhow::Result<String> {
+        for _ in 0..2 {
+            let installation = self.installation_for(repo).await?;
+            let scope = TokenScope {
+                installation,
+                repositories: Some(repository_names([repo])),
+                permissions: Some(BTreeMap::from([
+                    ("contents".to_owned(), "write".to_owned()),
+                    ("metadata".to_owned(), "read".to_owned()),
+                ])),
+            };
+            if let Some(token) = self.mint(scope).await? {
+                return Ok(token);
+            }
+        }
+        bail!("the GitHub App's installation on {repo} keeps disappearing")
+    }
+
+    /// A token from any of the app's installations, for the runtime's reads that aren't tied to one repository.
     pub async fn any_token(&self) -> anyhow::Result<String> {
         for _ in 0..2 {
             let cached = self
@@ -267,7 +429,12 @@ impl GitHubApp {
                         .context("the GitHub App has no installations")?
                 }
             };
-            if let Some(token) = self.installation_token(installation).await? {
+            let scope = TokenScope {
+                installation,
+                repositories: None,
+                permissions: None,
+            };
+            if let Some(token) = self.mint(scope).await? {
                 return Ok(token);
             }
         }
@@ -287,7 +454,12 @@ impl GitHubApp {
             let Some(id) = installation["id"].as_u64() else {
                 continue;
             };
-            let Some(token) = self.installation_token(id).await? else {
+            let scope = TokenScope {
+                installation: id,
+                repositories: None,
+                permissions: None,
+            };
+            let Some(token) = self.mint(scope).await? else {
                 continue;
             };
             let page: Value = self
@@ -302,7 +474,7 @@ impl GitHubApp {
                 .await?;
             for repo in page["repositories"].as_array().into_iter().flatten() {
                 if let Some(name) = repo["full_name"].as_str() {
-                    self.remember_installation(name, Some(id));
+                    self.remember_installation(name, &installation);
                     repos.push(name.to_owned());
                 }
             }
@@ -558,12 +730,15 @@ mod tests {
     /// Installation of `o/other`, which never changes.
     const OTHER: u64 = 10;
 
-    /// A fake GitHub: `o/r` is on the current installation, `o/other` on [`OTHER`], other repositories have none.
+    /// A fake GitHub: `o/r` and `o/r2` are on the current installation, `o/other` on [`OTHER`], other
+    /// repositories have none.
     #[derive(Default)]
     struct Fake {
         installation: AtomicU64,
         lookups: AtomicUsize,
         mints: AtomicUsize,
+        /// Each mint's installation and request body.
+        minted: Mutex<Vec<(u64, Value)>>,
         /// Holds each mint until this many are in flight at once.
         rendezvous: Option<tokio::sync::Barrier>,
     }
@@ -573,19 +748,28 @@ mod tests {
         Path((owner, name)): Path<(String, String)>,
     ) -> Result<Json<Value>, StatusCode> {
         fake.lookups.fetch_add(1, Ordering::SeqCst);
-        let id = match (owner.as_str(), name.as_str()) {
-            ("o", "r") => fake.installation.load(Ordering::SeqCst),
+        let id = match (owner.to_lowercase().as_str(), name.to_lowercase().as_str()) {
+            ("o", "r" | "r2") => fake.installation.load(Ordering::SeqCst),
             ("o", "other") => OTHER,
             _ => return Err(StatusCode::NOT_FOUND),
         };
-        Ok(Json(json!({"id": id})))
+        let permissions = json!({
+            "contents": "write",
+            "issues": "write",
+            "metadata": "read",
+            "pull_requests": "write",
+            "workflows": "write",
+        });
+        Ok(Json(json!({"id": id, "permissions": permissions})))
     }
 
     async fn mint(
         State(fake): State<Arc<Fake>>,
         Path(id): Path<u64>,
+        Json(body): Json<Value>,
     ) -> Result<Json<Value>, StatusCode> {
         fake.mints.fetch_add(1, Ordering::SeqCst);
+        fake.minted.lock().unwrap().push((id, body));
         tokio::time::sleep(Duration::from_millis(100)).await;
         if let Some(rendezvous) = &fake.rendezvous {
             tokio::time::timeout(Duration::from_secs(2), rendezvous.wait())
@@ -655,5 +839,48 @@ mod tests {
         fake.installation.store(2, Ordering::SeqCst);
         app.tokens.lock().unwrap().clear();
         assert_eq!(app.token_for("o/r").await.unwrap(), "token-2");
+    }
+
+    #[tokio::test]
+    async fn session_tokens_cover_only_their_grants() {
+        let (fake, app) = fake_github().await;
+        app.read_token("O/R", &["O/R", "o/other", "o/r2"])
+            .await
+            .unwrap();
+        app.push_token("o/r").await.unwrap();
+        // Same scope as the first read, so it comes from the cache.
+        app.read_token("o/r", &["o/r2", "o/r"]).await.unwrap();
+        let minted = fake.minted.lock().unwrap().clone();
+        assert_eq!(
+            minted,
+            vec![
+                (
+                    1,
+                    json!({
+                        "repositories": ["r", "r2"],
+                        "permissions": {
+                            "contents": "read",
+                            "issues": "read",
+                            "metadata": "read",
+                            "pull_requests": "read",
+                        },
+                    })
+                ),
+                (
+                    1,
+                    json!({
+                        "repositories": ["r"],
+                        "permissions": {"contents": "write", "metadata": "read"},
+                    })
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_tokens_have_the_whole_installation() {
+        let (fake, app) = fake_github().await;
+        app.token_for("o/r").await.unwrap();
+        assert_eq!(*fake.minted.lock().unwrap(), vec![(1, json!({}))]);
     }
 }
