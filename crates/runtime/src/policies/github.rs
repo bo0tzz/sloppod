@@ -11,8 +11,8 @@ use crate::credentials::Credentials;
 use crate::github::GitHubApp;
 use crate::proposals::is_session_branch;
 
-/// GitHub: reads with the owner's GitHub App, pushes only to the session branch, all other writes through
-/// proposals.
+/// GitHub: reads and session-branch pushes with the owner's GitHub App, through tokens scoped to the session's
+/// grants (ADR 11); all other writes go through proposals.
 pub struct GitHubPolicy {
     credentials: Arc<Credentials>,
 }
@@ -39,10 +39,14 @@ impl GitHubPolicy {
     ) -> Result<Decision> {
         match git.service {
             Service::UploadPack => {
-                // Repositories outside the app's installations may still be public, so read those without a token.
+                // Granted repositories are read with a token covering only the grants. Anything else goes out
+                // without one, so it's readable only if it's public.
+                let granted: Vec<&str> = session.repos().collect();
                 let token = match self.app(session).await {
-                    Some(app) => app.token_for(&git.repo).await.ok(),
-                    None => None,
+                    Some(app) if granted.iter().any(|r| r.eq_ignore_ascii_case(&git.repo)) => {
+                        app.read_token(&git.repo, &granted).await.ok()
+                    }
+                    _ => None,
                 };
                 let headers = token
                     .map(|t| vec![("authorization".into(), basic(&t))])
@@ -114,7 +118,7 @@ impl GitHubPolicy {
                         }
                     }
                 }
-                let token = app.token_for(repo).await.map_err(err)?;
+                let token = app.push_token(repo).await.map_err(err)?;
                 Ok(Decision::allow_with(
                     vec![("authorization".into(), basic(&token))],
                     Vec::new(),
@@ -160,12 +164,12 @@ impl GitHubPolicy {
                 session,
             )));
         }
-        // Reads use the session repository's installation, or any installation for sessions without one. Without
-        // a GitHub App they go out unauthenticated.
-        let token = match (self.app(session).await, session.writable_repo()) {
-            (Some(app), Some(grant)) => Some(app.token_for(grant.repo).await.map_err(err)?),
-            (Some(app), None) => Some(app.any_token().await.map_err(err)?),
-            (None, _) => None,
+        // Reads carry a read-only token covering the granted repositories (in the first one's installation), which
+        // also reads public data. Sessions without a repository grant, or a GitHub App, read unauthenticated.
+        let granted: Vec<&str> = session.repos().collect();
+        let token = match (self.app(session).await, granted.first()) {
+            (Some(app), Some(repo)) => Some(app.read_token(repo, &granted).await.map_err(err)?),
+            _ => None,
         };
         let headers = token
             .map(|t| vec![("authorization".into(), format!("token {t}"))])

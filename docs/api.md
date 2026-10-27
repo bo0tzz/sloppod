@@ -51,8 +51,8 @@ type Session = {
   updated_at: string;
 };
 
-// What the session may do (ADR 2). Capabilities so far: "model", "github" (read), "packages" (package
-// registries), "repo" {repo, access: "rw", branch}, "memory" {namespace, access: "rw"}.
+// What the session may do (ADR 2). Capabilities so far: "model", "github" (read: public data, plus the "repo"
+// grants), "packages" (package registries), "repo" {repo, access: "rw", branch}, "memory" {namespace, access: "rw"}.
 type Grant = { capability: string; params: Record<string, unknown> };
 
 type Phase =

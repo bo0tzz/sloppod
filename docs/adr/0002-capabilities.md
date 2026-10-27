@@ -71,3 +71,5 @@ Prior art:
 - [AWS session policies](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies.html#policies_session)
 - [Sandstorm Powerbox](https://docs.sandstorm.io/en/latest/developing/powerbox/)
 - [CB4A draft](https://www.ietf.org/archive/id/draft-hartman-credential-broker-4-agents-00.html)
+
+2026-10-27: the `github` capability is read access to public GitHub. Each `repo` grant is what lets the session's GitHub credential reach a repository: reads at any access level, and pushes with `rw`. Tokens are minted for exactly those grants ([ADR 11](0011-enforcement-at-the-pod-boundary.md)).
