@@ -49,6 +49,7 @@ type Session = {
   grants: Grant[];
   phase: Phase;
   agent: string;         // "claude-code" or "codex"
+  kind: "work" | "review"; // "review": a session reviewing a proposal (ADR 24); `GET /sessions` leaves these out
   created_at: string;    // RFC 3339
   updated_at: string;
   active_at: string;   // when something last happened (an event was recorded); `GET /sessions` is ordered by it, newest first
@@ -105,16 +106,19 @@ type Credential = {
 
 Outward actions and access the agent asked for ([ADR 3](adr/0003-proposals-and-trusted-executor.md), [ADR 2](adr/0002-capabilities.md)). Kinds:
 
-- `github.pr.create`: payload `{repo, base, head, head_sha, title, body, draft, auto_merge}`; the detail adds `diff` and `commits`, up to `head_sha`, the commit that was proposed. Approving opens the PR only if `head` still points there; otherwise it fails and the agent proposes again. With `auto_merge`, which the agent can ask for and the reviewer decides, sloppod turns on GitHub's auto-merge after opening the PR (with the first merge method the repository allows), so it merges once its required checks pass, and only at the reviewed commit (`expectedHeadOid`); the result's `message` says whether that worked. Pushing to a head with auto-merge on turns it off: the first push is refused with a message saying so, and the PR then needs merging by hand.
-- `github.stack.create`: pull requests that build on each other, e.g. branches managed with `gh stack`; payload `{repo, base, pull_requests: {head, base, head_sha, title, body, draft}[]}`, bottom first, each based on the one below and the first on `base`. The detail adds `layers: {diff, commits}[]`, one per pull request. Approving checks that every head is still at its `head_sha` before opening anything, opens them (reusing open ones), and links them as a stack on GitHub; the result is `{pull_requests: {url, number}[], stack, message}`, with `stack` null and the reason in `message` if linking failed. Edits: `{pull_requests: {title?, body?}[]}`, by position.
+- `github.pr.create`: payload `{repo, base, head, head_sha, title, body, draft, auto_merge}`, proposed with an optional `review` (below); the detail adds `diff` and `commits`, up to `head_sha`, the commit that was proposed. Approving opens the PR only if `head` still points there; otherwise it fails and the agent proposes again. With `auto_merge`, which the agent can ask for and the reviewer decides, sloppod turns on GitHub's auto-merge after opening the PR (with the first merge method the repository allows), so it merges once its required checks pass, and only at the reviewed commit (`expectedHeadOid`); the result's `message` says whether that worked. Pushing to a head with auto-merge on turns it off: the first push is refused with a message saying so, and the PR then needs merging by hand.
+- `github.stack.create`: pull requests that build on each other, e.g. branches managed with `gh stack`; payload `{repo, base, pull_requests: {head, base, head_sha, title, body, draft}[]}`, proposed with an optional `review` like a pull request; bottom first, each based on the one below and the first on `base`. The detail adds `layers: {diff, commits}[]`, one per pull request. Approving checks that every head is still at its `head_sha` before opening anything, opens them (reusing open ones), and links them as a stack on GitHub; the result is `{pull_requests: {url, number}[], stack, message}`, with `stack` null and the reason in `message` if linking failed. Edits: `{pull_requests: {title?, body?}[]}`, by position.
 - `sloppod.repo.grant`: write access to a repository; payload `{repo, reason, branch}`; the detail adds nothing.
 - `github.issue.create`: issues to file in a repository the session can push to; payload `{repo, issues: {title, body, labels}[]}`; the detail adds nothing. Labels that don't exist yet are created. The result lists the issues filed, and any that failed.
+
+**Review first** ([ADR 24](adr/0024-automated-review-before-human-review.md)): when the agent proposes a pull request or a stack with `review: true` and the user has a ChatGPT login, the proposal starts `in_review` rather than `pending`. The runtime starts a review session (`kind: "review"`, running Codex, with read-only access to the repository and the head branch checked out), which ends each round by calling its `submit_review` tool. A pass moves the proposal to `pending`, where the user sees it and standing approvals can match it. Changes requested move it to `changes_requested` and the findings go to the agent, not the user; the agent pushes fixes and calls `request_review` (with replies to findings it disputes), which re-pins the proposal to its branch's new head and runs the next round in the same review session. After three rounds with changes requested, the proposal goes to `pending` anyway, with the open findings in its reviews. The review session is deleted once the proposal passes, reaches that cap or is withdrawn. `GET /api/v1/proposals/{id}/reviews` lists the rounds.
 
 When a proposal is decided or carried out, the runtime tells the agent: the notice is recorded as a `user_message_chunk` with `_meta.sloppod.notice: true` and delivered as a new turn when the agent is idle, steered into a running turn, or queued until the agent is up. Sessions whose turn a runtime restart cut off get a notice of the same kind once their agent is back, naming the build now running (`SLOPPOD_BUILD`, the chart's app version).
 
 ```
 GET  /api/v1/proposals?session={id}&status={status}  -> Proposal[]
 GET  /api/v1/proposals/{id}                          -> ProposalDetail
+GET  /api/v1/proposals/{id}/reviews                  -> Review[]   its review rounds, first to last
 POST /api/v1/proposals/{id}/approve                  -> Proposal   body: {} or edits, per kind (below)
 POST /api/v1/proposals/{id}/reject                   -> Proposal   body: {reason?: string}
 ```
@@ -124,7 +128,7 @@ type Proposal = {
   id: string;
   session_id: string;
   kind: "github.pr.create" | "github.stack.create" | "github.issue.create" | "sloppod.repo.grant";
-  status: "pending" | "approved" | "rejected" | "executed" | "failed" | "withdrawn";
+  status: "in_review" | "changes_requested" | "pending" | "approved" | "rejected" | "executed" | "failed" | "withdrawn";
   payload: Record<string, unknown>;  // per kind, see above
   result?: Record<string, unknown>;            // when executed; pull requests: {url, number}; issues: {issues: {title, url, number}[], failed: {title, error}[], message}
   error?: string;                              // when failed
@@ -132,6 +136,18 @@ type Proposal = {
   created_at: string;
   decided_at?: string;
   decided_by?: string;                         // the user, or "standing-approval:<id>"
+  review_session_id?: string;                  // the session reviewing it, or that did
+};
+
+type Review = {
+  round: number;          // 1, 2, 3
+  head_sha: string;       // the commit reviewed
+  replies?: string;       // the author's replies to the previous round's findings
+  verdict?: "pass" | "changes";  // absent while the round runs
+  summary?: string;
+  findings: { path?: string; line?: number; severity?: "high" | "medium" | "low"; comment: string }[];
+  created_at: string;
+  finished_at?: string;
 };
 
 type ProposalDetail = Proposal & {
@@ -141,7 +157,7 @@ type ProposalDetail = Proposal & {
 };
 ```
 
-Approving returns as soon as the decision is recorded, with status `approved`; the proposal is carried out in the background and its outcome (`executed` or `failed`) follows as a `_sloppod/proposal` update, and in `GET /api/v1/proposals/{id}`. A proposal still `approved` when the runtime restarts is carried out again on startup; executors don't repeat work already done (an open pull request from the same head into the same base is reused, and issues with the same title filed in the last day aren't filed again). Approving with edits changes the payload first: `github.pr.create` takes `{title?, body?, auto_merge?}`; `github.issue.create` takes `{issues}`, the issues to file, so leaving one out drops it. Other kinds take no edits. A proposal's status only moves forward (`pending`, then `approved` or `rejected`, then `executed` or `failed`), so a UI can ignore a copy, e.g. from a slow refetch, that is behind the one it has.
+Approving returns as soon as the decision is recorded, with status `approved`; the proposal is carried out in the background and its outcome (`executed` or `failed`) follows as a `_sloppod/proposal` update, and in `GET /api/v1/proposals/{id}`. A proposal still `approved` when the runtime restarts is carried out again on startup; executors don't repeat work already done (an open pull request from the same head into the same base is reused, and issues with the same title filed in the last day aren't filed again). Approving with edits changes the payload first: `github.pr.create` takes `{title?, body?, auto_merge?}`; `github.issue.create` takes `{issues}`, the issues to file, so leaving one out drops it. Other kinds take no edits. A proposal's status only moves forward (`in_review` and `changes_requested`, back and forth between review rounds; then `pending`; then `approved` or `rejected`; then `executed` or `failed`), so a UI can ignore a copy, e.g. from a slow refetch, that is behind the one it has. Undecided proposals, in review or not, can be withdrawn.
 
 ### Standing approvals
 

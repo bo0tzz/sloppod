@@ -44,6 +44,7 @@ pub fn routes() -> Router<AppState> {
         .route("/standing-approvals/{id}", delete(revoke_standing_approval))
         .route("/proposals", get(list_proposals))
         .route("/proposals/{id}", get(get_proposal))
+        .route("/proposals/{id}/reviews", get(list_reviews))
         .route("/proposals/{id}/approve", post(approve))
         .route("/proposals/{id}/reject", post(reject))
 }
@@ -326,6 +327,7 @@ async fn create_session(
             custom_title: custom.is_some(),
             pending_prompt: prompt,
             agent,
+            kind: "work",
             model: model.as_deref(),
             repo: repo.as_deref(),
             grants: &grants,
@@ -458,11 +460,18 @@ async fn delete_session(
     let session = db::owned_session(&state.db, id, &user)
         .await?
         .ok_or_else(not_found)?;
+    remove_session(&state, &session).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Stops a session and deletes its pod, volume, egress policy and keys.
+pub async fn remove_session(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
+    let id = session.id;
     state.hub.stop(id).await;
     state.placement.delete(&id.to_string()).await?;
     state.enforcer.remove(&id.to_string()).await?;
     if session.context().has("memory")
-        && let Some((admin, _)) = state.credentials.memini(&user).await?
+        && let Some((admin, _)) = state.credentials.memini(&session.owner).await?
         && let Err(e) = admin
             .delete_key(&MeminiAdmin::key_name(&id.to_string()))
             .await
@@ -473,7 +482,7 @@ async fn delete_session(
         .credentials
         .delete_session_secret(id, SESSION_KEY)
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
 async fn list_credentials(
@@ -633,6 +642,22 @@ async fn get_proposal(
             .await?
             .ok_or_else(not_found)?,
     ))
+}
+
+async fn list_reviews(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    proposals::owned_proposal(&state, id, &user)
+        .await?
+        .ok_or_else(not_found)?;
+    let reviews: Vec<_> = db::reviews(&state.db, id)
+        .await?
+        .iter()
+        .map(db::ReviewRow::to_api)
+        .collect();
+    Ok(Json(reviews))
 }
 
 async fn approve(

@@ -113,6 +113,20 @@ impl SessionContext {
         self.writable_repos()
             .find(|g| g.repo.eq_ignore_ascii_case(repo))
     }
+
+    /// A read-only grant of `repo` with the branch to check out, e.g. a review session's (ADR 24).
+    pub fn readable_repo_for(&self, repo: &str) -> Option<RepoGrant<'_>> {
+        self.grants
+            .iter()
+            .filter(|g| g.capability == "repo" && g.param("access") == Some("r"))
+            .filter_map(|g| {
+                Some(RepoGrant {
+                    repo: g.param("repo")?,
+                    branch: g.param("branch")?,
+                })
+            })
+            .find(|g| g.repo.eq_ignore_ascii_case(repo))
+    }
 }
 
 /// One HTTP request leaving a session pod, as seen by the egress listener.
@@ -315,6 +329,17 @@ pub struct ToolSpec {
     pub input_schema: Value,
 }
 
+/// The change a reviewer looks at for a proposal (ADR 24): commits on a branch of a repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewSubject {
+    pub repo: String,
+    pub base: String,
+    pub head: String,
+    pub head_sha: String,
+    pub title: String,
+    pub body: String,
+}
+
 /// An outward action the agent can propose and a human approves (ADR 3).
 #[async_trait]
 pub trait ProposalKind: Send + Sync {
@@ -329,6 +354,10 @@ pub trait ProposalKind: Send + Sync {
     async fn detail(&self, session: &SessionContext, payload: &Value) -> Result<Value>;
     /// What a proposal acts on, for matching standing approvals against it, e.g. a repository as `owner/name`.
     fn target(&self, _payload: &Value) -> Option<String> {
+        None
+    }
+    /// What a review session reviews for a proposal (ADR 24); `None` for kinds that aren't reviewed.
+    fn review_subject(&self, _payload: &Value) -> Option<ReviewSubject> {
         None
     }
     /// Applies the reviewer's edits, sent along with the approval, to the payload.

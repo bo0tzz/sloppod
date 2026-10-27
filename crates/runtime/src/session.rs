@@ -796,6 +796,10 @@ impl Hub {
         })
     }
 
+    pub async fn turn_running(&self, id: Uuid) -> bool {
+        self.live(id).state.lock().await.turn_running
+    }
+
     pub async fn stop(&self, id: Uuid) {
         let (agent, queued) = {
             let live = self.live(id);

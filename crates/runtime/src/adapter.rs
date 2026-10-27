@@ -46,6 +46,20 @@ impl Agents {
 fn session_prompt(context: &AgentContext) -> String {
     let session = &context.session;
     let dir = &context.repo_dir;
+    if let Some(RepoGrant { repo, branch }) = context
+        .repo
+        .as_deref()
+        .and_then(|r| session.readable_repo_for(r))
+    {
+        return format!(
+            "You are running in a sloppod session: a sandboxed Kubernetes pod.\n\
+             - A read-only copy of {repo} is at {dir}, with `{branch}` checked out; `git fetch` gets newer commits. \
+             You can't push or propose changes.\n\
+             - Network access is limited to what this session is granted. Credentials are attached outside the pod, so \
+             the tokens you see in the environment are placeholders.\n\
+             - Install tools through mise (`mise use`, `mise install`, `mise exec`) rather than apt or curl-to-shell."
+        );
+    }
     let mut workspace = match context
         .repo
         .as_deref()

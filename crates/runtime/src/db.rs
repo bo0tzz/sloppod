@@ -25,6 +25,8 @@ pub struct SessionRow {
     pub phase: String,
     /// The agent the session runs, e.g. `claude-code`.
     pub agent: String,
+    /// `work`, or `review` for a session that reviews a proposal (ADR 24).
+    pub kind: String,
     pub agent_session_id: Option<String>,
     pub agent_state: Option<Value>,
     /// The session's current model, used whenever its agent starts.
@@ -48,6 +50,7 @@ impl SessionRow {
             title: String::new(),
             phase: "starting".to_owned(),
             agent: "claude-code".to_owned(),
+            kind: "work".to_owned(),
             agent_session_id: None,
             agent_state: None,
             model: None,
@@ -96,6 +99,7 @@ impl SessionRow {
                 .collect(),
             phase: Phase::parse(&self.phase),
             agent: self.agent.clone(),
+            kind: self.kind.clone(),
             created_at: self.created_at.to_rfc3339(),
             updated_at: self.updated_at.to_rfc3339(),
             active_at: self.active_at.to_rfc3339(),
@@ -107,7 +111,7 @@ impl SessionRow {
     }
 }
 
-const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, agent_session_id, agent_state, model, repo, created_at, updated_at, active_at, \
+const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, agent_session_id, agent_state, model, repo, created_at, updated_at, active_at, \
      coalesce((select jsonb_agg(jsonb_build_object('capability', g.capability, 'params', g.params) order by g.created_at) \
      from session_grants g where g.session_id = sessions.id), '[]'::jsonb) as grants";
 
@@ -118,6 +122,7 @@ pub struct NewSessionRow<'a> {
     pub custom_title: bool,
     pub pending_prompt: &'a str,
     pub agent: &'a str,
+    pub kind: &'a str,
     pub model: Option<&'a str>,
     pub repo: Option<&'a str>,
     pub grants: &'a [Grant],
@@ -126,8 +131,8 @@ pub struct NewSessionRow<'a> {
 pub async fn insert_session(db: &PgPool, new: NewSessionRow<'_>) -> sqlx::Result<SessionRow> {
     let mut tx = db.begin().await?;
     sqlx::query(
-        "insert into sessions (id, owner, title, custom_title, pending_prompt, model, repo, agent) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8)",
+        "insert into sessions (id, owner, title, custom_title, pending_prompt, model, repo, agent, kind) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(new.id)
     .bind(new.owner)
@@ -137,6 +142,7 @@ pub async fn insert_session(db: &PgPool, new: NewSessionRow<'_>) -> sqlx::Result
     .bind(new.model)
     .bind(new.repo)
     .bind(new.agent)
+    .bind(new.kind)
     .execute(&mut *tx)
     .await?;
     for grant in new.grants {
@@ -157,7 +163,7 @@ pub async fn insert_session(db: &PgPool, new: NewSessionRow<'_>) -> sqlx::Result
 
 pub async fn list_sessions(db: &PgPool, owner: &str) -> sqlx::Result<Vec<SessionRow>> {
     sqlx::query_as(AssertSqlSafe(format!(
-        "select {SESSION_COLUMNS} from sessions where owner = $1 order by active_at desc"
+        "select {SESSION_COLUMNS} from sessions where owner = $1 and kind = 'work' order by active_at desc"
     )))
     .bind(owner)
     .fetch_all(db)
@@ -323,6 +329,8 @@ pub struct ProposalRow {
     pub created_at: DateTime<Utc>,
     pub decided_at: Option<DateTime<Utc>>,
     pub decided_by: Option<String>,
+    /// The session reviewing it, while it's in review (ADR 24).
+    pub review_session_id: Option<Uuid>,
 }
 
 impl ProposalRow {
@@ -339,6 +347,7 @@ impl ProposalRow {
             created_at: self.created_at.to_rfc3339(),
             decided_at: self.decided_at.map(|d| d.to_rfc3339()),
             decided_by: self.decided_by.clone(),
+            review_session_id: self.review_session_id,
         }
     }
 }
@@ -443,20 +452,23 @@ pub async fn matching_standing_approval(
     .await
 }
 
-const PROPOSAL_COLUMNS: &str = "id, session_id, kind, status, payload, result, error, reason, created_at, decided_at, decided_by";
+const PROPOSAL_COLUMNS: &str = "id, session_id, kind, status, payload, result, error, reason, created_at, decided_at, decided_by, review_session_id";
 
+/// A new proposal, `pending` a human's review or `in_review` by a review session first (ADR 24).
 pub async fn insert_proposal(
     db: &PgPool,
     session_id: Uuid,
     kind: &str,
+    status: &str,
     payload: &Value,
 ) -> sqlx::Result<ProposalRow> {
     sqlx::query_as(AssertSqlSafe(format!(
-        "insert into proposals (id, session_id, kind, status, payload) values ($1, $2, $3, 'pending', $4) returning {PROPOSAL_COLUMNS}"
+        "insert into proposals (id, session_id, kind, status, payload) values ($1, $2, $3, $4, $5) returning {PROPOSAL_COLUMNS}"
     )))
     .bind(Uuid::now_v7())
     .bind(session_id)
     .bind(kind)
+    .bind(status)
     .bind(payload)
     .fetch_one(db)
     .await
@@ -480,7 +492,8 @@ pub async fn withdraw_proposal(
 ) -> sqlx::Result<Option<ProposalRow>> {
     sqlx::query_as(AssertSqlSafe(format!(
         "update proposals set status = 'withdrawn', reason = $3, decided_by = 'agent', decided_at = now() \
-         where id = $1 and session_id = $2 and status = 'pending' returning {PROPOSAL_COLUMNS}"
+         where id = $1 and session_id = $2 and status in ('pending', 'in_review', 'changes_requested') \
+         returning {PROPOSAL_COLUMNS}"
     )))
     .bind(id)
     .bind(session_id)
@@ -604,4 +617,122 @@ pub async fn latest_agent_state(db: &PgPool, owner: &str) -> sqlx::Result<Option
     .fetch_optional(db)
     .await?;
     Ok(row.and_then(|(state,)| state))
+}
+
+/// Moves a proposal from `from` to `to`, replacing its payload when given; `None` if it wasn't in `from`.
+pub async fn move_proposal(
+    db: &PgPool,
+    id: Uuid,
+    from: &str,
+    to: &str,
+    payload: Option<&Value>,
+) -> sqlx::Result<Option<ProposalRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "update proposals set status = $3, payload = coalesce($4, payload) where id = $1 and status = $2 \
+         returning {PROPOSAL_COLUMNS}"
+    )))
+    .bind(id)
+    .bind(from)
+    .bind(to)
+    .bind(payload)
+    .fetch_optional(db)
+    .await
+}
+
+pub async fn set_review_session(db: &PgPool, proposal: Uuid, session: Uuid) -> sqlx::Result<()> {
+    sqlx::query("update proposals set review_session_id = $2 where id = $1")
+        .bind(proposal)
+        .bind(session)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// The proposal a review session reviews.
+pub async fn reviewed_proposal(db: &PgPool, session: Uuid) -> sqlx::Result<Option<ProposalRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "select {PROPOSAL_COLUMNS} from proposals where review_session_id = $1"
+    )))
+    .bind(session)
+    .fetch_optional(db)
+    .await
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct ReviewRow {
+    pub round: i32,
+    pub head_sha: String,
+    pub replies: Option<String>,
+    pub verdict: Option<String>,
+    pub summary: Option<String>,
+    pub findings: Value,
+    pub created_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+impl ReviewRow {
+    pub fn to_api(&self) -> api::Review {
+        api::Review {
+            round: self.round,
+            head_sha: self.head_sha.clone(),
+            replies: self.replies.clone(),
+            verdict: self.verdict.clone(),
+            summary: self.summary.clone(),
+            findings: self.findings.clone(),
+            created_at: self.created_at.to_rfc3339(),
+            finished_at: self.finished_at.map(|d| d.to_rfc3339()),
+        }
+    }
+}
+
+const REVIEW_COLUMNS: &str =
+    "round, head_sha, replies, verdict, summary, findings, created_at, finished_at";
+
+/// A proposal's review rounds, first to last.
+pub async fn reviews(db: &PgPool, proposal: Uuid) -> sqlx::Result<Vec<ReviewRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "select {REVIEW_COLUMNS} from reviews where proposal_id = $1 order by round"
+    )))
+    .bind(proposal)
+    .fetch_all(db)
+    .await
+}
+
+/// Starts the next review round of a proposal; returns its number.
+pub async fn start_review_round(
+    db: &PgPool,
+    proposal: Uuid,
+    head_sha: &str,
+    replies: Option<&str>,
+) -> sqlx::Result<i32> {
+    sqlx::query_scalar(
+        "insert into reviews (proposal_id, round, head_sha, replies) \
+         values ($1, coalesce((select max(round) from reviews where proposal_id = $1), 0) + 1, $2, $3) \
+         returning round",
+    )
+    .bind(proposal)
+    .bind(head_sha)
+    .bind(replies)
+    .fetch_one(db)
+    .await
+}
+
+/// Records the verdict of a proposal's running review round; `None` if no round is running.
+pub async fn finish_review_round(
+    db: &PgPool,
+    proposal: Uuid,
+    verdict: &str,
+    summary: &str,
+    findings: &Value,
+) -> sqlx::Result<Option<ReviewRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "update reviews set verdict = $2, summary = $3, findings = $4, finished_at = now() \
+         where proposal_id = $1 and verdict is null returning {REVIEW_COLUMNS}"
+    )))
+    .bind(proposal)
+    .bind(verdict)
+    .bind(summary)
+    .bind(findings)
+    .fetch_optional(db)
+    .await
 }

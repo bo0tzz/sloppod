@@ -18,6 +18,7 @@ mod placement;
 mod pods;
 mod policies;
 mod proposals;
+mod reviews;
 mod session;
 #[cfg(test)]
 mod session_tests;

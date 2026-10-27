@@ -6,7 +6,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use sloppod_contracts::{
-    Error, Grant, Manifest, ProposalKind, RepoGrant, Result, SessionContext, ToolSpec,
+    Error, Grant, Manifest, ProposalKind, RepoGrant, Result, ReviewSubject, SessionContext,
+    ToolSpec,
 };
 use sloppod_protocol::api::Proposal;
 use sqlx::PgPool;
@@ -14,7 +15,7 @@ use uuid::Uuid;
 
 use crate::credentials::Credentials;
 use crate::github::GitHubApp;
-use crate::{AppState, db};
+use crate::{AppState, db, reviews};
 
 #[derive(Default, Clone)]
 pub struct ProposalKinds {
@@ -118,6 +119,7 @@ impl ProposalKind for PullRequest {
                     "head": {"type": "string", "description": "Branch to open it from: the session branch (the default) or `<session branch>-<name>`"},
                     "draft": {"type": "boolean", "description": "Open as a draft", "default": false},
                     "auto_merge": {"type": "boolean", "description": "Ask for the PR to merge by itself once its required checks pass; the reviewer decides", "default": false},
+                    "review": {"type": "boolean", "description": "Have another model review it before a human sees it; its findings come back to you", "default": false},
                 },
                 "required": ["title", "body"],
             }),
@@ -126,6 +128,18 @@ impl ProposalKind for PullRequest {
 
     fn target(&self, payload: &Value) -> Option<String> {
         payload["repo"].as_str().map(str::to_owned)
+    }
+
+    fn review_subject(&self, payload: &Value) -> Option<ReviewSubject> {
+        let field = |key: &str| payload[key].as_str().map(str::to_owned);
+        Some(ReviewSubject {
+            repo: field("repo")?,
+            base: field("base")?,
+            head: field("head")?,
+            head_sha: field("head_sha")?,
+            title: field("title")?,
+            body: field("body").unwrap_or_default(),
+        })
     }
 
     fn summary(&self, payload: &Value) -> String {
@@ -267,6 +281,35 @@ fn stack_layers(payload: &Value) -> &[Value] {
         .unwrap_or_default()
 }
 
+/// The whole stack at once: from its base to the top branch, with every layer's title and description.
+fn stack_review_subject(payload: &Value) -> Option<ReviewSubject> {
+    let layers = stack_layers(payload);
+    let top = layers.last()?;
+    let body = layers
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            format!(
+                "## {}. {} (`{}` into `{}`)\n\n{}",
+                i + 1,
+                l["title"].as_str().unwrap_or_default(),
+                l["head"].as_str().unwrap_or_default(),
+                l["base"].as_str().unwrap_or_default(),
+                l["body"].as_str().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Some(ReviewSubject {
+        repo: payload["repo"].as_str()?.to_owned(),
+        base: payload["base"].as_str()?.to_owned(),
+        head: top["head"].as_str()?.to_owned(),
+        head_sha: top["head_sha"].as_str()?.to_owned(),
+        title: format!("a stack of {} pull requests", layers.len()),
+        body,
+    })
+}
+
 /// Applies edits `{pull_requests: [{title?, body?}]}`, by position, to a stack's pull requests.
 fn edit_stack(payload: &Value, edits: &Value) -> Result<Value> {
     let mut payload = payload.clone();
@@ -327,6 +370,7 @@ impl ProposalKind for Stack {
                             "required": ["head", "title", "body"],
                         },
                     },
+                    "review": {"type": "boolean", "description": "Have another model review the stack before a human sees it; its findings come back to you", "default": false},
                 },
                 "required": ["pull_requests"],
             }),
@@ -335,6 +379,10 @@ impl ProposalKind for Stack {
 
     fn target(&self, payload: &Value) -> Option<String> {
         payload["repo"].as_str().map(str::to_owned)
+    }
+
+    fn review_subject(&self, payload: &Value) -> Option<ReviewSubject> {
+        stack_review_subject(payload)
     }
 
     fn summary(&self, payload: &Value) -> String {
@@ -836,7 +884,7 @@ impl ProposalKind for RepoAccess {
     }
 }
 
-/// Creates a proposal from an agent's tool call.
+/// Creates a proposal from an agent's tool call. With `review`, another model reviews it first (ADR 24).
 pub async fn propose(
     state: &AppState,
     session_id: Uuid,
@@ -846,27 +894,76 @@ pub async fn propose(
     let kind = state
         .proposals
         .by_tool(tool)
-        .ok_or_else(|| format!("unknown tool {tool}"))?;
+        .ok_or_else(|| format!("unknown tool {tool}"))?
+        .clone();
     let session = db::get_session(&state.db, session_id)
         .await
         .map_err(|e| e.to_string())?
         .ok_or("unknown session")?;
+    let review = arguments["review"].as_bool() == Some(true);
     let context = session.context();
     let payload = kind.prepare(&context, arguments).await.map_err(|e| e.0)?;
-    let row = db::insert_proposal(&state.db, session_id, &kind.kind(), &payload)
+    let subject = match review {
+        true => Some(
+            kind.review_subject(&payload)
+                .ok_or("proposals of this kind aren't reviewed; propose it without review")?,
+        ),
+        false => None,
+    };
+    if subject.is_some()
+        && !reviews::available(state, &session.owner)
+            .await
+            .map_err(|e| e.to_string())?
+    {
+        return Err("reviews need a ChatGPT login in sloppod's settings, which the user hasn't added; propose it \
+                    without review"
+            .into());
+    }
+    let status = if subject.is_some() {
+        "in_review"
+    } else {
+        "pending"
+    };
+    let row = db::insert_proposal(&state.db, session_id, &kind.kind(), status, &payload)
         .await
         .map_err(|e| e.to_string())?;
     let proposal = row.to_api();
     state.hub.broadcast_proposal(&proposal);
+    let Some(subject) = subject else {
+        return apply_standing_approval(state, &session, kind.as_ref(), proposal)
+            .await
+            .map_err(|e| e.to_string());
+    };
+    if let Err(e) = reviews::start(state, &row, &subject, None).await {
+        tracing::warn!(proposal = %row.id, error = %e, "starting a review");
+        let row = db::move_proposal(&state.db, row.id, "in_review", "pending", None)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("the proposal changed meanwhile")?;
+        state.hub.broadcast_proposal(&row.to_api());
+        return Err(format!(
+            "the review couldn't start ({e}), so proposal {} went to the user without one",
+            row.id
+        ));
+    }
+    Ok(proposal)
+}
+
+/// Approves a proposal that's waiting for a human when one of the owner's standing approvals covers it.
+pub async fn apply_standing_approval(
+    state: &AppState,
+    session: &db::SessionRow,
+    kind: &dyn ProposalKind,
+    proposal: Proposal,
+) -> anyhow::Result<Proposal> {
     let standing = db::matching_standing_approval(
         &state.db,
         &session.owner,
         &kind.kind(),
-        kind.target(&payload).as_deref(),
-        session_id,
+        kind.target(&proposal.payload).as_deref(),
+        session.id,
     )
-    .await
-    .map_err(|e| e.to_string())?;
+    .await?;
     let Some(standing) = standing else {
         return Ok(proposal);
     };
@@ -895,7 +992,7 @@ pub enum Verdict {
 
 /// Applies a human's decision; approving executes immediately (ADR 3).
 /// A proposal, if its session belongs to `owner`.
-async fn owned_proposal(
+pub async fn owned_proposal(
     state: &AppState,
     id: Uuid,
     owner: &str,
@@ -1154,6 +1251,29 @@ mod tests {
             true
         );
         assert!(edit_pull_request(&payload, &json!({"auto_merge": "yes"})).is_err());
+    }
+
+    #[test]
+    fn reviews_a_stack_as_a_whole() {
+        let payload = json!({"repo": "a/one", "base": "main", "pull_requests": [
+            {"head": "s-1", "base": "main", "head_sha": "111", "title": "One", "body": "First."},
+            {"head": "s-2", "base": "s-1", "head_sha": "222", "title": "Two", "body": "Second."},
+        ]});
+        let subject = stack_review_subject(&payload).unwrap();
+        assert_eq!(
+            (
+                subject.base.as_str(),
+                subject.head.as_str(),
+                subject.head_sha.as_str()
+            ),
+            ("main", "s-2", "222")
+        );
+        assert_eq!(subject.title, "a stack of 2 pull requests");
+        assert!(
+            subject
+                .body
+                .contains("## 2. Two (`s-2` into `s-1`)\n\nSecond.")
+        );
     }
 
     #[test]
