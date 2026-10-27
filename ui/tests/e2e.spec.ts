@@ -266,13 +266,15 @@ test('switches the model of a session', async ({ page, context }) => {
   page.on('websocket', (socket) => socket.on('framesent', ({ payload }) => sent.push(String(payload))));
   const id = await createSession(page, 'Switch models in sloppod');
   const select = page.getByTestId('model-select');
-  await expect(select).toContainText('Default (recommended)');
+  await expect(select).toContainText('Default · Sonnet');
 
   const other = await context.newPage();
   await other.goto(`/sessions/${id}`);
-  await expect(other.getByTestId('model-select')).toContainText('Default (recommended)');
+  await expect(other.getByTestId('model-select')).toContainText('Default · Sonnet');
 
   await select.getByRole('combobox').click();
+  // The default option says which model it currently is.
+  await expect(page.getByRole('option', { name: 'Default · Sonnet' })).toBeVisible();
   await page.getByRole('option', { name: 'Opus' }).click();
   await expect(select).toContainText('Opus');
   expect(sent.some((frame) => frame.includes('"session/set_config_option"') && frame.includes('"opus"'))).toBe(true);
