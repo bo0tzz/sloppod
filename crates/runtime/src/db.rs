@@ -35,6 +35,24 @@ pub struct SessionRow {
 }
 
 impl SessionRow {
+    /// A fresh session as the tests need it.
+    #[cfg(test)]
+    pub fn for_test(id: Uuid, owner: &str) -> Self {
+        Self {
+            id,
+            owner: owner.to_owned(),
+            title: String::new(),
+            phase: "starting".to_owned(),
+            agent_session_id: None,
+            agent_state: None,
+            model: None,
+            repo: None,
+            grants: Value::Array(Vec::new()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
     pub fn grants(&self) -> Vec<Grant> {
         serde_json::from_value(self.grants.clone()).unwrap_or_default()
     }

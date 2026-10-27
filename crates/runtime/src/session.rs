@@ -7,12 +7,11 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use serde_json::{Value, json};
 use sloppod_protocol::api::{Phase, Proposal};
-use sqlx::PgPool;
 use tokio::sync::{Mutex, broadcast, oneshot};
 use uuid::Uuid;
 
-use crate::db;
 use crate::link::{AgentConn, RpcError};
+use crate::store::SessionStore;
 
 #[derive(Clone, Debug)]
 pub enum UiEvent {
@@ -67,7 +66,7 @@ pub struct Live {
 }
 
 pub struct Hub {
-    db: PgPool,
+    store: Arc<dyn SessionStore>,
     sessions: StdMutex<HashMap<Uuid, Arc<Live>>>,
     agent_capabilities: StdMutex<Option<Value>>,
 }
@@ -93,9 +92,9 @@ pub struct Replay {
 }
 
 impl Hub {
-    pub fn new(db: PgPool) -> Self {
+    pub fn new(store: Arc<dyn SessionStore>) -> Self {
         Self {
-            db,
+            store,
             sessions: StdMutex::default(),
             agent_capabilities: StdMutex::default(),
         }
@@ -132,7 +131,7 @@ impl Hub {
     }
 
     pub async fn set_phase(&self, id: Uuid, phase: Phase) {
-        match db::set_phase(&self.db, id, phase).await {
+        match self.store.set_phase(id, phase).await {
             Ok(Some(row)) => self.broadcast(
                 id,
                 UiEvent::Notification {
@@ -146,7 +145,7 @@ impl Hub {
     }
 
     pub async fn broadcast_session(&self, id: Uuid) {
-        if let Ok(Some(row)) = db::get_session(&self.db, id).await {
+        if let Ok(Some(row)) = self.store.get_session(id).await {
             self.broadcast(
                 id,
                 UiEvent::Notification {
@@ -169,7 +168,7 @@ impl Hub {
 
     /// Appends an update to the event log and sends it to every UI.
     pub async fn record(&self, id: Uuid, update: Value) {
-        match db::append_event(&self.db, id, &update).await {
+        match self.store.append_event(id, &update).await {
             Ok(seq) => self.broadcast(
                 id,
                 UiEvent::Notification {
@@ -323,7 +322,7 @@ impl Hub {
         if update["sessionUpdate"] == "session_info_update"
             && let Some(title) = update["title"].as_str()
         {
-            match db::set_auto_title(&self.db, id, title).await {
+            match self.store.set_auto_title(id, title).await {
                 Ok(true) => self.broadcast_session(id).await,
                 Ok(false) => {}
                 Err(e) => tracing::warn!(session = %id, error = %e, "setting title"),
@@ -686,7 +685,7 @@ impl Hub {
         }
         if params["configId"] == "model"
             && let Some(model) = params["value"].as_str()
-            && let Err(e) = db::set_session_model(&self.db, id, model).await
+            && let Err(e) = self.store.set_session_model(id, model).await
         {
             tracing::warn!(session = %id, error = %e, "recording the session's model");
         }
@@ -695,11 +694,12 @@ impl Hub {
 
     /// Everything a UI needs when it loads a session.
     pub async fn replay(&self, id: Uuid) -> Result<Replay, sqlx::Error> {
-        let events = db::events(&self.db, id).await?;
+        let events = self.store.events(id).await?;
         let live = self.live(id);
         let state = live.state.lock().await;
         let agent_state = if state.agent_state.is_null() {
-            db::get_session(&self.db, id)
+            self.store
+                .get_session(id)
                 .await?
                 .and_then(|r| r.agent_state)
                 .unwrap_or_else(|| json!({}))
