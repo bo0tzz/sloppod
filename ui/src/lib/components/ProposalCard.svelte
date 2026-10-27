@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Badge, Button, Icon } from '@immich/ui';
+  import { Badge, Button, Icon, LoadingSpinner } from '@immich/ui';
   import { api, type Proposal } from '#lib/api.ts';
   import { proposalStatus, proposalSummary } from '#lib/presentation.ts';
 
@@ -52,12 +52,20 @@
         </span>
       {/if}
     </div>
-    {#if !inline}
+    {#if proposal.status === 'approved'}
+      <span class="text-muted flex shrink-0 items-center gap-2 text-xs" data-testid="proposal-working">
+        <LoadingSpinner size="small" />
+        Carrying it out…
+      </span>
+    {:else if !inline}
       <Button size="small" shape="round" variant={pending ? 'filled' : 'outline'} color={pending ? 'primary' : 'secondary'} onclick={onOpen}>
         {pending ? 'Review' : 'View'}
       </Button>
     {/if}
   </div>
+  {#if proposal.status === 'failed' && proposal.error}
+    <p class="text-danger text-xs" data-testid="proposal-error">{proposal.error}</p>
+  {/if}
   {#if inline}
     {#if payload.reason}
       <p class="text-sm whitespace-pre-wrap" data-testid="proposal-reason">{payload.reason}</p>
