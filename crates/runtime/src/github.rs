@@ -698,6 +698,31 @@ impl GitHubApp {
         }))
     }
 
+    /// The number of the stack a pull request is in, if any (GitHub's stacked pull requests).
+    pub async fn stack_of(&self, repo: &str, pull: u64) -> anyhow::Result<Option<u64>> {
+        let stacks: Vec<Value> = self
+            .repo_get(
+                repo,
+                &format!("/stacks?pull_request={pull}"),
+                "application/vnd.github+json",
+            )
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(stacks.first().and_then(|stack| stack["number"].as_u64()))
+    }
+
+    /// Links pull requests, bottom to top, into a stack; returns its number.
+    pub async fn link_stack(&self, repo: &str, pulls: &[u64]) -> anyhow::Result<u64> {
+        let body = self
+            .repo_post(repo, "/stacks", &json!({"pull_requests": pulls}))
+            .await?;
+        body["number"]
+            .as_u64()
+            .context("GitHub returned no stack number")
+    }
+
     /// Issues created in the last day, by title, in `create_issue`'s result shape.
     pub async fn recent_issues(&self, repo: &str) -> anyhow::Result<HashMap<String, Value>> {
         let since = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();

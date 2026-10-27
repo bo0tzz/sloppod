@@ -57,7 +57,9 @@ impl ClaudeCode {
              call the `request_repository` tool.\n\
              - Outward actions are proposals that a human reviews. To open a pull request, push your branch and call \
              the `propose_pull_request` tool; sloppod opens the PR once it's approved. To file issues, call the \
-             `propose_issues` tool. You're told when your proposals are decided. Direct writes to GitHub (gh pr \
+             `propose_issues` tool. For changes that build on each other, manage the branches with `gh stack` \
+             (`init`, `add`, `rebase`, `push`) and propose them together with the `propose_stack` tool rather than \
+             `gh stack submit`. You're told when your proposals are decided. Direct writes to GitHub (gh pr \
              create, gh issue create, comments, API POSTs) are refused.\n",
         );
         format!(

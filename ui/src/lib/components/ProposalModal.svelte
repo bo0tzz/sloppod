@@ -15,7 +15,7 @@
     Text,
     Textarea,
   } from '@immich/ui';
-  import { mdiOpenInNew, mdiSourceCommit } from '@mdi/js';
+  import { mdiOpenInNew } from '@mdi/js';
   import { onMount } from 'svelte';
   import {
     api,
@@ -26,12 +26,12 @@
     type ProposalEdits,
     type PullRequestPayload,
     type RepoGrantPayload,
+    type StackPayload,
   } from '#lib/api.ts';
-  import { parseUnifiedDiff } from '#lib/diff.ts';
   import { absoluteTime } from '#lib/format.ts';
   import { proposalStatus, proposalSummary } from '#lib/presentation.ts';
-  import DiffView from './DiffView.svelte';
   import Markdown from './Markdown.svelte';
+  import PullRequestChanges from './PullRequestChanges.svelte';
 
   let {
     proposal,
@@ -43,6 +43,7 @@
     'github.pr.create': 'Pull request proposal',
     'github.issue.create': 'Issues proposal',
     'sloppod.repo.grant': 'Repository access',
+    'github.stack.create': 'Stacked pull requests',
   };
   // svelte-ignore state_referenced_locally
   const kind = proposal.kind;
@@ -68,9 +69,7 @@
   const issues = $derived(detail?.kind === 'github.issue.create' ? (detail.payload as IssuesPayload) : null);
   const filing = $derived(drafts.filter((draft) => draft.file).length);
   const summary = $derived(proposalSummary(detail ?? proposal));
-  const parsed = $derived(pr && detail ? parseUnifiedDiff(detail.diff ?? '') : []);
-  const files = $derived(parsed ?? []);
-  const totalLines = $derived(files.reduce((sum, file) => sum + file.lines.length, 0));
+  const stack = $derived(detail?.kind === 'github.stack.create' ? (detail.payload as StackPayload) : null);
   const pending = $derived(detail?.status === 'pending');
 
   onMount(async () => {
@@ -142,7 +141,7 @@
   }
 </script>
 
-<Modal title={kindTitles[kind] ?? `Proposal: ${kind}`} icon={summary.icon} size={pr ? 'giant' : issues ? 'large' : 'medium'} {onClose}>
+<Modal title={kindTitles[kind] ?? `Proposal: ${kind}`} icon={summary.icon} size={pr || stack ? 'giant' : issues ? 'large' : 'medium'} {onClose}>
   <ModalBody>
     <div class="flex flex-col gap-5 pb-4" data-testid="proposal-detail">
       {#if loadError}
@@ -163,6 +162,8 @@
             <span class="text-muted min-w-0 font-mono text-xs break-all">{pr.repo}: {pr.head} → {pr.base}</span>
           {:else if issues}
             <span class="text-muted min-w-0 font-mono text-xs break-all">{issues.repo}</span>
+          {:else if stack}
+            <span class="text-muted min-w-0 font-mono text-xs break-all">{stack.repo}: {stack.pull_requests.length} pull requests → {stack.base}</span>
           {/if}
         </div>
 
@@ -172,6 +173,20 @@
               #{detail.result.number}
               <Icon icon={mdiOpenInNew} aria-hidden />
             </a>
+          </Alert>
+        {:else if detail.status === 'executed' && stack && detail.result?.pull_requests}
+          <Alert color="success" size="small" title="Pull requests opened">
+            <ul class="flex flex-col gap-1">
+              {#each detail.result.pull_requests as opened (opened.number)}
+                <li>
+                  <a href={opened.url} target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-1 underline" data-testid="proposal-result">
+                    #{opened.number}
+                    <Icon icon={mdiOpenInNew} aria-hidden />
+                  </a>
+                </li>
+              {/each}
+            </ul>
+            {#if detail.result.message}<p class="mt-1">{detail.result.message}</p>{/if}
           </Alert>
         {:else if detail.status === 'executed' && grant}
           <Alert color="success" size="small" title="Access granted">
@@ -201,6 +216,8 @@
 
         {#if pr}
           {@render pullRequest(detail, pr)}
+        {:else if stack}
+          {@render stackedPullRequests(detail, stack)}
         {:else if issues}
           {@render issueList()}
         {:else if grant}
@@ -322,6 +339,30 @@
   </div>
 {/snippet}
 
+{#snippet stackedPullRequests(detail: ProposalDetail, stack: StackPayload)}
+  <Text color="muted" size="small">
+    Each pull request merges into the one before it, the first into <span class="font-mono">{stack.base}</span>. Approving
+    opens them all and links them as a stack on GitHub.
+  </Text>
+  {#each stack.pull_requests as layer, index (layer.head)}
+    {@const changes = detail.layers?.[index]}
+    <section class="border-light-200 flex flex-col gap-3 rounded-2xl border p-3" data-testid="stack-layer">
+      <div class="flex flex-col gap-1">
+        <Heading tag="h2" size="tiny">{index + 1}. {layer.title}</Heading>
+        <span class="text-muted font-mono text-xs break-all">{layer.head} → {layer.base}</span>
+      </div>
+      {#if layer.body.trim()}
+        <div class="bg-light-100 rounded-xl p-3 text-sm">
+          <Markdown text={layer.body} />
+        </div>
+      {/if}
+      {#if changes}
+        <PullRequestChanges diff={changes.diff} commits={changes.commits} bind:wrap={wrapLines} />
+      {/if}
+    </section>
+  {/each}
+{/snippet}
+
 {#snippet pullRequest(detail: ProposalDetail, pr: PullRequestPayload)}
   {#if editing}
     <div class="flex flex-col gap-3">
@@ -345,46 +386,5 @@
     </div>
   {/if}
 
-  <section class="flex flex-col gap-2">
-    <Heading tag="h3" size="tiny">Commits ({detail.commits?.length ?? 0})</Heading>
-    <ul class="border-light-200 divide-light-200 divide-y rounded-xl border text-sm">
-      {#each detail.commits ?? [] as commit (commit.sha)}
-        <li class="flex items-start gap-2 px-3 py-2">
-          <Icon icon={mdiSourceCommit} class="text-muted mt-0.5 shrink-0" aria-hidden />
-          <span class="min-w-0 grow break-words">{commit.message.split('\n')[0]}</span>
-          <code class="text-muted shrink-0 font-mono text-xs">{commit.sha.slice(0, 7)}</code>
-        </li>
-      {:else}
-        <li class="text-muted px-3 py-2">No commits.</li>
-      {/each}
-    </ul>
-  </section>
-
-  <section class="flex flex-col gap-2">
-    <div class="flex items-center justify-between gap-3">
-      <Heading tag="h3" size="tiny">
-        Changes
-        {#if parsed}
-          <span class="text-muted font-normal">
-            ({files.length} {files.length === 1 ? 'file' : 'files'},
-            <span class="text-success-600">+{files.reduce((sum, file) => sum + file.additions, 0)}</span>
-            <span class="text-danger-600">−{files.reduce((sum, file) => sum + file.deletions, 0)}</span>)
-          </span>
-        {/if}
-      </Heading>
-      <label class="text-muted flex shrink-0 items-center gap-2 text-xs">
-        <Checkbox bind:checked={wrapLines} aria-label="Wrap lines" size="tiny" />
-        Wrap lines
-      </label>
-    </div>
-    {#if parsed === null}
-      <pre class="bg-light-100 max-h-[60dvh] overflow-auto rounded-lg p-3 font-mono text-xs">{detail.diff}</pre>
-    {:else}
-      {#each files as file, index (index)}
-        <DiffView diff={file} open={totalLines < 1500} wrap={wrapLines} />
-      {:else}
-        <Text color="muted" size="small">Empty diff.</Text>
-      {/each}
-    {/if}
-  </section>
+  <PullRequestChanges diff={detail.diff ?? ''} commits={detail.commits ?? []} bind:wrap={wrapLines} />
 {/snippet}

@@ -245,6 +245,240 @@ impl ProposalKind for PullRequest {
     }
 }
 
+/// Several pull requests that build on each other, opened together and linked as a stack on GitHub.
+pub struct Stack {
+    credentials: Arc<Credentials>,
+}
+
+impl Stack {
+    pub fn new(credentials: Arc<Credentials>) -> Self {
+        Self { credentials }
+    }
+
+    async fn app(&self, session: &SessionContext) -> Result<Arc<GitHubApp>> {
+        self.credentials.github(&session.owner).await.map_err(err)
+    }
+}
+
+fn stack_layers(payload: &Value) -> &[Value] {
+    payload["pull_requests"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+/// Applies edits `{pull_requests: [{title?, body?}]}`, by position, to a stack's pull requests.
+fn edit_stack(payload: &Value, edits: &Value) -> Result<Value> {
+    let mut payload = payload.clone();
+    let Some(edits) = edits.get("pull_requests") else {
+        return Ok(payload);
+    };
+    let edits = edits
+        .as_array()
+        .ok_or_else(|| Error::new("`pull_requests` must be a list"))?;
+    let layers = payload["pull_requests"]
+        .as_array_mut()
+        .ok_or_else(|| Error::new("the stack has no pull requests"))?;
+    if edits.len() > layers.len() {
+        return Err(Error::new("more edits than pull requests in the stack"));
+    }
+    for (layer, edit) in layers.iter_mut().zip(edits) {
+        *layer = edit_pull_request(layer, edit)?;
+    }
+    Ok(payload)
+}
+
+#[async_trait]
+impl ProposalKind for Stack {
+    fn manifest(&self) -> Manifest {
+        Manifest::builtin("github")
+    }
+
+    fn kind(&self) -> String {
+        "github.stack.create".into()
+    }
+
+    fn tool(&self) -> ToolSpec {
+        ToolSpec {
+            name: "propose_stack".into(),
+            description: "Propose a stack of pull requests that build on each other, e.g. branches managed with \
+                          `gh stack`: each one merges into the branch below it, the bottom one into the base. \
+                          Push every branch first; they come from your session branch or branches named after it. \
+                          A human reviews them together; once approved, sloppod opens them and links them as a \
+                          stack on GitHub. Returns the proposal's id; check it with get_proposal."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository as owner/name; needed when the session can push to more than one"},
+                    "base": {"type": "string", "description": "Branch the bottom pull request merges into; defaults to the repository's default branch"},
+                    "pull_requests": {
+                        "type": "array",
+                        "description": "The stack, bottom first; at least two",
+                        "minItems": 2,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "head": {"type": "string", "description": "Branch: the session branch or `<session branch>-<name>`"},
+                                "title": {"type": "string"},
+                                "body": {"type": "string", "description": "Description (Markdown)"},
+                                "draft": {"type": "boolean", "default": false},
+                            },
+                            "required": ["head", "title", "body"],
+                        },
+                    },
+                },
+                "required": ["pull_requests"],
+            }),
+        }
+    }
+
+    fn target(&self, payload: &Value) -> Option<String> {
+        payload["repo"].as_str().map(str::to_owned)
+    }
+
+    fn summary(&self, payload: &Value) -> String {
+        let layers = stack_layers(payload);
+        format!(
+            "stack of {} pull requests on {}, from \"{}\"",
+            layers.len(),
+            payload["repo"].as_str().unwrap_or_default(),
+            layers
+                .first()
+                .and_then(|l| l["title"].as_str())
+                .unwrap_or_default()
+        )
+    }
+
+    async fn prepare(&self, session: &SessionContext, arguments: Value) -> Result<Value> {
+        let RepoGrant { repo, branch } = target_repo(session, arguments["repo"].as_str())?;
+        let requested = stack_layers(&arguments);
+        if requested.len() < 2 {
+            return Err(Error::new(
+                "a stack has at least two pull requests; propose a single one with propose_pull_request",
+            ));
+        }
+        let app = self.app(session).await?;
+        let mut base = match arguments["base"].as_str() {
+            Some(base) => base.to_owned(),
+            None => app.default_branch(repo).await.map_err(err)?,
+        };
+        let bottom = base.clone();
+        let mut layers = Vec::new();
+        for requested in requested {
+            let head = head_branch(branch, requested["head"].as_str())?.to_owned();
+            if head == base || layers.iter().any(|l: &Value| l["head"] == head.as_str()) {
+                return Err(Error::new(format!("`{head}` is in the stack twice")));
+            }
+            let comparison = app.compare(repo, &base, &head).await.map_err(err)?;
+            if comparison.ahead_by == 0 {
+                return Err(Error::new(format!(
+                    "`{head}` has no commits that aren't on `{base}`; commit and push it first"
+                )));
+            }
+            let layer = edit_pull_request(
+                &json!({
+                    "head": head,
+                    "base": base,
+                    "head_sha": comparison.head_sha,
+                    "draft": requested["draft"].as_bool().unwrap_or(false),
+                }),
+                &json!({"title": requested["title"], "body": requested["body"].as_str().unwrap_or_default()}),
+            )?;
+            base = head;
+            layers.push(layer);
+        }
+        Ok(json!({"repo": repo, "base": bottom, "pull_requests": layers}))
+    }
+
+    async fn detail(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
+        let app = self.app(session).await?;
+        let repo = payload["repo"].as_str().unwrap_or_default();
+        let mut layers = Vec::new();
+        for layer in stack_layers(payload) {
+            let comparison = app
+                .compare(
+                    repo,
+                    layer["base"].as_str().unwrap_or_default(),
+                    layer["head_sha"].as_str().unwrap_or_default(),
+                )
+                .await
+                .map_err(err)?;
+            layers.push(json!({
+                "diff": comparison.diff,
+                "commits": comparison.commits.iter().map(|(sha, message)| json!({"sha": sha, "message": message})).collect::<Vec<_>>(),
+            }));
+        }
+        Ok(json!({"layers": layers}))
+    }
+
+    fn edit(&self, payload: &Value, edits: &Value) -> Result<Value> {
+        edit_stack(payload, edits)
+    }
+
+    async fn execute(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
+        let repo = payload["repo"].as_str().unwrap_or_default();
+        let app = self.app(session).await?;
+        let layers = stack_layers(payload);
+        // Nothing is opened unless every branch is still at the commit that was reviewed.
+        for layer in layers {
+            let head = layer["head"].as_str().unwrap_or_default();
+            let reviewed = layer["head_sha"].as_str().unwrap_or_default();
+            let current = app.branch_sha(repo, head).await.map_err(err)?;
+            if current != reviewed {
+                return Err(Error::new(format!(
+                    "`{head}` has moved since it was proposed (from {reviewed:.7} to {current:.7}), so nothing \
+                     was opened; propose the stack again so the new commits get reviewed"
+                )));
+            }
+        }
+        let mut pulls = Vec::new();
+        for layer in layers {
+            let head = layer["head"].as_str().unwrap_or_default();
+            let base = layer["base"].as_str().unwrap_or_default();
+            // A runtime restart can carry out an approved proposal again; reuse what it already opened.
+            let pull = match app.open_pull(repo, head, base).await.map_err(err)? {
+                Some(pull) => pull,
+                None => app
+                    .create_pull(
+                        repo,
+                        &json!({
+                            "title": layer["title"],
+                            "body": layer["body"],
+                            "head": head,
+                            "base": base,
+                            "draft": layer["draft"],
+                        }),
+                    )
+                    .await
+                    .map_err(err)?,
+            };
+            pulls.push(pull);
+        }
+        let numbers: Vec<u64> = pulls.iter().filter_map(|p| p["number"].as_u64()).collect();
+        let urls: Vec<&str> = pulls.iter().filter_map(|p| p["url"].as_str()).collect();
+        // An earlier attempt may have linked them already.
+        let top = numbers.last().copied().unwrap_or_default();
+        let linked = match app.stack_of(repo, top).await {
+            Ok(Some(stack)) => Ok(stack),
+            Ok(None) => app.link_stack(repo, &numbers).await,
+            Err(e) => Err(e),
+        };
+        let message = match &linked {
+            Ok(stack) => format!("Opened {} as stack #{stack}.", urls.join(", ")),
+            Err(e) => format!(
+                "Opened {}, but linking them as a stack failed ({e}); each one still merges into the one below.",
+                urls.join(", ")
+            ),
+        };
+        Ok(json!({
+            "pull_requests": pulls,
+            "stack": linked.ok(),
+            "message": message,
+        }))
+    }
+}
+
 /// Whether a session may push `branch`: its session branch, or one named after it (`<session branch>-<name>`).
 /// Not `<session branch>/<name>`, which git can't have next to the session branch itself.
 pub fn is_session_branch(session_branch: &str, branch: &str) -> bool {
@@ -920,6 +1154,25 @@ mod tests {
             true
         );
         assert!(edit_pull_request(&payload, &json!({"auto_merge": "yes"})).is_err());
+    }
+
+    #[test]
+    fn edits_stacks_by_position() {
+        let payload = json!({"repo": "a/one", "pull_requests": [
+            {"head": "s-1", "title": "One", "body": "1"},
+            {"head": "s-2", "title": "Two", "body": "2"},
+        ]});
+        let edited = edit_stack(
+            &payload,
+            &json!({"pull_requests": [{}, {"title": "Second"}]}),
+        )
+        .unwrap();
+        assert_eq!(edited["pull_requests"][0]["title"], "One");
+        assert_eq!(edited["pull_requests"][1]["title"], "Second");
+        assert_eq!(edited["pull_requests"][1]["body"], "2");
+        assert_eq!(edit_stack(&payload, &json!({})).unwrap(), payload);
+        assert!(edit_stack(&payload, &json!({"pull_requests": [{}, {}, {}]})).is_err());
+        assert!(edit_stack(&payload, &json!({"pull_requests": [{"title": ""}]})).is_err());
     }
 
     #[test]

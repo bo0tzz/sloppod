@@ -442,6 +442,20 @@ async function agentScript(session, turn, prompt) {
     return;
   }
 
+  if (session.data.repo && /propose a stack/i.test(prompt)) {
+    await step(2);
+    const proposeId = randomUUID();
+    tool({ toolCallId: proposeId, title: 'mcp__sloppod__propose_stack', kind: 'other', status: 'pending' });
+    await step(2);
+    const proposal = createStack(session);
+    update(proposeId, {
+      status: 'completed',
+      content: [{ type: 'content', content: { type: 'text', text: `Proposal ${proposal.id} created and waiting for human review.` } }],
+    });
+    await say("I've proposed the change as a stack of two pull requests.");
+    return;
+  }
+
   if (session.data.repo && /file issues/i.test(prompt)) {
     await step(2);
     const proposeId = randomUUID();
@@ -685,8 +699,39 @@ function createIssues(session) {
   return proposal;
 }
 
+function createStack(session) {
+  const branch = session.data.branch;
+  const layer = (file, before, after, message) => ({
+    diff: formatPatch({ ...structuredPatch(`a/${file}`, `b/${file}`, before, after, '', '', { context: 3 }), isGit: true }),
+    commits: [{ sha: sha(), message }],
+  });
+  const proposal = {
+    id: randomUUID(),
+    session_id: session.data.id,
+    kind: 'github.stack.create',
+    status: 'pending',
+    payload: {
+      repo: session.data.repo,
+      base: 'main',
+      pull_requests: [
+        { head: `${branch}-backoff`, base: 'main', head_sha: sha(), title: 'Back off when reconnecting', body: 'The backoff itself.', draft: false },
+        { head: `${branch}-ui`, base: `${branch}-backoff`, head_sha: sha(), title: 'Show the reconnect countdown', body: 'Uses the backoff.', draft: false },
+      ],
+    },
+    created_at: now(),
+    layers: [
+      layer(FILE, 'const DELAY = 1000;\n', 'const MAX_BACKOFF_MS = 10_000;\n', 'Back off exponentially'),
+      layer('ui/src/lib/components/Reconnecting.svelte', '<p>Reconnecting…</p>\n', '<p>Reconnecting in {seconds} s…</p>\n', 'Show the countdown'),
+    ],
+  };
+  proposals.set(proposal.id, proposal);
+  broadcastProposal(proposal);
+  applyStandingApproval(proposal);
+  return proposal;
+}
+
 function publicProposal(proposal) {
-  const { diff: _diff, commits: _commits, ...rest } = proposal;
+  const { diff: _diff, commits: _commits, layers: _layers, ...rest } = proposal;
   return rest;
 }
 
@@ -1079,6 +1124,15 @@ function approve(proposal, body, decidedBy) {
     proposal.result = { url: `https://github.com/${proposal.payload.repo}/pull/${number}`, number };
     notice = `Your pull request was approved and opened: ${proposal.result.url}`;
     ack = 'Great, the pull request is open.';
+  } else if (proposal.kind === 'github.stack.create') {
+    const opened = proposal.payload.pull_requests.map((_, index) => {
+      const number = 300 + proposals.size * 10 + index;
+      return { url: `https://github.com/${proposal.payload.repo}/pull/${number}`, number };
+    });
+    proposal.status = 'executed';
+    proposal.result = { pull_requests: opened, stack: 7, message: `Opened ${opened.map((p) => p.url).join(', ')} as stack #7.` };
+    notice = `Your stack was approved. ${proposal.result.message}`;
+    ack = 'Great, the stack is open.';
   } else if (proposal.kind === 'github.issue.create') {
     if (Array.isArray(body.issues)) proposal.payload.issues = body.issues;
     const filed = proposal.payload.issues.map((issue, index) => {
