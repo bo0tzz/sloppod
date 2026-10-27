@@ -27,7 +27,7 @@
     type RepoGrantPayload,
     type StackPayload,
   } from '#lib/api.ts';
-  import { parseUnifiedDiff } from '#lib/diff.ts';
+  import { diffStats, parseUnifiedDiff } from '#lib/diff.ts';
   import { absoluteTime } from '#lib/format.ts';
   import { proposalKinds, proposalStatus, proposalSummary } from '#lib/presentation.ts';
   import Markdown from './Markdown.svelte';
@@ -97,13 +97,7 @@
     }
   }
 
-  function diffCounts(diff: string) {
-    const files = parseUnifiedDiff(diff) ?? [];
-    return {
-      additions: files.reduce((sum, file) => sum + file.additions, 0),
-      deletions: files.reduce((sum, file) => sum + file.deletions, 0),
-    };
-  }
+  const diffCounts = (diff: string) => diffStats(parseUnifiedDiff(diff) ?? []);
 
   function resetDrafts() {
     if (detail?.kind !== 'github.issue.create') return;
