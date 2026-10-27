@@ -78,6 +78,14 @@
     }
   }
 
+  // Esc stops the turn like the Stop button, unless an open dialog, menu or list is the one it should close.
+  function onWindowKeydown(event: KeyboardEvent) {
+    if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing || !working) return;
+    if (document.querySelector('[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]')) return;
+    event.preventDefault();
+    view.cancel();
+  }
+
   async function setModel(value: string) {
     if (model?.type !== 'select' || value === model.currentValue) return;
     try {
@@ -87,6 +95,8 @@
     }
   }
 </script>
+
+<svelte:window onkeydown={onWindowKeydown} />
 
 {#if view.queue.length > 0}
   <div class="border-light-200 shrink-0 border-t px-3 pt-2" data-testid="queued-messages">
@@ -137,7 +147,15 @@
   {/snippet}
   {#snippet trailing()}
     {#if working}
-      <Button size="small" shape="round" color="danger" variant="outline" leadingIcon={mdiStop} onclick={() => view.cancel()}>
+      <Button
+        size="small"
+        shape="round"
+        color="danger"
+        variant="outline"
+        leadingIcon={mdiStop}
+        title="Stop (Esc)"
+        onclick={() => view.cancel()}
+      >
         Stop
       </Button>
     {/if}
