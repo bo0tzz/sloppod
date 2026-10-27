@@ -133,7 +133,7 @@ fn tools(state: &AppState, kind: &str) -> Vec<Value> {
             "type": "object",
             "properties": {
                 "id": {"type": "string"},
-                "update": {"type": "object", "description": "Fields of the proposal to replace, as you gave them when proposing, e.g. {\"title\", \"body\"} when they no longer describe the change; a stack's pull_requests are given whole"},
+                "update": {"type": "object", "description": "A new title or description when they no longer describe the change: {title?, body?} for a pull request, {pull_requests: [{title?, body?}]} by position for a stack. What's proposed (repository, branches) can't change; withdraw and propose again for that"},
                 "replies": {"type": "string", "description": "Your replies to findings you think don't apply, or that you addressed differently"},
             },
             "required": ["id"],

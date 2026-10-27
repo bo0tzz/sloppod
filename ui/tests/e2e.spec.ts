@@ -262,6 +262,7 @@ test('shows the review a proposal went through on request', async ({ page }) => 
   await expect(rounds.first()).toContainText('Changes requested');
   await expect(rounds.first().getByTestId('review-finding')).toHaveCount(2);
   await expect(rounds.first()).toContainText('ui/src/lib/acp/connection.ts:12');
+  await expect(rounds.first().getByTestId('review-finding').first()).toContainText(/^1\.1\s*p1/);
   await expect(rounds.first()).toContainText('The backoff never resets');
   await expect(rounds.first()).toContainText('Fix: Reset the attempt counter');
   await expect(rounds.last()).toContainText('Resolved since the last round: 1.1, 1.2');

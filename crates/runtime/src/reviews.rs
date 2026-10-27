@@ -283,21 +283,6 @@ fn check_findings(findings: &Value, round: i32, open: &[&str]) -> Result<Vec<Val
     Ok(checked)
 }
 
-/// A proposal's payload with the author's `update`, fields as the proposing tool takes them, laid over it.
-fn updated(payload: &Value, update: &Value) -> Result<Value, String> {
-    let mut payload = payload.clone();
-    match update {
-        Value::Null => {}
-        Value::Object(fields) => {
-            for (key, value) in fields {
-                payload[key] = value.clone();
-            }
-        }
-        _ => return Err("`update` is an object of the proposal's fields".into()),
-    }
-    Ok(payload)
-}
-
 /// The ids of a round's findings.
 fn finding_ids(findings: &Value) -> Vec<&str> {
     findings
@@ -485,11 +470,12 @@ pub async fn request(state: &AppState, session: Uuid, arguments: &Value) -> Resu
         .await
         .map_err(|e| e.to_string())?
         .ok_or("unknown session")?;
+    // Only what a human could edit when approving, so the update can't change what's being reviewed.
+    let edited = kind
+        .edit(&proposal.payload, &arguments["update"])
+        .map_err(|e| format!("`update`: {}", e.0))?;
     let payload = kind
-        .prepare(
-            &author.context(),
-            updated(&proposal.payload, &arguments["update"])?,
-        )
+        .prepare(&author.context(), edited)
         .await
         .map_err(|e| e.0)?;
     let subject = kind
@@ -576,18 +562,6 @@ mod tests {
         assert!(check_findings(&json!([finding(json!({"title": " "}))]), 1, &[]).is_err());
         assert!(check_findings(&json!([finding(json!({"prior": "9.9"}))]), 2, &["1.1"]).is_err());
         assert!(check_findings(&json!({"title": "x"}), 1, &[]).is_err());
-    }
-
-    #[test]
-    fn updates_lay_fields_over_the_payload() {
-        let payload = json!({"title": "Old", "body": "Old body", "head": "s"});
-        let new = updated(&payload, &json!({"title": "New"})).unwrap();
-        assert_eq!(
-            new,
-            json!({"title": "New", "body": "Old body", "head": "s"})
-        );
-        assert_eq!(updated(&payload, &Value::Null).unwrap(), payload);
-        assert!(updated(&payload, &json!("New")).is_err());
     }
 
     #[test]

@@ -64,6 +64,7 @@
               {#each review.findings as finding, index (index)}
                 <li class="bg-light-100 flex flex-col gap-1 rounded-lg p-2 text-sm" data-testid="review-finding">
                   <div class="flex flex-wrap items-center gap-2">
+                    <span class="text-muted font-mono text-xs">{finding.id}</span>
                     <Badge color={severityColors[finding.severity]} shape="round" size="tiny">{finding.severity}</Badge>
                     <span class="text-muted text-xs">{finding.category}</span>
                     <span class="font-medium">{finding.title}</span>
