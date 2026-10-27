@@ -65,6 +65,8 @@ pub mod api {
         pub grants: Vec<Grant>,
         pub phase: Phase,
         pub agent: String,
+        /// `work`, or `review` for a session that reviews a proposal.
+        pub kind: String,
         pub created_at: String,
         pub updated_at: String,
         /// When something last happened in the session; the session list is ordered by it.
@@ -120,6 +122,30 @@ pub mod api {
         /// The user who decided, or `standing-approval:<id>`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub decided_by: Option<String>,
+        /// The session reviewing it, or that did (ADR 24).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub review_session_id: Option<Uuid>,
+    }
+
+    /// One round of a proposal's review by another model (ADR 24).
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct Review {
+        pub round: i32,
+        /// The commit reviewed.
+        pub head_sha: String,
+        /// The author's replies to the previous round's findings.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub replies: Option<String>,
+        /// `pass` or `changes`; absent while the round runs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub verdict: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub summary: Option<String>,
+        /// `{path?, line?, severity?, comment}`
+        pub findings: Value,
+        pub created_at: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub finished_at: Option<String>,
     }
 
     /// A pre-approved proposal pattern (ADR 3).

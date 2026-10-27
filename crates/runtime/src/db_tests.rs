@@ -8,6 +8,10 @@ use uuid::Uuid;
 use crate::db::{self, NewSessionRow};
 
 async fn session(db: &PgPool, owner: &str) -> Uuid {
+    session_of_kind(db, owner, "work").await
+}
+
+async fn session_of_kind(db: &PgPool, owner: &str, kind: &str) -> Uuid {
     let id = Uuid::now_v7();
     db::insert_session(
         db,
@@ -18,6 +22,7 @@ async fn session(db: &PgPool, owner: &str) -> Uuid {
             custom_title: false,
             pending_prompt: "",
             agent: "claude-code",
+            kind,
             model: None,
             repo: None,
             grants: &[],
@@ -112,7 +117,7 @@ async fn only_approved_proposals_are_resumed(db: PgPool) {
     let mut ids = Vec::new();
     for _ in 0..4 {
         ids.push(
-            db::insert_proposal(&db, s, "github.issue.create", &json!({}))
+            db::insert_proposal(&db, s, "github.issue.create", "pending", &json!({}))
                 .await
                 .unwrap()
                 .id,
@@ -141,4 +146,94 @@ async fn only_approved_proposals_are_resumed(db: PgPool) {
         .map(|p| p.id)
         .collect();
     assert_eq!(resumed, &ids[1..3]);
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn review_rounds_track_a_proposal(db: PgPool) {
+    let author = session(&db, "dev").await;
+    let reviewer = session_of_kind(&db, "dev", "review").await;
+    let listed: Vec<Uuid> = db::list_sessions(&db, "dev")
+        .await
+        .unwrap()
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(listed, [author]);
+
+    let p = db::insert_proposal(
+        &db,
+        author,
+        "github.pr.create",
+        "in_review",
+        &json!({"n": 1}),
+    )
+    .await
+    .unwrap()
+    .id;
+    db::set_review_session(&db, p, reviewer).await.unwrap();
+    assert_eq!(
+        db::reviewed_proposal(&db, reviewer)
+            .await
+            .unwrap()
+            .map(|p| p.id),
+        Some(p)
+    );
+    assert_eq!(
+        db::start_review_round(&db, p, "aaa", None).await.unwrap(),
+        1
+    );
+    assert!(
+        db::finish_review_round(&db, p, "changes", "Fix it.", &json!([{"comment": "x"}]))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        db::finish_review_round(&db, p, "pass", "Again.", &json!([]))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let moved = db::move_proposal(&db, p, "in_review", "changes_requested", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(moved.payload, json!({"n": 1}));
+    assert!(
+        db::move_proposal(&db, p, "in_review", "pending", None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let moved = db::move_proposal(
+        &db,
+        p,
+        "changes_requested",
+        "in_review",
+        Some(&json!({"n": 2})),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(moved.payload, json!({"n": 2}));
+    assert_eq!(
+        db::start_review_round(&db, p, "bbb", Some("No."))
+            .await
+            .unwrap(),
+        2
+    );
+    let rounds = db::reviews(&db, p).await.unwrap();
+    assert_eq!(rounds.len(), 2);
+    assert_eq!(rounds[0].verdict.as_deref(), Some("changes"));
+    assert_eq!(rounds[1].replies.as_deref(), Some("No."));
+    assert_eq!(rounds[1].verdict, None);
+
+    // Proposals in review can be withdrawn like pending ones.
+    assert!(
+        db::withdraw_proposal(&db, p, author, None)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }

@@ -59,6 +59,8 @@ export const planStatuses: Record<PlanEntry['status'], { icon: string; class: st
 };
 
 export const proposalStatuses: Record<ProposalStatus, { label: string; color: Color }> = {
+  in_review: { label: 'In review', color: 'info' },
+  changes_requested: { label: 'Changes requested', color: 'secondary' },
   pending: { label: 'Pending review', color: 'warning' },
   approved: { label: 'Approved', color: 'info' },
   rejected: { label: 'Rejected', color: 'secondary' },

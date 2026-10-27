@@ -293,7 +293,12 @@ async fn launch_for(
         repo: session
             .repo
             .as_deref()
-            .and_then(|repo| context.session.writable_repo_for(repo))
+            .and_then(|repo| {
+                context
+                    .session
+                    .writable_repo_for(repo)
+                    .or_else(|| context.session.readable_repo_for(repo))
+            })
             .map(|grant| Repo {
                 clone_url: format!("https://github.com/{}.git", grant.repo),
                 branch: grant.branch.to_owned(),

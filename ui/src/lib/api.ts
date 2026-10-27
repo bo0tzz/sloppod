@@ -8,6 +8,8 @@ export type Session = {
   grants: Grant[];
   phase: Phase;
   agent: string;
+  /** 'work', or 'review' for a session that reviews a proposal. */
+  kind: string;
   created_at: string;
   updated_at: string;
   /** When something last happened in the session; the session list is ordered by it. */
@@ -23,7 +25,15 @@ export type NewSession = {
 
 export type Grant = { capability: string; params: Record<string, unknown>; description?: string };
 
-export type ProposalStatus = 'pending' | 'approved' | 'rejected' | 'executed' | 'failed' | 'withdrawn';
+export type ProposalStatus =
+  | 'in_review'
+  | 'changes_requested'
+  | 'pending'
+  | 'approved'
+  | 'rejected'
+  | 'executed'
+  | 'failed'
+  | 'withdrawn';
 
 export type PullRequestPayload = {
   repo: string;
@@ -189,8 +199,17 @@ export function newerSession(current: Session | null | undefined, incoming: Sess
   return incoming;
 }
 
-/** How far along a proposal is; it only ever moves forward. */
-const proposalStage: Record<ProposalStatus, number> = { pending: 0, approved: 1, rejected: 2, executed: 2, failed: 2, withdrawn: 2 };
+/** How far along a proposal is; it only ever moves forward, apart from going back and forth between review rounds. */
+const proposalStage: Record<ProposalStatus, number> = {
+  in_review: 0,
+  changes_requested: 0,
+  pending: 1,
+  approved: 2,
+  rejected: 3,
+  executed: 3,
+  failed: 3,
+  withdrawn: 3,
+};
 
 /** Keeps whichever copy of a proposal is further along, so a stale copy (e.g. a slow refetch) can't undo a decision. */
 export function newerProposal(current: Proposal | undefined, incoming: Proposal): Proposal {
