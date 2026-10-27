@@ -1,6 +1,6 @@
 //! What each grant lets a session do, in the words both its owner and its agent see.
 
-use sloppod_contracts::Grant;
+use sloppod_contracts::{Grant, READ_WRITE};
 
 pub fn describe(grant: &Grant) -> String {
     match grant.capability.as_str() {
@@ -19,7 +19,7 @@ pub fn describe(grant: &Grant) -> String {
         "repo" => {
             let repo = grant.param("repo").unwrap_or("?");
             match (grant.param("access"), grant.param("branch")) {
-                (Some("rw"), Some(branch)) => format!(
+                (Some(READ_WRITE), Some(branch)) => format!(
                     "{repo}: read, and push the session branch `{branch}` and branches named after it."
                 ),
                 _ => format!("{repo}: read only."),

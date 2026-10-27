@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use serde::Deserialize;
 use serde_json::json;
-use sloppod_contracts::Grant;
+use sloppod_contracts::{Grant, READ_WRITE};
 use sloppod_protocol::api::{
     Decision, NewCredential, NewSession, NewStandingApproval, Phase, ProposalStatus, ReviewPolicy,
     SessionKind,
@@ -369,7 +369,7 @@ async fn create_session(
         let branch = proposals::session_branch(id);
         grants.push(Grant::new(
             "repo",
-            json!({"repo": repo, "access": "rw", "branch": branch}),
+            json!({"repo": repo, "access": READ_WRITE, "branch": branch}),
         ));
     }
     let model = db::user_model(&state.db, &user).await?;
