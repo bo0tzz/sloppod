@@ -53,6 +53,9 @@
   let busy = $state<'approve' | 'reject' | null>(null);
 
   let editing = $state(false);
+  // Off by default would hide most of a docs change, whose paragraphs are single long lines.
+  let wrapLines = $state(localStorage.getItem('sloppod.diff.wrap') !== 'false');
+  $effect(() => localStorage.setItem('sloppod.diff.wrap', String(wrapLines)));
   let title = $state('');
   let body = $state('');
   let rejecting = $state(false);
@@ -357,21 +360,27 @@
   </section>
 
   <section class="flex flex-col gap-2">
-    <Heading tag="h3" size="tiny">
-      Changes
-      {#if parsed}
-        <span class="text-muted font-normal">
-          ({files.length} {files.length === 1 ? 'file' : 'files'},
-          <span class="text-success-600">+{files.reduce((sum, file) => sum + file.additions, 0)}</span>
-          <span class="text-danger-600">−{files.reduce((sum, file) => sum + file.deletions, 0)}</span>)
-        </span>
-      {/if}
-    </Heading>
+    <div class="flex items-center justify-between gap-3">
+      <Heading tag="h3" size="tiny">
+        Changes
+        {#if parsed}
+          <span class="text-muted font-normal">
+            ({files.length} {files.length === 1 ? 'file' : 'files'},
+            <span class="text-success-600">+{files.reduce((sum, file) => sum + file.additions, 0)}</span>
+            <span class="text-danger-600">−{files.reduce((sum, file) => sum + file.deletions, 0)}</span>)
+          </span>
+        {/if}
+      </Heading>
+      <label class="text-muted flex shrink-0 items-center gap-2 text-xs">
+        <Checkbox bind:checked={wrapLines} aria-label="Wrap lines" size="tiny" />
+        Wrap lines
+      </label>
+    </div>
     {#if parsed === null}
       <pre class="bg-light-100 max-h-[60dvh] overflow-auto rounded-lg p-3 font-mono text-xs">{detail.diff}</pre>
     {:else}
       {#each files as file, index (index)}
-        <DiffView diff={file} open={totalLines < 1500} />
+        <DiffView diff={file} open={totalLines < 1500} wrap={wrapLines} />
       {:else}
         <Text color="muted" size="small">Empty diff.</Text>
       {/each}
