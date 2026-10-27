@@ -119,6 +119,9 @@ impl AgentAdapter for ClaudeCode {
             content: serde_json::to_string_pretty(&json!({
                 "autoMemoryEnabled": false,
                 "attribution": {"pr": ""},
+                // The authorizer only lets pushes through to the session's own branches, so force pushes there
+                // are the agent's call; without this, auto mode blocks them as destructive.
+                "permissions": {"allow": ["Bash(git push:*)"]},
             }))
             .unwrap_or_default(),
             overwrite: true,
