@@ -175,6 +175,21 @@ export const credentialKinds: CredentialKindSpec[] = [
     ],
     secret: { label: 'Admin key' },
   },
+  {
+    kind: 'chatgpt',
+    title: 'ChatGPT logins',
+    noun: 'ChatGPT login',
+    description: 'Codex, for reviewing proposals before they reach you.',
+    empty: 'No ChatGPT login yet.',
+    fields: [],
+    secret: {
+      label: 'auth.json',
+      description:
+        "Run `codex login` with a fresh `CODEX_HOME` (e.g. `CODEX_HOME=$(mktemp -d) codex login`) and paste that directory's auth.json. Use a login only sloppod has: it refreshes the tokens, and another copy would invalidate them.",
+      multiline: true,
+      placeholder: 'Paste auth.json here',
+    },
+  },
 ];
 
 /** What a grant lets a session do, in plain words. */
@@ -183,6 +198,8 @@ export function grantLabel(grant: Grant): string {
   switch (grant.capability) {
     case 'model':
       return 'the model API';
+    case 'codex':
+      return 'Codex';
     case 'github':
       return 'read GitHub';
     case 'packages':

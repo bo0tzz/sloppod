@@ -39,7 +39,7 @@ use crate::config::Config;
 use crate::credentials::Credentials;
 use crate::enforcer::Cilium;
 use crate::pods::PodIndex;
-use crate::policies::{GitHubPolicy, MeminiPolicy, ModelPolicy, Policies};
+use crate::policies::{CodexPolicy, GitHubPolicy, MeminiPolicy, ModelPolicy, Policies};
 use crate::proposals::ProposalKinds;
 use crate::session::Hub;
 
@@ -124,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut policies = Policies::default();
     policies.register(Arc::new(ModelPolicy::new(credentials.clone())));
+    policies.register(Arc::new(CodexPolicy::new(credentials.clone())));
     policies.register(Arc::new(GitHubPolicy::new(credentials.clone())));
 
     let mut proposals = ProposalKinds::default();

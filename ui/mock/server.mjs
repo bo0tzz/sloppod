@@ -1123,7 +1123,7 @@ function handleStandingApprovals(req, res, parts) {
   return json(res, 404, { error: 'not found' });
 }
 
-const CREDENTIAL_CONFIG = { claude: [], 'github-app': ['app_id'], memini: ['url'] };
+const CREDENTIAL_CONFIG = { claude: [], 'github-app': ['app_id'], memini: ['url'], chatgpt: [] };
 
 function addCredential({ kind, name, config }) {
   const credential = {
