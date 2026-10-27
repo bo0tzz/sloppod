@@ -3,6 +3,7 @@
     Alert,
     Badge,
     Button,
+    Checkbox,
     Field,
     Heading,
     Icon,
@@ -45,6 +46,7 @@
   let title = $state('');
   let body = $state('');
   let rejecting = $state(false);
+  let autoMerge = $state(false);
   let reason = $state('');
 
   const pr = $derived(detail?.kind === 'github.pr.create' ? (detail.payload as PullRequestPayload) : null);
@@ -58,6 +60,7 @@
   onMount(async () => {
     try {
       detail = await api.getProposal(proposal.id);
+      autoMerge = detail.kind === 'github.pr.create' && (detail.payload as PullRequestPayload).auto_merge === true;
     } catch (error) {
       loadError = error instanceof Error ? error.message : String(error);
     }
@@ -72,9 +75,10 @@
     if (!detail) return;
     busy = 'approve';
     actionError = null;
-    const edits: { title?: string; body?: string } = {};
+    const edits: { title?: string; body?: string; auto_merge?: boolean } = {};
     if (editing && pr && title !== pr.title) edits.title = title;
     if (editing && pr && body !== pr.body) edits.body = body;
+    if (pr && autoMerge !== (pr.auto_merge === true)) edits.auto_merge = autoMerge;
     try {
       applyResult(await api.approveProposal(detail.id, edits));
       editing = false;
@@ -120,6 +124,9 @@
           <Badge color={status.color} shape="round" size="small" data-testid="proposal-status">{status.label}</Badge>
           {#if pr?.draft}
             <Badge color="secondary" shape="round" size="small">Draft</Badge>
+          {/if}
+          {#if pr?.auto_merge}
+            <Badge color="info" shape="round" size="small" data-testid="proposal-auto-merge">Merges when checks pass</Badge>
           {/if}
           {#if pr}
             <span class="text-muted min-w-0 font-mono text-xs break-all">{pr.repo}: {pr.head} → {pr.base}</span>
@@ -193,7 +200,13 @@
           <Button color="danger" shape="round" loading={busy === 'reject'} onclick={reject}>Reject</Button>
         </div>
       {:else}
-        <div class="flex flex-wrap justify-end gap-2">
+        <div class="flex flex-wrap items-center justify-end gap-2">
+          {#if pr}
+            <label class="text-muted mr-auto flex items-center gap-2 text-sm">
+              <Checkbox bind:checked={autoMerge} aria-label="Merge when checks pass" />
+              Merge when checks pass
+            </label>
+          {/if}
           <Button color="danger" variant="outline" shape="round" disabled={busy !== null} onclick={() => (rejecting = true)}>
             Reject…
           </Button>

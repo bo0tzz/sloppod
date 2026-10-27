@@ -22,7 +22,16 @@ export type Grant = { capability: string; params: Record<string, unknown> };
 
 export type ProposalStatus = 'pending' | 'approved' | 'rejected' | 'executed' | 'failed';
 
-export type PullRequestPayload = { repo: string; base: string; head: string; title: string; body: string; draft: boolean };
+export type PullRequestPayload = {
+  repo: string;
+  base: string;
+  head: string;
+  title: string;
+  body: string;
+  draft: boolean;
+  /** Merge once required checks pass; the agent asks, the reviewer decides. */
+  auto_merge?: boolean;
+};
 export type RepoGrantPayload = { repo: string; reason: string; branch: string };
 
 export type Proposal = {
@@ -124,7 +133,7 @@ export const api = {
     return call<Proposal[]>('GET', `/proposals?${params}`);
   },
   getProposal: (id: string) => call<ProposalDetail>('GET', `/proposals/${encodeURIComponent(id)}`),
-  approveProposal: (id: string, edits: { title?: string; body?: string } = {}) =>
+  approveProposal: (id: string, edits: { title?: string; body?: string; auto_merge?: boolean } = {}) =>
     call<Proposal>('POST', `/proposals/${encodeURIComponent(id)}/approve`, edits),
   rejectProposal: (id: string, reason?: string) =>
     call<Proposal>('POST', `/proposals/${encodeURIComponent(id)}/reject`, reason ? { reason } : {}),

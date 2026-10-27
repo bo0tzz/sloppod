@@ -526,6 +526,7 @@ async fn approve(
     let verdict = Verdict::Approve {
         title: decision.title,
         body: decision.body,
+        auto_merge: decision.auto_merge,
     };
     match proposals::decide(&state, id, verdict, &user).await {
         Ok(Some(proposal)) => Ok(Json(proposal)),

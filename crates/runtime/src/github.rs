@@ -294,6 +294,44 @@ impl GitHubApp {
                 body["message"].as_str().unwrap_or("no message")
             );
         }
-        Ok(json!({"url": body["html_url"], "number": body["number"]}))
+        Ok(json!({"url": body["html_url"], "number": body["number"], "node_id": body["node_id"]}))
+    }
+
+    /// Has GitHub merge a pull request once its required checks pass, with a merge method the repository allows.
+    pub async fn enable_auto_merge(&self, repo: &str, pull_node_id: &str) -> anyhow::Result<()> {
+        let info: Value = self
+            .repo_get(repo, "", "application/vnd.github+json")
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let method = [
+            ("allow_squash_merge", "SQUASH"),
+            ("allow_merge_commit", "MERGE"),
+            ("allow_rebase_merge", "REBASE"),
+        ]
+        .into_iter()
+        .find(|(setting, _)| info[*setting].as_bool() == Some(true))
+        .map(|(_, method)| method)
+        .context("the repository allows no merge method")?;
+        let token = self.token_for(repo).await?;
+        let response: Value = self
+            .http
+            .post(format!("{API}/graphql"))
+            .bearer_auth(token)
+            .json(&json!({
+                "query": "mutation($id: ID!, $method: PullRequestMergeMethod!) { \
+                          enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: $method}) { clientMutationId } }",
+                "variables": {"id": pull_node_id, "method": method},
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if let Some(error) = response["errors"].as_array().and_then(|e| e.first()) {
+            bail!("{}", error["message"].as_str().unwrap_or("unknown error"));
+        }
+        Ok(())
     }
 }

@@ -142,6 +142,9 @@ test('approves a proposal with an edited title', async ({ page }) => {
   await expect(detail.getByTestId('diff')).toHaveCount(2);
   await expect(detail.getByTestId('diff').first()).toContainText('MAX_BACKOFF_MS');
 
+  // The agent asked for auto-merge; the reviewer turns it off.
+  await expect(detail.getByTestId('proposal-auto-merge')).toBeVisible();
+  await page.getByRole('checkbox', { name: 'Merge when checks pass' }).click();
   await page.getByRole('button', { name: 'Edit' }).click();
   await page.getByRole('textbox', { name: 'Title' }).fill('Back off when reconnecting the ACP socket');
   await page.getByRole('button', { name: 'Approve with edits' }).click();
@@ -149,6 +152,7 @@ test('approves a proposal with an edited title', async ({ page }) => {
   await expect(detail.getByTestId('proposal-status')).toHaveText('Opened');
   await expect(detail.getByTestId('proposal-result')).toHaveAttribute('href', /github\.com\/bo0tzz\/sloppod\/pull\/\d+/);
   await expect(detail.getByTestId('proposal-title')).toHaveText('Back off when reconnecting the ACP socket');
+  await expect(detail.getByTestId('proposal-auto-merge')).toBeHidden();
 
   await page.getByRole('button', { name: 'Close' }).click();
   await expect(page.getByTestId('proposal-card')).toBeHidden();

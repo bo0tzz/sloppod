@@ -117,6 +117,7 @@ impl ProposalKind for PullRequest {
                     "base": {"type": "string", "description": "Branch to merge into; defaults to the repository's default branch"},
                     "head": {"type": "string", "description": "Branch to open it from: the session branch (the default) or `<session branch>-<name>`"},
                     "draft": {"type": "boolean", "description": "Open as a draft", "default": false},
+                    "auto_merge": {"type": "boolean", "description": "Ask for the PR to merge by itself once its required checks pass; the reviewer decides", "default": false},
                 },
                 "required": ["title", "body"],
             }),
@@ -156,6 +157,7 @@ impl ProposalKind for PullRequest {
             "title": title,
             "body": arguments["body"].as_str().unwrap_or_default(),
             "draft": arguments["draft"].as_bool().unwrap_or(false),
+            "auto_merge": arguments["auto_merge"].as_bool().unwrap_or(false),
         }))
     }
 
@@ -182,11 +184,30 @@ impl ProposalKind for PullRequest {
             "base": payload["base"],
             "draft": payload["draft"],
         });
-        self.app(session)
-            .await?
-            .create_pull(payload["repo"].as_str().unwrap_or_default(), &request)
+        let repo = payload["repo"].as_str().unwrap_or_default();
+        let app = self.app(session).await?;
+        let mut result = app.create_pull(repo, &request).await.map_err(err)?;
+        if payload["auto_merge"].as_bool() != Some(true) {
+            return Ok(result);
+        }
+        let url = result["url"].as_str().unwrap_or_default().to_owned();
+        let message = match app
+            .enable_auto_merge(repo, result["node_id"].as_str().unwrap_or_default())
             .await
-            .map_err(err)
+        {
+            Ok(()) => {
+                result["auto_merge"] = json!(true);
+                format!("{url} is open and merges once its required checks pass.")
+            }
+            Err(e) => {
+                result["auto_merge"] = json!(false);
+                format!(
+                    "{url} is open; auto-merge couldn't be turned on ({e}), so it needs merging by hand."
+                )
+            }
+        };
+        result["message"] = json!(message);
+        Ok(result)
     }
 }
 
@@ -363,6 +384,7 @@ pub enum Verdict {
     Approve {
         title: Option<String>,
         body: Option<String>,
+        auto_merge: Option<bool>,
     },
     Reject {
         reason: Option<String>,
@@ -395,12 +417,19 @@ pub async fn decide(
     };
     let mut payload = row.payload.clone();
     let (status, reason) = match verdict {
-        Verdict::Approve { title, body } => {
+        Verdict::Approve {
+            title,
+            body,
+            auto_merge,
+        } => {
             if let Some(title) = title {
                 payload["title"] = json!(title);
             }
             if let Some(body) = body {
                 payload["body"] = json!(body);
+            }
+            if let Some(auto_merge) = auto_merge {
+                payload["auto_merge"] = json!(auto_merge);
             }
             ("approved", None)
         }
