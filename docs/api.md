@@ -128,8 +128,8 @@ When a proposal is decided or carried out, the runtime tells the agent: the noti
 GET  /api/v1/proposals?session={id}&status={status}  -> Proposal[]   400 for a status that isn't one
 GET  /api/v1/proposals/{id}                          -> ProposalDetail
 GET  /api/v1/proposals/{id}/reviews                  -> Review[]   its review rounds, first to last
-POST /api/v1/proposals/{id}/approve                  -> Proposal   body: {} or edits, per kind (below)
-POST /api/v1/proposals/{id}/reject                   -> Proposal   body: {reason?: string}
+POST /api/v1/proposals/{id}/approve                  -> Proposal   body: {} or edits, per kind (below); 400 for edits that don't apply, 409 once decided
+POST /api/v1/proposals/{id}/reject                   -> Proposal   body: {reason?: string}; 409 once decided
 ```
 
 ```ts

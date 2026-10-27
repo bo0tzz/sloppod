@@ -16,7 +16,7 @@ use sloppod_protocol::api::{
 use uuid::Uuid;
 
 use crate::credentials::CHATGPT;
-use crate::proposals::{self, Verdict};
+use crate::proposals::{self, DecideError, Verdict};
 use crate::session::ParkError;
 use crate::users::User;
 use crate::{AppState, db, lifecycle, reviews};
@@ -64,6 +64,15 @@ impl<E: std::fmt::Display> From<E> for ApiError {
     fn from(e: E) -> Self {
         tracing::error!(error = %e, "API error");
         ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    }
+}
+
+/// Edits that don't apply are the request's fault, a decided proposal is a conflict, and the rest is ours.
+fn decide_error(e: DecideError) -> ApiError {
+    match e {
+        DecideError::Invalid(message) => bad_request(message),
+        DecideError::Decided => ApiError(StatusCode::CONFLICT, e.to_string()),
+        DecideError::Failed(e) => e.into(),
     }
 }
 
@@ -716,7 +725,7 @@ async fn approve(
     match proposals::decide(&state, id, verdict, &user, &user).await {
         Ok(Some(proposal)) => Ok(Json(proposal)),
         Ok(None) => Err(not_found()),
-        Err(e) => Err(ApiError(StatusCode::CONFLICT, e.to_string())),
+        Err(e) => Err(decide_error(e)),
     }
 }
 
@@ -740,7 +749,7 @@ async fn reject(
     {
         Ok(Some(proposal)) => Ok(Json(proposal)),
         Ok(None) => Err(not_found()),
-        Err(e) => Err(ApiError(StatusCode::CONFLICT, e.to_string())),
+        Err(e) => Err(decide_error(e)),
     }
 }
 
@@ -754,6 +763,19 @@ mod tests {
         assert_eq!(park_error(ParkError::Stopped).0, StatusCode::CONFLICT);
         assert_eq!(
             park_error(ParkError::Failed(anyhow::anyhow!("no"))).0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn decisions_fail_by_whose_fault_it_is() {
+        assert_eq!(
+            decide_error(DecideError::Invalid("bad edit".into())).0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(decide_error(DecideError::Decided).0, StatusCode::CONFLICT);
+        assert_eq!(
+            decide_error(DecideError::Failed(anyhow::anyhow!("db down"))).0,
             StatusCode::INTERNAL_SERVER_ERROR
         );
     }

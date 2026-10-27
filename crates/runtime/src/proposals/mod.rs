@@ -205,6 +205,24 @@ pub enum Verdict {
     Reject { reason: Option<String> },
 }
 
+/// Why a decision wasn't recorded.
+#[derive(Debug, thiserror::Error)]
+pub enum DecideError {
+    /// The edits don't apply to the proposal.
+    #[error("{0}")]
+    Invalid(String),
+    #[error("the proposal was already decided")]
+    Decided,
+    #[error(transparent)]
+    Failed(#[from] anyhow::Error),
+}
+
+impl From<sqlx::Error> for DecideError {
+    fn from(e: sqlx::Error) -> Self {
+        DecideError::Failed(e.into())
+    }
+}
+
 /// A proposal, if its session belongs to `owner`.
 pub async fn owned_proposal(
     state: &AppState,
@@ -226,7 +244,7 @@ pub async fn decide(
     verdict: Verdict,
     owner: &str,
     decided_by: &str,
-) -> anyhow::Result<Option<Proposal>> {
+) -> std::result::Result<Option<Proposal>, DecideError> {
     let Some(row) = owned_proposal(state, id, owner).await? else {
         return Ok(None);
     };
@@ -238,7 +256,7 @@ pub async fn decide(
         Verdict::Approve { edits } => (
             ProposalStatus::Approved,
             kind.edit(&row.payload, &edits)
-                .map_err(|e| anyhow::anyhow!(e.0))?,
+                .map_err(|e| DecideError::Invalid(e.0))?,
             None,
         ),
         Verdict::Reject { reason } => (ProposalStatus::Rejected, row.payload.clone(), reason),
@@ -253,7 +271,7 @@ pub async fn decide(
     )
     .await?
     else {
-        anyhow::bail!("proposal {id} was already decided");
+        return Err(DecideError::Decided);
     };
     state.hub.broadcast_proposal(&row.to_api());
     let summary = kind.summary(&payload);
