@@ -1205,8 +1205,8 @@ async fn carry_out(
 const STACK_WATCH_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Watches a stack that's set to merge itself until it has: if a layer moves from the commit that was proposed,
-/// however it got there, its auto-merge goes off and the session hears why. Required checks can't pass on the new
-/// commit before the next look, so nothing unreviewed merges. Other proposals are left alone.
+/// however it got there, its auto-merge goes off and the session hears why. Polling narrows the time a moved layer
+/// could merge to a check's interval; it doesn't rule it out. Other proposals are left alone.
 pub fn watch_stack(state: &AppState, proposal: &db::ProposalRow) {
     let result = proposal.result.clone().unwrap_or_default();
     if proposal.kind != "github.stack.create" || result["auto_merge"] != true {
