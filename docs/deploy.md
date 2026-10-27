@@ -5,7 +5,7 @@ sloppod ships as an OCI Helm chart, `oci://ghcr.io/bo0tzz/charts/sloppod`, publi
 - `ghcr.io/bo0tzz/sloppod`: the runtime and UI
 - `ghcr.io/bo0tzz/sloppod-session`: the session image with the supervisor, the Claude Code adapter, mise and the memini plugin
 
-Releases are `v<version>` tags: chart `<version>` on images tagged `v<version>` (and `latest`). Every push to `main` also publishes chart `<next version>-main.<run>` on images tagged with the commit (and `main`), which semver ranges without a prerelease part skip. Installing the chart from a checkout instead needs `image.tag` and `session.image.tag` set, because the in-repo `appVersion` isn't an image tag.
+Releases are `v<version>` tags: chart `<version>` on images tagged `v<version>` (and `latest`). Every push to `main` also publishes chart `<last release, next patch>-main.<run>` (e.g. `0.1.1-main.12` after `v0.1.0`) on images tagged with the commit (and `main`); semver ranges without a prerelease part skip those. A release commit sets the version in `Chart.yaml` and `Cargo.toml`; the tag has to match both. Installing the chart from a checkout instead needs `image.tag` and `session.image.tag` set, because the in-repo `appVersion` isn't an image tag.
 
 ## Cluster prerequisites
 
@@ -33,7 +33,7 @@ Everything else is added in the UI, under Settings, after the first login:
 
 - **A Claude account:** a long-lived token from `claude setup-token`. It stays in the runtime; session pods only see a placeholder.
 - **A GitHub App:** its app ID and private key (PEM). Sessions act through it, commit as its bot user (`<slug>[bot]`), and it opens approved pull requests, so it needs **Contents: read & write**, **Pull requests: read & write** and **Metadata: read**, installed on every repository sessions may work on. The repositories a first message can pick from are its installations. (`sl0pz`, the app sloppod itself is developed with, has these on `bo0tzz/sloppod`.)
-- **memini, optionally:** its URL, an admin key, and your personal namespace (e.g. `personal/bo0tzz`; sessions read it, and those without a repository write under it). The runtime uses the admin key only to mint one key per session ([ADR 22](adr/0022-memini-keys-per-session.md)).
+- **memini, optionally:** its URL, an admin key, and your personal namespace (e.g. `personal/bo0tzz`; sessions read it, and those without a repository write under it). Only the runtime talks to memini, sessions go through it, so prefer the in-cluster address (e.g. `http://memini.slop.svc.cluster.local:8080`). The runtime uses the admin key only to mint one key per session ([ADR 22](adr/0022-memini-keys-per-session.md)).
 
 ## HelmRelease (Flux)
 
