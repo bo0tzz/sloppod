@@ -69,6 +69,11 @@
   let showAddRepo = $state(false);
   let showGrants = $state(false);
 
+  const waiting = $derived(view.permissions.length > 0 || view.questions.length > 0 || openProposals.length > 0);
+  let width = $state(0);
+  // Room for the chat at its full width (max-w-3xl and its padding) with the panel beside it.
+  const sidePanel = $derived(width >= 1184);
+
   let scroller = $state<HTMLElement | null>(null);
   let content = $state<HTMLElement | null>(null);
   let atBottom = $state(true);
@@ -122,6 +127,52 @@
 <svelte:head>
   <title>{title} · sloppod</title>
 </svelte:head>
+
+{#snippet waitingItems()}
+      {#each view.questions as question (question.rpcId)}
+        <QuestionCard request={question} onRespond={(response) => view.answerQuestion(question, response)} />
+      {/each}
+      {#each view.permissions as request (request.rpcId)}
+        <PermissionCard
+          {request}
+          grants={session?.grants ?? []}
+          tool={view.transcript.tool(request.toolCall.toolCallId)}
+          onAnswer={(optionId) => view.answerPermission(request, optionId)}
+        />
+      {/each}
+      {#if sidePanel}
+        {#each openProposals as proposal (proposal.id)}
+          <ProposalCard
+            {proposal}
+            onOpen={() => (openProposalId = proposal.id)}
+            onChange={(updated) => view.upsertProposal(updated)}
+          />
+        {/each}
+      {:else if openProposals.length === 1}
+        <ProposalCard
+          proposal={openProposals[0]}
+          onOpen={() => (openProposalId = openProposals[0].id)}
+          onChange={(proposal) => view.upsertProposal(proposal)}
+        />
+      {:else if openProposals.length > 1}
+        <!-- Several at once would crowd out the chat, especially on a phone. -->
+        <div class="border-primary/40 bg-primary/5 flex items-center gap-3 rounded-2xl border px-3 py-2" data-testid="proposals-bar">
+          <span class="grow text-sm">
+            {#if pendingProposals.length > 0}
+              <span class="font-medium">{pendingProposals.length} {pendingProposals.length === 1 ? 'proposal' : 'proposals'} to review</span>
+            {/if}
+            {#if openProposals.length > pendingProposals.length}
+              <span class="text-muted">
+                {pendingProposals.length > 0 ? ', ' : ''}{openProposals.length - pendingProposals.length} being carried out
+              </span>
+            {/if}
+          </span>
+          <Button size="small" shape="round" onclick={() => (proposalList = 'open')}>
+            {pendingProposals.length > 0 ? 'Review' : 'View'}
+          </Button>
+        </div>
+      {/if}
+{/snippet}
 
 {#if view.notFound}
   <div class="mx-auto flex max-w-md flex-col items-center gap-4 px-4 py-16 text-center">
@@ -178,89 +229,68 @@
       </div>
     {/if}
 
-    <div class="relative min-h-0 grow">
-      <div bind:this={scroller} onscroll={onScroll} class="immich-scrollbar h-full overflow-y-auto">
-        <div bind:this={content} class="mx-auto flex w-full max-w-3xl flex-col gap-3 px-3 py-4 md:px-4">
-          {#if !view.loaded}
-            <div class="flex justify-center py-16">
-              {#if view.connectionError}
-                <Alert color="danger" size="small" title="Couldn't load the session">{view.connectionError}</Alert>
+    <div class="flex min-h-0 grow" bind:clientWidth={width}>
+      <div class="flex min-w-0 grow flex-col">
+        <div class="relative min-h-0 grow">
+          <div bind:this={scroller} onscroll={onScroll} class="immich-scrollbar h-full overflow-y-auto">
+            <div bind:this={content} class="mx-auto flex w-full max-w-3xl flex-col gap-3 px-3 py-4 md:px-4">
+              {#if !view.loaded}
+                <div class="flex justify-center py-16">
+                  {#if view.connectionError}
+                    <Alert color="danger" size="small" title="Couldn't load the session">{view.connectionError}</Alert>
+                  {:else}
+                    <LoadingSpinner size="large" />
+                  {/if}
+                </div>
               {:else}
-                <LoadingSpinner size="large" />
+                {#if view.transcript.items.length === 0 && session?.phase !== 'starting'}
+                  <Text color="muted" class="py-16 text-center">Nothing here yet. Send a message to get going.</Text>
+                {/if}
+                <TranscriptView items={view.transcript.items} running={view.turnRunning} />
+                {#if activity}
+                  <div class="text-muted flex items-center gap-2 py-1 text-sm" data-testid="activity">
+                    <LoadingSpinner size="tiny" />
+                    {activity}
+                  </div>
+                {/if}
               {/if}
             </div>
-          {:else}
-            {#if view.transcript.items.length === 0 && session?.phase !== 'starting'}
-              <Text color="muted" class="py-16 text-center">Nothing here yet. Send a message to get going.</Text>
-            {/if}
-            <TranscriptView items={view.transcript.items} running={view.turnRunning} />
-            {#if activity}
-              <div class="text-muted flex items-center gap-2 py-1 text-sm" data-testid="activity">
-                <LoadingSpinner size="tiny" />
-                {activity}
-              </div>
-            {/if}
-          {/if}
-        </div>
-      </div>
-      {#if !atBottom}
-        <div class="absolute end-4 bottom-3">
-          <IconButton
-            icon={mdiArrowDown}
-            aria-label="Scroll to the latest message"
-            shape="round"
-            color="secondary"
-            size="small"
-            class="shadow-md"
-            onclick={() => scrollToBottom('smooth')}
-          />
-        </div>
-      {/if}
-    </div>
-
-    {#if view.permissions.length > 0 || view.questions.length > 0 || openProposals.length > 0}
-      <div class="border-light-200 max-h-[55dvh] shrink-0 overflow-y-auto border-t px-3 py-2">
-        <div class="mx-auto flex w-full max-w-3xl flex-col gap-2">
-          {#each view.questions as question (question.rpcId)}
-            <QuestionCard request={question} onRespond={(response) => view.answerQuestion(question, response)} />
-          {/each}
-          {#each view.permissions as request (request.rpcId)}
-            <PermissionCard
-              {request}
-              grants={session?.grants ?? []}
-              tool={view.transcript.tool(request.toolCall.toolCallId)}
-              onAnswer={(optionId) => view.answerPermission(request, optionId)}
-            />
-          {/each}
-          {#if openProposals.length === 1}
-            <ProposalCard
-              proposal={openProposals[0]}
-              onOpen={() => (openProposalId = openProposals[0].id)}
-              onChange={(proposal) => view.upsertProposal(proposal)}
-            />
-          {:else if openProposals.length > 1}
-            <!-- Several at once would crowd out the chat, especially on a phone. -->
-            <div class="border-primary/40 bg-primary/5 flex items-center gap-3 rounded-2xl border px-3 py-2" data-testid="proposals-bar">
-              <span class="grow text-sm">
-                {#if pendingProposals.length > 0}
-                  <span class="font-medium">{pendingProposals.length} {pendingProposals.length === 1 ? 'proposal' : 'proposals'} to review</span>
-                {/if}
-                {#if openProposals.length > pendingProposals.length}
-                  <span class="text-muted">
-                    {pendingProposals.length > 0 ? ', ' : ''}{openProposals.length - pendingProposals.length} being carried out
-                  </span>
-                {/if}
-              </span>
-              <Button size="small" shape="round" onclick={() => (proposalList = 'open')}>
-                {pendingProposals.length > 0 ? 'Review' : 'View'}
-              </Button>
+          </div>
+          {#if !atBottom}
+            <div class="absolute end-4 bottom-3">
+              <IconButton
+                icon={mdiArrowDown}
+                aria-label="Scroll to the latest message"
+                shape="round"
+                color="secondary"
+                size="small"
+                class="shadow-md"
+                onclick={() => scrollToBottom('smooth')}
+              />
             </div>
           {/if}
         </div>
-      </div>
-    {/if}
 
-    <SessionComposer {view} />
+        {#if waiting && !sidePanel}
+          <div class="border-light-200 max-h-[55dvh] shrink-0 overflow-y-auto border-t px-3 py-2">
+            <div class="mx-auto flex w-full max-w-3xl flex-col gap-2">
+              {@render waitingItems()}
+            </div>
+          </div>
+        {/if}
+
+        <SessionComposer {view} />
+      </div>
+      {#if waiting && sidePanel}
+        <aside
+          class="border-light-200 immich-scrollbar flex w-96 shrink-0 flex-col gap-2 overflow-y-auto border-s p-3"
+          aria-label="Waiting on you"
+          data-testid="side-panel"
+        >
+          {@render waitingItems()}
+        </aside>
+      {/if}
+    </div>
   </div>
 {/if}
 

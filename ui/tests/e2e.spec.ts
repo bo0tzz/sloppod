@@ -628,6 +628,25 @@ test('a stale copy of a proposal does not undo its approval', async ({ page }) =
   await expect(pr).toBeHidden();
 });
 
+test('wide screens show what waits on the user in a side panel', async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1000 });
+  await createSession(page, 'Propose a PR for sloppod');
+  const panel = page.getByTestId('side-panel');
+  await expect(panel.getByTestId('permission-request')).toBeVisible();
+  await finishTurn(page);
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('File issues for sloppod');
+  await box.press('Enter');
+
+  await expect(panel.getByTestId('proposal-card')).toHaveCount(2);
+  await expect(page.getByTestId('proposals-bar')).toHaveCount(0);
+
+  // Without the room for both, several proposals fold into the bar above the composer.
+  await page.setViewportSize({ width: 1280, height: 1000 });
+  await expect(panel).toHaveCount(0);
+  await expect(page.getByTestId('proposals-bar')).toContainText('2 proposals to review');
+});
+
 test('the sidebar folds away on narrow screens', async ({ page }) => {
   const sidebar = page.getByRole('navigation', { name: 'Sessions' });
   await page.setViewportSize({ width: 900, height: 800 });
