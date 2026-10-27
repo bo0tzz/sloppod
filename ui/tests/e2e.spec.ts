@@ -481,6 +481,15 @@ test('answers questions from the agent, in every tab', async ({ page, context })
   });
 });
 
+test('Enter in the "Other" field submits the answer', async ({ page }) => {
+  await createSession(page, 'Ask me before you start');
+  const other = questionField(page, 'question_1_custom').getByRole('textbox');
+  await other.fill('Load tests');
+  await other.press('Enter');
+  await expect(questionCard(page)).toBeHidden();
+  await expect(agentMessages(page).filter({ hasText: 'Tests: Load tests.' })).toBeVisible();
+});
+
 test('skips questions from the agent', async ({ page }) => {
   await createSession(page, 'Ask me first');
   await questionCard(page).getByRole('button', { name: 'Skip' }).click();

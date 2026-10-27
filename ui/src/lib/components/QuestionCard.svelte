@@ -85,6 +85,14 @@
       return value === undefined || value === '' || (Array.isArray(value) && value.length === 0);
     }),
   );
+
+  const answer = () => onRespond({ action: 'accept', content: content() });
+
+  function submitOnEnter(event: KeyboardEvent) {
+    if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
+    event.preventDefault();
+    if (!missingRequired) answer();
+  }
 </script>
 
 <section
@@ -153,6 +161,7 @@
             class="grow"
             value={(values[key] as string | undefined) ?? ''}
             oninput={(event) => (values[key] = event.currentTarget.value)}
+            onkeydown={submitOnEnter}
             placeholder={field.description}
             aria-label={field.description ? `${field.title ?? 'Other'}: ${field.description}` : (field.title ?? 'Other')}
           />
@@ -189,6 +198,7 @@
         <Input
           value={(values[key] as string | undefined) ?? ''}
           oninput={(event) => (values[key] = event.currentTarget.value)}
+          onkeydown={submitOnEnter}
           aria-label={field.title ?? key}
         />
       {/if}
@@ -199,7 +209,7 @@
     <Button size="small" shape="round" variant="outline" color="secondary" onclick={() => onRespond({ action: 'decline' })}>
       Skip
     </Button>
-    <Button size="small" shape="round" disabled={missingRequired} onclick={() => onRespond({ action: 'accept', content: content() })}>
+    <Button size="small" shape="round" disabled={missingRequired} onclick={answer}>
       Answer
     </Button>
   </div>
