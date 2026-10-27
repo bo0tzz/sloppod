@@ -1,6 +1,7 @@
 //! The session pod's entrypoint (ADR 17): connects outward to the runtime, prepares the pod and bridges the
 //! agent's ACP stdio over the link.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -8,16 +9,20 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use base64::Engine;
 use clap::Parser;
+use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
+use serde_json::Value;
 use sloppod_protocol::link::{
-    FromSupervisor, Launch, PATH, RUNTIME_INFO, ToSupervisor, TranscriptFile,
+    AgentReady, FromSupervisor, Launch, PATH, RUNTIME_INFO, RunningAgent, ToSupervisor,
+    TranscriptFile,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::net::TcpStream;
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 const SYSTEM_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 
@@ -36,6 +41,10 @@ struct Args {
 
     #[arg(long, env = "SLOPPOD_WORKDIR", default_value = "/workspace")]
     workdir: PathBuf,
+
+    /// Exit successfully only if the runtime was heard from recently; for the liveness probe.
+    #[arg(long)]
+    check: bool,
 }
 
 enum Ending {
@@ -43,6 +52,67 @@ enum Ending {
     Reconnect,
     /// The pod is being terminated.
     Terminate,
+}
+
+type Sink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
+
+/// How long the link may be silent before it counts as dead; the runtime pings every 20 s.
+const LINK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Touched whenever the runtime is heard from; the pod's liveness probe (`--check`) reads it.
+const HEARTBEAT: &str = "/tmp/sloppod-link";
+/// How long the link may stay down before the pod counts as broken and the kubelet restarts it.
+const LINK_GRACE: Duration = Duration::from_secs(600);
+
+fn heartbeat() {
+    if let Err(e) = std::fs::write(HEARTBEAT, b"") {
+        tracing::warn!(error = %e, "writing the heartbeat");
+    }
+}
+
+/// The liveness probe: healthy while the runtime was heard from within the grace period.
+fn check() -> anyhow::Result<()> {
+    let age = std::fs::metadata(HEARTBEAT)?.modified()?.elapsed()?;
+    if age > LINK_GRACE {
+        bail!("no word from the runtime for {}s", age.as_secs());
+    }
+    Ok(())
+}
+
+/// The agent runs until it exits or the pod is terminated, across links (ADR 17).
+struct Agent {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: Lines<BufReader<ChildStdout>>,
+    transcript_dir: String,
+    /// Set once the runtime has the agent's session up; until then a new runtime launches afresh.
+    ready: Option<AgentReady>,
+    /// Requests the runtime sent the agent that it hasn't answered, by id.
+    open: HashMap<String, Value>,
+    /// Requests the agent sent the runtime that weren't answered, by id.
+    waiting: HashMap<String, Value>,
+    /// A message from the agent that the last link failed to send.
+    unsent: Option<Value>,
+}
+
+impl Agent {
+    fn running(&self) -> Option<RunningAgent> {
+        Some(RunningAgent {
+            ready: self.ready.clone()?,
+            open: self.open.values().cloned().collect(),
+            waiting: self.waiting.values().cloned().collect(),
+        })
+    }
+}
+
+/// Notes a message sent one way: a request the other side now owes an answer to, or an answer it was owed.
+fn track(sent: &mut HashMap<String, Value>, owed: &mut HashMap<String, Value>, message: &Value) {
+    let Some(id) = message.get("id") else { return };
+    if message.get("method").is_some() {
+        sent.insert(id.to_string(), message.clone());
+    } else {
+        owed.remove(&id.to_string());
+    }
 }
 
 #[tokio::main]
@@ -56,11 +126,16 @@ async fn main() -> anyhow::Result<()> {
         .install_default()
         .map_err(|_| anyhow::anyhow!("installing the rustls crypto provider"))?;
     let args = Args::parse();
+    if args.check {
+        return check();
+    }
+    heartbeat();
     let mut terminate = signal(SignalKind::terminate())?;
+    let mut agent = None;
     let mut backoff = Duration::from_secs(1);
     loop {
         let started = std::time::Instant::now();
-        match run(&args, &mut terminate).await {
+        match run(&args, &mut agent, &mut terminate).await {
             Ok(Ending::Terminate) => return Ok(()),
             Ok(Ending::Reconnect) => tracing::info!("link ended; reconnecting"),
             Err(e) => tracing::warn!(error = format!("{e:#}"), "link failed"),
@@ -70,7 +145,12 @@ async fn main() -> anyhow::Result<()> {
         }
         tokio::select! {
             _ = tokio::time::sleep(backoff) => {}
-            _ = terminate.recv() => return Ok(()),
+            _ = terminate.recv() => {
+                if let Some(mut agent) = agent.take() {
+                    stop(&mut agent.child).await;
+                }
+                return Ok(());
+            }
         }
         backoff = (backoff * 2).min(Duration::from_secs(30));
     }
@@ -89,7 +169,27 @@ fn link_url(base: &str) -> String {
     format!("{base}{PATH}")
 }
 
-async fn run(args: &Args, terminate: &mut tokio::signal::unix::Signal) -> anyhow::Result<Ending> {
+async fn send(sink: &mut Sink, message: &FromSupervisor) -> anyhow::Result<()> {
+    let text = serde_json::to_string(message)?;
+    sink.send(Message::Text(text.into())).await?;
+    Ok(())
+}
+
+/// Reads the link until it closes, for while the supervisor is busy with something else.
+async fn closed(stream: &mut SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>) {
+    while let Some(Ok(message)) = stream.next().await {
+        heartbeat();
+        if let Message::Close(_) = message {
+            return;
+        }
+    }
+}
+
+async fn run(
+    args: &Args,
+    agent: &mut Option<Agent>,
+    terminate: &mut tokio::signal::unix::Signal,
+) -> anyhow::Result<Ending> {
     let token = std::fs::read_to_string(&args.token_file).context("reading the pod's token")?;
     let mut request = link_url(&args.url).into_client_request()?;
     request
@@ -98,122 +198,206 @@ async fn run(args: &Args, terminate: &mut tokio::signal::unix::Signal) -> anyhow
     let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(256 << 20))
         .max_frame_size(Some(256 << 20));
-    let (socket, _) =
-        tokio_tungstenite::connect_async_with_config(request, Some(config), false).await?;
+    let (socket, _) = tokio::time::timeout(
+        LINK_TIMEOUT,
+        tokio_tungstenite::connect_async_with_config(request, Some(config), false),
+    )
+    .await
+    .context("connecting timed out")??;
     let (mut sink, mut stream) = socket.split();
+    heartbeat();
 
-    let (out, mut outgoing) = mpsc::unbounded_channel::<FromSupervisor>();
-    let writer = tokio::spawn(async move {
-        while let Some(message) = outgoing.recv().await {
-            let Ok(text) = serde_json::to_string(&message) else {
-                continue;
-            };
-            if sink.send(Message::Text(text.into())).await.is_err() {
-                break;
-            }
-        }
-        let _ = sink.close().await;
-    });
-    let send = |message: FromSupervisor| {
-        let _ = out.send(message);
-    };
-    send(FromSupervisor::Hello {
-        version: env!("CARGO_PKG_VERSION").to_owned(),
-    });
+    send(
+        &mut sink,
+        &FromSupervisor::Hello {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            agent: agent.as_ref().and_then(Agent::running),
+        },
+    )
+    .await?;
 
-    let launch = loop {
-        let Some(message) = stream.next().await else {
+    loop {
+        let message = tokio::time::timeout(LINK_TIMEOUT, stream.next())
+            .await
+            .context("no launch or attach from the runtime")?;
+        let Some(message) = message else {
             bail!("link closed before launch");
         };
-        if let Message::Text(text) = message?
-            && let ToSupervisor::Launch(launch) = serde_json::from_str(&text)?
+        let Message::Text(text) = message? else {
+            continue;
+        };
+        match serde_json::from_str(&text)? {
+            ToSupervisor::Attach { runtime_build } => {
+                if agent.is_none() {
+                    bail!("the runtime attached, but no agent is running");
+                }
+                write_runtime_info(args, runtime_build.as_deref())?;
+                tracing::info!("attached to the running agent");
+                break;
+            }
+            ToSupervisor::Launch(launch) => {
+                if let Some(mut old) = agent.take() {
+                    tracing::info!("replacing the running agent");
+                    stop(&mut old.child).await;
+                }
+                *agent = Some(launch_agent(args, &launch, &mut sink, &mut stream).await?);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let a = agent.as_mut().expect("an agent is running");
+    if let Some(message) = a.unsent.take() {
+        if send(
+            &mut sink,
+            &FromSupervisor::Acp {
+                message: message.clone(),
+            },
+        )
+        .await
+        .is_err()
         {
-            break *launch;
+            a.unsent = Some(message);
+            return Ok(Ending::Reconnect);
+        }
+        track(&mut a.waiting, &mut a.open, &message);
+    }
+
+    enum Event {
+        LinkEnded,
+        AgentExited,
+        Terminate,
+    }
+    let mut ping = tokio::time::interval(Duration::from_secs(20));
+    let deadline = tokio::time::sleep(LINK_TIMEOUT);
+    tokio::pin!(deadline);
+    let event = loop {
+        tokio::select! {
+            line = a.stdout.next_line() => match line {
+                Ok(Some(line)) => {
+                    if line.trim().is_empty() { continue; }
+                    let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                        tracing::warn!(line = %line.chars().take(200).collect::<String>(), "non-JSON line from agent");
+                        continue;
+                    };
+                    if send(&mut sink, &FromSupervisor::Acp { message: message.clone() }).await.is_err() {
+                        a.unsent = Some(message);
+                        break Event::LinkEnded;
+                    }
+                    track(&mut a.waiting, &mut a.open, &message);
+                }
+                Ok(None) | Err(_) => break Event::AgentExited,
+            },
+            message = stream.next() => {
+                deadline.as_mut().reset(tokio::time::Instant::now() + LINK_TIMEOUT);
+                heartbeat();
+                match message {
+                    Some(Ok(Message::Text(text))) => match serde_json::from_str::<ToSupervisor>(&text) {
+                        Ok(ToSupervisor::Acp { message }) => {
+                            let mut line = serde_json::to_vec(&message)?;
+                            line.push(b'\n');
+                            a.stdin.write_all(&line).await?;
+                            a.stdin.flush().await?;
+                            track(&mut a.open, &mut a.waiting, &message);
+                        }
+                        Ok(ToSupervisor::AgentReady(ready)) => a.ready = Some(ready),
+                        Ok(ToSupervisor::SyncTranscript) => sync_transcript(&a.transcript_dir, &mut sink).await,
+                        Ok(ToSupervisor::Launch(_) | ToSupervisor::Attach { .. }) => {}
+                        Err(e) => tracing::warn!(error = %e, "bad message from runtime"),
+                    },
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break Event::LinkEnded,
+                    Some(Ok(_)) => {}
+                }
+            },
+            _ = ping.tick() => {
+                if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break Event::LinkEnded;
+                }
+            }
+            _ = &mut deadline => {
+                tracing::warn!("no word from the runtime; dropping the link");
+                break Event::LinkEnded;
+            }
+            _ = terminate.recv() => break Event::Terminate,
         }
     };
-
-    let env = match prepare(args, &launch, &send).await {
-        Ok(env) => env,
-        Err(e) => {
-            send(FromSupervisor::Error {
-                message: format!("preparing the pod: {e:#}"),
-            });
-            drop(out);
-            let _ = writer.await;
-            return Err(e);
+    let ending = match event {
+        Event::LinkEnded => Ending::Reconnect,
+        Event::AgentExited => {
+            let mut a = agent.take().expect("an agent is running");
+            let status = a.child.wait().await.ok();
+            let _ = send(
+                &mut sink,
+                &FromSupervisor::AgentExited {
+                    code: status.and_then(|s| s.code()),
+                },
+            )
+            .await;
+            sync_transcript(&a.transcript_dir, &mut sink).await;
+            Ending::Reconnect
+        }
+        Event::Terminate => {
+            tracing::info!("terminating");
+            let mut a = agent.take().expect("an agent is running");
+            stop(&mut a.child).await;
+            sync_transcript(&a.transcript_dir, &mut sink).await;
+            Ending::Terminate
         }
     };
+    let _ = tokio::time::timeout(Duration::from_secs(10), sink.close()).await;
+    Ok(ending)
+}
 
-    let spawned = Command::new(&launch.command[0])
-        .args(&launch.command[1..])
-        .envs(env)
-        .current_dir(&launch.cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("starting {:?} in {}", launch.command, launch.cwd));
+/// Prepares the pod and starts the agent; the link stays read meanwhile, so the runtime sees it's alive.
+async fn launch_agent(
+    args: &Args,
+    launch: &Launch,
+    sink: &mut Sink,
+    stream: &mut SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+) -> anyhow::Result<Agent> {
+    let prepared = tokio::select! {
+        prepared = prepare(args, launch, sink) => prepared,
+        _ = closed(stream) => bail!("link closed while preparing the pod"),
+    };
+    let spawned = prepared.and_then(|env| {
+        Command::new(&launch.command[0])
+            .args(&launch.command[1..])
+            .envs(env)
+            .current_dir(&launch.cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("starting {:?} in {}", launch.command, launch.cwd))
+    });
     let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {
-            send(FromSupervisor::Error {
-                message: format!("{e:#}"),
-            });
-            drop(out);
-            let _ = writer.await;
+            let _ = send(
+                sink,
+                &FromSupervisor::Error {
+                    message: format!("preparing the pod: {e:#}"),
+                },
+            )
+            .await;
             return Err(e);
         }
     };
-    let mut stdin = child.stdin.take().context("agent stdin")?;
-    let mut stdout = BufReader::new(child.stdout.take().context("agent stdout")?).lines();
-    send(FromSupervisor::AgentStarted);
+    let stdin = child.stdin.take().context("agent stdin")?;
+    let stdout = BufReader::new(child.stdout.take().context("agent stdout")?).lines();
+    send(sink, &FromSupervisor::AgentStarted).await?;
     tracing::info!(session = %launch.session_id, "agent started");
-
-    let ending = loop {
-        tokio::select! {
-            line = stdout.next_line() => match line {
-                Ok(Some(line)) => {
-                    if line.trim().is_empty() { continue; }
-                    match serde_json::from_str(&line) {
-                        Ok(message) => send(FromSupervisor::Acp { message }),
-                        Err(_) => tracing::warn!(line = %line.chars().take(200).collect::<String>(), "non-JSON line from agent"),
-                    }
-                }
-                Ok(None) | Err(_) => {
-                    let status = child.wait().await.ok();
-                    send(FromSupervisor::AgentExited { code: status.and_then(|s| s.code()) });
-                    sync_transcript(&launch, &send);
-                    break Ending::Reconnect;
-                }
-            },
-            message = stream.next() => match message {
-                Some(Ok(Message::Text(text))) => match serde_json::from_str::<ToSupervisor>(&text) {
-                    Ok(ToSupervisor::Acp { message }) => {
-                        let mut line = serde_json::to_vec(&message)?;
-                        line.push(b'\n');
-                        stdin.write_all(&line).await?;
-                        stdin.flush().await?;
-                    }
-                    Ok(ToSupervisor::SyncTranscript) => sync_transcript(&launch, &send),
-                    Ok(ToSupervisor::Launch(_)) => {}
-                    Err(e) => tracing::warn!(error = %e, "bad message from runtime"),
-                },
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break Ending::Reconnect,
-                Some(Ok(_)) => {}
-            },
-            _ = terminate.recv() => {
-                tracing::info!("terminating");
-                stop(&mut child).await;
-                sync_transcript(&launch, &send);
-                break Ending::Terminate;
-            }
-        }
-    };
-    stop(&mut child).await;
-    drop(out);
-    let _ = tokio::time::timeout(Duration::from_secs(10), writer).await;
-    Ok(ending)
+    Ok(Agent {
+        child,
+        stdin,
+        stdout,
+        transcript_dir: launch.transcript_dir.clone(),
+        ready: None,
+        open: HashMap::new(),
+        waiting: HashMap::new(),
+        unsent: None,
+    })
 }
 
 async fn stop(child: &mut Child) {
@@ -233,8 +417,8 @@ async fn stop(child: &mut Child) {
     let _ = child.kill().await;
 }
 
-fn sync_transcript(launch: &Launch, send: &impl Fn(FromSupervisor)) {
-    let Ok(entries) = std::fs::read_dir(&launch.transcript_dir) else {
+async fn sync_transcript(dir: &str, sink: &mut Sink) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     let files: Vec<TranscriptFile> = entries
@@ -249,8 +433,15 @@ fn sync_transcript(launch: &Launch, send: &impl Fn(FromSupervisor)) {
         })
         .collect();
     if !files.is_empty() {
-        send(FromSupervisor::Transcript { files });
+        let _ = send(sink, &FromSupervisor::Transcript { files }).await;
     }
+}
+
+fn write_runtime_info(args: &Args, build: Option<&str>) -> anyhow::Result<()> {
+    write_file(
+        &args.workdir.join(RUNTIME_INFO),
+        &serde_json::to_vec_pretty(&serde_json::json!({ "build": build }))?,
+    )
 }
 
 fn write_file(path: &Path, content: &[u8]) -> anyhow::Result<()> {
@@ -264,7 +455,7 @@ fn write_file(path: &Path, content: &[u8]) -> anyhow::Result<()> {
 async fn prepare(
     args: &Args,
     launch: &Launch,
-    send: &impl Fn(FromSupervisor),
+    sink: &mut Sink,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let home =
         std::env::var("HOME").unwrap_or_else(|_| args.workdir.join("home").display().to_string());
@@ -285,10 +476,7 @@ async fn prepare(
     env.push(("GIT_CONFIG_KEY_1".into(), "push.default".into()));
     env.push(("GIT_CONFIG_VALUE_1".into(), "current".into()));
 
-    write_file(
-        &args.workdir.join(RUNTIME_INFO),
-        &serde_json::to_vec_pretty(&serde_json::json!({"build": launch.runtime_build}))?,
-    )?;
+    write_runtime_info(args, launch.runtime_build.as_deref())?;
 
     if let Some(ca) = &launch.ca_pem {
         let dir = args.workdir.join(".sloppod");
@@ -337,9 +525,13 @@ async fn prepare(
     if let Some(repo) = &launch.repo {
         let dir = Path::new(&repo.path);
         if !dir.join(".git").exists() {
-            send(FromSupervisor::Status {
-                message: format!("cloning {}", repo.clone_url),
-            });
+            let _ = send(
+                sink,
+                &FromSupervisor::Status {
+                    message: format!("cloning {}", repo.clone_url),
+                },
+            )
+            .await;
             run_cmd(&env, &home, "git", &["clone", &repo.clone_url, &repo.path]).await?;
             let remote_branch = format!("refs/heads/{}", repo.branch);
             let exists = Command::new("git")
@@ -376,9 +568,13 @@ async fn prepare(
             }
         }
         if launch.install_tools && has_mise_config(dir) {
-            send(FromSupervisor::Status {
-                message: "installing tools with mise".into(),
-            });
+            let _ = send(
+                sink,
+                &FromSupervisor::Status {
+                    message: "installing tools with mise".into(),
+                },
+            )
+            .await;
             // Only locked versions, verified against the lockfile's checksums and provenance (ADR 12). Only for this
             // install: the agent may still add tools and lock them.
             let mut install_env = env.clone();
@@ -396,9 +592,13 @@ async fn prepare(
                 ))
             };
             if let Err(e) = result {
-                send(FromSupervisor::Status {
-                    message: format!("mise install failed: {e:#}"),
-                });
+                let _ = send(
+                    sink,
+                    &FromSupervisor::Status {
+                        message: format!("mise install failed: {e:#}"),
+                    },
+                )
+                .await;
             }
         }
     }
@@ -439,4 +639,42 @@ async fn run_cmd(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn requests_stay_open_until_answered() {
+        let (mut open, mut waiting) = (HashMap::new(), HashMap::new());
+        let prompt = json!({"jsonrpc": "2.0", "id": 7, "method": "session/prompt", "params": {}});
+        track(&mut open, &mut waiting, &prompt);
+        let question =
+            json!({"jsonrpc": "2.0", "id": 7, "method": "elicitation/create", "params": {}});
+        track(&mut waiting, &mut open, &question);
+        track(
+            &mut waiting,
+            &mut open,
+            &json!({"jsonrpc": "2.0", "method": "session/update", "params": {}}),
+        );
+        assert_eq!(open.values().collect::<Vec<_>>(), [&prompt]);
+        assert_eq!(waiting.values().collect::<Vec<_>>(), [&question]);
+
+        // The runtime answers the question; the agent's id 7 is a different request from the runtime's.
+        track(
+            &mut open,
+            &mut waiting,
+            &json!({"jsonrpc": "2.0", "id": 7, "result": {}}),
+        );
+        assert!(waiting.is_empty());
+        assert_eq!(open.len(), 1);
+        track(
+            &mut waiting,
+            &mut open,
+            &json!({"jsonrpc": "2.0", "id": 7, "result": {}}),
+        );
+        assert!(open.is_empty());
+    }
 }

@@ -97,6 +97,13 @@ impl PlacementBackend for AgentSandbox {
                             "imagePullPolicy": self.pull_policy,
                             "env": env,
                             "resources": {"limits": limits, "requests": requests},
+                            // The supervisor keeps the agent through link drops; a link down past its grace
+                            // period (or a wedged supervisor) restarts the container (ADR 17).
+                            "livenessProbe": {
+                                "exec": {"command": ["sloppod-supervisor", "--check"]},
+                                "periodSeconds": 30,
+                                "failureThreshold": 3,
+                            },
                             "volumeMounts": [
                                 {"name": "workdir", "mountPath": WORKDIR},
                                 {"name": "sloppod-token", "mountPath": TOKEN_DIR, "readOnly": true},

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use sloppod_protocol::link::ToSupervisor;
+use sloppod_protocol::link::{AgentReady, RunningAgent, ToSupervisor};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -47,6 +47,27 @@ impl Harness {
     async fn ready() -> Self {
         let harness = Self::starting().await;
         harness.agent_ready().await;
+        harness
+    }
+
+    /// A session whose agent outlived an earlier link, with the requests still open in each direction.
+    async fn adopted(open: Vec<Value>, waiting: Vec<Value>) -> Self {
+        let harness = Self::starting().await;
+        harness
+            .hub
+            .adopt_agent(
+                harness.id,
+                &harness.agent,
+                RunningAgent {
+                    ready: AgentReady {
+                        agent_session_id: "agent-session".into(),
+                        capabilities: json!({}),
+                    },
+                    open,
+                    waiting,
+                },
+            )
+            .await;
         harness
     }
 
@@ -257,4 +278,63 @@ async fn a_notice_waits_for_the_agent_to_be_up() {
     assert_eq!(request["method"], "session/prompt");
     assert_eq!(prompt_text(&request), ["sloppod: the runtime restarted."]);
     h.respond(&request, json!({"stopReason": "end_turn"})).await;
+}
+
+#[tokio::test]
+async fn an_adopted_turn_runs_on_and_ends_as_usual() {
+    let turn = json!({"jsonrpc": "2.0", "id": 7, "method": "session/prompt", "params": {"sessionId": "agent-session"}});
+    let mut h = Harness::adopted(vec![turn.clone()], Vec::new()).await;
+    assert_eq!(h.phase().await, "working");
+
+    let next = h.prompt("Next");
+    wait_for_queue(&h, 1).await;
+    h.respond(&turn, json!({"stopReason": "end_turn"})).await;
+    let request = h.next().await;
+    assert_eq!(request["method"], "session/prompt");
+    assert_eq!(prompt_text(&request), ["Next"]);
+    // Numbered past the request the earlier link left open.
+    assert!(request["id"].as_i64().unwrap() > 7);
+
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    next.await.unwrap().unwrap();
+    assert_eq!(h.phase().await, "idle");
+}
+
+#[tokio::test]
+async fn an_adopted_question_is_shown_again_and_answered() {
+    let question = json!({
+        "jsonrpc": "2.0",
+        "id": "q-1",
+        "method": "elicitation/create",
+        "params": {"message": "Which branch?"},
+    });
+    let turn = json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {}});
+    let mut h = Harness::adopted(vec![turn], vec![question]).await;
+    assert_eq!(h.phase().await, "waiting");
+    let replay = h.hub.replay(h.id).await.unwrap();
+    assert_eq!(replay.permissions.len(), 1);
+    assert_eq!(replay.permissions[0].2["message"], "Which branch?");
+
+    h.hub
+        .answer_permission(
+            h.id,
+            replay.permissions[0].0,
+            Ok(json!({"action": "accept"})),
+        )
+        .await;
+    let answer = h.next().await;
+    assert_eq!(answer["id"], "q-1");
+    assert_eq!(answer["result"]["action"], "accept");
+    assert_eq!(h.phase().await, "working");
+}
+
+#[tokio::test]
+async fn an_idle_adopted_agent_takes_new_prompts() {
+    let mut h = Harness::adopted(Vec::new(), Vec::new()).await;
+    assert_eq!(h.phase().await, "idle");
+    let turn = h.prompt("Hello again");
+    let request = h.next().await;
+    assert_eq!(request["params"]["sessionId"], "agent-session");
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
 }

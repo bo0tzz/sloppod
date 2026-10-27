@@ -197,23 +197,65 @@ pub mod link {
         pub runtime_build: Option<String>,
     }
 
+    /// An agent that outlived the supervisor's last link, reported when it reconnects.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct RunningAgent {
+        pub ready: AgentReady,
+        /// Requests the runtime sent the agent that it hasn't answered.
+        pub open: Vec<Value>,
+        /// Requests the agent sent the runtime that weren't answered.
+        pub waiting: Vec<Value>,
+    }
+
+    /// The agent's session is up; the supervisor keeps this to report the agent after a reconnect.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct AgentReady {
+        pub agent_session_id: String,
+        /// The agent's `initialize` result.
+        pub capabilities: Value,
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     pub enum ToSupervisor {
+        /// Start the agent, replacing any that's running.
         Launch(Box<Launch>),
-        Acp { message: Value },
+        /// Carry on with the running agent.
+        Attach {
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            runtime_build: Option<String>,
+        },
+        AgentReady(AgentReady),
+        Acp {
+            message: Value,
+        },
         SyncTranscript,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     pub enum FromSupervisor {
-        Hello { version: String },
-        Status { message: String },
+        Hello {
+            version: String,
+            /// An agent still running from an earlier link; the runtime attaches to it rather than launching.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            agent: Option<RunningAgent>,
+        },
+        Status {
+            message: String,
+        },
         AgentStarted,
-        Acp { message: Value },
-        Transcript { files: Vec<TranscriptFile> },
-        AgentExited { code: Option<i32> },
-        Error { message: String },
+        Acp {
+            message: Value,
+        },
+        Transcript {
+            files: Vec<TranscriptFile>,
+        },
+        AgentExited {
+            code: Option<i32>,
+        },
+        Error {
+            message: String,
+        },
     }
 }

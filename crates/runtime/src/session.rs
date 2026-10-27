@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use serde_json::{Value, json};
 use sloppod_protocol::api::{Phase, Proposal};
+use sloppod_protocol::link::RunningAgent;
 use tokio::sync::{Mutex, broadcast, oneshot};
 use uuid::Uuid;
 
@@ -57,6 +58,8 @@ struct LiveState {
     permissions: HashMap<u64, Permission>,
     next_permission: u64,
     queue: Vec<Queued>,
+    /// For an agent a runtime restart cut off, if it has to be launched again rather than attached to.
+    restart_notice: Option<String>,
 }
 
 pub struct Live {
@@ -188,6 +191,74 @@ impl Hub {
         }
         state.agent_session_id = None;
         state.turn_running = false;
+    }
+
+    pub async fn set_restart_notice(&self, id: Uuid, notice: String) {
+        self.live(id).state.lock().await.restart_notice = Some(notice);
+    }
+
+    pub async fn take_restart_notice(&self, id: Uuid) -> Option<String> {
+        self.live(id).state.lock().await.restart_notice.take()
+    }
+
+    /// Carries on with an agent that outlived the last link: its session, the turn it's running and the questions
+    /// it's waiting on.
+    pub async fn adopt_agent(
+        self: &Arc<Self>,
+        id: Uuid,
+        agent: &Arc<AgentConn>,
+        running: RunningAgent,
+    ) {
+        if self.agent_capabilities().is_none() {
+            self.set_agent_capabilities(running.ready.capabilities);
+        }
+        let mut turn = None;
+        for request in &running.open {
+            if let Some(request_id) = request["id"].as_i64() {
+                let reply = agent.adopt(request_id);
+                if request["method"] == "session/prompt" {
+                    turn = Some(reply);
+                }
+            }
+        }
+        let agent_state = match self.store.get_session(id).await {
+            Ok(row) => row.and_then(|r| r.agent_state),
+            Err(e) => {
+                tracing::warn!(session = %id, error = %e, "loading the agent's state");
+                None
+            }
+        }
+        .unwrap_or_else(|| json!({}));
+        match turn {
+            None => {
+                self.agent_ready(id, agent, running.ready.agent_session_id, agent_state, None)
+                    .await
+            }
+            Some(turn) => {
+                {
+                    let live = self.live(id);
+                    let mut state = live.state.lock().await;
+                    if !state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
+                        return;
+                    }
+                    state.agent_session_id = Some(running.ready.agent_session_id);
+                    state.agent_state = agent_state;
+                    state.loading = false;
+                    state.turn_running = true;
+                }
+                self.set_phase(id, Phase::Working).await;
+                let (hub, agent) = (self.clone(), agent.clone());
+                tokio::spawn(async move {
+                    if let Ok(Err(e)) = turn.await {
+                        tracing::warn!(session = %id, error = %e, "adopted turn failed");
+                    }
+                    hub.end_turn(id, &agent).await;
+                });
+            }
+        }
+        for request in running.waiting {
+            self.on_agent_request(id, agent, request).await;
+        }
     }
 
     /// The agent is up; anything sent while it wasn't runs now, as one turn.
@@ -490,6 +561,12 @@ impl Hub {
                 json!({"sessionId": agent_session_id, "prompt": blocks}),
             )
             .await;
+        self.end_turn(id, &agent).await;
+        result
+    }
+
+    /// Syncs the transcript after a turn and runs the messages queued behind it as the next one.
+    async fn end_turn(self: &Arc<Self>, id: Uuid, agent: &Arc<AgentConn>) {
         let next = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
@@ -507,7 +584,6 @@ impl Hub {
                 None => self.set_phase(id, Phase::Idle).await,
             }
         }
-        result
     }
 
     /// Moves a message waiting behind the running turn into it.

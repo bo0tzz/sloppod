@@ -248,10 +248,10 @@ async fn reconcile(state: &AppState) {
             tracing::error!(session = %session.id, error = %e, "reconciling session");
         }
         if interrupted {
-            // Queued until the agent is back, then delivered as its next turn.
+            // Delivered if the agent has to be launched again; one that kept running carries on.
             state
                 .hub
-                .notify(session.id, restart_notice(state.config.build.as_deref()))
+                .set_restart_notice(session.id, restart_notice(state.config.build.as_deref()))
                 .await;
         }
     }

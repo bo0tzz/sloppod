@@ -18,7 +18,9 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, PostParams};
 use serde_json::{Value, json};
 use sloppod_contracts::{AgentContext, MemoryContext};
-use sloppod_protocol::link::{FromSupervisor, Launch, Repo, ToSupervisor, TranscriptFile};
+use sloppod_protocol::link::{
+    AgentReady, FromSupervisor, Launch, Repo, RunningAgent, ToSupervisor, TranscriptFile,
+};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
@@ -119,6 +121,19 @@ impl AgentConn {
 
     pub fn sync_transcript(&self) {
         let _ = self.tx.send(ToSupervisor::SyncTranscript);
+    }
+
+    /// Takes over a request an earlier link sent the agent, so its answer still reaches someone.
+    pub(crate) fn adopt(&self, id: i64) -> oneshot::Receiver<Result<Value, RpcError>> {
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().expect("pending lock").insert(id, tx);
+        self.next_id.fetch_max(id + 1, Ordering::Relaxed);
+        rx
+    }
+
+    /// Tells the supervisor the agent's session is up, so it can report the agent if the link drops.
+    pub fn ready(&self, ready: AgentReady) {
+        let _ = self.tx.send(ToSupervisor::AgentReady(ready));
     }
 
     pub(crate) fn handle_response(&self, message: &Value) {
@@ -319,7 +334,6 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
     if session.phase() == sloppod_protocol::api::Phase::Stopped {
         return;
     }
-    tracing::info!(session = %session_id, "supervisor connected");
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<ToSupervisor>();
     let writer = tokio::spawn(async move {
@@ -337,24 +351,57 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
             }
         }
     });
+    let Some((version, running)) = hello(&mut stream).await else {
+        tracing::warn!(session = %session_id, "supervisor connected without a hello");
+        writer.abort();
+        return;
+    };
+    tracing::info!(session = %session_id, %version, attach = running.is_some(), "supervisor connected");
     let agent = Arc::new(AgentConn::new(tx.clone()));
     state.hub.attach_agent(session_id, agent.clone()).await;
-    state
-        .hub
-        .set_phase(session_id, sloppod_protocol::api::Phase::Starting)
-        .await;
+    let restart_notice = state.hub.take_restart_notice(session_id).await;
 
-    let context = agent_context(&state, &session).await;
-    let (launch, agent_launch) = match launch_for(&state, &session, &context).await {
-        Ok(launch) => launch,
-        Err(e) => {
-            tracing::error!(session = %session_id, error = %e, "building launch spec");
-            return;
+    let agent_launch = match running {
+        Some(running) => {
+            let _ = tx.send(ToSupervisor::Attach {
+                runtime_build: state.config.build.clone(),
+            });
+            state.hub.adopt_agent(session_id, &agent, running).await;
+            None
+        }
+        None => {
+            state
+                .hub
+                .set_phase(session_id, sloppod_protocol::api::Phase::Starting)
+                .await;
+            if let Some(notice) = restart_notice {
+                state.hub.notify(session_id, notice).await;
+            }
+            let context = agent_context(&state, &session).await;
+            match launch_for(&state, &session, &context).await {
+                Ok((launch, agent_launch)) => {
+                    let _ = tx.send(ToSupervisor::Launch(Box::new(launch)));
+                    Some(agent_launch)
+                }
+                Err(e) => {
+                    tracing::error!(session = %session_id, error = %e, "building launch spec");
+                    state.hub.detach_agent(session_id, &agent).await;
+                    writer.abort();
+                    return;
+                }
+            }
         }
     };
-    let _ = tx.send(ToSupervisor::Launch(Box::new(launch)));
 
-    while let Some(Ok(message)) = stream.next().await {
+    loop {
+        let message = match tokio::time::timeout(LINK_TIMEOUT, stream.next()).await {
+            Ok(Some(Ok(message))) => message,
+            Ok(_) => break,
+            Err(_) => {
+                tracing::warn!(session = %session_id, "no word from the supervisor; dropping the link");
+                break;
+            }
+        };
         let text = match message {
             Message::Text(text) => text,
             Message::Close(_) => break,
@@ -368,19 +415,15 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
             }
         };
         match message {
-            FromSupervisor::Hello { version } => {
-                tracing::info!(session = %session_id, %version, "supervisor hello");
-            }
+            FromSupervisor::Hello { .. } => {}
             FromSupervisor::Status { message } => {
                 tracing::info!(session = %session_id, %message, "supervisor status");
             }
             FromSupervisor::AgentStarted => {
-                let (state, agent, session, agent_launch) = (
-                    state.clone(),
-                    agent.clone(),
-                    session.clone(),
-                    agent_launch.clone(),
-                );
+                let Some(agent_launch) = agent_launch.clone() else {
+                    continue;
+                };
+                let (state, agent, session) = (state.clone(), agent.clone(), session.clone());
                 tokio::spawn(async move {
                     if let Err(e) =
                         start_agent_session(&state, &agent, &session, &agent_launch).await
@@ -467,6 +510,10 @@ async fn start_agent_session(
     let agent_state = adapter::agent_state(&response);
     db::set_agent_session(&state.db, session.id, &agent_session_id, &agent_state).await?;
     let pending = db::take_pending_prompt(&state.db, session.id).await?;
+    agent.ready(AgentReady {
+        agent_session_id: agent_session_id.clone(),
+        capabilities: init,
+    });
     state
         .hub
         .agent_ready(session.id, agent, agent_session_id, agent_state, pending)
@@ -527,5 +574,30 @@ pub(crate) async fn from_agent(
         }
     } else {
         agent.handle_response(&message);
+    }
+}
+
+/// How long the link may be silent before it counts as dead; the supervisor pings every 20 s.
+const LINK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The supervisor's first message: its version, and the agent it kept running if there is one.
+async fn hello(
+    stream: &mut futures::stream::SplitStream<WebSocket>,
+) -> Option<(String, Option<RunningAgent>)> {
+    loop {
+        let message = tokio::time::timeout(LINK_TIMEOUT, stream.next())
+            .await
+            .ok()??
+            .ok()?;
+        match message {
+            Message::Text(text) => {
+                return match serde_json::from_str(&text).ok()? {
+                    FromSupervisor::Hello { version, agent } => Some((version, agent)),
+                    _ => None,
+                };
+            }
+            Message::Close(_) => return None,
+            _ => {}
+        }
     }
 }
