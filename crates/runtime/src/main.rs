@@ -31,6 +31,7 @@ use clap::Parser;
 use k8s_openapi::api::core::v1::Service;
 use kube::api::Api;
 use sloppod_contracts::{AgentAdapter, Enforcer, PlacementBackend};
+use sloppod_protocol::api::Phase;
 use sqlx::PgPool;
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -235,12 +236,40 @@ async fn reconcile(state: &AppState) {
         }
     };
     for session in sessions {
-        state
-            .hub
-            .set_phase(session.id, sloppod_protocol::api::Phase::Disconnected)
-            .await;
+        let interrupted = matches!(session.phase(), Phase::Working | Phase::Waiting);
+        state.hub.set_phase(session.id, Phase::Disconnected).await;
         if let Err(e) = api::place(state, &session).await {
             tracing::error!(session = %session.id, error = %e, "reconciling session");
         }
+        if interrupted {
+            // Queued until the agent is back, then delivered as its next turn.
+            state
+                .hub
+                .notify(session.id, restart_notice(state.config.build.as_deref()))
+                .await;
+        }
+    }
+}
+
+/// Tells an agent whose turn a runtime restart cut off what it lost, so it can carry on without the user.
+fn restart_notice(build: Option<&str>) -> String {
+    let build = build
+        .map(|b| format!(" (now running {b})"))
+        .unwrap_or_default();
+    format!(
+        "sloppod: the runtime restarted{build} while you were working, which ended your turn. The tool call that \
+         was running, any background tasks you started and any question you were waiting on are gone; your working \
+         tree and files are intact. Check what had finished, then carry on where you left off."
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restart_notice_names_the_build() {
+        assert!(restart_notice(Some("4f1a32e")).contains("restarted (now running 4f1a32e) while"));
+        assert!(restart_notice(None).contains("restarted while"));
     }
 }
