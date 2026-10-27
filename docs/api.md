@@ -124,6 +124,7 @@ type Proposal = {
   reason?: string;                             // when rejected
   created_at: string;
   decided_at?: string;
+  decided_by?: string;                         // the user, or "standing-approval:<id>"
 };
 
 type ProposalDetail = Proposal & {
@@ -134,6 +135,28 @@ type ProposalDetail = Proposal & {
 ```
 
 Approving returns as soon as the decision is recorded, with status `approved`; the proposal is carried out in the background and its outcome (`executed` or `failed`) follows as a `_sloppod/proposal` update, and in `GET /api/v1/proposals/{id}`. Approving with edits changes the payload first: `github.pr.create` takes `{title?, body?, auto_merge?}`; `github.issue.create` takes `{issues}`, the issues to file, so leaving one out drops it. Other kinds take no edits.
+
+### Standing approvals
+
+Pre-approved proposal patterns ([ADR 3](adr/0003-proposals-and-trusted-executor.md)): a proposal from one of the owner's sessions that matches a live standing approval (its kind, its target, and its session if it names one) is approved as soon as it's made, with the standing approval's edits, and carried out like any other approval. Its `decided_by` names the standing approval, and the agent's tool reply says it was approved. Every built-in kind's target is its repository.
+
+```
+GET    /api/v1/standing-approvals        -> StandingApproval[]   (live ones: not revoked, not expired)
+POST   /api/v1/standing-approvals        -> StandingApproval     body: {kind, target?, session_id?, edits?, expires_at?}
+DELETE /api/v1/standing-approvals/{id}   -> 204                  revokes it
+```
+
+```ts
+type StandingApproval = {
+  id: string;
+  kind: string;          // a proposal kind, e.g. "github.pr.create"
+  target?: string;       // owner/name; absent matches any
+  session_id?: string;   // absent matches all of the owner's sessions
+  edits: { auto_merge?: boolean };  // the only edit a standing approval can make
+  expires_at?: string;   // RFC 3339; absent means until revoked
+  created_at: string;
+};
+```
 
 ## ACP at `/acp`
 

@@ -223,7 +223,8 @@
         {/if}
 
         <Text color="muted" size="tiny">
-          Proposed {absoluteTime(detail.created_at)}{#if detail.decided_at}, decided {absoluteTime(detail.decided_at)}{/if}
+          Proposed {absoluteTime(detail.created_at)}{#if detail.decided_at}, decided {absoluteTime(detail.decided_at)}{/if}{#if detail.decided_by?.startsWith('standing-approval:')}
+            by a standing approval{/if}
         </Text>
       {/if}
     </div>

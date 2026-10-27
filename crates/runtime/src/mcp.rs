@@ -81,10 +81,18 @@ async fn call(state: &AppState, session: Uuid, params: &Value) -> Value {
         };
     }
     match proposals::propose(state, session, name, arguments).await {
-        Ok(proposal) => text(
+        Ok(proposal) if proposal.status == "pending" => text(
             format!(
                 "Proposal {} created and waiting for human review. Nothing has happened yet; once it's approved sloppod \
                  carries it out. Check its status with get_proposal.",
+                proposal.id
+            ),
+            false,
+        ),
+        Ok(proposal) => text(
+            format!(
+                "Proposal {} was approved by a standing approval and is being carried out; you'll be told how it went. \
+                 Check its status with get_proposal.",
                 proposal.id
             ),
             false,

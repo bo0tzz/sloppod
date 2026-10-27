@@ -6,6 +6,7 @@
   import ChatHeader from '#lib/components/ChatHeader.svelte';
   import CredentialSection from '#lib/components/CredentialSection.svelte';
   import SessionDefaults from '#lib/components/SessionDefaults.svelte';
+  import StandingApprovals from '#lib/components/StandingApprovals.svelte';
   import { credentialKinds } from '#lib/presentation.ts';
 
   let credentials = $state<Credential[] | null>(null);
@@ -35,6 +36,7 @@
   <div class="min-h-0 grow overflow-y-auto">
     <div class="mx-auto flex w-full max-w-2xl flex-col gap-8 px-4 py-6">
       <SessionDefaults />
+      <StandingApprovals />
       {#if error}
         <Alert color="danger" size="small" title="Couldn't load credentials">{error}</Alert>
       {/if}

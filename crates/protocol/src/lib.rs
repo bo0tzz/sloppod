@@ -108,6 +108,38 @@ pub mod api {
         pub created_at: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub decided_at: Option<String>,
+        /// The user who decided, or `standing-approval:<id>`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub decided_by: Option<String>,
+    }
+
+    /// A pre-approved proposal pattern (ADR 3).
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct StandingApproval {
+        pub id: Uuid,
+        pub kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub target: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub session_id: Option<Uuid>,
+        pub edits: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub expires_at: Option<String>,
+        pub created_at: String,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    pub struct NewStandingApproval {
+        pub kind: String,
+        #[serde(default)]
+        pub target: Option<String>,
+        #[serde(default)]
+        pub session_id: Option<Uuid>,
+        #[serde(default)]
+        pub edits: Option<Value>,
+        /// RFC 3339.
+        #[serde(default)]
+        pub expires_at: Option<String>,
     }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize)]
