@@ -85,6 +85,27 @@ impl GitHubPolicy {
                                 );
                                 return Ok(push.reject(&message));
                             }
+                            // Auto-merge must only merge what was reviewed (ADR 3): new commits on its head turn
+                            // it off, and the agent hears about it before the push goes through.
+                            for pushed in push
+                                .refs
+                                .iter()
+                                .filter_map(|r| r.strip_prefix("refs/heads/"))
+                            {
+                                let disabled =
+                                    app.disable_auto_merge(repo, pushed).await.map_err(err)?;
+                                if !disabled.is_empty() {
+                                    let pulls: Vec<String> =
+                                        disabled.iter().map(|n| format!("#{n}")).collect();
+                                    let message = format!(
+                                        "sloppod: `{pushed}` is the head of {}, which was set to merge once its checks \
+                                         pass. New commits there haven't been reviewed, so auto-merge is now off and it \
+                                         needs merging by hand. Push again to go ahead.",
+                                        pulls.join(", ")
+                                    );
+                                    return Ok(push.reject(&message));
+                                }
+                            }
                         }
                         _ => {
                             return Ok(Decision::deny(
