@@ -134,7 +134,7 @@ type ProposalDetail = Proposal & {
 };
 ```
 
-Approving returns as soon as the decision is recorded, with status `approved`; the proposal is carried out in the background and its outcome (`executed` or `failed`) follows as a `_sloppod/proposal` update, and in `GET /api/v1/proposals/{id}`. Approving with edits changes the payload first: `github.pr.create` takes `{title?, body?, auto_merge?}`; `github.issue.create` takes `{issues}`, the issues to file, so leaving one out drops it. Other kinds take no edits.
+Approving returns as soon as the decision is recorded, with status `approved`; the proposal is carried out in the background and its outcome (`executed` or `failed`) follows as a `_sloppod/proposal` update, and in `GET /api/v1/proposals/{id}`. Approving with edits changes the payload first: `github.pr.create` takes `{title?, body?, auto_merge?}`; `github.issue.create` takes `{issues}`, the issues to file, so leaving one out drops it. Other kinds take no edits. A proposal's status only moves forward (`pending`, then `approved` or `rejected`, then `executed` or `failed`), so a UI can ignore a copy, e.g. from a slow refetch, that is behind the one it has.
 
 ### Standing approvals
 

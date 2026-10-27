@@ -12,7 +12,7 @@ import type {
   SessionUpdate,
   StopReason,
 } from './acp/types.ts';
-import { api, ApiError, newerSession, type Proposal, type Session } from './api.ts';
+import { api, ApiError, newerProposal, newerSession, type Proposal, type Session } from './api.ts';
 import { sessions } from './sessions.svelte.ts';
 
 export type PendingPermission = RequestPermissionRequest & { rpcId: RequestId };
@@ -222,7 +222,7 @@ export class SessionView {
     if (index === -1) {
       this.proposals.push(proposal);
     } else {
-      this.proposals[index] = proposal;
+      this.proposals[index] = newerProposal(this.proposals[index], proposal);
     }
   }
 
