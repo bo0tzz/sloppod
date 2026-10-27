@@ -80,7 +80,16 @@ impl Authorizer {
         };
         let session = match db::get_session(&self.state.db, session_id).await {
             Ok(Some(session)) => session,
-            _ => return deny("sloppod: unknown session.\n"),
+            Ok(None) => return deny("sloppod: unknown session.\n"),
+            // Ours, not the request's: say so, so the agent tries again rather than giving up.
+            Err(e) => {
+                tracing::error!(session = %session_id, %host, error = %e, "loading the session to authorize a request");
+                return deny_with(
+                    503,
+                    "sloppod: couldn't load the session; try again.\n",
+                    None,
+                );
+            }
         };
         let Some(policy) = self.state.policies.for_host(&host) else {
             return deny(&format!("sloppod: no request policy for {host}.\n"));
