@@ -69,6 +69,7 @@ export const proposalStatuses: Record<ProposalStatus, { label: string; color: Co
 
 const executedLabels: Record<string, string> = {
   'github.pr.create': 'Opened',
+  'github.stack.create': 'Opened',
   'github.issue.create': 'Filed',
   'sloppod.repo.grant': 'Granted',
 };
@@ -91,6 +92,15 @@ export function proposalSummary(proposal: Proposal): { label: string; title: str
         detail: `${payloadText(payload.repo)}: ${payloadText(payload.head)} → ${payloadText(payload.base)}`,
         icon: mdiSourcePull,
       };
+    case 'github.stack.create': {
+      const layers = Array.isArray(payload.pull_requests) ? (payload.pull_requests as { title?: unknown }[]) : [];
+      return {
+        label: 'Stacked pull requests',
+        title: `${layers.length} pull requests, from “${payloadText(layers[0]?.title)}”`,
+        detail: `${payloadText(payload.repo)} → ${payloadText(payload.base)}`,
+        icon: mdiSourcePull,
+      };
+    }
     case 'github.issue.create': {
       const issues = Array.isArray(payload.issues) ? (payload.issues as { title?: unknown }[]) : [];
       return {

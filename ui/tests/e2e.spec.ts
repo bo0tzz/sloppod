@@ -224,6 +224,23 @@ test('approves a proposal with an edited title', async ({ page }) => {
   expect(pr?.payload.auto_merge).toBe(false);
 });
 
+test('approves a stack of pull requests', async ({ page }) => {
+  await createSession(page, 'Propose a stack for sloppod');
+  const card = page.getByTestId('proposal-card');
+  await expect(card).toContainText('2 pull requests, from “Back off when reconnecting”');
+  await card.getByRole('button', { name: 'Review' }).click();
+
+  const layers = page.getByTestId('stack-layer');
+  await expect(layers).toHaveCount(2);
+  await expect(layers.first()).toContainText('1. Back off when reconnecting');
+  await expect(layers.last()).toContainText('2. Show the reconnect countdown');
+  await expect(layers.last()).toContainText(/-ui → sloppod\/[0-9a-f]+-backoff/);
+  await expect(layers.last().getByTestId('diff')).toContainText('Reconnecting in {seconds} s');
+
+  await page.getByRole('button', { name: 'Approve', exact: true }).click();
+  await expect(page.getByTestId('system-notice')).toContainText('as stack #7');
+});
+
 test('rejects a proposal with a reason', async ({ page }) => {
   await createSession(page, 'Propose something for sloppod I will reject');
   await finishTurn(page);

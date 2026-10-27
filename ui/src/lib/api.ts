@@ -50,6 +50,8 @@ export type Proposal = {
     url?: string;
     number?: number;
     issues?: { title: string; url: string; number: number }[];
+    pull_requests?: { url: string; number: number }[];
+    message?: string;
     failed?: { title: string; error: string }[];
   };
   error?: string;
@@ -78,6 +80,15 @@ export type NewStandingApproval = Omit<StandingApproval, 'id' | 'created_at'>;
 export type ProposalDetail = Proposal & {
   diff?: string;
   commits?: { sha: string; message: string }[];
+  /** Stacks: each pull request's diff and commits, bottom first. */
+  layers?: { diff: string; commits: { sha: string; message: string }[] }[];
+};
+
+/** Pull requests that build on each other, bottom first; each merges into the one below it. */
+export type StackPayload = {
+  repo: string;
+  base: string;
+  pull_requests: { head: string; base: string; head_sha: string; title: string; body: string; draft: boolean }[];
 };
 
 export type CredentialKind = 'claude' | 'github-app' | 'memini' | 'chatgpt';
