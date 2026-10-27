@@ -205,8 +205,8 @@ fn proposal_hint(what: &str, session: &SessionContext) -> String {
             .to_owned(),
     };
     format!(
-        "sloppod: {what}. Outward actions go through human review: {pull_request}. Other GitHub writes \
-         (comments, issues, reviews, releases) aren't available to sessions yet.\n"
+        "sloppod: {what}. Outward actions go through human review: {pull_request}. To file issues, call the \
+         propose_issues tool. Other GitHub writes (comments, reviews, releases) aren't available to sessions yet.\n"
     )
 }
 

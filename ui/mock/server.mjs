@@ -437,6 +437,20 @@ async function agentScript(session, turn, prompt) {
     return;
   }
 
+  if (session.data.repo && /file issues/i.test(prompt)) {
+    await step(2);
+    const proposeId = randomUUID();
+    tool({ toolCallId: proposeId, title: 'mcp__sloppod__propose_issues', kind: 'other', status: 'pending' });
+    await step(2);
+    const proposal = createIssues(session);
+    update(proposeId, {
+      status: 'completed',
+      content: [{ type: 'content', content: { type: 'text', text: `Proposal ${proposal.id} created and waiting for human review.` } }],
+    });
+    await say("I've proposed three issues for the backlog. They're filed once you approve them.");
+    return;
+  }
+
   if (!session.data.repo && /request a repository/i.test(prompt)) {
     const repo = availableRepos().at(-1) ?? REPOS.at(-1);
     const reason = 'The change you asked for lives in that repository, and this session has none yet.';
@@ -635,6 +649,27 @@ function createRepoGrant(session, repo, reason) {
     kind: 'sloppod.repo.grant',
     status: 'pending',
     payload: { repo, reason, branch: sessionBranch(session) },
+    created_at: now(),
+  };
+  proposals.set(proposal.id, proposal);
+  broadcastProposal(proposal);
+  return proposal;
+}
+
+function createIssues(session) {
+  const proposal = {
+    id: randomUUID(),
+    session_id: session.data.id,
+    kind: 'github.issue.create',
+    status: 'pending',
+    payload: {
+      repo: session.data.repo,
+      issues: [
+        { title: 'Steers should land at the next tool boundary', body: 'Steering interrupts the running generation.', labels: ['dogfood'] },
+        { title: 'Fail fast on blocked egress', body: 'Blocked connections hang until the client times out.', labels: ['dogfood', 'enforcement'] },
+        { title: 'Show the version in the UI', body: '', labels: [] },
+      ],
+    },
     created_at: now(),
   };
   proposals.set(proposal.id, proposal);
@@ -1003,6 +1038,16 @@ async function handleApi(req, res, url) {
         proposal.result = { url: `https://github.com/${proposal.payload.repo}/pull/${number}`, number };
         notice = `Your pull request was approved and opened: ${proposal.result.url}`;
         ack = 'Great, the pull request is open.';
+      } else if (proposal.kind === 'github.issue.create') {
+        if (Array.isArray(body.issues)) proposal.payload.issues = body.issues;
+        const filed = proposal.payload.issues.map((issue, index) => {
+          const number = 200 + proposals.size * 10 + index;
+          return { title: issue.title, url: `https://github.com/${proposal.payload.repo}/issues/${number}`, number };
+        });
+        proposal.status = 'executed';
+        proposal.result = { issues: filed, failed: [], message: `Filed ${filed.map((i) => `#${i.number}`).join(', ')}.` };
+        notice = `Your issues were approved and filed: ${filed.map((i) => i.url).join(', ')}`;
+        ack = 'Thanks, the issues are filed.';
       } else if (proposal.kind === 'sloppod.repo.grant') {
         proposal.status = 'executed';
         if (session) grantRepo(session, proposal.payload.repo);

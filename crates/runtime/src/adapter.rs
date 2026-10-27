@@ -56,8 +56,9 @@ impl ClaudeCode {
              (`<session branch>-<name>`, e.g. for a second pull request). For write access to another repository, \
              call the `request_repository` tool.\n\
              - Outward actions are proposals that a human reviews. To open a pull request, push your branch and call \
-             the `propose_pull_request` tool; sloppod opens the PR once it's approved. You're told when your \
-             proposals are decided. Direct writes to GitHub (gh pr create, comments, API POSTs) are refused.\n",
+             the `propose_pull_request` tool; sloppod opens the PR once it's approved. To file issues, call the \
+             `propose_issues` tool. You're told when your proposals are decided. Direct writes to GitHub (gh pr \
+             create, gh issue create, comments, API POSTs) are refused.\n",
         );
         format!(
             "You are running in a sloppod session: a sandboxed Kubernetes pod.\n\

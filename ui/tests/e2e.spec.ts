@@ -197,6 +197,31 @@ test('rejects a proposal with a reason', async ({ page }) => {
   await expect(page.getByTestId('system-notice')).toContainText('Your proposal was rejected: Not now');
 });
 
+test('files issues, leaving one out and editing another', async ({ page }) => {
+  const id = await createSession(page, 'File issues for sloppod');
+  const card = page.getByTestId('proposal-card');
+  await expect(card).toHaveAttribute('data-kind', 'github.issue.create');
+  await card.getByRole('button', { name: 'Review' }).click();
+
+  const drafts = page.getByTestId('issue-draft');
+  await expect(drafts).toHaveCount(3);
+  await expect(drafts.nth(1)).toContainText('enforcement');
+  await drafts.nth(2).getByRole('checkbox', { name: 'File this issue' }).click();
+  await page.getByRole('button', { name: 'Edit' }).click();
+  await drafts.nth(0).getByRole('textbox', { name: 'Issue title' }).fill('Steer at the next tool boundary');
+  await page.getByRole('button', { name: 'File 2 issues' }).click();
+
+  await expect(page.getByTestId('proposal-detail')).toBeHidden();
+  await expect(page.getByTestId('system-notice')).toContainText(/issues\/\d+, https/);
+  const proposals: Proposal[] = await (await page.request.get(`/api/v1/proposals?session=${id}`)).json();
+  const filed = proposals.find((p) => p.kind === 'github.issue.create')!;
+  expect(filed.status).toBe('executed');
+  expect((filed.payload.issues as { title: string }[]).map((issue) => issue.title)).toEqual([
+    'Steer at the next tool boundary',
+    'Fail fast on blocked egress',
+  ]);
+});
+
 async function expectTranscriptOnce(page: Page, prompt: string) {
   await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(1);
   await expect(agentMessages(page).filter({ hasText: FINAL })).toHaveCount(1);

@@ -17,7 +17,16 @@
   } from '@immich/ui';
   import { mdiOpenInNew, mdiSourceCommit } from '@mdi/js';
   import { onMount } from 'svelte';
-  import { api, type Proposal, type ProposalDetail, type PullRequestPayload, type RepoGrantPayload } from '#lib/api.ts';
+  import {
+    api,
+    type IssueDraft,
+    type IssuesPayload,
+    type Proposal,
+    type ProposalDetail,
+    type ProposalEdits,
+    type PullRequestPayload,
+    type RepoGrantPayload,
+  } from '#lib/api.ts';
   import { parseUnifiedDiff } from '#lib/diff.ts';
   import { absoluteTime } from '#lib/format.ts';
   import { proposalStatus, proposalSummary } from '#lib/presentation.ts';
@@ -32,6 +41,7 @@
 
   const kindTitles: Record<string, string> = {
     'github.pr.create': 'Pull request proposal',
+    'github.issue.create': 'Issues proposal',
     'sloppod.repo.grant': 'Repository access',
   };
   // svelte-ignore state_referenced_locally
@@ -48,9 +58,12 @@
   let rejecting = $state(false);
   let autoMerge = $state(false);
   let reason = $state('');
+  let drafts = $state<(IssueDraft & { file: boolean })[]>([]);
 
   const pr = $derived(detail?.kind === 'github.pr.create' ? (detail.payload as PullRequestPayload) : null);
   const grant = $derived(detail?.kind === 'sloppod.repo.grant' ? (detail.payload as RepoGrantPayload) : null);
+  const issues = $derived(detail?.kind === 'github.issue.create' ? (detail.payload as IssuesPayload) : null);
+  const filing = $derived(drafts.filter((draft) => draft.file).length);
   const summary = $derived(proposalSummary(detail ?? proposal));
   const parsed = $derived(pr && detail ? parseUnifiedDiff(detail.diff ?? '') : []);
   const files = $derived(parsed ?? []);
@@ -61,10 +74,16 @@
     try {
       detail = await api.getProposal(proposal.id);
       autoMerge = detail.kind === 'github.pr.create' && (detail.payload as PullRequestPayload).auto_merge === true;
+      resetDrafts();
     } catch (error) {
       loadError = error instanceof Error ? error.message : String(error);
     }
   });
+
+  function resetDrafts() {
+    if (detail?.kind !== 'github.issue.create') return;
+    drafts = (detail.payload as IssuesPayload).issues.map((issue) => ({ ...issue, labels: [...issue.labels], file: true }));
+  }
 
   /** Records the decision; the modal only stays open to show a failure. */
   function applyResult(proposal: Proposal) {
@@ -77,9 +96,10 @@
     if (!detail) return;
     busy = 'approve';
     actionError = null;
-    const edits: { title?: string; body?: string; auto_merge?: boolean } = {};
+    const edits: ProposalEdits = {};
     if (editing && pr && title !== pr.title) edits.title = title;
     if (editing && pr && body !== pr.body) edits.body = body;
+    if (issues) edits.issues = drafts.filter((draft) => draft.file).map(({ file: _file, ...issue }) => issue);
     if (pr && autoMerge !== (pr.auto_merge === true)) edits.auto_merge = autoMerge;
     try {
       applyResult(await api.approveProposal(detail.id, edits));
@@ -106,14 +126,20 @@
   }
 
   function startEditing() {
-    if (!pr) return;
-    title = pr.title;
-    body = pr.body;
+    if (pr) {
+      title = pr.title;
+      body = pr.body;
+    }
     editing = true;
+  }
+
+  function discardEdits() {
+    resetDrafts();
+    editing = false;
   }
 </script>
 
-<Modal title={kindTitles[kind] ?? `Proposal: ${kind}`} icon={summary.icon} size={pr ? 'giant' : 'medium'} {onClose}>
+<Modal title={kindTitles[kind] ?? `Proposal: ${kind}`} icon={summary.icon} size={pr ? 'giant' : issues ? 'large' : 'medium'} {onClose}>
   <ModalBody>
     <div class="flex flex-col gap-5 pb-4" data-testid="proposal-detail">
       {#if loadError}
@@ -132,6 +158,8 @@
           {/if}
           {#if pr}
             <span class="text-muted min-w-0 font-mono text-xs break-all">{pr.repo}: {pr.head} → {pr.base}</span>
+          {:else if issues}
+            <span class="text-muted min-w-0 font-mono text-xs break-all">{issues.repo}</span>
           {/if}
         </div>
 
@@ -146,6 +174,22 @@
           <Alert color="success" size="small" title="Access granted">
             The session can now push to <span class="font-mono">{grant.branch}</span> on {grant.repo}.
           </Alert>
+        {:else if detail.status === 'executed' && issues && detail.result?.issues}
+          <Alert color="success" size="small" title="Issues filed">
+            <ul class="flex flex-col gap-1">
+              {#each detail.result.issues as filed (filed.number)}
+                <li>
+                  <a href={filed.url} target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-1 underline" data-testid="filed-issue">
+                    #{filed.number} {filed.title}
+                    <Icon icon={mdiOpenInNew} aria-hidden />
+                  </a>
+                </li>
+              {/each}
+              {#each detail.result.failed ?? [] as failure, index (index)}
+                <li class="text-danger">{failure.title}: {failure.error}</li>
+              {/each}
+            </ul>
+          </Alert>
         {:else if detail.status === 'failed'}
           <Alert color="danger" size="small" title="Execution failed">{detail.error ?? 'Unknown error'}</Alert>
         {:else if detail.status === 'rejected'}
@@ -154,6 +198,8 @@
 
         {#if pr}
           {@render pullRequest(detail, pr)}
+        {:else if issues}
+          {@render issueList()}
         {:else if grant}
           <div class="flex flex-col gap-3">
             <Heading tag="h2" size="tiny" data-testid="proposal-title">{summary.title}</Heading>
@@ -213,18 +259,64 @@
             Reject…
           </Button>
           {#if editing}
-            <Button color="secondary" variant="ghost" shape="round" onclick={() => (editing = false)}>Discard edits</Button>
-          {:else if pr}
+            <Button color="secondary" variant="ghost" shape="round" onclick={discardEdits}>Discard edits</Button>
+          {:else if pr || issues}
             <Button color="secondary" variant="outline" shape="round" onclick={startEditing}>Edit</Button>
           {/if}
-          <Button color="success" shape="round" loading={busy === 'approve'} disabled={busy === 'reject'} onclick={approve}>
-            {editing ? 'Approve with edits' : 'Approve'}
+          <Button
+            color="success"
+            shape="round"
+            loading={busy === 'approve'}
+            disabled={busy === 'reject' || (issues !== null && filing === 0)}
+            onclick={approve}
+          >
+            {#if issues}
+              File {filing} {filing === 1 ? 'issue' : 'issues'}
+            {:else}
+              {editing ? 'Approve with edits' : 'Approve'}
+            {/if}
           </Button>
         </div>
       {/if}
     </div>
   </ModalFooter>
 </Modal>
+
+{#snippet issueList()}
+  <div class="flex flex-col gap-3">
+    {#each drafts as draft, index (index)}
+      <section
+        class="border-light-200 flex flex-col gap-2 rounded-xl border p-3 {draft.file ? '' : 'opacity-50'}"
+        data-testid="issue-draft"
+      >
+        <div class="flex items-start gap-2">
+          {#if pending}
+            <Checkbox bind:checked={draft.file} aria-label="File this issue" class="mt-0.5" />
+          {/if}
+          {#if editing && draft.file}
+            <Input bind:value={draft.title} aria-label="Issue title" class="grow" />
+          {:else}
+            <Heading tag="h3" size="tiny" data-testid="issue-title">{draft.title}</Heading>
+          {/if}
+        </div>
+        {#if draft.labels.length > 0}
+          <div class="flex flex-wrap gap-1">
+            {#each draft.labels as label (label)}
+              <Badge size="tiny" shape="round" color="secondary">{label}</Badge>
+            {/each}
+          </div>
+        {/if}
+        {#if editing && draft.file}
+          <Textarea bind:value={draft.body} rows={6} aria-label="Issue description" class="font-mono" />
+        {:else if draft.body.trim()}
+          <div class="bg-light-100 rounded-xl p-3 text-sm">
+            <Markdown text={draft.body} />
+          </div>
+        {/if}
+      </section>
+    {/each}
+  </div>
+{/snippet}
 
 {#snippet pullRequest(detail: ProposalDetail, pr: PullRequestPayload)}
   {#if editing}

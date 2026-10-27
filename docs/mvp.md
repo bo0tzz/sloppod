@@ -18,7 +18,7 @@ A sloppod session can take a change to this repository from prompt to reviewed P
 |---|---|---|
 | Sessions ([1](adr/0001-sessions-decoupled-from-directories.md)) | Runtime-owned session object, event log and transcript blob. Resume after pod loss. A session starts from its first message, which decides the repository it's about (if any). Messages sent before the agent is up are queued. Decided proposals and repositories added later are delivered to the agent as notices | Projects, sub-sessions, messaging |
 | Capabilities ([2](adr/0002-capabilities.md)) | Grants stored per session, from a fixed set: `model`, `github` (read), `packages`, `repo` (`rw`, session branch only) when the first message names one, `memory` when memini is configured. More `repo` grants come from the agent's `request_repository` proposals or the session menu | Requests for other capabilities, approvals with TTL, standing approvals, profiles, starting-set suggestion |
-| Proposals ([3](adr/0003-proposals-and-trusted-executor.md)) | One kind, `github.pr.create`: review title, body and diff; approve or reject | Editing fields, more kinds, a reviewer model |
+| Proposals ([3](adr/0003-proposals-and-trusted-executor.md)) | `github.pr.create` (review title, body and diff, edit title and body), `sloppod.repo.grant`, and `github.issue.create` (a batch of issues, each editable or droppable); approve or reject | More kinds, a reviewer model |
 | Async ([4](adr/0004-asynchronous-interaction.md)) | Prompts and steering through the adapter; proposals return a pending ID | Inbox urgency levels, delivery of grant changes |
 | Park/wake ([5](adr/0005-park-and-wake.md)) | Not in the MVP | Everything |
 | Self-reference ([6](adr/0006-self-reference.md)) | Not in the MVP | Everything |

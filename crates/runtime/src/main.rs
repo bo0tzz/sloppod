@@ -128,6 +128,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut proposals = ProposalKinds::default();
     proposals.register(Arc::new(proposals::PullRequest::new(credentials.clone())));
+    proposals.register(Arc::new(proposals::Issues::new(credentials.clone())));
     proposals.register(Arc::new(proposals::RepoAccess::new(
         db.clone(),
         credentials.clone(),

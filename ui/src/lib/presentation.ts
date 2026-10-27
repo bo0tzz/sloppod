@@ -1,4 +1,5 @@
 import {
+  mdiAlertCircleOutline,
   mdiHelpCircleOutline,
   mdiSourcePull,
   mdiSourceRepository,
@@ -67,6 +68,7 @@ export const proposalStatuses: Record<ProposalStatus, { label: string; color: Co
 
 const executedLabels: Record<string, string> = {
   'github.pr.create': 'Opened',
+  'github.issue.create': 'Filed',
   'sloppod.repo.grant': 'Granted',
 };
 
@@ -88,6 +90,15 @@ export function proposalSummary(proposal: Proposal): { label: string; title: str
         detail: `${payloadText(payload.repo)}: ${payloadText(payload.head)} → ${payloadText(payload.base)}`,
         icon: mdiSourcePull,
       };
+    case 'github.issue.create': {
+      const issues = Array.isArray(payload.issues) ? (payload.issues as { title?: unknown }[]) : [];
+      return {
+        label: 'Issues',
+        title: issues.length === 1 ? payloadText(issues[0].title) : `${issues.length} issues`,
+        detail: payloadText(payload.repo),
+        icon: mdiAlertCircleOutline,
+      };
+    }
     case 'sloppod.repo.grant':
       return {
         label: 'Repository access',

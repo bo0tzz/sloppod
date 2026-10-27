@@ -313,6 +313,15 @@ pub trait ProposalKind: Send + Sync {
     async fn prepare(&self, session: &SessionContext, arguments: Value) -> Result<Value>;
     /// Extra material for review, e.g. a diff.
     async fn detail(&self, session: &SessionContext, payload: &Value) -> Result<Value>;
+    /// Applies the reviewer's edits, sent along with the approval, to the payload.
+    fn edit(&self, payload: &Value, edits: &Value) -> Result<Value> {
+        match edits.as_object() {
+            Some(edits) if !edits.is_empty() => {
+                Err(Error::new("this kind of proposal can't be edited"))
+            }
+            _ => Ok(payload.clone()),
+        }
+    }
     /// Runs the approved action with the runtime's credentials.
     async fn execute(&self, session: &SessionContext, payload: &Value) -> Result<Value>;
 }
