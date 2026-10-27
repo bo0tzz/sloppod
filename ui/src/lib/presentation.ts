@@ -70,16 +70,21 @@ export const proposalStatuses: Record<ProposalStatus, { label: string; color: Co
   withdrawn: { label: 'Withdrawn', color: 'secondary' },
 };
 
-const executedLabels: Record<string, string> = {
-  'github.pr.create': 'Opened',
-  'github.stack.create': 'Opened',
-  'github.issue.create': 'Filed',
-  'sloppod.repo.grant': 'Granted',
+/**
+ * What each proposal kind is called: `title` heads its modal, `plural` names its standing approvals, and `executed`
+ * is its status once carried out. Kinds missing here show their kind name.
+ */
+export const proposalKinds: Record<string, { title: string; plural: string; executed: string }> = {
+  'github.pr.create': { title: 'Pull request proposal', plural: 'Pull requests', executed: 'Opened' },
+  'github.stack.create': { title: 'Stacked pull requests', plural: 'Stacked pull requests', executed: 'Opened' },
+  'github.issue.create': { title: 'Issues proposal', plural: 'Issues', executed: 'Filed' },
+  'sloppod.repo.grant': { title: 'Repository access', plural: 'Repository access', executed: 'Granted' },
 };
 
 export function proposalStatus(proposal: Proposal): { label: string; color: Color } {
   const status = proposalStatuses[proposal.status] ?? { label: proposal.status, color: 'secondary' };
-  return proposal.status === 'executed' ? { ...status, label: executedLabels[proposal.kind] ?? status.label } : status;
+  const executed = proposalKinds[proposal.kind]?.executed;
+  return proposal.status === 'executed' && executed ? { ...status, label: executed } : status;
 }
 
 const payloadText = (value: unknown) => (typeof value === 'string' ? value : '');

@@ -29,7 +29,7 @@
   } from '#lib/api.ts';
   import { parseUnifiedDiff } from '#lib/diff.ts';
   import { absoluteTime } from '#lib/format.ts';
-  import { proposalStatus, proposalSummary } from '#lib/presentation.ts';
+  import { proposalKinds, proposalStatus, proposalSummary } from '#lib/presentation.ts';
   import Markdown from './Markdown.svelte';
   import PullRequestChanges from './PullRequestChanges.svelte';
   import ReviewHistory from './ReviewHistory.svelte';
@@ -40,12 +40,6 @@
     onClose,
   }: { proposal: Proposal; onChange: (proposal: Proposal) => void; onClose: () => void } = $props();
 
-  const kindTitles: Record<string, string> = {
-    'github.pr.create': 'Pull request proposal',
-    'github.issue.create': 'Issues proposal',
-    'sloppod.repo.grant': 'Repository access',
-    'github.stack.create': 'Stacked pull requests',
-  };
   // svelte-ignore state_referenced_locally
   const kind = proposal.kind;
 
@@ -171,7 +165,7 @@
   }
 </script>
 
-<Modal title={kindTitles[kind] ?? `Proposal: ${kind}`} icon={summary.icon} size={pr || stack ? 'giant' : issues ? 'large' : 'medium'} {onClose}>
+<Modal title={proposalKinds[kind]?.title ?? `Proposal: ${kind}`} icon={summary.icon} size={pr || stack ? 'giant' : issues ? 'large' : 'medium'} {onClose}>
   <ModalBody>
     <div class="flex flex-col gap-5 pb-4" data-testid="proposal-detail">
       {#if loadError}
