@@ -1,7 +1,5 @@
 //! REST API (`docs/api.md`).
 
-use std::collections::BTreeMap;
-
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
@@ -10,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use serde::Deserialize;
 use serde_json::json;
-use sloppod_contracts::{EgressSpec, Grant, PlacementSpec};
+use sloppod_contracts::Grant;
 use sloppod_protocol::api::{
     Decision, NewCredential, NewSession, NewStandingApproval, Phase, ProposalStatus, ReviewPolicy,
     SessionKind,
@@ -18,14 +16,10 @@ use sloppod_protocol::api::{
 use uuid::Uuid;
 
 use crate::credentials::CHATGPT;
-use crate::memini::MeminiAdmin;
-use crate::placement::{TOKEN_DIR, WORKDIR};
-use crate::pods::SESSION_LABEL;
-use crate::policies::SESSION_KEY;
 use crate::proposals::{self, Verdict};
 use crate::session::ParkError;
 use crate::users::User;
-use crate::{AppState, db, reviews};
+use crate::{AppState, db, lifecycle, reviews};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -404,7 +398,7 @@ async fn create_session(
     let row = db::get_session(&state.db, id)
         .await?
         .ok_or_else(not_found)?;
-    if let Err(e) = place(&state, &row).await {
+    if let Err(e) = lifecycle::place(&state, &row).await {
         state.hub.set_phase(id, Phase::Stopped).await;
         return Err(ApiError(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -417,103 +411,6 @@ async fn create_session(
 /// Makes sure a session's pod and egress policy exist.
 /// Gives a session its memini key when its owner has memini and it has none, e.g. because it was just created, or
 /// its key was lost (ADR 22). Keeps the namespace of an existing memory grant.
-async fn ensure_memini_key(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
-    let Some((admin, memini)) = state.credentials.memini(&session.owner).await? else {
-        return Ok(());
-    };
-    if state
-        .credentials
-        .session_secret(session.id, SESSION_KEY)
-        .await?
-        .is_some()
-    {
-        return Ok(());
-    }
-    let context = session.context();
-    let granted = context
-        .grant("memory")
-        .and_then(|g| g.param("namespace"))
-        .map(str::to_owned);
-    let home = memini
-        .config("home")
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("personal/{}", session.owner));
-    let namespace = granted
-        .clone()
-        .unwrap_or_else(|| state.memory_namespace(session.repo.as_deref(), &home));
-    let key = admin
-        .create_session_key(
-            &session.id.to_string(),
-            memini.config("home"),
-            &namespace,
-            false,
-        )
-        .await?;
-    state
-        .credentials
-        .put_session_secret(session.id, SESSION_KEY, &key.secret)
-        .await?;
-    if granted.is_none() {
-        let grant = Grant::new(
-            "memory",
-            json!({"namespace": namespace, "access": "rw", "key": key.name}),
-        );
-        db::add_grant(&state.db, session.id, &grant).await?;
-    }
-    Ok(())
-}
-
-pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
-    if let Err(e) = ensure_memini_key(state, session).await {
-        tracing::warn!(session = %session.id, error = %e, "minting the session's memini key; no memory");
-    }
-    // Minting may have added a memory grant, which the placement below must see.
-    let session = &db::get_session(&state.db, session.id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("session {} is gone", session.id))?;
-    let id = session.id.to_string();
-    let context = session.context();
-    let labels = BTreeMap::from([
-        (SESSION_LABEL.to_owned(), id.clone()),
-        ("app.kubernetes.io/part-of".to_owned(), "sloppod".to_owned()),
-        (
-            "app.kubernetes.io/component".to_owned(),
-            "session".to_owned(),
-        ),
-    ]);
-    state
-        .enforcer
-        .apply(&EgressSpec {
-            session_id: id.clone(),
-            pod_labels: BTreeMap::from([(SESSION_LABEL.to_owned(), id.clone())]),
-            intercepted_hosts: state.policies.hosts(),
-            direct_hosts: if context.has("packages") {
-                state.config.direct_hosts.clone()
-            } else {
-                Vec::new()
-            },
-        })
-        .await?;
-    state
-        .placement
-        .ensure(&PlacementSpec {
-            session_id: id,
-            image: state.config.session_image.clone(),
-            labels,
-            env: vec![
-                ("SLOPPOD_URL".into(), state.config.runtime_url()),
-                ("SLOPPOD_TOKEN_FILE".into(), format!("{TOKEN_DIR}/token")),
-                ("HOME".into(), format!("{WORKDIR}/home")),
-            ],
-            cpu: state.config.session_cpu.clone(),
-            memory: state.config.session_memory.clone(),
-            storage_size: state.config.session_storage_size.clone(),
-            storage_class: state.config.session_storage_class.clone(),
-        })
-        .await?;
-    Ok(())
-}
-
 async fn delete_session(
     State(state): State<AppState>,
     User(user): User,
@@ -532,9 +429,6 @@ async fn delete_session(
     state.hub.broadcast_session(id).await;
     Ok(StatusCode::NO_CONTENT)
 }
-
-/// How long a deleted session can be restored before it's purged for good.
-pub const RESTORABLE_FOR: chrono::Duration = chrono::Duration::days(7);
 
 async fn list_deleted_sessions(
     State(state): State<AppState>,
@@ -573,7 +467,7 @@ async fn restore_session(
 /// Parks a session for deletion, cancelling its turn first if it's in one.
 async fn park_ending_turn(state: &AppState, session: &db::SessionRow) -> ApiResult<()> {
     for attempt in 0..30 {
-        match park(state, session).await {
+        match lifecycle::park(state, session).await {
             Ok(()) => return Ok(()),
             Err(ParkError::InTurn) => {
                 if attempt == 0 {
@@ -590,29 +484,6 @@ async fn park_ending_turn(state: &AppState, session: &db::SessionRow) -> ApiResu
     ))
 }
 
-/// Purges sessions deleted longer ago than [`RESTORABLE_FOR`]: their pod, volume, egress policy and keys go.
-pub async fn purge_deleted(state: &AppState) {
-    let sessions = match db::claim_purges(&state.db, RESTORABLE_FOR).await {
-        Ok(sessions) => sessions,
-        Err(e) => {
-            tracing::error!(error = %e, "listing deleted sessions to purge");
-            return;
-        }
-    };
-    for session in sessions {
-        // Left claimed when cleanup fails, so the next sweep tries again.
-        let purged = match remove_session(state, &session).await {
-            Ok(()) => db::finish_purge(&state.db, session.id)
-                .await
-                .map_err(Into::into),
-            Err(e) => Err(e),
-        };
-        if let Err(e) = purged {
-            tracing::warn!(session = %session.id, error = %e, "purging a deleted session");
-        }
-    }
-}
-
 async fn park_session(
     State(state): State<AppState>,
     User(user): User,
@@ -621,7 +492,9 @@ async fn park_session(
     let session = db::owned_session(&state.db, id, &user)
         .await?
         .ok_or_else(not_found)?;
-    park(&state, &session).await.map_err(park_error)?;
+    lifecycle::park(&state, &session)
+        .await
+        .map_err(park_error)?;
     let session = db::get_session(&state.db, id)
         .await?
         .ok_or_else(not_found)?;
@@ -642,65 +515,11 @@ async fn wake_session(
             "the session is deleted; restore it first".into(),
         ));
     }
-    wake(&state, &session).await?;
+    lifecycle::wake(&state, &session).await?;
     let session = db::get_session(&state.db, id)
         .await?
         .ok_or_else(not_found)?;
     Ok(Json(session.to_api()))
-}
-
-/// Parks a session (ADR 5): its pod ends, and its volume, transcript, branch, grants and keys stay.
-pub async fn park(state: &AppState, session: &db::SessionRow) -> Result<(), ParkError> {
-    let id = session.id.to_string();
-    state
-        .hub
-        .park(session.id, || async {
-            state
-                .placement
-                .suspend(&id)
-                .await
-                .map_err(anyhow::Error::from)
-        })
-        .await
-}
-
-/// Brings a parked session back: its pod starts again and the agent resumes its conversation. Other sessions are
-/// left as they are, and a deleted one stays parked until it's restored.
-pub async fn wake(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
-    state
-        .hub
-        .wake(session.id, || async {
-            // Under the session's transition lock, which deleting parks it under too.
-            let current = db::get_session(&state.db, session.id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("the session is gone"))?;
-            if current.deleted_at.is_some() {
-                anyhow::bail!("the session is deleted; restore it from Settings first");
-            }
-            place(state, &current).await
-        })
-        .await
-}
-
-/// Stops a session and deletes its pod, volume, egress policy and keys.
-pub async fn remove_session(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
-    let id = session.id;
-    state.hub.stop(id).await;
-    state.placement.delete(&id.to_string()).await?;
-    state.enforcer.remove(&id.to_string()).await?;
-    if session.context().has("memory")
-        && let Some((admin, _)) = state.credentials.memini(&session.owner).await?
-        && let Err(e) = admin
-            .delete_key(&MeminiAdmin::key_name(&id.to_string()))
-            .await
-    {
-        tracing::warn!(session = %id, error = %e, "deleting the session's memini key");
-    }
-    state
-        .credentials
-        .delete_session_secret(id, SESSION_KEY)
-        .await?;
-    Ok(())
 }
 
 async fn list_credentials(

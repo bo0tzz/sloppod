@@ -208,6 +208,13 @@ async fn run(
     let (mut sink, mut stream) = socket.split();
     heartbeat();
 
+    // An agent that exited while the link was down isn't read from then, so check before saying it's running.
+    if let Some(a) = agent.as_mut()
+        && let Ok(Some(status)) = a.child.try_wait()
+    {
+        tracing::info!(%status, "the agent exited while the link was down");
+        *agent = None;
+    }
     send(
         &mut sink,
         &FromSupervisor::Hello {
@@ -227,12 +234,19 @@ async fn run(
         let Message::Text(text) = message? else {
             continue;
         };
-        match serde_json::from_str(&text)? {
+        let message = match serde_json::from_str(&text) {
+            Ok(message) => message,
+            Err(e) => {
+                tracing::warn!(error = %e, "bad message from runtime");
+                continue;
+            }
+        };
+        match message {
             ToSupervisor::Attach { runtime_build } => {
                 if agent.is_none() {
                     bail!("the runtime attached, but no agent is running");
                 }
-                write_runtime_info(args, runtime_build.as_deref())?;
+                write_runtime_info(args, runtime_build.as_deref());
                 tracing::info!("attached to the running agent");
                 break;
             }
@@ -297,8 +311,10 @@ async fn run(
                         Ok(ToSupervisor::Acp { message }) => {
                             let mut line = serde_json::to_vec(&message)?;
                             line.push(b'\n');
-                            a.stdin.write_all(&line).await?;
-                            a.stdin.flush().await?;
+                            // The agent's stdin only fails when the agent has gone.
+                            if a.stdin.write_all(&line).await.is_err() || a.stdin.flush().await.is_err() {
+                                break Event::AgentExited;
+                            }
                             track(&mut a.open, &mut a.waiting, &message);
                         }
                         Ok(ToSupervisor::AgentReady(ready)) => a.ready = Some(ready),
@@ -330,7 +346,14 @@ async fn run(
         Event::LinkEnded => Ending::Reconnect,
         Event::AgentExited => {
             let mut a = agent.take().expect("an agent is running");
-            let status = a.child.wait().await.ok();
+            // Its stdin or stdout closing usually means it exited; one that lingers on is stopped.
+            let status = match tokio::time::timeout(Duration::from_secs(5), a.child.wait()).await {
+                Ok(status) => status.ok(),
+                Err(_) => {
+                    stop(&mut a.child).await;
+                    None
+                }
+            };
             let _ = send(
                 &mut sink,
                 &FromSupervisor::AgentExited {
@@ -365,8 +388,11 @@ async fn launch_agent(
         _ = closed(stream) => bail!("link closed while preparing the pod"),
     };
     let spawned = prepared.and_then(|env| {
-        Command::new(&launch.command[0])
-            .args(&launch.command[1..])
+        let [program, args @ ..] = &launch.command[..] else {
+            bail!("the runtime sent no command to run");
+        };
+        Command::new(program)
+            .args(args)
             .envs(env)
             .current_dir(&launch.cwd)
             .stdin(Stdio::piped())
@@ -480,11 +506,13 @@ async fn read_appended(
     Ok(Some((offset, content)))
 }
 
-fn write_runtime_info(args: &Args, build: Option<&str>) -> anyhow::Result<()> {
-    write_file(
-        &args.workdir.join(RUNTIME_INFO),
-        &serde_json::to_vec_pretty(&serde_json::json!({ "build": build }))?,
-    )
+/// Tells the agent which runtime build it's connected to. It's informational, so a failure doesn't stop anything.
+fn write_runtime_info(args: &Args, build: Option<&str>) {
+    let content = serde_json::to_vec_pretty(&serde_json::json!({ "build": build }))
+        .expect("a JSON object serializes");
+    if let Err(e) = write_file(&args.workdir.join(RUNTIME_INFO), &content) {
+        tracing::warn!(error = %format!("{e:#}"), "writing the runtime info");
+    }
 }
 
 fn write_file(path: &Path, content: &[u8]) -> anyhow::Result<()> {
@@ -539,7 +567,7 @@ async fn prepare(
     env.push(("GIT_CONFIG_KEY_1".into(), "push.default".into()));
     env.push(("GIT_CONFIG_VALUE_1".into(), "current".into()));
 
-    write_runtime_info(args, launch.runtime_build.as_deref())?;
+    write_runtime_info(args, launch.runtime_build.as_deref());
 
     if let Some(ca) = &launch.ca_pem {
         let dir = args.workdir.join(".sloppod");
