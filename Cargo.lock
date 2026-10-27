@@ -3210,7 +3210,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "sloppod-cli"
-version = "0.2.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3226,7 +3226,7 @@ dependencies = [
 
 [[package]]
 name = "sloppod-contracts"
-version = "0.2.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "serde",
@@ -3236,7 +3236,7 @@ dependencies = [
 
 [[package]]
 name = "sloppod-protocol"
-version = "0.2.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3245,7 +3245,7 @@ dependencies = [
 
 [[package]]
 name = "sloppod-runtime"
-version = "0.2.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3282,7 +3282,7 @@ dependencies = [
 
 [[package]]
 name = "sloppod-supervisor"
-version = "0.2.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",

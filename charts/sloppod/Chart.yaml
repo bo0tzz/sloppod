@@ -2,8 +2,8 @@ apiVersion: v2
 name: sloppod
 description: A runtime for coding-agent sessions in sandbox pods
 type: application
-version: 0.2.0
-appVersion: "0.2.0"
+version: 0.1.1
+appVersion: "0.1.1"
 home: https://github.com/bo0tzz/sloppod
 sources:
   - https://github.com/bo0tzz/sloppod
