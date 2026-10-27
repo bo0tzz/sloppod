@@ -270,6 +270,11 @@ test('shows the review a proposal went through on request', async ({ page }) => 
   await expect(rounds.last()).toContainText('Passed');
   await expect(rounds.last()).toContainText('Reset it after a successful session/load.');
   await expect(history.getByRole('link', { name: 'Open the review session' })).toHaveAttribute('href', /^\/sessions\/[0-9a-f-]+$/);
+
+  // A review session opens like any other, but the session list doesn't take it in.
+  await history.getByRole('link', { name: 'Open the review session' }).click();
+  await expect(page.getByRole('heading', { level: 1 })).toContainText('Review:');
+  await expect(page.getByRole('navigation', { name: 'Sessions' }).getByText('Review:')).toHaveCount(0);
 });
 
 test('rejects a proposal with a reason', async ({ page }) => {

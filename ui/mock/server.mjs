@@ -625,7 +625,23 @@ async function agentScript(session, turn, prompt) {
 
 /** A review that asked for changes once, then passed: what a proposal looks like when it reaches the user. */
 function addReview(proposal) {
-  proposal.review_session_id = randomUUID();
+  const created = now();
+  const reviewer = new MockSession({
+    id: randomUUID(),
+    title: `Review: ${proposal.payload.title}`,
+    repo: proposal.payload.repo,
+    branch: null,
+    grants: [],
+    phase: 'parked',
+    agent: 'codex',
+    kind: 'review',
+    review: 'off',
+    created_at: created,
+    updated_at: created,
+    active_at: created,
+  });
+  sessions.set(reviewer.data.id, reviewer);
+  proposal.review_session_id = reviewer.data.id;
   reviews.set(proposal.id, [
     {
       round: 1,
@@ -1071,7 +1087,7 @@ async function readBody(req) {
 const sortedSessions = () =>
   [...sessions.values()]
     .map((s) => s.data)
-    .filter((d) => !d.deleted_at)
+    .filter((d) => d.kind === 'work' && !d.deleted_at)
     .sort((a, b) => Date.parse(b.active_at) - Date.parse(a.active_at));
 
 async function handleApi(req, res, url) {
