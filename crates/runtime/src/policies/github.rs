@@ -116,6 +116,9 @@ impl GitHubPolicy {
                                 }
                             }
                         }
+                        // Before a push larger than its post buffer, git checks it can talk to the server with a
+                        // request that updates nothing.
+                        _ if is_push_probe(request) => {}
                         _ => {
                             return Ok(Decision::deny(
                                 "sloppod: could not read which refs this push updates.\n",
@@ -335,6 +338,11 @@ impl Push {
     }
 }
 
+/// git's probe before a large push: a `git-receive-pack` request with no commands, just a flush packet.
+fn is_push_probe(request: &HttpRequest) -> bool {
+    !request.body_truncated && request.body == b"0000"
+}
+
 /// Reads the leading pkt-lines of a `git-receive-pack` request.
 fn pushed_refs(body: &[u8]) -> Option<Push> {
     let mut push = Push {
@@ -429,6 +437,18 @@ mod tests {
         );
         assert_eq!(push.capabilities, vec!["report-status", "side-band-64k"]);
         assert!(pushed_refs(b"00").is_none());
+        let probe = |body: &[u8], body_truncated: bool| HttpRequest {
+            method: "POST".into(),
+            host: "github.com".into(),
+            path: "/o/r.git/git-receive-pack".into(),
+            headers: Default::default(),
+            body: body.to_vec(),
+            body_truncated,
+        };
+        assert!(is_push_probe(&probe(b"0000", false)));
+        assert!(!is_push_probe(&probe(b"0000", true)));
+        assert!(!is_push_probe(&probe(b"0000PACK", false)));
+        assert!(!is_push_probe(&probe(&body, false)));
         let Decision::Deny {
             status, message, ..
         } = push.reject("no")
