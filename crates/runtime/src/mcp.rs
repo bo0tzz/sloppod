@@ -27,7 +27,7 @@ pub async fn handler(
         "initialize" => Ok(json!({
             "protocolVersion": message["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "sloppod", "version": env!("CARGO_PKG_VERSION")},
+            "serverInfo": {"name": "sloppod", "version": state.config.build.as_deref().unwrap_or(env!("CARGO_PKG_VERSION"))},
             "instructions": "Tools for outward actions. Each creates a proposal that a human reviews before sloppod carries it out.",
         })),
         "ping" => Ok(json!({})),

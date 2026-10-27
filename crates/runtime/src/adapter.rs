@@ -2,6 +2,7 @@
 
 use serde_json::{Value, json};
 use sloppod_contracts::{AgentAdapter, AgentContext, AgentFile, AgentLaunch, Manifest, RepoGrant};
+use sloppod_protocol::link::RUNTIME_INFO;
 
 /// Credentials in the pod are placeholders; the authorizer attaches the real ones (ADR 11).
 pub const PLACEHOLDER: &str = "sloppod-placeholder";
@@ -64,7 +65,10 @@ impl ClaudeCode {
              - Network access is limited to the model API, GitHub, memory and package registries. Credentials are \
              attached outside the pod, so the tokens you see in the environment are placeholders; don't try to use \
              or replace them.\n\
-             - Install tools through mise (`mise use`, `mise install`, `mise exec`) rather than apt or curl-to-shell."
+             - Install tools through mise (`mise use`, `mise install`, `mise exec`) rather than apt or curl-to-shell.\n\
+             - `{}/{RUNTIME_INFO}` says which sloppod runtime build your pod is connected to; it's rewritten whenever \
+             the pod reconnects, e.g. after a deploy. Your session image only changes when your pod is recreated.",
+            context.workdir
         )
     }
 }

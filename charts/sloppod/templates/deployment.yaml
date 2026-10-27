@@ -49,6 +49,8 @@ spec:
               value: app.kubernetes.io/name=sloppod,app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=runtime
             - name: SLOPPOD_CA_SECRET
               value: {{ include "sloppod.caSecret" . }}
+            - name: SLOPPOD_BUILD
+              value: {{ .Chart.AppVersion | quote }}
             - name: SLOPPOD_SESSION_IMAGE
               value: "{{ .Values.session.image.repository }}:{{ .Values.session.image.tag | default .Chart.AppVersion }}"
             - name: SLOPPOD_SESSION_IMAGE_PULL_POLICY
