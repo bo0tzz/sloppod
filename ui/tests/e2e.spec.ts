@@ -142,6 +142,28 @@ test('runs a queued message as the next turn', async ({ page }) => {
   await expect(page.getByTestId('question-card')).toBeVisible();
 });
 
+test('typing goes to the message box unless something else is focused or selected', async ({ page }) => {
+  await createSession(page, 'Type at me in sloppod');
+  await finishTurn(page);
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  const message = agentMessages(page).filter({ hasText: FINAL });
+
+  await message.click();
+  await expect(box).not.toBeFocused();
+  await page.keyboard.type('hi there');
+  await expect(box).toBeFocused();
+  await expect(box).toHaveValue('hi there');
+
+  await box.fill('');
+  await message.dblclick();
+  await page.keyboard.type('x');
+  await expect(box).toHaveValue('');
+
+  await page.getByRole('button', { name: 'Proposals' }).focus();
+  await page.keyboard.type('y');
+  await expect(box).toHaveValue('');
+});
+
 test('stops a running turn', async ({ page }) => {
   await createSession(page, 'Stop me in sloppod');
   await expect(permissionCard(page)).toBeVisible();

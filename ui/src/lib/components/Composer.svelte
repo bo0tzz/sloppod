@@ -37,6 +37,21 @@
   // On touch keyboards Enter inserts a newline; there's a send button instead.
   const touch = new MediaQuery('(pointer: coarse)');
 
+  // Typing with nothing else focused or selected goes to the message box: focusing it during keydown lets the
+  // character land there.
+  function onWindowKeydown(event: KeyboardEvent) {
+    if (!ref || event.defaultPrevented || event.isComposing || event.ctrlKey || event.metaKey || event.altKey) return;
+    // Space is left to scroll the page.
+    if (event.key.length !== 1 || event.key === ' ') return;
+    const focused = document.activeElement;
+    if (focused && focused !== document.body && focused.closest('input, textarea, select, button, a, [contenteditable], [tabindex]')) {
+      return;
+    }
+    if (document.querySelector('[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]')) return;
+    if (window.getSelection()?.toString()) return;
+    ref.focus();
+  }
+
   function onKeydown(event: KeyboardEvent) {
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && (!touch.current || event.ctrlKey || event.metaKey)) {
       event.preventDefault();
@@ -44,6 +59,8 @@
     }
   }
 </script>
+
+<svelte:window onkeydown={onWindowKeydown} />
 
 <div class="safe-bottom border-light-200 bg-light shrink-0 border-t px-3 pt-2" data-testid="composer">
   <div class="mx-auto flex w-full max-w-3xl flex-col gap-2">
