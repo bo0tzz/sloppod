@@ -38,6 +38,8 @@ pub struct Comparison {
     pub diff: String,
     pub commits: Vec<(String, String)>,
     pub ahead_by: u64,
+    /// The commit `head` resolved to.
+    pub head_sha: String,
 }
 
 impl GitHubApp {
@@ -249,6 +251,7 @@ impl GitHubApp {
             bail!("branch {head} not found on {repo}; push it first");
         }
         let info: Value = response.error_for_status()?.json().await?;
+        let head_sha = self.branch_sha(repo, head).await?;
         let commits = info["commits"]
             .as_array()
             .into_iter()
@@ -273,7 +276,63 @@ impl GitHubApp {
             diff,
             commits,
             ahead_by: info["ahead_by"].as_u64().unwrap_or(0),
+            head_sha,
         })
+    }
+
+    /// The commit a branch (or commit) points to.
+    pub async fn branch_sha(&self, repo: &str, reference: &str) -> anyhow::Result<String> {
+        let commit: Value = self
+            .repo_get(
+                repo,
+                &format!("/commits/{reference}"),
+                "application/vnd.github+json",
+            )
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        commit["sha"]
+            .as_str()
+            .map(str::to_owned)
+            .context("commit without sha")
+    }
+
+    /// Turns auto-merge off on open pull requests from `branch`, returning their numbers.
+    pub async fn disable_auto_merge(&self, repo: &str, branch: &str) -> anyhow::Result<Vec<u64>> {
+        let owner = repo.split('/').next().unwrap_or_default();
+        let pulls: Vec<Value> = self
+            .repo_get(
+                repo,
+                &format!("/pulls?state=open&head={owner}:{branch}"),
+                "application/vnd.github+json",
+            )
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let mut disabled = Vec::new();
+        for pull in pulls.iter().filter(|pull| !pull["auto_merge"].is_null()) {
+            let token = self.token_for(repo).await?;
+            let response: Value = self
+                .http
+                .post(format!("{API}/graphql"))
+                .bearer_auth(token)
+                .json(&json!({
+                    "query": "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }",
+                    "variables": {"id": pull["node_id"]},
+                }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            if let Some(error) = response["errors"].as_array().and_then(|e| e.first()) {
+                bail!("{}", error["message"].as_str().unwrap_or("unknown error"));
+            }
+            disabled.extend(pull["number"].as_u64());
+        }
+        Ok(disabled)
     }
 
     async fn repo_post(&self, repo: &str, path: &str, payload: &Value) -> anyhow::Result<Value> {
@@ -303,7 +362,12 @@ impl GitHubApp {
     }
 
     /// Has GitHub merge a pull request once its required checks pass, with a merge method the repository allows.
-    pub async fn enable_auto_merge(&self, repo: &str, pull_node_id: &str) -> anyhow::Result<()> {
+    pub async fn enable_auto_merge(
+        &self,
+        repo: &str,
+        pull_node_id: &str,
+        expected_head: &str,
+    ) -> anyhow::Result<()> {
         let info: Value = self
             .repo_get(repo, "", "application/vnd.github+json")
             .await?
@@ -325,9 +389,10 @@ impl GitHubApp {
             .post(format!("{API}/graphql"))
             .bearer_auth(token)
             .json(&json!({
-                "query": "mutation($id: ID!, $method: PullRequestMergeMethod!) { \
-                          enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: $method}) { clientMutationId } }",
-                "variables": {"id": pull_node_id, "method": method},
+                "query": "mutation($id: ID!, $method: PullRequestMergeMethod!, $head: GitObjectID!) { \
+                          enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: $method, expectedHeadOid: $head}) \
+                          { clientMutationId } }",
+                "variables": {"id": pull_node_id, "method": method, "head": expected_head},
             }))
             .send()
             .await?

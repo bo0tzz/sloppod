@@ -154,6 +154,7 @@ impl ProposalKind for PullRequest {
             "repo": repo,
             "base": base,
             "head": head,
+            "head_sha": comparison.head_sha,
             "title": title,
             "body": arguments["body"].as_str().unwrap_or_default(),
             "draft": arguments["draft"].as_bool().unwrap_or(false),
@@ -163,7 +164,11 @@ impl ProposalKind for PullRequest {
 
     async fn detail(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
         let base = payload["base"].as_str().unwrap_or("main");
-        let head = payload["head"].as_str().unwrap_or_default();
+        // What the reviewer sees is the commit that was proposed, not wherever the branch is now.
+        let head = payload["head_sha"]
+            .as_str()
+            .or(payload["head"].as_str())
+            .unwrap_or_default();
         let comparison = self
             .app(session)
             .await?
@@ -189,14 +194,27 @@ impl ProposalKind for PullRequest {
             "draft": payload["draft"],
         });
         let repo = payload["repo"].as_str().unwrap_or_default();
+        let head = payload["head"].as_str().unwrap_or_default();
         let app = self.app(session).await?;
+        let reviewed = payload["head_sha"].as_str().unwrap_or_default();
+        let current = app.branch_sha(repo, head).await.map_err(err)?;
+        if current != reviewed {
+            return Err(Error::new(format!(
+                "`{head}` has moved since it was proposed (from {reviewed:.7} to {current:.7}), so the pull request \
+                 wasn't opened; propose it again so the new commits get reviewed"
+            )));
+        }
         let mut result = app.create_pull(repo, &request).await.map_err(err)?;
         if payload["auto_merge"].as_bool() != Some(true) {
             return Ok(result);
         }
         let url = result["url"].as_str().unwrap_or_default().to_owned();
         let message = match app
-            .enable_auto_merge(repo, result["node_id"].as_str().unwrap_or_default())
+            .enable_auto_merge(
+                repo,
+                result["node_id"].as_str().unwrap_or_default(),
+                reviewed,
+            )
             .await
         {
             Ok(()) => {
