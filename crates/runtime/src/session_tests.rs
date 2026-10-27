@@ -592,3 +592,99 @@ async fn a_turn_ending_on_a_replaced_agent_leaves_the_new_one_alone() {
     let _waiting = h.prompt("And then this");
     assert_eq!(wait_for_queue(&h, 1).await.len(), 1);
 }
+
+/// A batch of one message, as `run_queued` gets it, with the receiver of its reply.
+fn batch(
+    text: &str,
+) -> (
+    Vec<crate::session::Queued>,
+    tokio::sync::oneshot::Receiver<Result<Value, RpcError>>,
+) {
+    let (reply, receiver) = tokio::sync::oneshot::channel();
+    let queued = crate::session::Queued {
+        id: None,
+        blocks: vec![json!({"type": "text", "text": text})],
+        reply: Some(reply),
+    };
+    (vec![queued], receiver)
+}
+
+/// A new agent replacing the harness's, ready, and the ACP messages it's sent.
+async fn replace_agent(h: &Harness) -> (Arc<AgentConn>, mpsc::UnboundedReceiver<ToSupervisor>) {
+    let (tx, to_new) = mpsc::unbounded_channel();
+    let new = Arc::new(AgentConn::new(tx));
+    h.hub.attach_agent(h.id, new.clone()).await;
+    h.hub
+        .agent_ready(h.id, &new, "agent-session-2".into(), json!({}), None)
+        .await;
+    (new, to_new)
+}
+
+async fn next_prompt(to_agent: &mut mpsc::UnboundedReceiver<ToSupervisor>) -> Value {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), to_agent.recv()).await {
+            Ok(Some(ToSupervisor::Acp { message })) if message["method"] == "session/prompt" => {
+                return message;
+            }
+            Ok(Some(_)) => {}
+            other => panic!("no prompt for the agent: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_batch_taken_for_a_replaced_agent_runs_on_the_new_idle_one() {
+    let h = Harness::ready().await;
+    let old = h.agent.clone();
+    let (new, mut to_new) = replace_agent(&h).await;
+    let (queued, reply) = batch("Late");
+    h.hub.clone().run_queued(h.id, old, None, queued).await;
+
+    let request = next_prompt(&mut to_new).await;
+    assert_eq!(prompt_text(&request), ["Late"]);
+    let response =
+        json!({"jsonrpc": "2.0", "id": request["id"], "result": {"stopReason": "end_turn"}});
+    from_agent(&h.hub, h.id, &new, response).await;
+    assert_eq!(reply.await.unwrap().unwrap()["stopReason"], "end_turn");
+}
+
+#[tokio::test]
+async fn a_batch_for_a_replaced_agent_waits_behind_the_new_ones_turn() {
+    let h = Harness::ready().await;
+    let old = h.agent.clone();
+    let (new, mut to_new) = replace_agent(&h).await;
+    let (hub, id) = (h.hub.clone(), h.id);
+    let _turn = tokio::spawn(async move {
+        hub.prompt(
+            id,
+            json!({"sessionId": id, "prompt": [{"type": "text", "text": "Busy"}]}),
+        )
+        .await
+    });
+    let busy = next_prompt(&mut to_new).await;
+
+    let (queued, reply) = batch("Late");
+    h.hub.clone().run_queued(h.id, old, None, queued).await;
+    assert_eq!(h.phase().await, "working");
+
+    // Only once the new agent's turn ends does the batch run on it.
+    let response =
+        json!({"jsonrpc": "2.0", "id": busy["id"], "result": {"stopReason": "end_turn"}});
+    from_agent(&h.hub, h.id, &new, response).await;
+    let late = next_prompt(&mut to_new).await;
+    assert_eq!(prompt_text(&late), ["Late"]);
+    let response =
+        json!({"jsonrpc": "2.0", "id": late["id"], "result": {"stopReason": "end_turn"}});
+    from_agent(&h.hub, h.id, &new, response).await;
+    assert!(reply.await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn a_batch_that_can_no_longer_start_in_a_stopped_session_fails() {
+    let h = Harness::ready().await;
+    let agent = h.agent.clone();
+    h.hub.stop(h.id).await;
+    let (queued, reply) = batch("Too late");
+    h.hub.clone().run_queued(h.id, agent, None, queued).await;
+    assert!(reply.await.unwrap().is_err());
+}
