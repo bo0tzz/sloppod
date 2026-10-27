@@ -8,7 +8,7 @@ objects.githubusercontent.com,release-assets.githubusercontent.com,raw.githubuse
 registry.npmjs.org,nodejs.org,pypi.org,files.pythonhosted.org,mise.jdx.dev,mise-versions.jdx.dev,\
 dl.k8s.io,get.helm.sh,proxy.golang.org,sum.golang.org,storage.googleapis.com,\
 results-receiver.actions.githubusercontent.com,pipelines.actions.githubusercontent.com,productionresultssa*.blob.core.windows.net,\
-cdn.playwright.dev,playwright.download.prss.microsoft.com";
+cdn.playwright.dev,playwright.download.prss.microsoft.com,tuf-repo-cdn.sigstore.dev";
 
 #[derive(Debug, Clone, Parser)]
 #[command(version, about)]
