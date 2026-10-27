@@ -596,3 +596,24 @@ test('a stale copy of a proposal does not undo its approval', async ({ page }) =
   await expect(page.getByTestId('proposal-card').and(page.locator('[data-kind="kube.apply"]'))).toBeVisible();
   await expect(pr).toBeHidden();
 });
+
+test('the sidebar folds away on narrow screens', async ({ page }) => {
+  const sidebar = page.getByRole('navigation', { name: 'Sessions' });
+  await page.setViewportSize({ width: 900, height: 800 });
+  await createSession(page, 'Fold the sidebar away in sloppod');
+  await expect(sidebar).toHaveCount(0);
+
+  await page.getByRole('button', { name: 'Show sessions' }).click();
+  await expect(sidebar.getByTestId('session-row').filter({ hasText: 'Fold the sidebar away' })).toBeVisible();
+  // Picking a session folds it away again.
+  await sidebar.locator('[data-testid="session-row"]:not([aria-current])').first().click();
+  await expect(sidebar).toHaveCount(0);
+
+  await page.getByRole('button', { name: 'Show sessions' }).click();
+  await sidebar.getByRole('button', { name: 'Hide sessions' }).click();
+  await expect(sidebar).toHaveCount(0);
+
+  // On a wide screen it's open beside the page.
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await expect(sidebar).toBeVisible();
+});
