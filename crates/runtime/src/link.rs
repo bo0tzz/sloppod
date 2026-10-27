@@ -26,6 +26,7 @@ use crate::adapter::{self, PLACEHOLDER};
 use crate::github::GitIdentity;
 use crate::placement::WORKDIR;
 use crate::pods::SESSION_LABEL;
+use crate::session::Hub;
 use crate::{AppState, db};
 
 pub const REPO_DIR: &str = "/workspace/repo";
@@ -83,7 +84,7 @@ pub struct AgentConn {
 }
 
 impl AgentConn {
-    fn new(tx: mpsc::UnboundedSender<ToSupervisor>) -> Self {
+    pub(crate) fn new(tx: mpsc::UnboundedSender<ToSupervisor>) -> Self {
         Self {
             tx,
             pending: Mutex::default(),
@@ -120,7 +121,7 @@ impl AgentConn {
         let _ = self.tx.send(ToSupervisor::SyncTranscript);
     }
 
-    fn handle_response(&self, message: &Value) {
+    pub(crate) fn handle_response(&self, message: &Value) {
         let Some(id) = message["id"].as_i64() else {
             return;
         };
@@ -389,18 +390,7 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
                 });
             }
             FromSupervisor::Acp { message } => {
-                if message.get("method").is_some() {
-                    if message.get("id").is_some() {
-                        state
-                            .hub
-                            .on_agent_request(session_id, &agent, message)
-                            .await;
-                    } else {
-                        state.hub.on_agent_notification(session_id, message).await;
-                    }
-                } else {
-                    agent.handle_response(&message);
-                }
+                from_agent(&state.hub, session_id, &agent, message).await
             }
             FromSupervisor::Transcript { files } => {
                 for file in files {
@@ -519,5 +509,23 @@ async fn auto_mode(
     {
         Ok(_) => response["modes"]["currentModeId"] = json!("auto"),
         Err(e) => tracing::warn!(session = %session.id, error = %e, "switching to auto mode"),
+    }
+}
+
+/// Routes an ACP message from the agent: requests and notifications to the hub, responses to their caller.
+pub(crate) async fn from_agent(
+    hub: &Arc<Hub>,
+    session_id: Uuid,
+    agent: &Arc<AgentConn>,
+    message: Value,
+) {
+    if message.get("method").is_some() {
+        if message.get("id").is_some() {
+            hub.on_agent_request(session_id, agent, message).await;
+        } else {
+            hub.on_agent_notification(session_id, message).await;
+        }
+    } else {
+        agent.handle_response(&message);
     }
 }

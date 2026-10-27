@@ -16,6 +16,9 @@ mod pods;
 mod policies;
 mod proposals;
 mod session;
+#[cfg(test)]
+mod session_tests;
+mod store;
 mod tls;
 mod users;
 mod vault;
@@ -164,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let state = AppState(Arc::new(Inner {
-        hub: Arc::new(Hub::new(db.clone())),
+        hub: Arc::new(Hub::new(Arc::new(store::PgStore(db.clone())))),
         config: config.clone(),
         db,
         kube,
