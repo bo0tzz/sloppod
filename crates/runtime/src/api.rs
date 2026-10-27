@@ -11,7 +11,10 @@ use axum::routing::{delete, get, post, put};
 use serde::Deserialize;
 use serde_json::json;
 use sloppod_contracts::{EgressSpec, Grant, PlacementSpec};
-use sloppod_protocol::api::{Decision, NewCredential, NewSession, NewStandingApproval, Phase};
+use sloppod_protocol::api::{
+    Decision, NewCredential, NewSession, NewStandingApproval, Phase, ProposalStatus, ReviewPolicy,
+    SessionKind,
+};
 use uuid::Uuid;
 
 use crate::credentials::CHATGPT;
@@ -131,17 +134,11 @@ fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     T::deserialize(deserializer).map(Some)
 }
 
-fn review_policy(review: &str) -> ApiResult<&str> {
-    reviews::POLICIES
-        .iter()
-        .copied()
-        .find(|p| *p == review)
-        .ok_or_else(|| {
-            bad_request(format!(
-                "review must be one of {}",
-                reviews::POLICIES.join(", ")
-            ))
-        })
+fn review_policy(review: &str) -> ApiResult<ReviewPolicy> {
+    review.parse().map_err(|_| {
+        let policies: Vec<_> = ReviewPolicy::ALL.iter().map(|p| p.as_str()).collect();
+        bad_request(format!("review must be one of {}", policies.join(", ")))
+    })
 }
 
 async fn get_settings(
@@ -391,8 +388,8 @@ async fn create_session(
             custom_title: custom.is_some(),
             pending_prompt: prompt,
             agent,
-            kind: "work",
-            review: &review,
+            kind: SessionKind::Work,
+            review,
             model: model.as_deref(),
             repo: repo.as_deref(),
             grants: &grants,
@@ -849,12 +846,17 @@ async fn list_proposals(
     User(user): User,
     Query(filter): Query<ProposalFilter>,
 ) -> ApiResult<impl IntoResponse> {
-    let proposals: Vec<_> =
-        db::list_proposals(&state.db, &user, filter.session, filter.status.as_deref())
-            .await?
-            .iter()
-            .map(|p| p.to_api())
-            .collect();
+    let status = filter
+        .status
+        .as_deref()
+        .map(str::parse::<ProposalStatus>)
+        .transpose()
+        .map_err(bad_request)?;
+    let proposals: Vec<_> = db::list_proposals(&state.db, &user, filter.session, status)
+        .await?
+        .iter()
+        .map(|p| p.to_api())
+        .collect();
     Ok(Json(proposals))
 }
 

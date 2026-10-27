@@ -5,6 +5,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use sloppod_contracts::{Grant, ReviewSubject};
+use sloppod_protocol::api::{ProposalStatus, ReviewPolicy, SessionKind};
 use uuid::Uuid;
 
 use crate::{AppState, api, db, proposals};
@@ -13,9 +14,6 @@ use crate::{AppState, api, db, proposals};
 pub const MAX_ROUNDS: i32 = 3;
 /// The agent review sessions run: a different model from the authoring agent's.
 pub const REVIEWER: &str = "codex";
-
-/// A session's review policy: `off`, or `required` for every proposal of a kind that's reviewed.
-pub const POLICIES: &[&str] = &["off", "required"];
 
 /// Whether `owner` has what the reviewer's model needs.
 pub async fn available(state: &AppState, owner: &str) -> anyhow::Result<bool> {
@@ -83,8 +81,8 @@ pub async fn start(
             custom_title: true,
             pending_prompt: &prompt,
             agent: REVIEWER,
-            kind: "review",
-            review: "off",
+            kind: SessionKind::Review,
+            review: ReviewPolicy::Off,
             model: None,
             repo: Some(&subject.repo),
             grants: &grants,
@@ -156,7 +154,9 @@ fn watch_round(state: &AppState, proposal: Uuid, session: Uuid, round: i32) {
             let Some(this) = rounds.into_iter().find(|r| r.round == round) else {
                 return;
             };
-            if this.verdict.is_some() || current.is_none_or(|p| p.status != "in_review") {
+            if this.verdict.is_some()
+                || current.is_none_or(|p| p.status != ProposalStatus::InReview)
+            {
                 return;
             }
             let timed_out = round_timed_out(this.created_at, Utc::now());
@@ -191,7 +191,7 @@ fn watch_round(state: &AppState, proposal: Uuid, session: Uuid, round: i32) {
 /// Watches the review rounds still running, e.g. after the runtime restarted; a round that ran out of time
 /// meanwhile is handed over at the first check.
 pub async fn resume_round_watches(state: &AppState) {
-    let proposals = match db::proposals_with_status(&state.db, "in_review").await {
+    let proposals = match db::proposals_with_status(&state.db, ProposalStatus::InReview).await {
         Ok(proposals) => proposals,
         Err(e) => {
             tracing::error!(error = %e, "listing proposals in review");
@@ -220,7 +220,14 @@ async fn give_up(
     session: Uuid,
     round: i32,
 ) -> anyhow::Result<()> {
-    let Some(row) = db::move_proposal(&state.db, proposal, "in_review", "pending", None).await?
+    let Some(row) = db::move_proposal(
+        &state.db,
+        proposal,
+        ProposalStatus::InReview,
+        ProposalStatus::Pending,
+        None,
+    )
+    .await?
     else {
         // It left review meanwhile, which settles it too.
         return Ok(());
@@ -470,7 +477,7 @@ pub async fn submit(state: &AppState, session: Uuid, arguments: &Value) -> Resul
         .await
         .map_err(|e| e.to_string())?
         .ok_or("this session isn't reviewing a proposal")?;
-    if proposal.status != "in_review" {
+    if proposal.status != ProposalStatus::InReview {
         return Err(format!(
             "the proposal isn't waiting for a review; it's {}",
             proposal.status
@@ -552,8 +559,8 @@ pub async fn submit(state: &AppState, session: Uuid, arguments: &Value) -> Resul
         let row = db::move_proposal(
             &state.db,
             proposal.id,
-            "in_review",
-            "changes_requested",
+            ProposalStatus::InReview,
+            ProposalStatus::ChangesRequested,
             None,
         )
         .await
@@ -579,10 +586,16 @@ pub async fn submit(state: &AppState, session: Uuid, arguments: &Value) -> Resul
         return Ok("Review recorded. You'll be told if the author asks for another round.".into());
     }
 
-    let row = db::move_proposal(&state.db, proposal.id, "in_review", "pending", None)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or("the proposal changed meanwhile")?;
+    let row = db::move_proposal(
+        &state.db,
+        proposal.id,
+        ProposalStatus::InReview,
+        ProposalStatus::Pending,
+        None,
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or("the proposal changed meanwhile")?;
     state.hub.broadcast_proposal(&row.to_api());
     let notice = if verdict == "pass" && findings.is_empty() {
         format!(
@@ -626,7 +639,7 @@ pub async fn request(state: &AppState, session: Uuid, arguments: &Value) -> Resu
         .map_err(|e| e.to_string())?
         .filter(|p| p.session_id == session)
         .ok_or("no such proposal of yours")?;
-    if proposal.status != "changes_requested" {
+    if proposal.status != ProposalStatus::ChangesRequested {
         return Err(format!(
             "only proposals with changes requested go to another round; this one is {}",
             proposal.status
@@ -665,8 +678,8 @@ pub async fn request(state: &AppState, session: Uuid, arguments: &Value) -> Resu
     let row = db::move_proposal(
         &state.db,
         id,
-        "changes_requested",
-        "in_review",
+        ProposalStatus::ChangesRequested,
+        ProposalStatus::InReview,
         Some(&payload),
     )
     .await
@@ -696,7 +709,7 @@ fn rest(state: &AppState, session: Uuid, proposal: Uuid) {
         turn_ended(&state, session).await;
         let waiting = matches!(
             db::get_proposal(&state.db, proposal).await,
-            Ok(Some(p)) if p.status == "changes_requested"
+            Ok(Some(p)) if p.status == ProposalStatus::ChangesRequested
         );
         let result: anyhow::Result<()> = match db::get_session(&state.db, session).await {
             Ok(Some(row)) if waiting => park_between_rounds(&state, &row, proposal).await,
@@ -719,7 +732,7 @@ async fn park_between_rounds(
     api::park(state, session).await?;
     let still_waiting = matches!(
         db::get_proposal(&state.db, proposal).await?,
-        Some(p) if p.status == "changes_requested"
+        Some(p) if p.status == ProposalStatus::ChangesRequested
     );
     if !still_waiting && let Some(row) = db::get_session(&state.db, session.id).await? {
         api::wake(state, &row).await?;

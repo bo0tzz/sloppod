@@ -59,6 +59,84 @@ pub mod api {
         }
     }
 
+    /// An enum stored and sent as its snake_case name.
+    macro_rules! named {
+        ($(#[$meta:meta])* $name:ident { $($(#[$vmeta:meta])* $variant:ident = $text:literal),+ $(,)? }) => {
+            $(#[$meta])*
+            #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+            #[serde(rename_all = "snake_case")]
+            pub enum $name {
+                $($(#[$vmeta])* $variant),+
+            }
+
+            impl $name {
+                pub const ALL: &[$name] = &[$($name::$variant),+];
+
+                pub fn as_str(self) -> &'static str {
+                    match self {
+                        $($name::$variant => $text),+
+                    }
+                }
+            }
+
+            impl std::str::FromStr for $name {
+                type Err = String;
+
+                fn from_str(s: &str) -> Result<Self, String> {
+                    match s {
+                        $($text => Ok($name::$variant),)+
+                        _ => Err(format!("unknown {} {s}", stringify!($name))),
+                    }
+                }
+            }
+
+            impl TryFrom<String> for $name {
+                type Error = String;
+
+                fn try_from(s: String) -> Result<Self, String> {
+                    s.parse()
+                }
+            }
+
+            impl std::fmt::Display for $name {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str(self.as_str())
+                }
+            }
+        };
+    }
+
+    named! {
+        /// What a session is for.
+        SessionKind {
+            Work = "work",
+            /// It reviews another session's proposal (ADR 24).
+            Review = "review",
+        }
+    }
+
+    named! {
+        /// Whether a session's proposals are reviewed by another model before a human sees them (ADR 24).
+        ReviewPolicy {
+            Off = "off",
+            Required = "required",
+        }
+    }
+
+    named! {
+        /// Where a proposal is in its life (ADR 3, ADR 24).
+        ProposalStatus {
+            InReview = "in_review",
+            ChangesRequested = "changes_requested",
+            Pending = "pending",
+            Approved = "approved",
+            Rejected = "rejected",
+            Executed = "executed",
+            Failed = "failed",
+            Withdrawn = "withdrawn",
+        }
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct Session {
         pub id: Uuid,
@@ -69,10 +147,8 @@ pub mod api {
         pub grants: Vec<Grant>,
         pub phase: Phase,
         pub agent: String,
-        /// `work`, or `review` for a session that reviews a proposal.
-        pub kind: String,
-        /// Whether its proposals are reviewed by another model before a human sees them: `off` or `required`.
-        pub review: String,
+        pub kind: SessionKind,
+        pub review: ReviewPolicy,
         pub created_at: String,
         pub updated_at: String,
         /// When something last happened in the session; the session list is ordered by it.
@@ -117,7 +193,7 @@ pub mod api {
         pub id: Uuid,
         pub session_id: Uuid,
         pub kind: String,
-        pub status: String,
+        pub status: ProposalStatus,
         pub payload: Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub result: Option<Value>,

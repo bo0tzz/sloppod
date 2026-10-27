@@ -125,7 +125,7 @@ Outward actions and access the agent asked for ([ADR 3](adr/0003-proposals-and-t
 When a proposal is decided or carried out, the runtime tells the agent: the notice is recorded as a `user_message_chunk` with `_meta.sloppod.notice: true` and delivered as a new turn when the agent is idle, steered into a running turn, or queued until the agent is up. Sessions whose turn a runtime restart cut off get a notice of the same kind once their agent is back, naming the build now running (`SLOPPOD_BUILD`, the chart's app version).
 
 ```
-GET  /api/v1/proposals?session={id}&status={status}  -> Proposal[]
+GET  /api/v1/proposals?session={id}&status={status}  -> Proposal[]   400 for a status that isn't one
 GET  /api/v1/proposals/{id}                          -> ProposalDetail
 GET  /api/v1/proposals/{id}/reviews                  -> Review[]   its review rounds, first to last
 POST /api/v1/proposals/{id}/approve                  -> Proposal   body: {} or edits, per kind (below)
