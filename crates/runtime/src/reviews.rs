@@ -24,7 +24,7 @@ pub async fn available(state: &AppState, owner: &str) -> anyhow::Result<bool> {
     };
     Ok(state
         .credentials
-        .secret(owner, reviewer.credential().0)
+        .secret(owner, &reviewer.credential().kind)
         .await?
         .is_some())
 }

@@ -5,9 +5,7 @@ use kube::api::{
     Api, ApiResource, DeleteParams, DynamicObject, GroupVersionKind, Patch, PatchParams,
 };
 use serde_json::json;
-use sloppod_contracts::{
-    Error, Manifest, PlacementBackend, PlacementSpec, PlacementStatus, Result,
-};
+use sloppod_contracts::{Error, Manifest, PlacementBackend, PlacementSpec, Result};
 
 pub const WORKDIR: &str = "/workspace";
 pub const TOKEN_DIR: &str = "/var/run/secrets/sloppod";
@@ -136,16 +134,6 @@ impl PlacementBackend for AgentSandbox {
             .await
             .map_err(err)?;
         Ok(())
-    }
-
-    async fn status(&self, session_id: &str) -> Result<PlacementStatus> {
-        let exists = self
-            .api
-            .get_opt(&sandbox_name(session_id))
-            .await
-            .map_err(err)?
-            .is_some();
-        Ok(PlacementStatus { exists })
     }
 
     async fn suspend(&self, session_id: &str) -> Result<()> {
