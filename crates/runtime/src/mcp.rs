@@ -133,6 +133,43 @@ fn tools(state: &AppState, kind: SessionKind) -> Vec<Value> {
         },
     }));
     tools.push(json!({
+        "name": "ask_user",
+        "description": "Ask the user one to four multiple-choice questions without waiting for them: the questions are shown in their client, this returns at once, and their answer arrives later as a message starting \"sloppod: the user answered your question\". Carry on with work that doesn't depend on it meanwhile.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 4,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": {"type": "string", "description": "The question, ending with a question mark"},
+                            "header": {"type": "string", "description": "A short label for it, e.g. \"Auth method\""},
+                            "options": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 4,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {"type": "string"},
+                                        "description": {"type": "string", "description": "What choosing it means"},
+                                    },
+                                    "required": ["label"],
+                                },
+                            },
+                            "multi_select": {"type": "boolean", "default": false},
+                        },
+                        "required": ["question", "options"],
+                    },
+                },
+            },
+            "required": ["questions"],
+        },
+    }));
+    tools.push(json!({
         "name": "request_review",
         "description": "After a review asked for changes to your proposal, ask for the next round once you've pushed fixes. The proposal is re-pinned to your branch's new head.",
         "inputSchema": {
@@ -165,6 +202,15 @@ async fn call(state: &AppState, session: Uuid, params: &Value) -> Value {
     if name == "submit_review" {
         return match reviews::submit(state, session, &arguments).await {
             Ok(message) => text(message, false),
+            Err(e) => text(e, true),
+        };
+    }
+    if name == "ask_user" {
+        return match state.hub.ask(session, arguments["questions"].clone()).await {
+            Ok(()) => text(
+                "Asked. The answer arrives later as a message; carry on with what doesn't depend on it.".into(),
+                false,
+            ),
             Err(e) => text(e, true),
         };
     }

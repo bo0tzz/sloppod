@@ -41,10 +41,20 @@ pub(crate) struct Queued {
 }
 
 struct Permission {
-    agent_request_id: Value,
     method: String,
     params: Value,
-    agent: Arc<AgentConn>,
+    asker: Asker,
+}
+
+/// Who waits on a permission request or question.
+enum Asker {
+    /// The agent, blocked on its request until it's answered.
+    Agent {
+        request_id: Value,
+        agent: Arc<AgentConn>,
+    },
+    /// The agent's `ask_user` tool, which returned at once: the answer goes to the agent as a notice.
+    Tool { questions: Value },
 }
 
 #[derive(Default)]
@@ -465,7 +475,7 @@ impl Hub {
             self.set_phase(id, Phase::Disconnected).await;
             state
                 .permissions
-                .drain()
+                .extract_if(|_, p| matches!(p.asker, Asker::Agent { .. }))
                 .map(|(pid, p)| (pid, tool_call_id(&p.params)))
                 .collect()
         };
@@ -544,10 +554,12 @@ impl Hub {
             state.permissions.insert(
                 pid,
                 Permission {
-                    agent_request_id: request_id,
                     method: method.clone(),
                     params: params.clone(),
-                    agent: agent.clone(),
+                    asker: Asker::Agent {
+                        request_id,
+                        agent: agent.clone(),
+                    },
                 },
             );
             self.set_phase(id, Phase::Waiting).await;
@@ -564,12 +576,21 @@ impl Hub {
     }
 
     /// The first answer to a permission request wins; later ones are ignored.
-    pub async fn answer_permission(&self, id: Uuid, pid: u64, result: Result<Value, RpcError>) {
+    pub async fn answer_permission(
+        self: &Arc<Self>,
+        id: Uuid,
+        pid: u64,
+        result: Result<Value, RpcError>,
+    ) {
         let permission = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
             let permission = state.permissions.remove(&pid);
-            if permission.is_some() && state.permissions.is_empty() && state.agent.is_some() {
+            let blocked = |p: &Permission| matches!(p.asker, Asker::Agent { .. });
+            if permission.as_ref().is_some_and(blocked)
+                && !state.permissions.values().any(blocked)
+                && state.agent.is_some()
+            {
                 let phase = if state.turn_running {
                     Phase::Working
                 } else {
@@ -581,9 +602,14 @@ impl Hub {
         };
         let Some(permission) = permission else { return };
         let tool_call_id = tool_call_id(&permission.params);
-        permission
-            .agent
-            .respond(permission.agent_request_id, result);
+        match permission.asker {
+            Asker::Agent { request_id, agent } => agent.respond(request_id, result),
+            Asker::Tool { questions } => {
+                let answer = result.unwrap_or_else(|_| json!({"action": "cancel"}));
+                self.notify(id, crate::questions::answer_text(&questions, &answer))
+                    .await;
+            }
+        }
         self.broadcast(
             id,
             UiEvent::PermissionResolved {
@@ -875,11 +901,12 @@ impl Hub {
         self.steer_in(id, blocks).await
     }
 
-    pub async fn cancel(&self, id: Uuid) {
+    pub async fn cancel(self: &Arc<Self>, id: Uuid) {
         if let Ok((agent, agent_session_id)) = self.agent_for(id).await {
             agent.notify("session/cancel", json!({"sessionId": agent_session_id}));
         }
         // ACP: a client that cancels a turn answers its outstanding permission requests and questions as cancelled.
+        // Questions from `ask_user` don't belong to the turn, so they stay.
         let pending: Vec<(u64, bool)> = self
             .live(id)
             .state
@@ -887,6 +914,7 @@ impl Hub {
             .await
             .permissions
             .iter()
+            .filter(|(_, p)| matches!(p.asker, Asker::Agent { .. }))
             .map(|(pid, p)| (*pid, p.method == "elicitation/create"))
             .collect();
         for (pid, question) in pending {
@@ -947,6 +975,36 @@ impl Hub {
             permissions,
             queue: Self::queue_notification(id, &state.queue),
         })
+    }
+
+    /// Shows the user questions from the agent's `ask_user` tool, without the agent waiting: the answer reaches it
+    /// as a notice.
+    pub async fn ask(&self, id: Uuid, questions: Value) -> Result<(), String> {
+        let params = crate::questions::elicitation(&questions, &id.to_string())?;
+        let pid = {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            state.next_permission += 1;
+            let pid = state.next_permission;
+            state.permissions.insert(
+                pid,
+                Permission {
+                    method: "elicitation/create".into(),
+                    params: params.clone(),
+                    asker: Asker::Tool { questions },
+                },
+            );
+            pid
+        };
+        self.broadcast(
+            id,
+            UiEvent::PermissionRequest {
+                id: pid,
+                method: "elicitation/create".into(),
+                params,
+            },
+        );
+        Ok(())
     }
 
     pub async fn turn_running(&self, id: Uuid) -> bool {

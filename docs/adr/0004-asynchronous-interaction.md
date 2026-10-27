@@ -46,3 +46,5 @@ Spike, 2026-10-26, `claude-agent-acp` 0.97.0 with Haiku:
 For comparison, in Claude Code's own terminal UI, 93% of 441 messages queued while the agent worked were taken up after 0–1 tool rounds. That is a tendency, not a guarantee: runs of five or more tool calls and a message without the queued message being picked up have been seen since.
 
 2026-10-27: user messages sent during a turn moved from `next-boundary` to `idle`: they queue for the next turn and can be steered in one by one (#20). Steering is still delivered at the adapter's `now` priority, which pre-empts the running generation, rather than at `next-boundary`; `claude-agent-acp` doesn't let the client choose yet.
+
+2026-10-27: questions from the agent no longer block its turn (#29). Agents ask with sloppod's `ask_user` MCP tool, which shows the questions like any other and returns at once; the answer arrives as a notice. Claude Code's `AskUserQuestion`, which keeps the turn open until answered, is disallowed. Codex sessions get the same tool.

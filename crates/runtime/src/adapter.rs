@@ -16,7 +16,8 @@ pub const PLACEHOLDER: &str = "sloppod-placeholder";
 const OAUTH_PLACEHOLDER: &str = "sk-ant-oat01-sloppod-placeholder";
 const MEMINI_PLUGIN: &str = "/opt/sloppod/plugins/memini";
 /// Claude Code tools that don't fit a sloppod session: scheduling starts turns the runtime doesn't see and dies with
-/// the pod, plan mode would leave auto mode on exit, and worktrees put work on branches the session can't push.
+/// the pod, plan mode would leave auto mode on exit, worktrees put work on branches the session can't push, and
+/// AskUserQuestion stops the turn until answered, where sloppod's `ask_user` doesn't.
 const DISALLOWED_TOOLS: &[&str] = &[
     "CronCreate",
     "CronDelete",
@@ -26,6 +27,7 @@ const DISALLOWED_TOOLS: &[&str] = &[
     "ExitPlanMode",
     "EnterWorktree",
     "ExitWorktree",
+    "AskUserQuestion",
 ];
 
 /// The agents sessions can run, by name.
@@ -94,7 +96,8 @@ fn session_prompt(context: &AgentContext) -> String {
          the `propose_pull_request` tool; sloppod opens the PR once it's approved. To file issues, call the \
          `propose_issues` tool. For changes that build on each other, manage the branches with `gh stack` \
          (`init`, `add`, `rebase`, `push`) and propose them together with the `propose_stack` tool rather than \
-         `gh stack submit`. You're told when your proposals are decided. Direct writes to GitHub (gh pr \
+         `gh stack submit`. You're told when your proposals are decided. To ask the user something, use the \
+         `ask_user` tool: it doesn't wait, and the answer arrives later as a message. Direct writes to GitHub (gh pr \
          create, gh issue create, comments, API POSTs) are refused.\n",
     );
     format!(

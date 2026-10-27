@@ -284,17 +284,12 @@ export class SessionView {
     return this.#conn.request('_sloppod/steer_queued', { sessionId: this.id, id });
   }
 
+  /**
+   * Stops the turn. The runtime answers the turn's open requests as cancelled and tells every UI they're resolved;
+   * questions asked with `ask_user` aren't the turn's, so they stay open.
+   */
   cancel() {
     this.#conn.notify('session/cancel', { sessionId: this.id });
-    // ACP: after cancelling, the client answers its open permission requests as cancelled.
-    for (const request of this.permissions) {
-      this.#conn.respond(request.rpcId, { outcome: { outcome: 'cancelled' } });
-    }
-    for (const question of this.questions) {
-      this.#conn.respond(question.rpcId, { action: 'cancel' } satisfies ElicitationResponse);
-    }
-    this.permissions = [];
-    this.questions = [];
   }
 
   async setConfigOption(configId: string, value: string) {
