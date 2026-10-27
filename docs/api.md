@@ -178,7 +178,7 @@ Session pods use three more endpoints, on their own port (8081, `sessions`); tha
 
 - `/link/v1`: the supervisor link ([ADR 17](adr/0017-in-pod-supervisor.md)), a WebSocket authenticated with the pod's projected ServiceAccount token. Its types are in `crates/protocol`.
 - `/mcp`: an MCP server (streamable HTTP, JSON responses) registered with the agent at session start. It identifies the session by the pod's IP. Its tools:
-  - `propose_pull_request {title, body, repo?, base?, draft?}` creates a `github.pr.create` proposal from the session branch (`repo` is needed when the session can write to more than one).
+  - `propose_pull_request {title, body, repo?, base?, head?, draft?}` creates a `github.pr.create` proposal from the session branch, or from `head`, a branch named after it (`<session branch>-<name>`), so a session can have several open; `repo` is needed when the session can write to more than one.
   - `request_repository {repo, reason}` creates a `sloppod.repo.grant` proposal.
   - `get_proposal {id}` returns a proposal's status and result. The agent is also told when its proposals are decided.
 - `/memini/*`: memini, for sessions with a `memory` grant, identified by the pod's IP. The runtime forwards each request to the owner's memini with the session's own key and namespace, and refuses memini's administration endpoints. The memini plugin's `MEMINI_BASE_URL` points here.

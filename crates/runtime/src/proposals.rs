@@ -85,7 +85,7 @@ pub fn repo_granted(repo: &str, session: Uuid) -> String {
     format!(
         "You can now push to {repo}. Clone it with `git clone https://github.com/{repo} {}/{repo}` if you haven't, \
          work on your session branch (`git switch -c {branch}`) and push with `git push origin HEAD:{branch}`; \
-         that's the only ref you can push there.",
+         only it and branches named after it (`{branch}-<name>`) can be pushed there.",
         crate::link::REPOS_DIR
     )
 }
@@ -103,9 +103,10 @@ impl ProposalKind for PullRequest {
     fn tool(&self) -> ToolSpec {
         ToolSpec {
             name: "propose_pull_request".into(),
-            description: "Propose opening a pull request from your session branch. Push your commits to the \
-                          session branch first. A human reviews the title, body and diff; once approved, \
-                          sloppod opens the PR. Returns the proposal's id; check it with get_proposal."
+            description: "Propose opening a pull request from your session branch, or from a branch named after it \
+                          (`<session branch>-<name>`) so several pull requests can be open at once. Push your \
+                          commits first. A human reviews the title, body and diff; once approved, sloppod opens \
+                          the PR. Returns the proposal's id; check it with get_proposal."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -114,6 +115,7 @@ impl ProposalKind for PullRequest {
                     "body": {"type": "string", "description": "Pull request description (Markdown)"},
                     "repo": {"type": "string", "description": "Repository as owner/name; needed when the session can push to more than one"},
                     "base": {"type": "string", "description": "Branch to merge into; defaults to the repository's default branch"},
+                    "head": {"type": "string", "description": "Branch to open it from: the session branch (the default) or `<session branch>-<name>`"},
                     "draft": {"type": "boolean", "description": "Open as a draft", "default": false},
                 },
                 "required": ["title", "body"],
@@ -131,6 +133,7 @@ impl ProposalKind for PullRequest {
 
     async fn prepare(&self, session: &SessionContext, arguments: Value) -> Result<Value> {
         let RepoGrant { repo, branch } = pull_request_repo(session, arguments["repo"].as_str())?;
+        let head = head_branch(branch, arguments["head"].as_str())?;
         let app = self.app(session).await?;
         let title = arguments["title"].as_str().filter(|t| !t.trim().is_empty());
         let Some(title) = title else {
@@ -140,17 +143,16 @@ impl ProposalKind for PullRequest {
             Some(base) => base.to_owned(),
             None => app.default_branch(repo).await.map_err(err)?,
         };
-        let comparison = app.compare(repo, &base, branch).await.map_err(err)?;
+        let comparison = app.compare(repo, &base, head).await.map_err(err)?;
         if comparison.ahead_by == 0 {
             return Err(Error::new(format!(
-                "`{}` has no commits that aren't on `{base}`; commit and `git push origin HEAD:{}` first",
-                branch, branch
+                "`{head}` has no commits that aren't on `{base}`; commit and `git push origin HEAD:{head}` first"
             )));
         }
         Ok(json!({
             "repo": repo,
             "base": base,
-            "head": branch,
+            "head": head,
             "title": title,
             "body": arguments["body"].as_str().unwrap_or_default(),
             "draft": arguments["draft"].as_bool().unwrap_or(false),
@@ -185,6 +187,32 @@ impl ProposalKind for PullRequest {
             .create_pull(payload["repo"].as_str().unwrap_or_default(), &request)
             .await
             .map_err(err)
+    }
+}
+
+/// Whether a session may push `branch`: its session branch, or one named after it (`<session branch>-<name>`).
+/// Not `<session branch>/<name>`, which git can't have next to the session branch itself.
+pub fn is_session_branch(session_branch: &str, branch: &str) -> bool {
+    branch == session_branch
+        || branch
+            .strip_prefix(session_branch)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|name| !name.is_empty())
+}
+
+/// The branch a pull request is from.
+fn head_branch<'a>(session_branch: &'a str, named: Option<&'a str>) -> Result<&'a str> {
+    let Some(head) = named.map(str::trim).filter(|h| !h.is_empty()) else {
+        return Ok(session_branch);
+    };
+    let head = head.strip_prefix("refs/heads/").unwrap_or(head);
+    if is_session_branch(session_branch, head) {
+        Ok(head)
+    } else {
+        Err(Error::new(format!(
+            "pull requests come from your session branch `{session_branch}` or one named after it, like \
+             `{session_branch}-<name>`"
+        )))
     }
 }
 
@@ -502,5 +530,25 @@ mod tests {
             pull_request_repo(&two, Some("a/two")).unwrap().repo,
             "a/two"
         );
+    }
+
+    #[test]
+    fn picks_the_head_branch() {
+        let branch = "sloppod/00000000";
+        assert_eq!(head_branch(branch, None).unwrap(), branch);
+        assert_eq!(head_branch(branch, Some(" ")).unwrap(), branch);
+        assert_eq!(head_branch(branch, Some(branch)).unwrap(), branch);
+        assert_eq!(
+            head_branch(branch, Some("sloppod/00000000-issues")).unwrap(),
+            "sloppod/00000000-issues"
+        );
+        assert_eq!(
+            head_branch(branch, Some("refs/heads/sloppod/00000000-issues")).unwrap(),
+            "sloppod/00000000-issues"
+        );
+        assert!(head_branch(branch, Some("sloppod/00000000-")).is_err());
+        assert!(head_branch(branch, Some("sloppod/00000000/issues")).is_err());
+        assert!(head_branch(branch, Some("sloppod/000000001")).is_err());
+        assert!(head_branch(branch, Some("main")).is_err());
     }
 }
