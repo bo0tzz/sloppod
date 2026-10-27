@@ -1233,6 +1233,26 @@ mod tests {
         assert_eq!(auto_merging(&fake), [4]);
     }
 
+    #[tokio::test]
+    async fn a_push_finds_its_pull_request_whatever_the_branch_is_called() {
+        // Session branches can't have these characters, but the lookup must still ask about the branch pushed: an
+        // unencoded `+` reads as a space and a `#` ends the URL, so the pull request would be missed.
+        let fake = Fake {
+            pulls: Mutex::new(vec![
+                (1, "a+b", true),
+                (2, "a b", true),
+                (3, "c#d", true),
+                (4, "c", true),
+            ]),
+            stacks: None,
+            ..Fake::default()
+        };
+        let (fake, app) = serve(fake).await;
+        assert_eq!(app.disable_auto_merge("o/r", "a+b").await.unwrap(), [1]);
+        assert_eq!(app.disable_auto_merge("o/r", "c#d").await.unwrap(), [3]);
+        assert_eq!(auto_merging(&fake), [2, 4]);
+    }
+
     /// The unmerged stack #7 of three layers, each at the commit it was proposed at.
     fn unmerged() -> Fake {
         Fake {
