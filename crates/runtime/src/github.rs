@@ -48,21 +48,25 @@ impl PushLog {
             .insert((repo.to_lowercase(), branch.to_owned()), Instant::now());
     }
 
-    /// The first of `branches` a push was let through to since `since`.
+    /// The first of `branches` a push was let through to since `settle` before `since`.
     pub fn pushed_since<'a>(
         &self,
         repo: &str,
         branches: &[&'a str],
         since: Instant,
+        settle: Duration,
     ) -> Option<&'a str> {
         let admitted = self.admitted.lock().unwrap();
         branches.iter().copied().find(|branch| {
             admitted
                 .get(&(repo.to_lowercase(), (*branch).to_owned()))
-                .is_some_and(|at| *at >= since)
+                .is_some_and(|at| *at + settle >= since)
         })
     }
 }
+
+/// How long a push the authorizer let through may take to land, for work that needs branches to hold still.
+const PUSH_SETTLE: Duration = Duration::from_secs(10 * 60);
 
 /// A linked stack to merge: its number, its pull requests and each layer's branch and proposed commit, bottom to
 /// top, and the top pull request's node id.
@@ -811,20 +815,49 @@ impl GitHubApp {
         let Some((_, top_sha)) = layers.last() else {
             bail!("the stack has no layers");
         };
+        let branches: Vec<&str> = layers.iter().map(|(branch, _)| *branch).collect();
+        // The authorizer sees a push start, not land, so a push it let through lately may still be on its way.
+        if let Some(branch) = pushes.pushed_since(repo, &branches, since, PUSH_SETTLE) {
+            bail!(
+                "`{branch}` was pushed to in the last few minutes, and that push may still be landing"
+            );
+        }
+        if let Some(branch) = self.moved_layer(repo, layers).await? {
+            bail!("`{branch}` moved since it was proposed");
+        }
         self.enable_auto_merge(repo, top_node_id, top_sha).await?;
-        let mut moved = None;
+        // A push let through in the meantime: GitHub can't merge its commits before their required checks pass, so
+        // turning auto-merge off again in time is enough. Any doubt turns it off.
+        let doubt = match self.moved_layer(repo, layers).await {
+            Ok(Some(branch)) => Some(format!("`{branch}` moved while the stack was being opened")),
+            Ok(None) => pushes
+                .pushed_since(repo, &branches, since, Duration::ZERO)
+                .map(|branch| format!("`{branch}` was pushed to while the stack was being opened")),
+            Err(e) => Some(format!("its layers couldn't be checked ({e})")),
+        };
+        let Some(doubt) = doubt else {
+            return Ok(());
+        };
+        match self.disable_pull_auto_merge_in(repo, top_node_id).await {
+            Ok(()) => bail!("{doubt}"),
+            Err(e) => bail!(
+                "{doubt}, and auto-merge couldn't be turned off again ({e}): turn it off by hand"
+            ),
+        }
+    }
+
+    /// The first layer not at the commit it was proposed at.
+    async fn moved_layer<'a>(
+        &self,
+        repo: &str,
+        layers: &[(&'a str, &str)],
+    ) -> anyhow::Result<Option<&'a str>> {
         for (branch, sha) in layers {
             if self.branch_sha(repo, branch).await? != *sha {
-                moved = Some(*branch);
-                break;
+                return Ok(Some(branch));
             }
         }
-        let branches: Vec<&str> = layers.iter().map(|(branch, _)| *branch).collect();
-        if let Some(branch) = moved.or_else(|| pushes.pushed_since(repo, &branches, since)) {
-            self.disable_pull_auto_merge_in(repo, top_node_id).await?;
-            bail!("`{branch}` changed while the stack was being opened");
-        }
-        Ok(())
+        Ok(None)
     }
 
     /// A stack's pull requests, bottom to top.
@@ -961,12 +994,17 @@ mod tests {
         stacks: Option<Vec<(u64, Vec<u64>)>>,
         /// Branch heads of `o/r`.
         heads: Mutex<HashMap<String, String>>,
+        /// Head lookups fail while any pull request has auto-merge on.
+        heads_fail_once_merging: bool,
     }
 
     async fn commit(
         State(fake): State<Arc<Fake>>,
         Path((_, _, reference)): Path<(String, String, String)>,
     ) -> Result<Json<Value>, StatusCode> {
+        if fake.heads_fail_once_merging && fake.pulls.lock().unwrap().iter().any(|p| p.2) {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
         let heads = fake.heads.lock().unwrap();
         heads
             .get(&reference)
@@ -1239,25 +1277,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_push_still_landing_stops_the_stack_merging() {
+    async fn a_push_let_through_meanwhile_stops_the_stack_merging() {
         let (fake, app) = serve(unmerged()).await;
         let pushes = PushLog::default();
         let since = Instant::now();
-        // Let through after the stack started opening; its commits haven't reached the branch yet.
+        // Let through after the stack started opening, its commits not on the branch yet.
         pushes.admit("O/R", "s-2");
         let refused = app
             .auto_merge_stack("o/r", &merge(&[1, 2, 3]), &pushes, since)
             .await;
         assert!(refused.unwrap_err().to_string().contains("s-2"));
         assert!(auto_merging(&fake).is_empty());
+    }
 
-        // A push let through before the stack started opening has landed, which the heads show.
-        let earlier = PushLog::default();
-        earlier.admit("o/r", "s-2");
-        app.auto_merge_stack("o/r", &merge(&[1, 2, 3]), &earlier, Instant::now())
+    #[tokio::test]
+    async fn a_recent_push_that_may_still_land_keeps_auto_merge_off() {
+        let (fake, app) = serve(unmerged()).await;
+        let pushes = PushLog::default();
+        // Let through before the stack started opening, and maybe still landing.
+        pushes.admit("o/r", "s-1");
+        let since = Instant::now();
+        let refused = app
+            .auto_merge_stack("o/r", &merge(&[1, 2, 3]), &pushes, since)
+            .await;
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("may still be landing")
+        );
+        assert!(auto_merging(&fake).is_empty());
+
+        // Long enough ago, with every layer at its proposed commit, it's fine.
+        let settled = since + PUSH_SETTLE + Duration::from_secs(1);
+        app.auto_merge_stack("o/r", &merge(&[1, 2, 3]), &pushes, settled)
             .await
             .unwrap();
         assert_eq!(auto_merging(&fake), [3]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_check_after_turning_auto_merge_on_turns_it_off() {
+        let fake = Fake {
+            heads_fail_once_merging: true,
+            ..unmerged()
+        };
+        let (fake, app) = serve(fake).await;
+        let refused = app
+            .auto_merge_stack(
+                "o/r",
+                &merge(&[1, 2, 3]),
+                &PushLog::default(),
+                Instant::now(),
+            )
+            .await;
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("couldn't be checked")
+        );
+        assert!(auto_merging(&fake).is_empty());
     }
 
     #[tokio::test]
