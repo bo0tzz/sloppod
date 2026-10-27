@@ -18,6 +18,7 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, PostParams};
 use serde_json::{Value, json};
 use sloppod_contracts::{AgentContext, MemoryContext};
+use sloppod_protocol::api::SessionKind;
 use sloppod_protocol::link::{
     AgentReady, FromSupervisor, Launch, Repo, RunningAgent, ToSupervisor, TranscriptFile,
 };
@@ -344,9 +345,9 @@ pub async fn agent_context(state: &AppState, session: &db::SessionRow) -> AgentC
         repos_dir: REPOS_DIR.to_owned(),
         tools_url: format!("{}/mcp", state.config.runtime_url()),
         // A review session's instructions are the reviewer's own, not the ones the owner's sessions work by.
-        instructions: match session.kind.as_str() {
-            "review" => Some(crate::reviews::INSTRUCTIONS.to_owned()),
-            _ => state.instructions.clone(),
+        instructions: match session.kind {
+            SessionKind::Review => Some(crate::reviews::INSTRUCTIONS.to_owned()),
+            SessionKind::Work => state.instructions.clone(),
         },
         model: session.model.clone(),
         memory,

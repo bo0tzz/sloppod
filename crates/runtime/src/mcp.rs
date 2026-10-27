@@ -7,6 +7,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
+use sloppod_protocol::api::{ProposalStatus, SessionKind};
 use uuid::Uuid;
 
 use crate::{AppState, db, proposals, reviews};
@@ -31,7 +32,10 @@ pub async fn handler(
             "instructions": "Tools for outward actions. Each creates a proposal that a human reviews before sloppod carries it out.",
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({"tools": tools(&state, &session_kind(&state, session).await)})),
+        "tools/list" => match session_kind(&state, session).await {
+            Ok(kind) => Ok(json!({"tools": tools(&state, kind)})),
+            Err(e) => Err(json!({"code": -32603, "message": e})),
+        },
         "tools/call" => Ok(call(&state, session, &message["params"]).await),
         _ => Err(json!({"code": -32601, "message": format!("{method} is not supported")})),
     };
@@ -42,10 +46,12 @@ pub async fn handler(
     Json(body).into_response()
 }
 
-async fn session_kind(state: &AppState, session: Uuid) -> String {
+/// Which tools a session gets depends on its kind, so a session that can't be loaded gets none.
+async fn session_kind(state: &AppState, session: Uuid) -> Result<SessionKind, String> {
     match db::get_session(&state.db, session).await {
-        Ok(Some(row)) => row.kind,
-        _ => "work".into(),
+        Ok(Some(row)) => Ok(row.kind),
+        Ok(None) => Err("this session no longer exists".into()),
+        Err(e) => Err(format!("couldn't load the session: {e}")),
     }
 }
 
@@ -98,8 +104,8 @@ fn review_tools() -> Vec<Value> {
     ]
 }
 
-fn tools(state: &AppState, kind: &str) -> Vec<Value> {
-    if kind == "review" {
+fn tools(state: &AppState, kind: SessionKind) -> Vec<Value> {
+    if kind == SessionKind::Review {
         return review_tools();
     }
     let mut tools: Vec<Value> = state
@@ -149,8 +155,11 @@ fn text(text: String, is_error: bool) -> Value {
 async fn call(state: &AppState, session: Uuid, params: &Value) -> Value {
     let name = params["name"].as_str().unwrap_or_default();
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-    let kind = session_kind(state, session).await;
-    if !tools(state, &kind).iter().any(|t| t["name"] == name) {
+    let kind = match session_kind(state, session).await {
+        Ok(kind) => kind,
+        Err(e) => return text(e, true),
+    };
+    if !tools(state, kind).iter().any(|t| t["name"] == name) {
         return text(format!("{name} isn't one of this session's tools"), true);
     }
     if name == "submit_review" {
@@ -215,7 +224,7 @@ async fn call(state: &AppState, session: Uuid, params: &Value) -> Value {
         };
     }
     match proposals::propose(state, session, name, arguments).await {
-        Ok(proposal) if proposal.status == "in_review" => text(
+        Ok(proposal) if proposal.status == ProposalStatus::InReview => text(
             format!(
                 "Proposal {} created; another model is reviewing it before a human sees it. Its findings, if any, \
                  come back to you.",
@@ -223,7 +232,7 @@ async fn call(state: &AppState, session: Uuid, params: &Value) -> Value {
             ),
             false,
         ),
-        Ok(proposal) if proposal.status == "pending" => text(
+        Ok(proposal) if proposal.status == ProposalStatus::Pending => text(
             format!(
                 "Proposal {} created and waiting for human review. Nothing has happened yet; once it's approved sloppod \
                  carries it out. Check its status with get_proposal.",

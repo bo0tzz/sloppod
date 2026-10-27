@@ -9,7 +9,7 @@ use sloppod_contracts::{
     Error, Grant, Manifest, ProposalKind, RepoGrant, Result, ReviewSubject, SessionContext,
     ToolSpec,
 };
-use sloppod_protocol::api::Proposal;
+use sloppod_protocol::api::{Proposal, ProposalStatus, ReviewPolicy};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -959,7 +959,7 @@ pub async fn propose(
     // The session's policy covers every kind that can be reviewed; asking for a review of one that can't is an
     // error, as is asking when the owner has no login for the reviewer. Under the policy those just skip review.
     let asked = arguments["review"].as_bool() == Some(true);
-    let required = session.review == "required";
+    let required = session.review == ReviewPolicy::Required;
     let context = session.context();
     let payload = kind.prepare(&context, arguments).await.map_err(|e| e.0)?;
     let mut subject = kind.review_subject(&payload).filter(|_| asked || required);
@@ -981,9 +981,9 @@ pub async fn propose(
         subject = None;
     }
     let status = if subject.is_some() {
-        "in_review"
+        ProposalStatus::InReview
     } else {
-        "pending"
+        ProposalStatus::Pending
     };
     let row = db::insert_proposal(&state.db, session_id, &kind.kind(), status, &payload)
         .await
@@ -997,10 +997,16 @@ pub async fn propose(
     };
     if let Err(e) = reviews::start(state, &row, &subject, None).await {
         tracing::warn!(proposal = %row.id, error = %e, "starting a review");
-        let row = db::move_proposal(&state.db, row.id, "in_review", "pending", None)
-            .await
-            .map_err(|e| e.to_string())?
-            .ok_or("the proposal changed meanwhile")?;
+        let row = db::move_proposal(
+            &state.db,
+            row.id,
+            ProposalStatus::InReview,
+            ProposalStatus::Pending,
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("the proposal changed meanwhile")?;
         state.hub.broadcast_proposal(&row.to_api());
         return Err(format!(
             "the review couldn't start ({e}), so proposal {} went to the user without one",
@@ -1083,12 +1089,12 @@ pub async fn decide(
         .ok_or_else(|| anyhow::anyhow!("no executor for {}", row.kind))?;
     let (status, payload, reason) = match verdict {
         Verdict::Approve { edits } => (
-            "approved",
+            ProposalStatus::Approved,
             kind.edit(&row.payload, &edits)
                 .map_err(|e| anyhow::anyhow!(e.0))?,
             None,
         ),
-        Verdict::Reject { reason } => ("rejected", row.payload.clone(), reason),
+        Verdict::Reject { reason } => (ProposalStatus::Rejected, row.payload.clone(), reason),
     };
     let Some(row) = db::decide_proposal(
         &state.db,
@@ -1104,7 +1110,7 @@ pub async fn decide(
     };
     state.hub.broadcast_proposal(&row.to_api());
     let summary = kind.summary(&payload);
-    if status == "rejected" {
+    if status == ProposalStatus::Rejected {
         let reason = row
             .reason
             .as_deref()
@@ -1175,8 +1181,13 @@ async fn carry_out(
         .await?
         .ok_or_else(|| anyhow::anyhow!("session gone"))?;
     let finished = match kind.execute(&session.context(), payload).await {
-        Ok(result) => db::finish_proposal(&state.db, id, "executed", Some(&result), None).await?,
-        Err(e) => db::finish_proposal(&state.db, id, "failed", None, Some(&e.0)).await?,
+        Ok(result) => {
+            db::finish_proposal(&state.db, id, ProposalStatus::Executed, Some(&result), None)
+                .await?
+        }
+        Err(e) => {
+            db::finish_proposal(&state.db, id, ProposalStatus::Failed, None, Some(&e.0)).await?
+        }
     };
     let proposal = finished.to_api();
     state.hub.broadcast_proposal(&proposal);

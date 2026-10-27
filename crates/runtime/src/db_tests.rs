@@ -2,16 +2,17 @@
 
 use chrono::{Duration, Utc};
 use serde_json::json;
+use sloppod_protocol::api::{ProposalStatus, ReviewPolicy, SessionKind};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::db::{self, NewSessionRow};
 
 async fn session(db: &PgPool, owner: &str) -> Uuid {
-    session_of_kind(db, owner, "work").await
+    session_of_kind(db, owner, SessionKind::Work).await
 }
 
-async fn session_of_kind(db: &PgPool, owner: &str, kind: &str) -> Uuid {
+async fn session_of_kind(db: &PgPool, owner: &str, kind: SessionKind) -> Uuid {
     let id = Uuid::now_v7();
     db::insert_session(
         db,
@@ -23,7 +24,7 @@ async fn session_of_kind(db: &PgPool, owner: &str, kind: &str) -> Uuid {
             pending_prompt: "",
             agent: "claude-code",
             kind,
-            review: "off",
+            review: ReviewPolicy::Off,
             model: None,
             repo: None,
             grants: &[],
@@ -118,26 +119,45 @@ async fn only_approved_proposals_are_resumed(db: PgPool) {
     let mut ids = Vec::new();
     for _ in 0..4 {
         ids.push(
-            db::insert_proposal(&db, s, "github.issue.create", "pending", &json!({}))
-                .await
-                .unwrap()
-                .id,
+            db::insert_proposal(
+                &db,
+                s,
+                "github.issue.create",
+                ProposalStatus::Pending,
+                &json!({}),
+            )
+            .await
+            .unwrap()
+            .id,
         );
     }
     for &id in &ids[..3] {
-        db::decide_proposal(&db, id, "approved", &json!({}), None, "dev")
+        db::decide_proposal(&db, id, ProposalStatus::Approved, &json!({}), None, "dev")
             .await
             .unwrap()
             .unwrap();
     }
-    db::finish_proposal(&db, ids[0], "done", Some(&json!({})), None)
-        .await
-        .unwrap();
+    db::finish_proposal(
+        &db,
+        ids[0],
+        ProposalStatus::Executed,
+        Some(&json!({})),
+        None,
+    )
+    .await
+    .unwrap();
     assert!(
-        db::decide_proposal(&db, ids[1], "rejected", &json!({}), None, "dev")
-            .await
-            .unwrap()
-            .is_none()
+        db::decide_proposal(
+            &db,
+            ids[1],
+            ProposalStatus::Rejected,
+            &json!({}),
+            None,
+            "dev"
+        )
+        .await
+        .unwrap()
+        .is_none()
     );
 
     let resumed: Vec<Uuid> = db::approved_proposals(&db)
@@ -152,7 +172,7 @@ async fn only_approved_proposals_are_resumed(db: PgPool) {
 #[sqlx::test(migrator = "db::MIGRATOR")]
 async fn review_rounds_track_a_proposal(db: PgPool) {
     let author = session(&db, "dev").await;
-    let reviewer = session_of_kind(&db, "dev", "review").await;
+    let reviewer = session_of_kind(&db, "dev", SessionKind::Review).await;
     let listed: Vec<Uuid> = db::list_sessions(&db, "dev")
         .await
         .unwrap()
@@ -165,7 +185,7 @@ async fn review_rounds_track_a_proposal(db: PgPool) {
         &db,
         author,
         "github.pr.create",
-        "in_review",
+        ProposalStatus::InReview,
         &json!({"n": 1}),
     )
     .await
@@ -202,23 +222,35 @@ async fn review_rounds_track_a_proposal(db: PgPool) {
             .unwrap()
             .is_none()
     );
-    let moved = db::move_proposal(&db, p, "in_review", "changes_requested", None)
-        .await
-        .unwrap()
-        .unwrap();
+    let moved = db::move_proposal(
+        &db,
+        p,
+        ProposalStatus::InReview,
+        ProposalStatus::ChangesRequested,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(moved.payload, json!({"n": 1}));
     assert!(
-        db::move_proposal(&db, p, "in_review", "pending", None)
-            .await
-            .unwrap()
-            .is_none()
+        db::move_proposal(
+            &db,
+            p,
+            ProposalStatus::InReview,
+            ProposalStatus::Pending,
+            None
+        )
+        .await
+        .unwrap()
+        .is_none()
     );
 
     let moved = db::move_proposal(
         &db,
         p,
-        "changes_requested",
-        "in_review",
+        ProposalStatus::ChangesRequested,
+        ProposalStatus::InReview,
         Some(&json!({"n": 2})),
     )
     .await
@@ -248,28 +280,44 @@ async fn review_rounds_track_a_proposal(db: PgPool) {
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
 async fn review_policy_defaults_to_off(db: PgPool) {
-    assert_eq!(db::user_review(&db, "dev").await.unwrap(), "off");
+    assert_eq!(
+        db::user_review(&db, "dev").await.unwrap(),
+        ReviewPolicy::Off
+    );
     db::set_user_model(&db, "dev", Some("haiku")).await.unwrap();
-    db::set_user_review(&db, "dev", "required").await.unwrap();
-    assert_eq!(db::user_review(&db, "dev").await.unwrap(), "required");
+    db::set_user_review(&db, "dev", ReviewPolicy::Required)
+        .await
+        .unwrap();
+    assert_eq!(
+        db::user_review(&db, "dev").await.unwrap(),
+        ReviewPolicy::Required
+    );
     assert_eq!(
         db::user_model(&db, "dev").await.unwrap().as_deref(),
         Some("haiku")
     );
 
     let s = session(&db, "dev").await;
-    db::set_session_review(&db, s, "required").await.unwrap();
+    db::set_session_review(&db, s, ReviewPolicy::Required)
+        .await
+        .unwrap();
     let row = db::get_session(&db, s).await.unwrap().unwrap();
-    assert_eq!(row.review, "required");
+    assert_eq!(row.review, ReviewPolicy::Required);
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
 async fn findings_from_before_severities_still_read(db: PgPool) {
     let s = session(&db, "dev").await;
-    let p = db::insert_proposal(&db, s, "github.pr.create", "changes_requested", &json!({}))
-        .await
-        .unwrap()
-        .id;
+    let p = db::insert_proposal(
+        &db,
+        s,
+        "github.pr.create",
+        ProposalStatus::ChangesRequested,
+        &json!({}),
+    )
+    .await
+    .unwrap()
+    .id;
     db::start_review_round(&db, p, "aaa", None).await.unwrap();
     sqlx::query("update reviews set verdict = 'changes', findings = $2 where proposal_id = $1")
         .bind(p)
@@ -328,7 +376,11 @@ async fn parked_sessions_are_left_alone_on_startup(db: PgPool) {
 async fn finds_proposals_still_with_their_reviewer(db: PgPool) {
     let s = session(&db, "dev").await;
     let mut ids = Vec::new();
-    for status in ["in_review", "changes_requested", "pending"] {
+    for status in [
+        ProposalStatus::InReview,
+        ProposalStatus::ChangesRequested,
+        ProposalStatus::Pending,
+    ] {
         ids.push(
             db::insert_proposal(&db, s, "github.pr.create", status, &json!({}))
                 .await
