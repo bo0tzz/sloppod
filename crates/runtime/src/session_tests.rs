@@ -555,3 +555,40 @@ async fn messages_are_recorded_under_the_ids_their_ui_gave_them() {
         .collect();
     assert_eq!(ids, [first.to_string(), second.to_string()]);
 }
+
+#[tokio::test]
+async fn a_turn_ending_on_a_replaced_agent_leaves_the_new_one_alone() {
+    let mut h = Harness::ready().await;
+    let old = h.agent.clone();
+    let _old_turn = h.prompt("Fix the build");
+    h.next().await;
+
+    // The supervisor reconnects: a new agent takes over and starts a turn.
+    let (tx, mut to_new) = mpsc::unbounded_channel();
+    let new = Arc::new(AgentConn::new(tx));
+    h.hub.attach_agent(h.id, new.clone()).await;
+    h.hub
+        .agent_ready(h.id, &new, "agent-session-2".into(), json!({}), None)
+        .await;
+    let (hub, id) = (h.hub.clone(), h.id);
+    let _new_turn = tokio::spawn(async move {
+        let params = json!({"sessionId": id, "prompt": [{"type": "text", "text": "Carry on"}]});
+        hub.prompt(id, params).await
+    });
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), to_new.recv()).await {
+            Ok(Some(ToSupervisor::Acp { message })) if message["method"] == "session/prompt" => {
+                break;
+            }
+            Ok(Some(_)) => {}
+            other => panic!("the new agent got no prompt: {other:?}"),
+        }
+    }
+    assert_eq!(h.phase().await, "working");
+
+    // The old agent's turn ends late, and changes nothing: the new turn still runs, so the next message waits.
+    h.hub.end_turn(h.id, &old).await;
+    assert_eq!(h.phase().await, "working");
+    let _waiting = h.prompt("And then this");
+    assert_eq!(wait_for_queue(&h, 1).await.len(), 1);
+}
