@@ -1,15 +1,18 @@
 name: Publish
 
+# main publishes `<version>-main.<run>` charts on `:<sha>` images; a `v<version>` tag publishes the release.
 on:
   push:
     branches: [main]
+    tags: ['v*']
 
 permissions:
   contents: read
   packages: write
 
+# Per ref, so a push to main never replaces a pending release; on main only the newest pending build survives.
 concurrency:
-  group: publish
+  group: publish-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -38,7 +41,8 @@ jobs:
           push: true
           tags: |
             ${{ matrix.image }}:${{ github.sha }}
-            ${{ matrix.image }}:latest
+            ${{ github.ref_type == 'tag' && format('{0}:{1}', matrix.image, github.ref_name) || format('{0}:main', matrix.image) }}
+            ${{ github.ref_type == 'tag' && format('{0}:latest', matrix.image) || '' }}
           cache-from: type=gha,scope=${{ matrix.target }}
           cache-to: type=gha,mode=max,scope=${{ matrix.target }}
 
@@ -55,8 +59,18 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           base=$(awk '/^version:/ {print $2}' charts/sloppod/Chart.yaml)
-          version="${base}-main.${GITHUB_RUN_NUMBER}"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            if [ "$GITHUB_REF_NAME" != "v${base}" ]; then
+              echo "tag $GITHUB_REF_NAME doesn't match the chart version $base" >&2
+              exit 1
+            fi
+            version="$base"
+            app_version="$GITHUB_REF_NAME"
+          else
+            version="${base}-main.${GITHUB_RUN_NUMBER}"
+            app_version="$GITHUB_SHA"
+          fi
           echo "$GITHUB_TOKEN" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
-          helm package charts/sloppod --version "$version" --app-version "$GITHUB_SHA" -d dist
+          helm package charts/sloppod --version "$version" --app-version "$app_version" -d dist
           helm push "dist/sloppod-${version}.tgz" oci://ghcr.io/bo0tzz/charts
-          echo "Published chart sloppod ${version} (images ${GITHUB_SHA})" >> "$GITHUB_STEP_SUMMARY"
+          echo "Published chart sloppod ${version} (images ${app_version})" >> "$GITHUB_STEP_SUMMARY"
