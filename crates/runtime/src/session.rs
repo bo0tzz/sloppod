@@ -93,7 +93,7 @@ pub enum ParkError {
     Failed(#[from] anyhow::Error),
 }
 
-/// Brings a parked session back; the runtime's is `api::wake`, which leaves other sessions alone.
+/// Brings a parked session back; the runtime's is `lifecycle::wake`, which leaves other sessions alone.
 pub type Waker =
     Arc<dyn Fn(Uuid) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync>;
 

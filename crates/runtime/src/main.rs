@@ -10,6 +10,7 @@ mod db_tests;
 mod enforcer;
 mod github;
 mod grants;
+mod lifecycle;
 mod link;
 mod mcp;
 mod memini;
@@ -204,7 +205,7 @@ async fn main() -> anyhow::Result<()> {
         let state = waker.clone();
         Box::pin(async move {
             match db::get_session(&state.db, id).await? {
-                Some(session) => api::wake(&state, &session).await,
+                Some(session) => lifecycle::wake(&state, &session).await,
                 None => Ok(()),
             }
         })
@@ -221,7 +222,7 @@ async fn main() -> anyhow::Result<()> {
             let mut every = tokio::time::interval(std::time::Duration::from_secs(3600));
             loop {
                 every.tick().await;
-                api::purge_deleted(&state).await;
+                lifecycle::purge_deleted(&state).await;
             }
         });
     }
@@ -278,7 +279,7 @@ async fn reconcile(state: &AppState) {
     for session in sessions {
         let interrupted = matches!(session.phase(), Phase::Working | Phase::Waiting);
         state.hub.set_phase(session.id, Phase::Disconnected).await;
-        if let Err(e) = api::place(state, &session).await {
+        if let Err(e) = lifecycle::place(state, &session).await {
             tracing::error!(session = %session.id, error = %e, "reconciling session");
         }
         if interrupted {
