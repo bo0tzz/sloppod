@@ -1,7 +1,7 @@
 <script lang="ts">
   import { Checkbox, Heading, Icon, Text } from '@immich/ui';
   import { mdiChevronRight, mdiSourceCommit } from '@mdi/js';
-  import { parseUnifiedDiff } from '#lib/diff.ts';
+  import { diffStats, parseUnifiedDiff } from '#lib/diff.ts';
   import DiffView from './DiffView.svelte';
 
   let {
@@ -12,6 +12,7 @@
 
   const parsed = $derived(parseUnifiedDiff(diff));
   const files = $derived(parsed ?? []);
+  const stats = $derived(diffStats(files));
 </script>
 
 <section class="flex flex-col gap-2">
@@ -37,8 +38,8 @@
       {#if parsed}
         <span class="text-muted font-normal">
           ({files.length} {files.length === 1 ? 'file' : 'files'},
-          <span class="text-success-600">+{files.reduce((sum, file) => sum + file.additions, 0)}</span>
-          <span class="text-danger-600">−{files.reduce((sum, file) => sum + file.deletions, 0)}</span>)
+          <span class="text-success-600">+{stats.additions}</span>
+          <span class="text-danger-600">−{stats.deletions}</span>)
         </span>
       {/if}
     </Heading>

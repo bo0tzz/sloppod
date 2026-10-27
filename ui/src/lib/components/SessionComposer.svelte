@@ -9,7 +9,6 @@
   let { view }: { view: SessionView } = $props();
 
   let text = $state('');
-  let sending = $state(false);
   let textarea = $state<HTMLTextAreaElement | null>(null);
 
   const phase = $derived(view.session?.phase);
@@ -31,7 +30,7 @@
         ? 'The agent is reconnecting; messages are queued.'
         : null,
   );
-  const canSend = $derived(!blockedReason && text.trim().length > 0 && !sending);
+  const canSend = $derived(!blockedReason && text.trim().length > 0);
 
   const model = $derived(phase === 'stopped' ? undefined : view.model);
   const modelOptions = $derived(model?.type === 'select' ? configSelectOptions(model.options) : []);
@@ -57,10 +56,10 @@
     view.undelivered = view.undelivered.filter((message) => message.id !== id);
   }
 
-  async function send() {
+  /** Sends the message and returns at once: its turn's outcome arrives later, as a toast if it went wrong. */
+  function send() {
     const message = text.trim();
-    if (!message || blockedReason || sending) return;
-    sending = true;
+    if (!message || blockedReason) return;
     text = '';
     const id = crypto.randomUUID();
     view.prompt(message, id).then(
@@ -76,7 +75,6 @@
         toastManager.danger({ title: "Couldn't send the prompt", description: errorMessage(error) });
       },
     );
-    sending = false;
     textarea?.focus();
   }
 
@@ -164,7 +162,6 @@
   sendIcon={mdiSend}
   sendColor="primary"
   {canSend}
-  {sending}
   onSend={send}
   notice={blockedReason || queuedHint ? notice : undefined}
 >
