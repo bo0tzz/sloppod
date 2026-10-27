@@ -14,7 +14,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::credentials::Credentials;
-use crate::github::GitHubApp;
+use crate::github::{GitHubApp, PushLog, StackMerge};
 use crate::{AppState, db, reviews};
 
 #[derive(Default, Clone)]
@@ -262,11 +262,15 @@ impl ProposalKind for PullRequest {
 /// Several pull requests that build on each other, opened together and linked as a stack on GitHub.
 pub struct Stack {
     credentials: Arc<Credentials>,
+    pushes: Arc<PushLog>,
 }
 
 impl Stack {
-    pub fn new(credentials: Arc<Credentials>) -> Self {
-        Self { credentials }
+    pub fn new(credentials: Arc<Credentials>, pushes: Arc<PushLog>) -> Self {
+        Self {
+            credentials,
+            pushes,
+        }
     }
 
     async fn app(&self, session: &SessionContext) -> Result<Arc<GitHubApp>> {
@@ -477,6 +481,7 @@ impl ProposalKind for Stack {
     }
 
     async fn execute(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
+        let started = std::time::Instant::now();
         let repo = payload["repo"].as_str().unwrap_or_default();
         let app = self.app(session).await?;
         let layers = stack_layers(payload);
@@ -534,15 +539,27 @@ impl ProposalKind for Stack {
         let mut auto_merge = false;
         if payload["auto_merge"].as_bool() == Some(true) {
             // Auto-merge on the top pull request merges the whole stack, so only a linked stack gets it.
-            let (top, top_layer) = (pulls.last(), layers.last());
-            message.push_str(&match (&linked, top, top_layer) {
-                (Ok(stack), Some(top), Some(layer)) => match app
+            let pinned: Vec<(&str, &str)> = layers
+                .iter()
+                .map(|l| {
+                    (
+                        l["head"].as_str().unwrap_or_default(),
+                        l["head_sha"].as_str().unwrap_or_default(),
+                    )
+                })
+                .collect();
+            message.push_str(&match (&linked, pulls.last()) {
+                (Ok(stack), Some(top)) => match app
                     .auto_merge_stack(
                         repo,
-                        *stack,
-                        &numbers,
-                        top["node_id"].as_str().unwrap_or_default(),
-                        layer["head_sha"].as_str().unwrap_or_default(),
+                        &StackMerge {
+                            stack: *stack,
+                            pulls: &numbers,
+                            top_node_id: top["node_id"].as_str().unwrap_or_default(),
+                            layers: &pinned,
+                        },
+                        &self.pushes,
+                        started,
                     )
                     .await
                 {

@@ -33,6 +33,47 @@ const READ_PERMISSIONS: &[&str] = &[
 ];
 
 /// One cached token, minted by whichever caller gets the slot first; the others wait for it.
+/// When the authorizer let pushes to branches through. A push it admitted may still be landing, so work that needs
+/// branches to hold still checks here as well as their heads. The runtime is one process (ADR 14), so this is too.
+#[derive(Default)]
+pub struct PushLog {
+    admitted: Mutex<HashMap<(String, String), Instant>>,
+}
+
+impl PushLog {
+    pub fn admit(&self, repo: &str, branch: &str) {
+        self.admitted
+            .lock()
+            .unwrap()
+            .insert((repo.to_lowercase(), branch.to_owned()), Instant::now());
+    }
+
+    /// The first of `branches` a push was let through to since `since`.
+    pub fn pushed_since<'a>(
+        &self,
+        repo: &str,
+        branches: &[&'a str],
+        since: Instant,
+    ) -> Option<&'a str> {
+        let admitted = self.admitted.lock().unwrap();
+        branches.iter().copied().find(|branch| {
+            admitted
+                .get(&(repo.to_lowercase(), (*branch).to_owned()))
+                .is_some_and(|at| *at >= since)
+        })
+    }
+}
+
+/// A linked stack to merge: its number, its pull requests and each layer's branch and proposed commit, bottom to
+/// top, and the top pull request's node id.
+#[derive(Clone, Copy)]
+pub struct StackMerge<'a> {
+    pub stack: u64,
+    pub pulls: &'a [u64],
+    pub top_node_id: &'a str,
+    pub layers: &'a [(&'a str, &'a str)],
+}
+
 type TokenSlot = Arc<tokio::sync::Mutex<Option<AccessToken>>>;
 
 /// What a token is minted for. `None` is everything the installation has.
@@ -606,26 +647,32 @@ impl GitHubApp {
             if pull["state"] != "open" || pull["auto_merge"].is_null() {
                 continue;
             }
-            let token = self.token_for(repo).await?;
-            let response: Value = self
-                .http
-                .post(self.url("/graphql"))
-                .bearer_auth(token)
-                .json(&json!({
-                    "query": "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }",
-                    "variables": {"id": pull["node_id"]},
-                }))
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
+            self.disable_pull_auto_merge_in(repo, pull["node_id"].as_str().unwrap_or_default())
                 .await?;
-            if let Some(error) = response["errors"].as_array().and_then(|e| e.first()) {
-                bail!("{}", error["message"].as_str().unwrap_or("unknown error"));
-            }
             disabled.push(number);
         }
         Ok(disabled)
+    }
+
+    async fn disable_pull_auto_merge_in(&self, repo: &str, node_id: &str) -> anyhow::Result<()> {
+        let token = self.token_for(repo).await?;
+        let response: Value = self
+            .http
+            .post(self.url("/graphql"))
+            .bearer_auth(token)
+            .json(&json!({
+                "query": "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }",
+                "variables": {"id": node_id},
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if let Some(error) = response["errors"].as_array().and_then(|e| e.first()) {
+            bail!("{}", error["message"].as_str().unwrap_or("unknown error"));
+        }
+        Ok(())
     }
 
     async fn repo_post(&self, repo: &str, path: &str, payload: &Value) -> anyhow::Result<Value> {
@@ -740,19 +787,44 @@ impl GitHubApp {
 
     /// Has a stack merge itself once its required checks pass, through auto-merge on its top pull request, at
     /// `top_sha`. Refused unless the stack holds exactly `pulls`, bottom to top: others in it would merge unreviewed.
+    ///
+    /// `layers` are each layer's branch and the commit it was proposed at, bottom to top. After turning auto-merge
+    /// on, every layer must still be there with no push let through to it since `since`, or it's turned off again:
+    /// the push guard only turns off auto-merge that's already on, and a push it let through earlier may land late.
     pub async fn auto_merge_stack(
         &self,
         repo: &str,
-        stack: u64,
-        pulls: &[u64],
-        top_node_id: &str,
-        top_sha: &str,
+        merge: &StackMerge<'_>,
+        pushes: &PushLog,
+        since: Instant,
     ) -> anyhow::Result<()> {
+        let StackMerge {
+            stack,
+            pulls,
+            top_node_id,
+            layers,
+        } = *merge;
         let members = self.stack_members(repo, stack).await?;
         if members != pulls {
             bail!("stack #{stack} holds other pull requests than these");
         }
-        self.enable_auto_merge(repo, top_node_id, top_sha).await
+        let Some((_, top_sha)) = layers.last() else {
+            bail!("the stack has no layers");
+        };
+        self.enable_auto_merge(repo, top_node_id, top_sha).await?;
+        let mut moved = None;
+        for (branch, sha) in layers {
+            if self.branch_sha(repo, branch).await? != *sha {
+                moved = Some(*branch);
+                break;
+            }
+        }
+        let branches: Vec<&str> = layers.iter().map(|(branch, _)| *branch).collect();
+        if let Some(branch) = moved.or_else(|| pushes.pushed_since(repo, &branches, since)) {
+            self.disable_pull_auto_merge_in(repo, top_node_id).await?;
+            bail!("`{branch}` changed while the stack was being opened");
+        }
+        Ok(())
     }
 
     /// A stack's pull requests, bottom to top.
@@ -887,6 +959,19 @@ mod tests {
         pulls: Mutex<Vec<(u64, &'static str, bool)>>,
         /// Stacks of `o/r` by number, with their pull requests bottom to top; None for a repository without them.
         stacks: Option<Vec<(u64, Vec<u64>)>>,
+        /// Branch heads of `o/r`.
+        heads: Mutex<HashMap<String, String>>,
+    }
+
+    async fn commit(
+        State(fake): State<Arc<Fake>>,
+        Path((_, _, reference)): Path<(String, String, String)>,
+    ) -> Result<Json<Value>, StatusCode> {
+        let heads = fake.heads.lock().unwrap();
+        heads
+            .get(&reference)
+            .map(|sha| Json(json!({"sha": sha})))
+            .ok_or(StatusCode::NOT_FOUND)
     }
 
     fn pull_json(&(number, head, auto_merge): &(u64, &str, bool)) -> Value {
@@ -1039,6 +1124,7 @@ mod tests {
             .route("/repos/{owner}/{name}/pulls/{number}", get(pull))
             .route("/repos/{owner}/{name}/stacks", get(stacks))
             .route("/repos/{owner}/{name}/stacks/{number}", get(stack))
+            .route("/repos/{owner}/{name}/commits/{reference}", get(commit))
             .route("/graphql", post(graphql))
             .with_state(fake.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1092,26 +1178,83 @@ mod tests {
         assert_eq!(auto_merging(&fake), [4]);
     }
 
-    #[tokio::test]
-    async fn a_stack_merges_only_with_exactly_its_proposed_layers() {
-        let fake = Fake {
+    /// The unmerged stack #7 of three layers, each at the commit it was proposed at.
+    fn unmerged() -> Fake {
+        Fake {
             pulls: Mutex::new(vec![
                 (1, "s-1", false),
                 (2, "s-2", false),
                 (3, "s-3", false),
             ]),
             stacks: Some(vec![(7, vec![1, 2, 3])]),
+            heads: Mutex::new(
+                [("s-1", "a"), ("s-2", "b"), ("s-3", "c")]
+                    .into_iter()
+                    .map(|(b, s)| (b.to_owned(), s.to_owned()))
+                    .collect(),
+            ),
             ..Fake::default()
-        };
-        let (fake, app) = serve(fake).await;
+        }
+    }
+
+    const LAYERS: &[(&str, &str)] = &[("s-1", "a"), ("s-2", "b"), ("s-3", "c")];
+
+    fn merge<'a>(pulls: &'a [u64]) -> StackMerge<'a> {
+        StackMerge {
+            stack: 7,
+            pulls,
+            top_node_id: "PR3",
+            layers: LAYERS,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stack_merges_only_with_exactly_its_proposed_layers() {
+        let (fake, app) = serve(unmerged()).await;
+        let pushes = PushLog::default();
+        let since = Instant::now();
         // The upper two of an existing three-layer stack.
         assert!(
-            app.auto_merge_stack("o/r", 7, &[2, 3], "PR3", "sha")
+            app.auto_merge_stack("o/r", &merge(&[2, 3]), &pushes, since)
                 .await
                 .is_err()
         );
         assert!(auto_merging(&fake).is_empty());
-        app.auto_merge_stack("o/r", 7, &[1, 2, 3], "PR3", "sha")
+        app.auto_merge_stack("o/r", &merge(&[1, 2, 3]), &pushes, since)
+            .await
+            .unwrap();
+        assert_eq!(auto_merging(&fake), [3]);
+    }
+
+    #[tokio::test]
+    async fn a_layer_that_moved_meanwhile_stops_the_stack_merging() {
+        let (fake, app) = serve(unmerged()).await;
+        let since = Instant::now();
+        fake.heads.lock().unwrap().insert("s-1".into(), "a2".into());
+        let refused = app
+            .auto_merge_stack("o/r", &merge(&[1, 2, 3]), &PushLog::default(), since)
+            .await;
+        assert!(refused.unwrap_err().to_string().contains("s-1"));
+        assert!(auto_merging(&fake).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_push_still_landing_stops_the_stack_merging() {
+        let (fake, app) = serve(unmerged()).await;
+        let pushes = PushLog::default();
+        let since = Instant::now();
+        // Let through after the stack started opening; its commits haven't reached the branch yet.
+        pushes.admit("O/R", "s-2");
+        let refused = app
+            .auto_merge_stack("o/r", &merge(&[1, 2, 3]), &pushes, since)
+            .await;
+        assert!(refused.unwrap_err().to_string().contains("s-2"));
+        assert!(auto_merging(&fake).is_empty());
+
+        // A push let through before the stack started opening has landed, which the heads show.
+        let earlier = PushLog::default();
+        earlier.admit("o/r", "s-2");
+        app.auto_merge_stack("o/r", &merge(&[1, 2, 3]), &earlier, Instant::now())
             .await
             .unwrap();
         assert_eq!(auto_merging(&fake), [3]);
