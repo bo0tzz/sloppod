@@ -1,15 +1,23 @@
 # syntax=docker/dockerfile:1
 # Two images from one build: `--target runtime` and `--target session`.
 
-FROM rust:1.99.1-trixie AS build
+FROM rust:1.99.1-trixie AS chef
+ARG CARGO_CHEF_VERSION=0.1.78
+RUN cargo install cargo-chef --locked --version ${CARGO_CHEF_VERSION}
 WORKDIR /src
+
+FROM chef AS plan
 COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# Dependencies build in their own layer, which only changes with the manifests and lockfile, so CI's layer cache
+# keeps it across commits.
+FROM chef AS build
 ARG CARGO_BUILD_JOBS=4
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
-    # COPY doesn't give changed sources newer mtimes than the cached target dir, so cargo would skip them.
-    find crates -type f -exec touch {} + \
-    && cargo build --release --locked -p sloppod-runtime -p sloppod-supervisor \
+COPY --from=plan /src/recipe.json recipe.json
+RUN cargo chef cook --release --locked --recipe-path recipe.json
+COPY . .
+RUN cargo build --release --locked -p sloppod-runtime -p sloppod-supervisor \
     && mkdir /out && cp target/release/sloppod target/release/sloppod-supervisor /out/
 
 FROM node:24.22.1-trixie-slim AS ui
