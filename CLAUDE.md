@@ -23,6 +23,6 @@ A runtime for coding-agent sessions on Kubernetes. The design lives in the ADRs 
   3. Port-forward `svc/sloppod` (e.g. to 18080) and drive it with `sloppodctl` (`cargo build -p sloppod-cli`; set `SLOPPOD_URL`) or the UI. Requests act as the user `dev`.
   4. Add a Claude account and a GitHub App under Settings, or with `sloppodctl add-credential` (see `docs/deploy.md`); they're stored in the database, not in Secrets.
   5. `dev/smoke.sh` runs the milestone checks; it pushes a `sloppod/<id>` branch to the repository and uses a few small model calls. Set the model to Haiku in Settings first to keep them cheap.
-- Inside a sloppod session there's no container runtime, so stick to `mise run check` and the UI tests there.
+- Inside a sloppod session there's no container runtime, so stick to `mise run check` and the UI tests there. The UI tests need a browser first: `npx playwright install chromium` (its download can be slow).
 - ADRs are MADR style. Numbers are permanent and append-only; add new ones to the README index under the right group.
 - Only comment code for intent a reader couldn't infer.
