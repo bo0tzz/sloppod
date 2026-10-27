@@ -10,8 +10,6 @@ session:
   storage:
     size: 5Gi
   memory: 3Gi
-  model: claude-haiku-5-5
-  defaultMode: auto
 database:
   existingSecret: sloppod-db
 masterKey:

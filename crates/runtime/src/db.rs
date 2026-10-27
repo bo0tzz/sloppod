@@ -25,6 +25,8 @@ pub struct SessionRow {
     pub phase: String,
     pub agent_session_id: Option<String>,
     pub agent_state: Option<Value>,
+    /// The session's current model, used whenever its agent starts.
+    pub model: Option<String>,
     grants: Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -70,7 +72,7 @@ impl SessionRow {
     }
 }
 
-const SESSION_COLUMNS: &str = "id, owner, title, phase, agent_session_id, agent_state, created_at, updated_at, \
+const SESSION_COLUMNS: &str = "id, owner, title, phase, agent_session_id, agent_state, model, created_at, updated_at, \
      coalesce((select jsonb_agg(jsonb_build_object('capability', g.capability, 'params', g.params) order by g.created_at) \
      from session_grants g where g.session_id = sessions.id), '[]'::jsonb) as grants";
 
@@ -80,17 +82,21 @@ pub struct NewSessionRow<'a> {
     pub title: &'a str,
     pub custom_title: bool,
     pub pending_prompt: &'a str,
+    pub model: Option<&'a str>,
     pub grants: &'a [Grant],
 }
 
 pub async fn insert_session(db: &PgPool, new: NewSessionRow<'_>) -> sqlx::Result<SessionRow> {
     let mut tx = db.begin().await?;
-    sqlx::query("insert into sessions (id, owner, title, custom_title, pending_prompt) values ($1, $2, $3, $4, $5)")
-        .bind(new.id)
-        .bind(new.owner)
-        .bind(new.title)
-        .bind(new.custom_title)
-        .bind(new.pending_prompt)
+    sqlx::query(
+        "insert into sessions (id, owner, title, custom_title, pending_prompt, model) values ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(new.id)
+    .bind(new.owner)
+    .bind(new.title)
+    .bind(new.custom_title)
+    .bind(new.pending_prompt)
+    .bind(new.model)
         .execute(&mut *tx)
         .await?;
     for grant in new.grants {
@@ -368,4 +374,45 @@ pub async fn add_grant(db: &PgPool, session: Uuid, grant: &Grant) -> sqlx::Resul
         .execute(db)
         .await
         .map(|_| ())
+}
+
+pub async fn set_session_model(db: &PgPool, id: Uuid, model: &str) -> sqlx::Result<()> {
+    sqlx::query("update sessions set model = $2 where id = $1")
+        .bind(id)
+        .bind(model)
+        .execute(db)
+        .await
+        .map(|_| ())
+}
+
+pub async fn user_model(db: &PgPool, owner: &str) -> sqlx::Result<Option<String>> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("select model from user_settings where owner = $1")
+            .bind(owner)
+            .fetch_optional(db)
+            .await?;
+    Ok(row.and_then(|(model,)| model))
+}
+
+pub async fn set_user_model(db: &PgPool, owner: &str, model: Option<&str>) -> sqlx::Result<()> {
+    sqlx::query(
+        "insert into user_settings (owner, model) values ($1, $2) \
+         on conflict (owner) do update set model = excluded.model, updated_at = now()",
+    )
+    .bind(owner)
+    .bind(model)
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
+/// The agent's state from the owner's most recently active session, for the models it offered.
+pub async fn latest_agent_state(db: &PgPool, owner: &str) -> sqlx::Result<Option<Value>> {
+    let row: Option<(Option<Value>,)> = sqlx::query_as(
+        "select agent_state from sessions where owner = $1 and agent_state is not null order by updated_at desc limit 1",
+    )
+    .bind(owner)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.and_then(|(state,)| state))
 }

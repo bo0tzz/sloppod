@@ -26,6 +26,7 @@ use crate::{AppState, db};
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/me", get(me))
+        .route("/settings", get(get_settings).put(put_settings))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}", get(get_session).delete(delete_session))
         .route("/repos", get(repos))
@@ -68,6 +69,63 @@ type ApiResult<T> = Result<T, ApiError>;
 
 async fn me(User(user): User) -> impl IntoResponse {
     Json(json!({"user": user}))
+}
+
+/// The models the agent offered, from a `configOptions` list; options may be grouped.
+fn offered_models(agent_state: &serde_json::Value) -> Vec<serde_json::Value> {
+    let options = agent_state["configOptions"]
+        .as_array()
+        .into_iter()
+        .flatten();
+    let Some(model) = options.into_iter().find(|o| o["id"] == "model") else {
+        return Vec::new();
+    };
+    model["options"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|o| match o["options"].as_array() {
+            Some(group) => group.clone(),
+            None => vec![o.clone()],
+        })
+        .filter(|o| o["value"].is_string())
+        .map(|o| json!({"value": o["value"], "name": o["name"].as_str().or(o["value"].as_str())}))
+        .collect()
+}
+
+async fn settings(state: &AppState, user: &str) -> ApiResult<serde_json::Value> {
+    let model = db::user_model(&state.db, user).await?;
+    let models = db::latest_agent_state(&state.db, user)
+        .await?
+        .map(|s| offered_models(&s))
+        .unwrap_or_default();
+    Ok(json!({"model": model, "models": models}))
+}
+
+async fn get_settings(
+    State(state): State<AppState>,
+    User(user): User,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(settings(&state, &user).await?))
+}
+
+#[derive(Deserialize)]
+struct SettingsUpdate {
+    model: Option<String>,
+}
+
+async fn put_settings(
+    State(state): State<AppState>,
+    User(user): User,
+    Json(update): Json<SettingsUpdate>,
+) -> ApiResult<impl IntoResponse> {
+    let model = update
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty());
+    db::set_user_model(&state.db, &user, model).await?;
+    Ok(Json(settings(&state, &user).await?))
 }
 
 async fn list_sessions(
@@ -196,6 +254,7 @@ async fn create_session(
             json!({"repo": repo, "access": "rw", "branch": branch}),
         ));
     }
+    let model = db::user_model(&state.db, &user).await?;
     let custom = new
         .title
         .as_deref()
@@ -212,6 +271,7 @@ async fn create_session(
             title: &title,
             custom_title: custom.is_some(),
             pending_prompt: prompt,
+            model: model.as_deref(),
             grants: &grants,
         },
     )
@@ -473,6 +533,25 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect()
+    }
+
+    #[test]
+    fn lists_offered_models_flat() {
+        let state = json!({"configOptions": [
+            {"id": "mode", "options": [{"value": "auto", "name": "Auto"}]},
+            {"id": "model", "options": [
+                {"value": "default", "name": "Default"},
+                {"group": "more", "name": "More", "options": [{"value": "claude-haiku-5-5", "name": "Haiku"}]},
+            ]},
+        ]});
+        assert_eq!(
+            offered_models(&state),
+            vec![
+                json!({"value": "default", "name": "Default"}),
+                json!({"value": "claude-haiku-5-5", "name": "Haiku"}),
+            ]
+        );
+        assert!(offered_models(&json!({})).is_empty());
     }
 
     #[test]

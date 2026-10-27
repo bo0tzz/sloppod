@@ -15,11 +15,6 @@ session:
     storageClass: ""
   cpu: ""
   memory: 4Gi
-  # Mode new sessions start in: auto (Claude Code's classifier decides permission prompts), default (ask every
-  # time), acceptEdits, plan or bypassPermissions. The pod boundary limits what any of them can reach.
-  defaultMode: auto
-  # Model for the agent, e.g. claude-opus-5-5. Empty uses the agent's default.
-  model: ""
   # Hosts sessions may reach without the authorizer, e.g. package registries. Empty keeps the built-in list.
   directHosts: []
 

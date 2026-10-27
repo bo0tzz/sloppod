@@ -17,6 +17,17 @@ GET    /api/v1/sessions/{id}        -> Session
 DELETE /api/v1/sessions/{id}        -> 204         stops the session and deletes its pod and volume
 GET    /api/v1/repos                -> string[]    repositories sessions can be granted, e.g. ["bo0tzz/sloppod"]
 GET    /api/v1/me                   -> {user: string}
+GET    /api/v1/settings             -> Settings
+PUT    /api/v1/settings             -> Settings    body: {model?: string | null}
+```
+
+```ts
+// The user's defaults for new sessions. `models` is what the agent offered in the user's most recent session
+// (empty before the first one); `model` null means the agent's default.
+type Settings = {
+  model: string | null;
+  models: { value: string; name: string }[];
+};
 ```
 
 A session starts from its first message: the UI opens an empty chat, and sending the first message creates the session. The runtime derives the session's repository from that message: an `owner/name` the user's GitHub App can access, or a bare repository name that matches exactly one of them. Without one, the session has no repository ([ADR 1](adr/0001-sessions-decoupled-from-directories.md)). Messages sent before the agent is up are queued and shown immediately.
@@ -129,7 +140,9 @@ UI → runtime:
 | `session/prompt` `{sessionId, prompt: ContentBlock[]}` | Starts a turn. Responds `{stopReason}` when the turn ends. While the agent isn't up (`starting`, `disconnected`) the prompt is queued: it's echoed right away, everything queued runs as one turn once the agent is ready, and each queued request responds when that turn ends. |
 | `session/cancel` `{sessionId}` (notification) | Cancels the running turn. Messages still queued for an agent that isn't up stay queued. |
 | `_session/steering` `{sessionId, prompt: ContentBlock[]}` | Delivers a message into the running turn. Before the agent is up it joins the queue like a prompt and returns `{outcome: "queued"}`. |
-| `session/set_mode` `{sessionId, modeId}` | Switches the permission mode. |
+| `session/set_config_option` `{sessionId, configId, value}` | Changes one of the session's config options from the load response's `configOptions`, e.g. `model`. Responds `{configOptions}`. The session keeps its model across restarts. |
+
+Sessions always run in the agent's auto mode: the agent decides which tool calls need a person, and the sandbox and the session's grants bound what any of them can reach. Mode isn't configurable.
 
 Runtime → UI:
 

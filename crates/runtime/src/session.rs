@@ -480,10 +480,26 @@ impl Hub {
         }
     }
 
-    pub async fn set_mode(&self, id: Uuid, mut params: Value) -> Result<Value, RpcError> {
+    /// Changes a session config option; the mode is fixed, and a model change sticks across restarts.
+    pub async fn set_config_option(&self, id: Uuid, mut params: Value) -> Result<Value, RpcError> {
+        if params["configId"] == "mode" {
+            return Err(RpcError::new(-32602, "sessions always run in auto mode"));
+        }
         let (agent, agent_session_id) = self.agent_for(id).await?;
         params["sessionId"] = json!(agent_session_id);
-        agent.request("session/set_mode", params).await
+        let result = agent
+            .request("session/set_config_option", params.clone())
+            .await?;
+        if let Some(options) = result.get("configOptions") {
+            self.live(id).state.lock().await.agent_state["configOptions"] = options.clone();
+        }
+        if params["configId"] == "model"
+            && let Some(model) = params["value"].as_str()
+            && let Err(e) = db::set_session_model(&self.db, id, model).await
+        {
+            tracing::warn!(session = %id, error = %e, "recording the session's model");
+        }
+        Ok(result)
     }
 
     /// Everything a UI needs when it loads a session.

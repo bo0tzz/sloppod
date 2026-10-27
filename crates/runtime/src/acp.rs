@@ -151,7 +151,9 @@ impl Conn {
             )),
             ("session/prompt", Some(session)) => hub.prompt(session, params).await,
             ("_session/steering", Some(session)) => hub.steer(session, params).await,
-            ("session/set_mode", Some(session)) => hub.set_mode(session, params).await,
+            ("session/set_config_option", Some(session)) => {
+                hub.set_config_option(session, params).await
+            }
             (_, None) if method.starts_with("session/") || method.starts_with("_session/") => {
                 Err(RpcError::new(-32602, "missing or invalid sessionId"))
             }

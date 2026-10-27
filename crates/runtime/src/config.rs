@@ -99,13 +99,6 @@ pub struct Config {
     #[arg(long, env = "SLOPPOD_INSTRUCTIONS_FILE")]
     pub instructions_file: Option<PathBuf>,
 
-    #[arg(long, env = "SLOPPOD_AGENT_MODEL")]
-    pub agent_model: Option<String>,
-
-    /// ACP mode new sessions start in, e.g. `default`, `acceptEdits`, `bypassPermissions`.
-    #[arg(long, env = "SLOPPOD_DEFAULT_MODE")]
-    pub default_mode: Option<String>,
-
     /// Hosts sessions may reach directly, without the authorizer (package registries).
     #[arg(long, env = "SLOPPOD_DIRECT_HOSTS", value_delimiter = ',', default_value = DEFAULT_DIRECT_HOSTS)]
     pub direct_hosts: Vec<String>,

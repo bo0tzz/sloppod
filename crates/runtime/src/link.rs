@@ -287,7 +287,7 @@ pub async fn agent_context(state: &AppState, session: &db::SessionRow) -> AgentC
         repo_dir: work_dir(session).to_owned(),
         tools_url: format!("{}/mcp", state.config.runtime_url()),
         instructions: state.instructions.clone(),
-        model: state.config.agent_model.clone(),
+        model: session.model.clone(),
         memory,
     }
 }
@@ -444,14 +444,17 @@ async fn start_agent_session(
             let response = agent.request("session/load", params).await;
             state.hub.set_loading(session.id, false).await;
             match response {
-                Ok(response) => (existing.clone(), response),
+                Ok(mut response) => {
+                    auto_mode(agent, &session, existing, &mut response).await;
+                    (existing.clone(), response)
+                }
                 Err(e) => {
                     tracing::warn!(session = %session.id, error = %e, "session/load failed; starting a new agent session");
-                    new_agent_session(state, agent, &session, launch).await?
+                    new_agent_session(agent, &session, launch).await?
                 }
             }
         }
-        None => new_agent_session(state, agent, &session, launch).await?,
+        None => new_agent_session(agent, &session, launch).await?,
     };
     let agent_state = adapter::agent_state(&response);
     db::set_agent_session(&state.db, session.id, &agent_session_id, &agent_state).await?;
@@ -464,7 +467,6 @@ async fn start_agent_session(
 }
 
 async fn new_agent_session(
-    state: &AppState,
     agent: &Arc<AgentConn>,
     session: &db::SessionRow,
     launch: &sloppod_contracts::AgentLaunch,
@@ -479,17 +481,25 @@ async fn new_agent_session(
         .as_str()
         .context("session/new without sessionId")?
         .to_owned();
-    if let Some(mode) = &state.config.default_mode {
-        match agent
-            .request(
-                "session/set_mode",
-                json!({"sessionId": agent_session_id, "modeId": mode}),
-            )
-            .await
-        {
-            Ok(_) => response["modes"]["currentModeId"] = json!(mode),
-            Err(e) => tracing::warn!(session = %session.id, error = %e, "setting default mode"),
-        }
-    }
+    auto_mode(agent, session, &agent_session_id, &mut response).await;
     Ok((agent_session_id, response))
+}
+
+/// Sessions always run in the agent's auto mode; the sandbox and grants bound what it can do.
+async fn auto_mode(
+    agent: &Arc<AgentConn>,
+    session: &db::SessionRow,
+    agent_session_id: &str,
+    response: &mut Value,
+) {
+    match agent
+        .request(
+            "session/set_mode",
+            json!({"sessionId": agent_session_id, "modeId": "auto"}),
+        )
+        .await
+    {
+        Ok(_) => response["modes"]["currentModeId"] = json!("auto"),
+        Err(e) => tracing::warn!(session = %session.id, error = %e, "switching to auto mode"),
+    }
 }

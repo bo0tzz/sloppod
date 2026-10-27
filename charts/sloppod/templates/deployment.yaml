@@ -69,14 +69,6 @@ spec:
             - name: SLOPPOD_SESSION_MEMORY
               value: {{ . | quote }}
             {{- end }}
-            {{- with .Values.session.defaultMode }}
-            - name: SLOPPOD_DEFAULT_MODE
-              value: {{ . | quote }}
-            {{- end }}
-            {{- with .Values.session.model }}
-            - name: SLOPPOD_AGENT_MODEL
-              value: {{ . | quote }}
-            {{- end }}
             {{- with .Values.session.directHosts }}
             - name: SLOPPOD_DIRECT_HOSTS
               value: {{ join "," . | quote }}
