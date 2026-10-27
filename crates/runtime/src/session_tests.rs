@@ -338,3 +338,184 @@ async fn an_idle_adopted_agent_takes_new_prompts() {
     h.respond(&request, json!({"stopReason": "end_turn"})).await;
     turn.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn parking_waits_for_the_turn_to_end() {
+    let mut h = Harness::ready().await;
+    let turn = h.prompt("Fix the build");
+    let request = h.next().await;
+    let suspended = Arc::new(std::sync::Mutex::new(false));
+    let parked = h
+        .hub
+        .park(h.id, || {
+            let suspended = suspended.clone();
+            async move {
+                *suspended.lock().unwrap() = true;
+                Ok(())
+            }
+        })
+        .await;
+    assert!(matches!(parked, Err(crate::session::ParkError::InTurn)));
+    assert!(!*suspended.lock().unwrap());
+    assert_eq!(h.phase().await, "working");
+
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+    h.hub.park(h.id, || async { Ok(()) }).await.unwrap();
+    assert_eq!(h.phase().await, "parked");
+}
+
+#[tokio::test]
+async fn a_message_to_a_parked_session_waits_for_its_wake() {
+    let h = Harness::ready().await;
+    h.hub.park(h.id, || async { Ok(()) }).await.unwrap();
+    let turn = h.prompt("Carry on");
+    while h.user_messages().is_empty() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(h.user_messages(), [("Carry on".to_owned(), false)]);
+    assert!(!turn.is_finished());
+    assert_eq!(h.phase().await, "parked");
+}
+
+#[tokio::test]
+async fn a_failed_wake_leaves_the_session_parked_to_retry() {
+    let h = Harness::ready().await;
+    h.hub.park(h.id, || async { Ok(()) }).await.unwrap();
+
+    let failed = h
+        .hub
+        .wake(h.id, || async {
+            Err(anyhow::anyhow!("the API server is down"))
+        })
+        .await;
+    assert!(failed.is_err());
+    assert_eq!(h.phase().await, "parked");
+
+    h.hub.wake(h.id, || async { Ok(()) }).await.unwrap();
+    assert_eq!(h.phase().await, "starting");
+    // Waking a session that isn't parked places nothing.
+    h.hub
+        .wake(h.id, || async {
+            panic!("placed a session that isn't parked")
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_wake_during_parking_runs_after_it() {
+    let h = Harness::ready().await;
+    let steps = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let park = {
+        let (hub, id, steps) = (h.hub.clone(), h.id, steps.clone());
+        tokio::spawn(async move {
+            hub.park(id, || async move {
+                released.await.unwrap();
+                steps.lock().unwrap().push("suspended");
+                Ok(())
+            })
+            .await
+        })
+    };
+    while h.phase().await != "parked" {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let wake = {
+        let (hub, id, steps) = (h.hub.clone(), h.id, steps.clone());
+        tokio::spawn(async move {
+            hub.wake(id, || async move {
+                steps.lock().unwrap().push("placed");
+                Ok(())
+            })
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(steps.lock().unwrap().is_empty());
+
+    release.send(()).unwrap();
+    park.await.unwrap().unwrap();
+    wake.await.unwrap().unwrap();
+    assert_eq!(*steps.lock().unwrap(), ["suspended", "placed"]);
+    assert_eq!(h.phase().await, "starting");
+}
+
+#[tokio::test]
+async fn a_failed_suspend_gives_the_session_its_agent_back() {
+    let mut h = Harness::ready().await;
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let park = {
+        let hub = h.hub.clone();
+        let id = h.id;
+        tokio::spawn(async move {
+            hub.park(id, || async move {
+                released.await.unwrap();
+                Err(anyhow::anyhow!("the API server is down"))
+            })
+            .await
+        })
+    };
+    while h.phase().await != "parked" {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Sent while parking, so it waits for the agent.
+    let turn = h.prompt("Carry on");
+    while h.user_messages().is_empty() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    release.send(()).unwrap();
+    assert!(park.await.unwrap().is_err());
+
+    let request = h.next().await;
+    assert_eq!(prompt_text(&request), ["Carry on"]);
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+    assert_eq!(h.phase().await, "idle");
+}
+
+#[tokio::test]
+async fn a_message_queued_while_parking_wakes_the_session() {
+    let h = Harness::ready().await;
+    let woken = Arc::new(std::sync::Mutex::new(0));
+    {
+        let (hub, woken) = (Arc::downgrade(&h.hub), woken.clone());
+        h.hub.set_waker(Arc::new(move |id| {
+            let (hub, woken) = (hub.clone(), woken.clone());
+            Box::pin(async move {
+                let hub = hub.upgrade().expect("hub");
+                hub.wake(id, || async move {
+                    *woken.lock().unwrap() += 1;
+                    Ok(())
+                })
+                .await
+            })
+        }));
+    }
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let park = {
+        let (hub, id) = (h.hub.clone(), h.id);
+        tokio::spawn(async move {
+            hub.park(id, || async move {
+                released.await.unwrap();
+                Ok(())
+            })
+            .await
+        })
+    };
+    while h.phase().await != "parked" {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let _turn = h.prompt("Carry on");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The wake waits for the park to finish rather than missing it.
+    assert_eq!(*woken.lock().unwrap(), 0);
+
+    release.send(()).unwrap();
+    park.await.unwrap().unwrap();
+    while *woken.lock().unwrap() == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(h.phase().await, "starting");
+}

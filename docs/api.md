@@ -15,6 +15,8 @@ GET    /api/v1/sessions             -> Session[]   (most recently updated first)
 POST   /api/v1/sessions             -> Session     body: NewSession
 GET    /api/v1/sessions/{id}        -> Session
 DELETE /api/v1/sessions/{id}        -> 204         stops the session and deletes its pod and volume
+POST   /api/v1/sessions/{id}/park   -> Session     ends its pod and keeps its volume, transcript, branch, grants and keys; 409 during a turn
+POST   /api/v1/sessions/{id}/wake   -> Session     brings a parked session back (no-op otherwise); a message sent to it does too
 POST   /api/v1/sessions/{id}/repos  -> Session     body: {repo: string}; grants write access to another repository and tells the agent (no-op if it has it)
 PUT    /api/v1/sessions/{id}/review -> Session     body: {review: "off" | "required"}
 GET    /api/v1/repos                -> string[]    repositories sessions can be granted, e.g. ["bo0tzz/sloppod"]
@@ -70,6 +72,7 @@ type Phase =
   | "working"            // a turn is running
   | "waiting"            // a turn is blocked on a permission request or a question
   | "disconnected"       // pod went away; the runtime is bringing it back
+  | "parked"             // no pod (ADR 5); messages queue, and sending one wakes it
   | "stopped";
 ```
 

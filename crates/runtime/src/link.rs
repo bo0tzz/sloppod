@@ -351,7 +351,11 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
         tracing::warn!(session = %session_id, "link from unknown session");
         return;
     };
-    if session.phase() == sloppod_protocol::api::Phase::Stopped {
+    // A parked session's pod may still reach out while it shuts down.
+    if matches!(
+        session.phase(),
+        sloppod_protocol::api::Phase::Stopped | sloppod_protocol::api::Phase::Parked
+    ) {
         return;
     }
     let (mut sink, mut stream) = socket.split();

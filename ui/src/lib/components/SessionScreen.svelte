@@ -14,6 +14,8 @@
     mdiArrowDown,
     mdiCheckDecagramOutline,
     mdiCogOutline,
+    mdiPauseCircleOutline,
+    mdiPlayCircleOutline,
     mdiMagnifyScan,
     mdiShieldKeyOutline,
     mdiSourcePull,
@@ -149,6 +151,17 @@
     }
   }
 
+  async function setParked(parked: boolean) {
+    try {
+      view.setSession(await (parked ? api.parkSession(id) : api.wakeSession(id)));
+    } catch (error) {
+      toastManager.danger({
+        title: parked ? "Couldn't park the session" : "Couldn't wake the session",
+        description: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   async function deleteSession() {
     const confirmed = await modalManager.showDialog({
       title: 'Delete session?',
@@ -268,6 +281,18 @@
               icon: mdiCheckDecagramOutline,
               $if: () => session?.kind === 'work',
               onAction: () => setAutoApproval(autoApprovals.length === 0),
+            },
+            {
+              title: 'Park',
+              icon: mdiPauseCircleOutline,
+              $if: () => session?.phase === 'idle' || session?.phase === 'disconnected',
+              onAction: () => setParked(true),
+            },
+            {
+              title: 'Wake',
+              icon: mdiPlayCircleOutline,
+              $if: () => session?.phase === 'parked',
+              onAction: () => setParked(false),
             },
             { title: 'Settings', icon: mdiCogOutline, href: '/settings' },
             { title: 'Delete session', icon: mdiTrashCanOutline, color: 'danger', onAction: deleteSession },

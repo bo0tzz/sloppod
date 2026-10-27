@@ -20,6 +20,7 @@ use crate::placement::{TOKEN_DIR, WORKDIR};
 use crate::pods::SESSION_LABEL;
 use crate::policies::SESSION_KEY;
 use crate::proposals::{self, Verdict};
+use crate::session::ParkError;
 use crate::users::User;
 use crate::{AppState, db, reviews};
 
@@ -30,6 +31,8 @@ pub fn routes() -> Router<AppState> {
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}", get(get_session).delete(delete_session))
         .route("/sessions/{id}/repos", post(add_repo))
+        .route("/sessions/{id}/park", post(park_session))
+        .route("/sessions/{id}/wake", post(wake_session))
         .route("/sessions/{id}/review", put(set_review))
         .route("/repos", get(repos))
         .route(
@@ -62,6 +65,14 @@ impl<E: std::fmt::Display> From<E> for ApiError {
     fn from(e: E) -> Self {
         tracing::error!(error = %e, "API error");
         ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    }
+}
+
+/// A session that's in a turn or deleted can't be parked: a conflict, not a failure.
+fn park_error(e: ParkError) -> ApiError {
+    match e {
+        ParkError::InTurn | ParkError::Stopped => ApiError(StatusCode::CONFLICT, e.to_string()),
+        ParkError::Failed(e) => e.into(),
     }
 }
 
@@ -515,6 +526,57 @@ async fn delete_session(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn park_session(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    let session = db::owned_session(&state.db, id, &user)
+        .await?
+        .ok_or_else(not_found)?;
+    park(&state, &session).await.map_err(park_error)?;
+    let session = db::get_session(&state.db, id)
+        .await?
+        .ok_or_else(not_found)?;
+    Ok(Json(session.to_api()))
+}
+
+async fn wake_session(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    let session = db::owned_session(&state.db, id, &user)
+        .await?
+        .ok_or_else(not_found)?;
+    wake(&state, &session).await?;
+    let session = db::get_session(&state.db, id)
+        .await?
+        .ok_or_else(not_found)?;
+    Ok(Json(session.to_api()))
+}
+
+/// Parks a session (ADR 5): its pod ends, and its volume, transcript, branch, grants and keys stay.
+pub async fn park(state: &AppState, session: &db::SessionRow) -> Result<(), ParkError> {
+    let id = session.id.to_string();
+    state
+        .hub
+        .park(session.id, || async {
+            state
+                .placement
+                .suspend(&id)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+        .await
+}
+
+/// Brings a parked session back: its pod starts again and the agent resumes its conversation. Other sessions are
+/// left as they are.
+pub async fn wake(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
+    state.hub.wake(session.id, || place(state, session)).await
+}
+
 /// Stops a session and deletes its pod, volume, egress policy and keys.
 pub async fn remove_session(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
     let id = session.id;
@@ -759,6 +821,16 @@ async fn reject(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parking_conflicts_are_409s() {
+        assert_eq!(park_error(ParkError::InTurn).0, StatusCode::CONFLICT);
+        assert_eq!(park_error(ParkError::Stopped).0, StatusCode::CONFLICT);
+        assert_eq!(
+            park_error(ParkError::Failed(anyhow::anyhow!("no"))).0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 
     fn repos() -> Vec<String> {
         [

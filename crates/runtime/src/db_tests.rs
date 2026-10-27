@@ -301,3 +301,25 @@ async fn findings_from_before_severities_still_read(db: PgPool) {
         ])
     );
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn parked_sessions_are_left_alone_on_startup(db: PgPool) {
+    use sloppod_protocol::api::Phase;
+
+    let running = session(&db, "dev").await;
+    let parked = session(&db, "dev").await;
+    let deleted = session(&db, "dev").await;
+    db::set_phase(&db, parked, Phase::Parked).await.unwrap();
+    db::set_phase(&db, deleted, Phase::Stopped).await.unwrap();
+    let active: Vec<Uuid> = db::active_sessions(&db)
+        .await
+        .unwrap()
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(active, [running]);
+    assert_eq!(
+        db::get_session(&db, parked).await.unwrap().unwrap().phase(),
+        Phase::Parked
+    );
+}

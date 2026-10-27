@@ -194,6 +194,17 @@ async fn main() -> anyhow::Result<()> {
         agents,
         instructions,
     }));
+    // A message queued for a parked session's absent agent wakes the session.
+    let waker = state.clone();
+    state.hub.set_waker(Arc::new(move |id| {
+        let state = waker.clone();
+        Box::pin(async move {
+            match db::get_session(&state.db, id).await? {
+                Some(session) => api::wake(&state, &session).await,
+                None => Ok(()),
+            }
+        })
+    }));
     state
         .install_listener()
         .await

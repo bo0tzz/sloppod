@@ -788,6 +788,36 @@ test('the sidebar folds away on narrow screens', async ({ page }) => {
   await expect(sidebar).toBeVisible();
 });
 
+test('parks a session and wakes it by sending a message', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  await createSession(page, 'Park me in sloppod');
+  await finishTurn(page);
+
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await page.getByRole('menuitem', { name: 'Park' }).click();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'parked');
+  const parked = page.getByTestId('parked-sessions');
+  await expect(parked.getByTestId('session-row').filter({ hasText: 'Park me' })).toBeVisible();
+  await expect(page.getByTestId('session-list').getByTestId('session-row').filter({ hasText: 'Park me' })).toHaveCount(0);
+
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Carry on');
+  await box.press('Enter');
+  await expect(phase(page)).not.toHaveAttribute('data-phase', 'parked');
+  await expect(parked).toHaveCount(0);
+});
+
+test('wakes a parked session from the session menu', async ({ page }) => {
+  await createSession(page, 'Park and wake me in sloppod');
+  await finishTurn(page);
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await page.getByRole('menuitem', { name: 'Park' }).click();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'parked');
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await page.getByRole('menuitem', { name: 'Wake' }).click();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+});
+
 test('lists the session grants from the session menu', async ({ page }) => {
   await createSession(page, 'Fix the build in bo0tzz/sloppod');
   await page.getByRole('button', { name: 'Session actions' }).click();

@@ -77,6 +77,7 @@ impl PlacementBackend for AgentSandbox {
             "kind": "Sandbox",
             "metadata": {"name": name, "labels": spec.labels},
             "spec": {
+                "operatingMode": "Running",
                 "podTemplate": {
                     "metadata": {"labels": spec.labels},
                     "spec": {
@@ -145,6 +146,23 @@ impl PlacementBackend for AgentSandbox {
             .map_err(err)?
             .is_some();
         Ok(PlacementStatus { exists })
+    }
+
+    async fn suspend(&self, session_id: &str) -> Result<()> {
+        let patch = json!({"spec": {"operatingMode": "Suspended"}});
+        match self
+            .api
+            .patch(
+                &sandbox_name(session_id),
+                &PatchParams::default(),
+                &Patch::Merge(&patch),
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+            Err(e) => Err(err(e)),
+        }
     }
 
     async fn delete(&self, session_id: &str) -> Result<()> {

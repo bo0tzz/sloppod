@@ -1,4 +1,4 @@
-export type Phase = 'starting' | 'idle' | 'working' | 'waiting' | 'disconnected' | 'stopped';
+export type Phase = 'starting' | 'idle' | 'working' | 'waiting' | 'disconnected' | 'parked' | 'stopped';
 
 export type Session = {
   id: string;
@@ -200,6 +200,8 @@ export const api = {
   getSession: (id: string) => call<Session>('GET', `/sessions/${encodeURIComponent(id)}`),
   createSession: (body: NewSession) => call<Session>('POST', '/sessions', body),
   deleteSession: (id: string) => call<void>('DELETE', `/sessions/${encodeURIComponent(id)}`),
+  parkSession: (id: string) => call<Session>('POST', `/sessions/${encodeURIComponent(id)}/park`, {}),
+  wakeSession: (id: string) => call<Session>('POST', `/sessions/${encodeURIComponent(id)}/wake`, {}),
   addSessionRepo: (id: string, repo: string) =>
     call<Session>('POST', `/sessions/${encodeURIComponent(id)}/repos`, { repo }),
   listRepos: () => call<string[]>('GET', '/repos'),

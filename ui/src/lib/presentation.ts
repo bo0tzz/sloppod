@@ -29,6 +29,7 @@ export const phases: Record<Phase, { label: string; color: Color; description: s
   working: { label: 'Working', color: 'primary', description: 'A turn is running' },
   waiting: { label: 'Waiting', color: 'warning', description: 'Blocked on a permission request' },
   disconnected: { label: 'Disconnected', color: 'danger', description: 'The pod went away; the runtime is bringing it back' },
+  parked: { label: 'Parked', color: 'secondary', description: 'No pod; sending a message or Wake brings it back' },
   stopped: { label: 'Stopped', color: 'secondary', description: 'The session has stopped' },
 };
 

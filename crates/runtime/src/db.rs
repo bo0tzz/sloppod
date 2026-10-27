@@ -178,7 +178,7 @@ pub async fn list_sessions(db: &PgPool, owner: &str) -> sqlx::Result<Vec<Session
 
 pub async fn active_sessions(db: &PgPool) -> sqlx::Result<Vec<SessionRow>> {
     sqlx::query_as(AssertSqlSafe(format!(
-        "select {SESSION_COLUMNS} from sessions where phase <> 'stopped'"
+        "select {SESSION_COLUMNS} from sessions where phase not in ('stopped', 'parked')"
     )))
     .fetch_all(db)
     .await

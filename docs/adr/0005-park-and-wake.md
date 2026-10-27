@@ -40,3 +40,5 @@ Prior art:
 - Devin auto-resumes suspended sessions.
 - Paseo has both schedules (a new agent per run) and heartbeats (the same agent).
 - Claude Code's in-session cron has no catch-up for missed runs and expires after 7 days.
+
+2026-10-27: the first slice, parking and waking by hand (#117). Parking suspends the session's Sandbox (agent-sandbox's `operatingMode: Suspended`), which ends the pod and keeps its volume, and the session's phase becomes `parked`; the runtime doesn't bring parked sessions back on startup. Waking, from the session menu or by sending the session a message, sets the Sandbox running again, and the agent resumes with `session/load` as after any restart; notices sent while it's parked wait in its queue. Parked sessions are listed apart from running ones. Wake conditions, wake briefs and triage are still to come.

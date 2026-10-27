@@ -66,10 +66,28 @@ pub struct Live {
     pub id: Uuid,
     events: broadcast::Sender<UiEvent>,
     state: Mutex<LiveState>,
+    /// Held while the session is parked or woken, so the two never overlap.
+    transition: Mutex<()>,
 }
+
+/// Why a session couldn't be parked.
+#[derive(Debug, thiserror::Error)]
+pub enum ParkError {
+    #[error("the session is in a turn; stop it or let it finish before parking")]
+    InTurn,
+    #[error("the session is deleted")]
+    Stopped,
+    #[error(transparent)]
+    Failed(#[from] anyhow::Error),
+}
+
+/// Brings a parked session back; the runtime's is `api::wake`, which leaves other sessions alone.
+pub type Waker =
+    Arc<dyn Fn(Uuid) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync>;
 
 pub struct Hub {
     store: Arc<dyn SessionStore>,
+    waker: StdMutex<Option<Waker>>,
     sessions: StdMutex<HashMap<Uuid, Arc<Live>>>,
     agent_capabilities: StdMutex<Option<Value>>,
 }
@@ -98,8 +116,28 @@ impl Hub {
     pub fn new(store: Arc<dyn SessionStore>) -> Self {
         Self {
             store,
+            waker: StdMutex::default(),
             sessions: StdMutex::default(),
             agent_capabilities: StdMutex::default(),
+        }
+    }
+
+    pub fn set_waker(&self, waker: Waker) {
+        *self.waker.lock().unwrap() = Some(waker);
+    }
+
+    /// Wakes the session if it's parked, after any park in progress, so a message queued for an absent agent
+    /// can't be left waiting on a parked session.
+    async fn wake_for_message(&self, id: Uuid) -> Result<(), RpcError> {
+        let waker = self.waker.lock().unwrap().clone();
+        match waker {
+            Some(waker) => waker(id).await.map_err(|e| {
+                RpcError::new(
+                    -32603,
+                    format!("couldn't wake the session: {e}; the message stays queued"),
+                )
+            }),
+            None => Ok(()),
         }
     }
 
@@ -112,6 +150,7 @@ impl Hub {
                     id,
                     events: broadcast::channel(4096).0,
                     state: Mutex::default(),
+                    transition: Mutex::default(),
                 })
             })
             .clone()
@@ -534,6 +573,9 @@ impl Hub {
         } else {
             self.record_user_message(id, &params["prompt"], false).await;
         }
+        if queued.is_some() && !behind_turn {
+            self.wake_for_message(id).await?;
+        }
         match queued {
             Some(receiver) => receiver.await.unwrap_or_else(|_| {
                 Err(RpcError::new(
@@ -716,6 +758,7 @@ impl Hub {
                 reply: None,
             });
             self.record_user_message(id, &params["prompt"], false).await;
+            self.wake_for_message(id).await?;
             return Ok(json!({"outcome": "queued"}));
         }
         self.record_user_message(id, &params["prompt"], true).await;
@@ -798,6 +841,101 @@ impl Hub {
 
     pub async fn turn_running(&self, id: Uuid) -> bool {
         self.live(id).state.lock().await.turn_running
+    }
+
+    /// Parks a session between turns (ADR 5): lets go of its agent, then `suspend` ends its pod. Messages sent
+    /// meanwhile stay queued for its wake. Refused during a turn, as one that starts while parking can't.
+    pub async fn park<F, Fut>(self: &Arc<Self>, id: Uuid, suspend: F) -> Result<(), ParkError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<()>>,
+    {
+        let live = self.live(id);
+        let _transition = live.transition.lock().await;
+        match self
+            .store
+            .get_session(id)
+            .await
+            .map_err(anyhow::Error::from)?
+        {
+            Some(row) if row.phase() == Phase::Stopped => return Err(ParkError::Stopped),
+            Some(row) if row.phase() == Phase::Parked => return Ok(()),
+            Some(_) => {}
+            None => return Err(ParkError::Stopped),
+        }
+        let (agent, agent_session_id) = {
+            let mut state = live.state.lock().await;
+            if state.turn_running {
+                return Err(ParkError::InTurn);
+            }
+            (state.agent.take(), state.agent_session_id.take())
+        };
+        // Parked before the pod ends, so its supervisor's attempts to reconnect meanwhile are turned away.
+        self.set_phase(id, Phase::Parked).await;
+        if let Err(e) = suspend().await {
+            self.unpark(id, agent, agent_session_id).await;
+            return Err(e.into());
+        }
+        if let Some(agent) = agent {
+            agent.close();
+        }
+        Ok(())
+    }
+
+    /// Gives a session whose suspend failed its agent back, and runs what was sent to it meanwhile.
+    async fn unpark(
+        self: &Arc<Self>,
+        id: Uuid,
+        agent: Option<Arc<AgentConn>>,
+        agent_session_id: Option<String>,
+    ) {
+        let queued = {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            let up = agent.is_some() && agent_session_id.is_some();
+            state.agent = agent;
+            state.agent_session_id = agent_session_id;
+            if !up {
+                None
+            } else {
+                let queued = std::mem::take(&mut state.queue);
+                state.turn_running = !queued.is_empty();
+                Some(queued)
+            }
+        };
+        match queued {
+            Some(queued) if !queued.is_empty() => {
+                self.set_phase(id, Phase::Working).await;
+                tokio::spawn(self.clone().run_queued(id, None, queued));
+            }
+            Some(_) => self.set_phase(id, Phase::Idle).await,
+            None => self.set_phase(id, Phase::Disconnected).await,
+        }
+    }
+
+    /// Wakes a parked session: `place` brings its pod back. A failure leaves it parked, so waking can be retried.
+    /// Sessions that aren't parked are left as they are.
+    pub async fn wake<F, Fut>(&self, id: Uuid, place: F) -> anyhow::Result<()>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<()>>,
+    {
+        let live = self.live(id);
+        let _transition = live.transition.lock().await;
+        let parked = self
+            .store
+            .get_session(id)
+            .await?
+            .is_some_and(|row| row.phase() == Phase::Parked);
+        if !parked {
+            return Ok(());
+        }
+        self.set_phase(id, Phase::Starting).await;
+        if let Err(e) = place().await {
+            self.set_phase(id, Phase::Parked).await;
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub async fn stop(&self, id: Uuid) {
