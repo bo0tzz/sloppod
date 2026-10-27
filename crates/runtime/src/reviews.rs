@@ -8,7 +8,7 @@ use sloppod_contracts::{Grant, ReviewSubject};
 use sloppod_protocol::api::{ProposalStatus, ReviewPolicy, SessionKind};
 use uuid::Uuid;
 
-use crate::{AppState, api, db, proposals};
+use crate::{AppState, db, lifecycle, proposals};
 
 /// After this many rounds with changes requested, the proposal goes to the human with the open findings.
 pub const MAX_ROUNDS: i32 = 3;
@@ -97,7 +97,7 @@ pub async fn start(
     let session = db::get_session(&state.db, id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("the review session vanished"))?;
-    api::place(state, &session).await?;
+    lifecycle::place(state, &session).await?;
     watch_round(state, proposal.id, id, round);
     Ok(())
 }
@@ -298,7 +298,7 @@ fn wake_for_round(state: &AppState, session: Uuid) {
     tokio::spawn(async move {
         for attempt in 1..=6 {
             let woken = match db::get_session(&state.db, session).await {
-                Ok(Some(row)) => api::wake(&state, &row).await,
+                Ok(Some(row)) => lifecycle::wake(&state, &row).await,
                 Ok(None) => return,
                 Err(e) => Err(e.into()),
             };
@@ -729,13 +729,13 @@ async fn park_between_rounds(
     session: &db::SessionRow,
     proposal: Uuid,
 ) -> anyhow::Result<()> {
-    api::park(state, session).await?;
+    lifecycle::park(state, session).await?;
     let still_waiting = matches!(
         db::get_proposal(&state.db, proposal).await?,
         Some(p) if p.status == ProposalStatus::ChangesRequested
     );
     if !still_waiting && let Some(row) = db::get_session(&state.db, session.id).await? {
-        api::wake(state, &row).await?;
+        lifecycle::wake(state, &row).await?;
     }
     Ok(())
 }
@@ -760,7 +760,7 @@ pub fn end(state: &AppState, session: Uuid) {
     tokio::spawn(async move {
         turn_ended(&state, session).await;
         let result = match db::get_session(&state.db, session).await {
-            Ok(Some(row)) => api::remove_session(&state, &row).await,
+            Ok(Some(row)) => lifecycle::remove_session(&state, &row).await,
             Ok(None) => Ok(()),
             Err(e) => Err(e.into()),
         };
