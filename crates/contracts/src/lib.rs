@@ -91,17 +91,22 @@ impl SessionContext {
             .filter_map(|g| g.param("repo"))
     }
 
-    /// Repositories the session may push to, each with its session branch.
-    pub fn writable_repos(&self) -> impl Iterator<Item = RepoGrant<'_>> {
+    /// The session's repository grants with `access`, each with its branch.
+    fn repo_grants(&self, access: &'static str) -> impl Iterator<Item = RepoGrant<'_>> {
         self.grants
             .iter()
-            .filter(|g| g.capability == "repo" && g.param("access") == Some("rw"))
+            .filter(move |g| g.capability == "repo" && g.param("access") == Some(access))
             .filter_map(|g| {
                 Some(RepoGrant {
                     repo: g.param("repo")?,
                     branch: g.param("branch")?,
                 })
             })
+    }
+
+    /// Repositories the session may push to, each with its session branch.
+    pub fn writable_repos(&self) -> impl Iterator<Item = RepoGrant<'_>> {
+        self.repo_grants("rw")
     }
 
     /// The first repository the session may push to, if any.
@@ -116,15 +121,7 @@ impl SessionContext {
 
     /// A read-only grant of `repo` with the branch to check out, e.g. a review session's (ADR 24).
     pub fn readable_repo_for(&self, repo: &str) -> Option<RepoGrant<'_>> {
-        self.grants
-            .iter()
-            .filter(|g| g.capability == "repo" && g.param("access") == Some("r"))
-            .filter_map(|g| {
-                Some(RepoGrant {
-                    repo: g.param("repo")?,
-                    branch: g.param("branch")?,
-                })
-            })
+        self.repo_grants("r")
             .find(|g| g.repo.eq_ignore_ascii_case(repo))
     }
 }
@@ -203,20 +200,6 @@ pub trait RequestPolicy: Send + Sync {
     async fn decide(&self, session: &SessionContext, request: &HttpRequest) -> Result<Decision>;
 }
 
-/// A credential minted for a session, with expiry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Credential {
-    pub value: String,
-    /// RFC 3339.
-    pub expires_at: Option<String>,
-}
-
-#[async_trait]
-pub trait CredentialProvider: Send + Sync {
-    fn manifest(&self) -> Manifest;
-    async fn credential(&self, session: &SessionContext) -> Result<Credential>;
-}
-
 /// What a placement backend needs to run one session pod.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlacementSpec {
@@ -230,18 +213,12 @@ pub struct PlacementSpec {
     pub storage_class: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlacementStatus {
-    pub exists: bool,
-}
-
 /// Creates and deletes session pods (ADR 16).
 #[async_trait]
 pub trait PlacementBackend: Send + Sync {
     fn manifest(&self) -> Manifest;
     /// Creates or updates the session's pod and volume, and runs the pod if it was suspended.
     async fn ensure(&self, spec: &PlacementSpec) -> Result<()>;
-    async fn status(&self, session_id: &str) -> Result<PlacementStatus>;
     /// Ends the session's pod and keeps its volume, for a parked session (ADR 5); `ensure` brings it back.
     async fn suspend(&self, session_id: &str) -> Result<()>;
     async fn delete(&self, session_id: &str) -> Result<()>;
@@ -319,8 +296,8 @@ pub trait AgentAdapter: Send + Sync {
     fn manifest(&self) -> Manifest;
     /// The name sessions pick this agent by, e.g. `claude-code`.
     fn agent(&self) -> String;
-    /// The kind of credential its model needs from the session's owner, e.g. `claude`, and what to call it.
-    fn credential(&self) -> (&'static str, &'static str);
+    /// The credential its model needs from the session's owner.
+    fn credential(&self) -> NeededCredential;
     fn launch(&self, context: &AgentContext) -> AgentLaunch;
 }
 
@@ -332,8 +309,17 @@ pub struct ToolSpec {
     pub input_schema: Value,
 }
 
+/// The credential an agent's model needs from a session's owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NeededCredential {
+    /// The credential kind, e.g. `claude`.
+    pub kind: String,
+    /// What to call it when it's missing, e.g. "a Claude account".
+    pub name: String,
+}
+
 /// The change a reviewer looks at for a proposal (ADR 24): commits on a branch of a repository.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewSubject {
     pub repo: String,
     pub base: String,

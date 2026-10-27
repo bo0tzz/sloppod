@@ -334,7 +334,8 @@ async fn create_session(
     let Some(adapter) = state.agents.get(agent) else {
         return Err(bad_request(format!("there's no agent called {agent}")));
     };
-    let (kind, account) = adapter.credential();
+    let needed = adapter.credential();
+    let (kind, account) = (needed.kind.as_str(), needed.name.as_str());
     if state.credentials.secret(&user, kind).await?.is_none() {
         return Err(ApiError(
             StatusCode::CONFLICT,

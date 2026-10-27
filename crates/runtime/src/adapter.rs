@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
-use sloppod_contracts::{AgentAdapter, AgentContext, AgentFile, AgentLaunch, Manifest, RepoGrant};
+use sloppod_contracts::{
+    AgentAdapter, AgentContext, AgentFile, AgentLaunch, Manifest, NeededCredential, RepoGrant,
+};
 use sloppod_protocol::link::RUNTIME_INFO;
 
 use crate::credentials::{CHATGPT, CLAUDE};
@@ -121,8 +123,11 @@ impl AgentAdapter for ClaudeCode {
         "claude-code".into()
     }
 
-    fn credential(&self) -> (&'static str, &'static str) {
-        (CLAUDE, "a Claude account")
+    fn credential(&self) -> NeededCredential {
+        NeededCredential {
+            kind: CLAUDE.into(),
+            name: "a Claude account".into(),
+        }
     }
 
     fn launch(&self, context: &AgentContext) -> AgentLaunch {
@@ -236,8 +241,11 @@ impl AgentAdapter for Codex {
         "codex".into()
     }
 
-    fn credential(&self) -> (&'static str, &'static str) {
-        (CHATGPT, "a ChatGPT login")
+    fn credential(&self) -> NeededCredential {
+        NeededCredential {
+            kind: CHATGPT.into(),
+            name: "a ChatGPT login".into(),
+        }
     }
 
     fn launch(&self, context: &AgentContext) -> AgentLaunch {
