@@ -243,8 +243,9 @@ test('approves a stack of pull requests', async ({ page }) => {
   await expect(layers.last().getByTestId('diff')).toBeHidden();
 
   await layers.first().getByText('1. Back off when reconnecting').click();
+  await page.getByRole('checkbox', { name: 'Merge when checks pass' }).click();
   await page.getByRole('button', { name: 'Approve', exact: true }).click();
-  await expect(page.getByTestId('system-notice')).toContainText('as stack #7');
+  await expect(page.getByTestId('system-notice')).toContainText('as stack #7. The stack merges once its required checks pass.');
 });
 
 test('shows the review a proposal went through on request', async ({ page }) => {

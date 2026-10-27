@@ -313,6 +313,12 @@ fn stack_review_subject(payload: &Value) -> Option<ReviewSubject> {
 /// Applies edits `{pull_requests: [{title?, body?}]}`, by position, to a stack's pull requests.
 fn edit_stack(payload: &Value, edits: &Value) -> Result<Value> {
     let mut payload = payload.clone();
+    if let Some(value) = edits.get("auto_merge") {
+        let auto_merge = value
+            .as_bool()
+            .ok_or_else(|| Error::new("`auto_merge` must be true or false"))?;
+        payload["auto_merge"] = json!(auto_merge);
+    }
     let Some(edits) = edits.get("pull_requests") else {
         return Ok(payload);
     };
@@ -370,6 +376,7 @@ impl ProposalKind for Stack {
                             "required": ["head", "title", "body"],
                         },
                     },
+                    "auto_merge": {"type": "boolean", "description": "Ask for the whole stack to merge by itself once its required checks pass; the reviewer decides", "default": false},
                     "review": {"type": "boolean", "description": "Have another model review the stack before a human sees it; its findings come back to you", "default": false},
                 },
                 "required": ["pull_requests"],
@@ -436,7 +443,12 @@ impl ProposalKind for Stack {
             base = head;
             layers.push(layer);
         }
-        Ok(json!({"repo": repo, "base": bottom, "pull_requests": layers}))
+        Ok(json!({
+            "repo": repo,
+            "base": bottom,
+            "pull_requests": layers,
+            "auto_merge": arguments["auto_merge"].as_bool().unwrap_or(false),
+        }))
     }
 
     async fn detail(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
@@ -512,16 +524,41 @@ impl ProposalKind for Stack {
             Ok(None) => app.link_stack(repo, &numbers).await,
             Err(e) => Err(e),
         };
-        let message = match &linked {
+        let mut message = match &linked {
             Ok(stack) => format!("Opened {} as stack #{stack}.", urls.join(", ")),
             Err(e) => format!(
                 "Opened {}, but linking them as a stack failed ({e}); each one still merges into the one below.",
                 urls.join(", ")
             ),
         };
+        let mut auto_merge = false;
+        if payload["auto_merge"].as_bool() == Some(true) {
+            // Auto-merge on the top pull request merges the whole stack, so only a linked stack gets it.
+            let (top, top_layer) = (pulls.last(), layers.last());
+            message.push_str(&match (&linked, top, top_layer) {
+                (Ok(_), Some(top), Some(layer)) => match app
+                    .enable_auto_merge(
+                        repo,
+                        top["node_id"].as_str().unwrap_or_default(),
+                        layer["head_sha"].as_str().unwrap_or_default(),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        auto_merge = true;
+                        " The stack merges once its required checks pass.".to_owned()
+                    }
+                    Err(e) => format!(
+                        " Auto-merge couldn't be turned on ({e}), so it needs merging by hand."
+                    ),
+                },
+                _ => " Without a linked stack, auto-merge stays off.".to_owned(),
+            });
+        }
         Ok(json!({
             "pull_requests": pulls,
             "stack": linked.ok(),
+            "auto_merge": auto_merge,
             "message": message,
         }))
     }
@@ -1298,6 +1335,11 @@ mod tests {
         assert_eq!(edit_stack(&payload, &json!({})).unwrap(), payload);
         assert!(edit_stack(&payload, &json!({"pull_requests": [{}, {}, {}]})).is_err());
         assert!(edit_stack(&payload, &json!({"pull_requests": [{"title": ""}]})).is_err());
+        assert_eq!(
+            edit_stack(&payload, &json!({"auto_merge": true})).unwrap()["auto_merge"],
+            true
+        );
+        assert!(edit_stack(&payload, &json!({"auto_merge": "yes"})).is_err());
     }
 
     #[test]

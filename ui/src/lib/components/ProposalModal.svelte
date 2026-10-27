@@ -77,7 +77,9 @@
   onMount(async () => {
     try {
       detail = await api.getProposal(proposal.id);
-      autoMerge = detail.kind === 'github.pr.create' && (detail.payload as PullRequestPayload).auto_merge === true;
+      autoMerge =
+        (detail.kind === 'github.pr.create' || detail.kind === 'github.stack.create') &&
+        (detail.payload as { auto_merge?: boolean }).auto_merge === true;
       resetDrafts();
     } catch (error) {
       loadError = error instanceof Error ? error.message : String(error);
@@ -113,6 +115,7 @@
     if (editing && pr && body !== pr.body) edits.body = body;
     if (issues) edits.issues = drafts.filter((draft) => draft.file).map(({ file: _file, ...issue }) => issue);
     if (pr && autoMerge !== (pr.auto_merge === true)) edits.auto_merge = autoMerge;
+    if (stack && autoMerge !== (stack.auto_merge === true)) edits.auto_merge = autoMerge;
     try {
       applyResult(await api.approveProposal(detail.id, edits));
       editing = false;
@@ -284,10 +287,10 @@
         </div>
       {:else}
         <div class="flex flex-wrap items-center justify-end gap-2">
-          {#if pr}
+          {#if pr || stack}
             <label class="text-muted mr-auto flex items-center gap-2 text-sm">
               <Checkbox bind:checked={autoMerge} aria-label="Merge when checks pass" />
-              Merge when checks pass
+              {stack ? 'Merge the stack when checks pass' : 'Merge when checks pass'}
             </label>
           {/if}
           <Button color="danger" variant="outline" shape="round" disabled={busy !== null} onclick={() => (rejecting = true)}>
