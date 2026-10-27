@@ -101,13 +101,14 @@ Outward actions and access the agent asked for ([ADR 3](adr/0003-proposals-and-t
 
 - `github.pr.create`: payload `{repo, base, head, title, body, draft, auto_merge}`; the detail adds `diff` and `commits`. With `auto_merge`, which the agent can ask for and the reviewer decides, sloppod turns on GitHub's auto-merge after opening the PR (with the first merge method the repository allows), so it merges once its required checks pass; the result's `message` says whether that worked.
 - `sloppod.repo.grant`: write access to a repository; payload `{repo, reason, branch}`; the detail adds nothing.
+- `github.issue.create`: issues to file in a repository the session can push to; payload `{repo, issues: {title, body, labels}[]}`; the detail adds nothing. Labels that don't exist yet are created. The result lists the issues filed, and any that failed.
 
 When a proposal is decided or carried out, the runtime tells the agent: the notice is recorded as a `user_message_chunk` with `_meta.sloppod.notice: true` and delivered as a new turn when the agent is idle, steered into a running turn, or queued until the agent is up. Sessions whose turn a runtime restart cut off get a notice of the same kind once their agent is back, naming the build now running (`SLOPPOD_BUILD`, the chart's app version).
 
 ```
 GET  /api/v1/proposals?session={id}&status={status}  -> Proposal[]
 GET  /api/v1/proposals/{id}                          -> ProposalDetail
-POST /api/v1/proposals/{id}/approve                  -> Proposal   body: {} (optional: {title?, body?, auto_merge?} to change a pull request before executing)
+POST /api/v1/proposals/{id}/approve                  -> Proposal   body: {} or edits, per kind (below)
 POST /api/v1/proposals/{id}/reject                   -> Proposal   body: {reason?: string}
 ```
 
@@ -115,10 +116,10 @@ POST /api/v1/proposals/{id}/reject                   -> Proposal   body: {reason
 type Proposal = {
   id: string;
   session_id: string;
-  kind: "github.pr.create" | "sloppod.repo.grant";
+  kind: "github.pr.create" | "github.issue.create" | "sloppod.repo.grant";
   status: "pending" | "approved" | "rejected" | "executed" | "failed";
   payload: Record<string, unknown>;  // per kind, see above
-  result?: { url: string; number: number };   // when executed
+  result?: Record<string, unknown>;            // when executed; pull requests: {url, number}; issues: {issues: {title, url, number}[], failed: {title, error}[], message}
   error?: string;                              // when failed
   reason?: string;                             // when rejected
   created_at: string;
@@ -132,7 +133,7 @@ type ProposalDetail = Proposal & {
 };
 ```
 
-Approving returns as soon as the decision is recorded, with status `approved`; the proposal is carried out in the background and its outcome (`executed` or `failed`) follows as a `_sloppod/proposal` update, and in `GET /api/v1/proposals/{id}`.
+Approving returns as soon as the decision is recorded, with status `approved`; the proposal is carried out in the background and its outcome (`executed` or `failed`) follows as a `_sloppod/proposal` update, and in `GET /api/v1/proposals/{id}`. Approving with edits changes the payload first: `github.pr.create` takes `{title?, body?, auto_merge?}`; `github.issue.create` takes `{issues}`, the issues to file, so leaving one out drops it. Other kinds take no edits.
 
 ## ACP at `/acp`
 
@@ -181,6 +182,7 @@ Session pods use three more endpoints, on their own port (8081, `sessions`); tha
 - `/link/v1`: the supervisor link ([ADR 17](adr/0017-in-pod-supervisor.md)), a WebSocket authenticated with the pod's projected ServiceAccount token. Its types are in `crates/protocol`.
 - `/mcp`: an MCP server (streamable HTTP, JSON responses) registered with the agent at session start. It identifies the session by the pod's IP. Its tools:
   - `propose_pull_request {title, body, repo?, base?, head?, draft?, auto_merge?}` creates a `github.pr.create` proposal from the session branch, or from `head`, a branch named after it (`<session branch>-<name>`), so a session can have several open; `repo` is needed when the session can write to more than one.
+  - `propose_issues {issues: {title, body?, labels?}[], repo?}` creates a `github.issue.create` proposal (up to 50 issues; `repo` as for pull requests).
   - `request_repository {repo, reason}` creates a `sloppod.repo.grant` proposal.
   - `get_proposal {id}` returns a proposal's status and result. The agent is also told when its proposals are decided.
 - `/memini/*`: memini, for sessions with a `memory` grant, identified by the pod's IP. The runtime forwards each request to the owner's memini with the session's own key and namespace, and refuses memini's administration endpoints. The memini plugin's `MEMINI_BASE_URL` points here.

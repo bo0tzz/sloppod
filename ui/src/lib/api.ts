@@ -33,15 +33,23 @@ export type PullRequestPayload = {
   auto_merge?: boolean;
 };
 export type RepoGrantPayload = { repo: string; reason: string; branch: string };
+export type IssueDraft = { title: string; body: string; labels: string[] };
+export type IssuesPayload = { repo: string; issues: IssueDraft[] };
+export type ProposalEdits = { title?: string; body?: string; auto_merge?: boolean; issues?: IssueDraft[] };
 
 export type Proposal = {
   id: string;
   session_id: string;
-  /** `github.pr.create` and `sloppod.repo.grant` so far; others render generically. */
+  /** `github.pr.create`, `github.issue.create` and `sloppod.repo.grant` so far; others render generically. */
   kind: string;
   status: ProposalStatus;
   payload: Record<string, unknown>;
-  result?: { url: string; number: number };
+  result?: {
+    url?: string;
+    number?: number;
+    issues?: { title: string; url: string; number: number }[];
+    failed?: { title: string; error: string }[];
+  };
   error?: string;
   reason?: string;
   created_at: string;
@@ -133,7 +141,7 @@ export const api = {
     return call<Proposal[]>('GET', `/proposals?${params}`);
   },
   getProposal: (id: string) => call<ProposalDetail>('GET', `/proposals/${encodeURIComponent(id)}`),
-  approveProposal: (id: string, edits: { title?: string; body?: string; auto_merge?: boolean } = {}) =>
+  approveProposal: (id: string, edits: ProposalEdits = {}) =>
     call<Proposal>('POST', `/proposals/${encodeURIComponent(id)}/approve`, edits),
   rejectProposal: (id: string, reason?: string) =>
     call<Proposal>('POST', `/proposals/${encodeURIComponent(id)}/reject`, reason ? { reason } : {}),

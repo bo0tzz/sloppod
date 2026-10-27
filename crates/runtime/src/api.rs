@@ -520,13 +520,10 @@ async fn approve(
     State(state): State<AppState>,
     User(user): User,
     Path(id): Path<Uuid>,
-    body: Option<Json<Decision>>,
+    body: Option<Json<serde_json::Value>>,
 ) -> ApiResult<impl IntoResponse> {
-    let decision = body.map(|Json(d)| d).unwrap_or_default();
     let verdict = Verdict::Approve {
-        title: decision.title,
-        body: decision.body,
-        auto_merge: decision.auto_merge,
+        edits: body.map(|Json(edits)| edits).unwrap_or_default(),
     };
     match proposals::decide(&state, id, verdict, &user).await {
         Ok(Some(proposal)) => Ok(Json(proposal)),

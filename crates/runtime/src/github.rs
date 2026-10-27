@@ -276,11 +276,11 @@ impl GitHubApp {
         })
     }
 
-    pub async fn create_pull(&self, repo: &str, payload: &Value) -> anyhow::Result<Value> {
+    async fn repo_post(&self, repo: &str, path: &str, payload: &Value) -> anyhow::Result<Value> {
         let token = self.token_for(repo).await?;
         let response = self
             .http
-            .post(format!("{API}/repos/{repo}/pulls"))
+            .post(format!("{API}/repos/{repo}{path}"))
             .bearer_auth(token)
             .header("accept", "application/vnd.github+json")
             .json(payload)
@@ -290,10 +290,15 @@ impl GitHubApp {
         let body: Value = response.json().await.unwrap_or(Value::Null);
         if !status.is_success() {
             bail!(
-                "GitHub refused the pull request ({status}): {}",
+                "GitHub refused it ({status}): {}",
                 body["message"].as_str().unwrap_or("no message")
             );
         }
+        Ok(body)
+    }
+
+    pub async fn create_pull(&self, repo: &str, payload: &Value) -> anyhow::Result<Value> {
+        let body = self.repo_post(repo, "/pulls", payload).await?;
         Ok(json!({"url": body["html_url"], "number": body["number"], "node_id": body["node_id"]}))
     }
 
@@ -331,6 +336,46 @@ impl GitHubApp {
             .await?;
         if let Some(error) = response["errors"].as_array().and_then(|e| e.first()) {
             bail!("{}", error["message"].as_str().unwrap_or("unknown error"));
+        }
+        Ok(())
+    }
+
+    pub async fn create_issue(&self, repo: &str, payload: &Value) -> anyhow::Result<Value> {
+        let body = self.repo_post(repo, "/issues", payload).await?;
+        Ok(json!({"url": body["html_url"], "number": body["number"]}))
+    }
+
+    /// Creates the labels in `names` that `repo` doesn't have yet.
+    pub async fn ensure_labels(&self, repo: &str, names: &[&str]) -> anyhow::Result<()> {
+        let mut existing = Vec::new();
+        for page in 1.. {
+            let labels: Vec<Value> = self
+                .repo_get(
+                    repo,
+                    &format!("/labels?per_page=100&page={page}"),
+                    "application/vnd.github+json",
+                )
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let last = labels.len() < 100;
+            existing.extend(
+                labels
+                    .iter()
+                    .filter_map(|l| l["name"].as_str().map(str::to_lowercase)),
+            );
+            if last {
+                break;
+            }
+        }
+        for name in names {
+            if !existing.contains(&name.to_lowercase()) {
+                self.repo_post(repo, "/labels", &json!({"name": name, "color": "ededed"}))
+                    .await
+                    .with_context(|| format!("creating the label {name}"))?;
+                existing.push(name.to_lowercase());
+            }
         }
         Ok(())
     }

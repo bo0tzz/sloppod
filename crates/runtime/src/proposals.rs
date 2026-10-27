@@ -133,7 +133,7 @@ impl ProposalKind for PullRequest {
     }
 
     async fn prepare(&self, session: &SessionContext, arguments: Value) -> Result<Value> {
-        let RepoGrant { repo, branch } = pull_request_repo(session, arguments["repo"].as_str())?;
+        let RepoGrant { repo, branch } = target_repo(session, arguments["repo"].as_str())?;
         let head = head_branch(branch, arguments["head"].as_str())?;
         let app = self.app(session).await?;
         let title = arguments["title"].as_str().filter(|t| !t.trim().is_empty());
@@ -174,6 +174,10 @@ impl ProposalKind for PullRequest {
             "diff": comparison.diff,
             "commits": comparison.commits.iter().map(|(sha, message)| json!({"sha": sha, "message": message})).collect::<Vec<_>>(),
         }))
+    }
+
+    fn edit(&self, payload: &Value, edits: &Value) -> Result<Value> {
+        edit_pull_request(payload, edits)
     }
 
     async fn execute(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
@@ -237,11 +241,33 @@ fn head_branch<'a>(session_branch: &'a str, named: Option<&'a str>) -> Result<&'
     }
 }
 
-/// The repository a pull request is from: the one named, or the only one the session can push to.
-fn pull_request_repo<'a>(
-    session: &'a SessionContext,
-    named: Option<&str>,
-) -> Result<RepoGrant<'a>> {
+fn edit_pull_request(payload: &Value, edits: &Value) -> Result<Value> {
+    let mut payload = payload.clone();
+    for field in ["title", "body"] {
+        if let Some(value) = edits.get(field) {
+            let text = value
+                .as_str()
+                .ok_or_else(|| Error::new(format!("`{field}` must be a string")))?;
+            payload[field] = json!(text);
+        }
+    }
+    if let Some(value) = edits.get("auto_merge") {
+        let auto_merge = value
+            .as_bool()
+            .ok_or_else(|| Error::new("`auto_merge` must be true or false"))?;
+        payload["auto_merge"] = json!(auto_merge);
+    }
+    if payload["title"]
+        .as_str()
+        .is_none_or(|title| title.trim().is_empty())
+    {
+        return Err(Error::new("a title is required"));
+    }
+    Ok(payload)
+}
+
+/// The repository a pull request or issue is for: the one named, or the only one the session can push to.
+fn target_repo<'a>(session: &'a SessionContext, named: Option<&str>) -> Result<RepoGrant<'a>> {
     if let Some(repo) = named {
         return session.writable_repo_for(repo).ok_or_else(|| {
             Error::new(format!(
@@ -263,6 +289,183 @@ fn pull_request_repo<'a>(
                 .collect::<Vec<_>>()
                 .join(", ")
         ))),
+    }
+}
+
+pub struct Issues {
+    credentials: Arc<Credentials>,
+}
+
+impl Issues {
+    pub fn new(credentials: Arc<Credentials>) -> Self {
+        Self { credentials }
+    }
+}
+
+const MAX_ISSUES: usize = 50;
+
+/// Checks a list of issues from the agent or the reviewer, keeping only the fields GitHub gets.
+fn issue_list(issues: &Value) -> Result<Vec<Value>> {
+    let Some(issues) = issues.as_array().filter(|i| !i.is_empty()) else {
+        return Err(Error::new("give at least one issue"));
+    };
+    if issues.len() > MAX_ISSUES {
+        return Err(Error::new(format!(
+            "propose at most {MAX_ISSUES} issues at a time"
+        )));
+    }
+    issues
+        .iter()
+        .enumerate()
+        .map(|(i, issue)| {
+            let title = issue["title"].as_str().map(str::trim).unwrap_or_default();
+            if title.is_empty() {
+                return Err(Error::new(format!("issue {} has no title", i + 1)));
+            }
+            let labels: Vec<&str> = match &issue["labels"] {
+                Value::Null => Vec::new(),
+                Value::Array(labels) => labels
+                    .iter()
+                    .map(|l| l.as_str().map(str::trim).filter(|l| !l.is_empty()))
+                    .collect::<Option<_>>()
+                    .ok_or_else(|| Error::new(format!("issue {}'s labels must be names", i + 1)))?,
+                _ => {
+                    return Err(Error::new(format!(
+                        "issue {}'s labels must be a list",
+                        i + 1
+                    )));
+                }
+            };
+            Ok(json!({
+                "title": title,
+                "body": issue["body"].as_str().unwrap_or_default(),
+                "labels": labels,
+            }))
+        })
+        .collect()
+}
+
+/// The reviewer sends the issues to file, so dropping one leaves it out.
+fn edit_issues(payload: &Value, edits: &Value) -> Result<Value> {
+    let mut payload = payload.clone();
+    if let Some(issues) = edits.get("issues") {
+        payload["issues"] = json!(issue_list(issues)?);
+    }
+    Ok(payload)
+}
+
+#[async_trait]
+impl ProposalKind for Issues {
+    fn manifest(&self) -> Manifest {
+        Manifest::builtin("github")
+    }
+
+    fn kind(&self) -> String {
+        "github.issue.create".into()
+    }
+
+    fn tool(&self) -> ToolSpec {
+        ToolSpec {
+            name: "propose_issues".into(),
+            description: "Propose filing one or more GitHub issues in a repository this session can push to. A \
+                          human reviews them together, and can edit or drop any of them; once approved, sloppod \
+                          files them, creating labels that don't exist yet. Returns the proposal's id; check it \
+                          with get_proposal."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repository as owner/name; needed when the session can push to more than one"},
+                    "issues": {
+                        "type": "array",
+                        "maxItems": MAX_ISSUES,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "body": {"type": "string", "description": "Markdown"},
+                                "labels": {"type": "array", "items": {"type": "string"}},
+                            },
+                            "required": ["title"],
+                        },
+                    },
+                },
+                "required": ["issues"],
+            }),
+        }
+    }
+
+    fn summary(&self, payload: &Value) -> String {
+        let repo = payload["repo"].as_str().unwrap_or_default();
+        match payload["issues"].as_array().map(Vec::as_slice) {
+            Some([issue]) => format!(
+                "issue \"{}\" on {repo}",
+                issue["title"].as_str().unwrap_or_default()
+            ),
+            Some(issues) => format!("{} issues on {repo}", issues.len()),
+            None => format!("issues on {repo}"),
+        }
+    }
+
+    async fn prepare(&self, session: &SessionContext, arguments: Value) -> Result<Value> {
+        let RepoGrant { repo, .. } = target_repo(session, arguments["repo"].as_str())?;
+        Ok(json!({"repo": repo, "issues": issue_list(&arguments["issues"])?}))
+    }
+
+    async fn detail(&self, _session: &SessionContext, _payload: &Value) -> Result<Value> {
+        Ok(json!({}))
+    }
+
+    fn edit(&self, payload: &Value, edits: &Value) -> Result<Value> {
+        edit_issues(payload, edits)
+    }
+
+    async fn execute(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
+        let repo = payload["repo"].as_str().unwrap_or_default();
+        let issues = issue_list(&payload["issues"])?;
+        let app = self.credentials.github(&session.owner).await.map_err(err)?;
+        let mut labels: Vec<&str> = issues
+            .iter()
+            .flat_map(|i| i["labels"].as_array().into_iter().flatten())
+            .filter_map(Value::as_str)
+            .collect();
+        labels.sort_unstable();
+        labels.dedup();
+        app.ensure_labels(repo, &labels).await.map_err(err)?;
+
+        let (mut filed, mut failed) = (Vec::new(), Vec::new());
+        for issue in &issues {
+            match app.create_issue(repo, issue).await {
+                Ok(result) => filed.push(json!({
+                    "title": issue["title"],
+                    "url": result["url"],
+                    "number": result["number"],
+                })),
+                Err(e) => failed.push(json!({"title": issue["title"], "error": e.to_string()})),
+            }
+        }
+        if filed.is_empty() {
+            return Err(Error::new(format!(
+                "no issues were filed: {}",
+                failed[0]["error"].as_str().unwrap_or_default()
+            )));
+        }
+        let mut message = format!(
+            "Filed {}.",
+            filed
+                .iter()
+                .map(|i| format!("#{} {}", i["number"], i["url"].as_str().unwrap_or_default()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        for failure in &failed {
+            message.push_str(&format!(
+                " \"{}\" failed: {}.",
+                failure["title"].as_str().unwrap_or_default(),
+                failure["error"].as_str().unwrap_or_default()
+            ));
+        }
+        Ok(json!({"issues": filed, "failed": failed, "message": message}))
     }
 }
 
@@ -381,14 +584,8 @@ pub async fn propose(
 }
 
 pub enum Verdict {
-    Approve {
-        title: Option<String>,
-        body: Option<String>,
-        auto_merge: Option<bool>,
-    },
-    Reject {
-        reason: Option<String>,
-    },
+    Approve { edits: Value },
+    Reject { reason: Option<String> },
 }
 
 /// Applies a human's decision; approving executes immediately (ADR 3).
@@ -415,25 +612,18 @@ pub async fn decide(
     let Some(row) = owned_proposal(state, id, owner).await? else {
         return Ok(None);
     };
-    let mut payload = row.payload.clone();
-    let (status, reason) = match verdict {
-        Verdict::Approve {
-            title,
-            body,
-            auto_merge,
-        } => {
-            if let Some(title) = title {
-                payload["title"] = json!(title);
-            }
-            if let Some(body) = body {
-                payload["body"] = json!(body);
-            }
-            if let Some(auto_merge) = auto_merge {
-                payload["auto_merge"] = json!(auto_merge);
-            }
-            ("approved", None)
-        }
-        Verdict::Reject { reason } => ("rejected", reason),
+    let kind = state
+        .proposals
+        .get(&row.kind)
+        .ok_or_else(|| anyhow::anyhow!("no executor for {}", row.kind))?;
+    let (status, payload, reason) = match verdict {
+        Verdict::Approve { edits } => (
+            "approved",
+            kind.edit(&row.payload, &edits)
+                .map_err(|e| anyhow::anyhow!(e.0))?,
+            None,
+        ),
+        Verdict::Reject { reason } => ("rejected", row.payload.clone(), reason),
     };
     let Some(row) =
         db::decide_proposal(&state.db, id, status, &payload, reason.as_deref(), owner).await?
@@ -441,10 +631,6 @@ pub async fn decide(
         anyhow::bail!("proposal {id} was already decided");
     };
     state.hub.broadcast_proposal(&row.to_api());
-    let kind = state
-        .proposals
-        .get(&row.kind)
-        .ok_or_else(|| anyhow::anyhow!("no executor for {}", row.kind))?;
     let summary = kind.summary(&payload);
     if status == "rejected" {
         let reason = row
@@ -558,26 +744,69 @@ mod tests {
     }
 
     #[test]
-    fn picks_the_pull_request_repository() {
+    fn picks_the_target_repository() {
         let one = session(&["a/one"]);
-        assert_eq!(pull_request_repo(&one, None).unwrap().repo, "a/one");
-        assert_eq!(
-            pull_request_repo(&one, Some("A/One")).unwrap().repo,
-            "a/one"
-        );
-        assert!(pull_request_repo(&one, Some("a/two")).is_err());
-        assert!(pull_request_repo(&session(&[]), None).is_err());
+        assert_eq!(target_repo(&one, None).unwrap().repo, "a/one");
+        assert_eq!(target_repo(&one, Some("A/One")).unwrap().repo, "a/one");
+        assert!(target_repo(&one, Some("a/two")).is_err());
+        assert!(target_repo(&session(&[]), None).is_err());
         let two = session(&["a/one", "a/two"]);
         assert!(
-            pull_request_repo(&two, None)
+            target_repo(&two, None)
                 .unwrap_err()
                 .0
                 .contains("a/one, a/two")
         );
+        assert_eq!(target_repo(&two, Some("a/two")).unwrap().repo, "a/two");
+    }
+
+    #[test]
+    fn checks_issue_lists() {
+        let issues = issue_list(&json!([
+            {"title": "  First  ", "body": "Details", "labels": ["dogfood", " ui "]},
+            {"title": "Second"},
+        ]))
+        .unwrap();
         assert_eq!(
-            pull_request_repo(&two, Some("a/two")).unwrap().repo,
-            "a/two"
+            issues,
+            vec![
+                json!({"title": "First", "body": "Details", "labels": ["dogfood", "ui"]}),
+                json!({"title": "Second", "body": "", "labels": []}),
+            ]
         );
+        assert!(issue_list(&json!([])).is_err());
+        assert!(issue_list(&json!([{"title": " "}])).is_err());
+        assert!(issue_list(&json!([{"title": "a", "labels": "ui"}])).is_err());
+        assert!(issue_list(&json!([{"title": "a", "labels": [""]}])).is_err());
+        assert!(issue_list(&json!(vec![json!({"title": "a"}); MAX_ISSUES + 1])).is_err());
+    }
+
+    #[test]
+    fn edits_issues() {
+        let payload = json!({"repo": "a/one", "issues": [{"title": "One", "body": "", "labels": []}, {"title": "Two", "body": "", "labels": []}]});
+        assert_eq!(edit_issues(&payload, &json!({})).unwrap(), payload);
+        let edited = edit_issues(&payload, &json!({"issues": [{"title": "Two, edited"}]})).unwrap();
+        assert_eq!(edited["repo"], "a/one");
+        assert_eq!(
+            edited["issues"],
+            json!([{"title": "Two, edited", "body": "", "labels": []}])
+        );
+        assert!(edit_issues(&payload, &json!({"issues": []})).is_err());
+    }
+
+    #[test]
+    fn edits_pull_requests() {
+        let payload = json!({"repo": "a/one", "title": "Old", "body": "Old body"});
+        let edited = edit_pull_request(&payload, &json!({"title": "New"})).unwrap();
+        assert_eq!(edited["title"], "New");
+        assert_eq!(edited["body"], "Old body");
+        assert!(edit_pull_request(&payload, &json!({"title": " "})).is_err());
+        assert!(edit_pull_request(&payload, &json!({"body": 1})).is_err());
+        assert_eq!(
+            edit_pull_request(&payload, &json!({"auto_merge": true})).unwrap()["auto_merge"],
+            true
+        );
+        assert!(edit_pull_request(&payload, &json!({"auto_merge": "yes"})).is_err());
     }
 
     #[test]
