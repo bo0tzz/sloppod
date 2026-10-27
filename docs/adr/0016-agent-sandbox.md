@@ -1,6 +1,6 @@
 # 16. Session pods are agent-sandbox Sandboxes
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-10-26
 
 ## Context and Problem Statement

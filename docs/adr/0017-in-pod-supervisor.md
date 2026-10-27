@@ -1,6 +1,6 @@
 # 17. An in-pod supervisor bridges the agent to the runtime
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-10-26
 
 ## Context and Problem Statement
