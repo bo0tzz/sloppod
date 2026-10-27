@@ -27,7 +27,7 @@ export const phases: Record<Phase, { label: string; color: Color; description: s
   starting: { label: 'Starting', color: 'info', description: 'The pod is starting or the agent has not connected yet' },
   idle: { label: 'Idle', color: 'secondary', description: 'Waiting for a prompt' },
   working: { label: 'Working', color: 'primary', description: 'A turn is running' },
-  waiting: { label: 'Waiting', color: 'warning', description: 'Blocked on a permission request' },
+  waiting: { label: 'Waiting', color: 'warning', description: 'Blocked on a permission request or a question' },
   disconnected: { label: 'Disconnected', color: 'danger', description: 'The pod went away; the runtime is bringing it back' },
   parked: { label: 'Parked', color: 'secondary', description: 'No pod; sending a message or Wake brings it back' },
   stopped: { label: 'Stopped', color: 'secondary', description: 'The session has stopped' },

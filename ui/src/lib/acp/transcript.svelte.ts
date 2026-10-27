@@ -1,3 +1,4 @@
+import { SvelteMap } from 'svelte/reactivity';
 import type {
   ContentBlock,
   ContentChunk,
@@ -89,7 +90,8 @@ export class Transcript {
   items = $state<TranscriptItem[]>([]);
 
   #seq = 0;
-  #tools = new Map<string, ToolItem>();
+  // Reactive, so a permission card that looked its tool call up before it arrived picks it up.
+  #tools = new SvelteMap<string, ToolItem>();
   #compactions = new Map<string, CompactionItem>();
   #plan: PlanItem | null = null;
 

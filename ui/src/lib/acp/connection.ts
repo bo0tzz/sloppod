@@ -25,7 +25,6 @@ type Pending = { resolve: (value: unknown) => void; reject: (error: Error) => vo
 
 const MAX_BACKOFF_MS = 10_000;
 
-/** JSON-RPC 2.0 over a WebSocket that reconnects with backoff until closed. */
 /** A request was cut off by the connection closing: the runtime may well have received it. */
 export class ConnectionClosedError extends Error {
   constructor() {
@@ -33,6 +32,7 @@ export class ConnectionClosedError extends Error {
   }
 }
 
+/** JSON-RPC 2.0 over a WebSocket that reconnects with backoff until closed. */
 export class AcpConnection {
   #url: string;
   #handlers: ConnectionHandlers;

@@ -54,7 +54,7 @@
       const current = Array.isArray(values[key]) ? (values[key] as string[]) : [];
       values[key] = current.includes(value) ? current.filter((item) => item !== value) : [...current, value];
     } else {
-      // Nothing is required, so picking the chosen option again clears it.
+      // Picking the chosen option again clears it; a required question then needs an answer again before sending.
       values[key] = values[key] === value ? undefined : value;
     }
   }
