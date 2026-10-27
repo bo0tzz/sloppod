@@ -12,6 +12,8 @@ use crate::policies::SESSION_KEY;
 use crate::session::ParkError;
 use crate::{AppState, db};
 
+/// Gives a session its memini key when its owner has memini and it has none, e.g. because it was just created, or
+/// its key was lost (ADR 22). Keeps the namespace of an existing memory grant.
 async fn ensure_memini_key(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
     let Some((admin, memini)) = state.credentials.memini(&session.owner).await? else {
         return Ok(());
@@ -58,6 +60,7 @@ async fn ensure_memini_key(state: &AppState, session: &db::SessionRow) -> anyhow
     Ok(())
 }
 
+/// Makes sure a session's pod and egress policy exist.
 pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
     if let Err(e) = ensure_memini_key(state, session).await {
         tracing::warn!(session = %session.id, error = %e, "minting the session's memini key; no memory");
