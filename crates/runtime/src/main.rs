@@ -5,6 +5,8 @@ mod authz;
 mod config;
 mod credentials;
 mod db;
+#[cfg(test)]
+mod db_tests;
 mod enforcer;
 mod github;
 mod grants;
