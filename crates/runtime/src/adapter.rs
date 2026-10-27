@@ -91,6 +91,10 @@ impl AgentAdapter for ClaudeCode {
                 "1".to_owned(),
             ),
             ("CLAUDE_CODE_DISABLE_AUTO_MEMORY".to_owned(), "1".to_owned()),
+            (
+                "CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS".to_owned(),
+                "15000".to_owned(),
+            ),
             ("DISABLE_AUTOUPDATER".to_owned(), "1".to_owned()),
         ];
         if let Some(model) = &context.model {
@@ -111,8 +115,11 @@ impl AgentAdapter for ClaudeCode {
 
         let mut files = vec![AgentFile {
             path: format!("{config_dir}/settings.json"),
-            content: serde_json::to_string_pretty(&json!({"autoMemoryEnabled": false}))
-                .unwrap_or_default(),
+            content: serde_json::to_string_pretty(&json!({
+                "autoMemoryEnabled": false,
+                "attribution": {"pr": ""},
+            }))
+            .unwrap_or_default(),
             overwrite: true,
         }];
         if let Some(instructions) = &context.instructions {

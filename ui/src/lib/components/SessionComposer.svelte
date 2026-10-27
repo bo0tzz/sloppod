@@ -97,7 +97,6 @@
   {canSend}
   {sending}
   onSend={send}
-  hint={steering && !blockedReason ? 'Messages now steer the running turn.' : ''}
   notice={blockedReason || queuedHint ? notice : undefined}
 >
   {#snippet leading()}

@@ -15,7 +15,6 @@
     sending = false,
     onSend,
     notice,
-    hint = '',
     leading,
     trailing,
   }: {
@@ -31,8 +30,6 @@
     onSend: () => void;
     /** Shown on its own line above the controls, on every screen size. */
     notice?: Snippet;
-    /** A short inline hint next to the controls, hidden on small screens. */
-    hint?: string;
     leading?: Snippet;
     trailing?: Snippet;
   } = $props();
@@ -65,9 +62,7 @@
     {/if}
     <div class="flex items-center gap-2">
       {@render leading?.()}
-      <span class="text-muted min-w-0 grow truncate text-xs">
-        <span class="hidden sm:inline">{hint}</span>
-      </span>
+      <div class="grow"></div>
       {@render trailing?.()}
       <Button
         size="small"
