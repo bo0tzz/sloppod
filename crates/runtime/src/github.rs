@@ -32,7 +32,6 @@ const READ_PERMISSIONS: &[&str] = &[
     "statuses",
 ];
 
-/// One cached token, minted by whichever caller gets the slot first; the others wait for it.
 /// When the authorizer let pushes to branches through. A push it admitted may still be landing, so work that needs
 /// branches to hold still checks here as well as their heads. The runtime is one process (ADR 14), so this is too.
 #[derive(Default)]
@@ -65,6 +64,27 @@ impl PushLog {
     }
 }
 
+/// Items per page when reading GitHub's lists.
+const PAGE: usize = 100;
+
+/// Every item of a paged GitHub list: `fetch` gets page 1, 2, … until one comes back short.
+async fn all_pages<F, Fut>(mut fetch: F) -> anyhow::Result<Vec<Value>>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<Value>>>,
+{
+    let mut all = Vec::new();
+    for page in 1.. {
+        let items = fetch(page).await?;
+        let last = items.len() < PAGE;
+        all.extend(items);
+        if last {
+            break;
+        }
+    }
+    Ok(all)
+}
+
 /// How long a push the authorizer let through may take to land, for work that needs branches to hold still.
 const PUSH_SETTLE: Duration = Duration::from_secs(10 * 60);
 
@@ -78,6 +98,7 @@ pub struct StackMerge<'a> {
     pub layers: &'a [(&'a str, &'a str)],
 }
 
+/// One cached token, minted by whichever caller gets the slot first; the others wait for it.
 type TokenSlot = Arc<tokio::sync::Mutex<Option<AccessToken>>>;
 
 /// What a token is minted for. `None` is everything the installation has.
@@ -488,12 +509,15 @@ impl GitHubApp {
 
     /// Repositories the app is installed on.
     pub async fn repos(&self) -> anyhow::Result<Vec<String>> {
-        let installations: Vec<Value> = self
-            .app_get("/app/installations")
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let installations = all_pages(|page| async move {
+            Ok(self
+                .app_get(&format!("/app/installations?per_page={PAGE}&page={page}"))
+                .await?
+                .error_for_status()?
+                .json()
+                .await?)
+        })
+        .await?;
         let mut repos = Vec::new();
         for installation in installations {
             let Some(id) = installation["id"].as_u64() else {
@@ -507,17 +531,27 @@ impl GitHubApp {
             let Some(token) = self.mint(scope).await? else {
                 continue;
             };
-            let page: Value = self
-                .http
-                .get(self.url("/installation/repositories?per_page=100"))
-                .bearer_auth(token)
-                .header("accept", "application/vnd.github+json")
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            for repo in page["repositories"].as_array().into_iter().flatten() {
+            let token = &token;
+            let accessible = all_pages(|page| async move {
+                let listed: Value = self
+                    .http
+                    .get(self.url(&format!(
+                        "/installation/repositories?per_page={PAGE}&page={page}"
+                    )))
+                    .bearer_auth(token)
+                    .header("accept", "application/vnd.github+json")
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                Ok(listed["repositories"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default())
+            })
+            .await?;
+            for repo in &accessible {
                 if let Some(name) = repo["full_name"].as_str() {
                     self.remember_installation(name, &installation);
                     repos.push(name.to_owned());
@@ -598,14 +632,7 @@ impl GitHubApp {
     /// The commit a branch (or commit) points to.
     pub async fn branch_sha(&self, repo: &str, reference: &str) -> anyhow::Result<String> {
         let commit: Value = self
-            .repo_get(
-                repo,
-                &format!("/commits/{reference}"),
-                "application/vnd.github+json",
-            )
-            .await?
-            .error_for_status()?
-            .json()
+            .repo_json(repo, &format!("/commits/{reference}"))
             .await?;
         commit["sha"]
             .as_str()
@@ -617,14 +644,7 @@ impl GitHubApp {
     pub async fn disable_auto_merge(&self, repo: &str, branch: &str) -> anyhow::Result<Vec<u64>> {
         let owner = repo.split('/').next().unwrap_or_default();
         let headed: Vec<Value> = self
-            .repo_get(
-                repo,
-                &format!("/pulls?state=open&head={owner}:{branch}"),
-                "application/vnd.github+json",
-            )
-            .await?
-            .error_for_status()?
-            .json()
+            .repo_json(repo, &format!("/pulls?state=open&head={owner}:{branch}"))
             .await?;
         // A stack merges through auto-merge on its top pull request, so a push to any layer turns that off too.
         let mut numbers: Vec<u64> = Vec::new();
@@ -638,16 +658,7 @@ impl GitHubApp {
         numbers.dedup();
         let mut disabled = Vec::new();
         for number in numbers {
-            let pull: Value = self
-                .repo_get(
-                    repo,
-                    &format!("/pulls/{number}"),
-                    "application/vnd.github+json",
-                )
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
+            let pull: Value = self.repo_json(repo, &format!("/pulls/{number}")).await?;
             if pull["state"] != "open" || pull["auto_merge"].is_null() {
                 continue;
             }
@@ -659,15 +670,23 @@ impl GitHubApp {
     }
 
     async fn disable_pull_auto_merge_in(&self, repo: &str, node_id: &str) -> anyhow::Result<()> {
+        self.graphql(
+            repo,
+            "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }",
+            json!({"id": node_id}),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Runs a GraphQL query or mutation with the repository's token; GraphQL errors come back as errors.
+    async fn graphql(&self, repo: &str, query: &str, variables: Value) -> anyhow::Result<Value> {
         let token = self.token_for(repo).await?;
         let response: Value = self
             .http
             .post(self.url("/graphql"))
             .bearer_auth(token)
-            .json(&json!({
-                "query": "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }",
-                "variables": {"id": node_id},
-            }))
+            .json(&json!({"query": query, "variables": variables}))
             .send()
             .await?
             .error_for_status()?
@@ -676,7 +695,21 @@ impl GitHubApp {
         if let Some(error) = response["errors"].as_array().and_then(|e| e.first()) {
             bail!("{}", error["message"].as_str().unwrap_or("unknown error"));
         }
-        Ok(())
+        Ok(response)
+    }
+
+    /// A GET of the repository's REST API, as JSON.
+    async fn repo_json<T: serde::de::DeserializeOwned>(
+        &self,
+        repo: &str,
+        path: &str,
+    ) -> anyhow::Result<T> {
+        Ok(self
+            .repo_get(repo, path, "application/vnd.github+json")
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
     }
 
     async fn repo_post(&self, repo: &str, path: &str, payload: &Value) -> anyhow::Result<Value> {
@@ -727,26 +760,15 @@ impl GitHubApp {
         .find(|(setting, _)| info[*setting].as_bool() == Some(true))
         .map(|(_, method)| method)
         .context("the repository allows no merge method")?;
-        let token = self.token_for(repo).await?;
-        let response: Value = self
-            .http
-            .post(self.url("/graphql"))
-            .bearer_auth(token)
-            .json(&json!({
-                "query": "mutation($id: ID!, $method: PullRequestMergeMethod!, $head: GitObjectID!) { \
-                          enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: $method, expectedHeadOid: $head}) \
-                          { clientMutationId } }",
-                "variables": {"id": pull_node_id, "method": method, "head": expected_head},
-            }))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        if let Some(error) = response["errors"].as_array().and_then(|e| e.first()) {
-            bail!("{}", error["message"].as_str().unwrap_or("unknown error"));
-        }
-        Ok(())
+        self.graphql(
+            repo,
+            "mutation($id: ID!, $method: PullRequestMergeMethod!, $head: GitObjectID!) { \
+             enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: $method, expectedHeadOid: $head}) \
+             { clientMutationId } }",
+            json!({"id": pull_node_id, "method": method, "head": expected_head}),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// An open pull request from `head` into `base`, if there is one, in `create_pull`'s result shape.
@@ -758,14 +780,10 @@ impl GitHubApp {
     ) -> anyhow::Result<Option<Value>> {
         let owner = repo.split('/').next().unwrap_or_default();
         let pulls: Vec<Value> = self
-            .repo_get(
+            .repo_json(
                 repo,
                 &format!("/pulls?state=open&head={owner}:{head}&base={base}"),
-                "application/vnd.github+json",
             )
-            .await?
-            .error_for_status()?
-            .json()
             .await?;
         Ok(pulls.first().map(|body| {
             json!({"url": body["html_url"], "number": body["number"], "node_id": body["node_id"]})
@@ -862,16 +880,7 @@ impl GitHubApp {
 
     /// A stack's pull requests, bottom to top.
     pub async fn stack_members(&self, repo: &str, stack: u64) -> anyhow::Result<Vec<u64>> {
-        let stack: Value = self
-            .repo_get(
-                repo,
-                &format!("/stacks/{stack}"),
-                "application/vnd.github+json",
-            )
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let stack: Value = self.repo_json(repo, &format!("/stacks/{stack}")).await?;
         Ok(stack["pull_requests"]
             .as_array()
             .into_iter()
@@ -893,16 +902,15 @@ impl GitHubApp {
     /// Issues created in the last day, by title, in `create_issue`'s result shape.
     pub async fn recent_issues(&self, repo: &str) -> anyhow::Result<HashMap<String, Value>> {
         let since = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
-        let issues: Vec<Value> = self
-            .repo_get(
+        let since = &since;
+        let issues = all_pages(|page| async move {
+            self.repo_json(
                 repo,
-                &format!("/issues?state=all&since={since}&per_page=100"),
-                "application/vnd.github+json",
+                &format!("/issues?state=all&since={since}&per_page={PAGE}&page={page}"),
             )
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+            .await
+        })
+        .await?;
         Ok(issues
             .into_iter()
             .filter(|issue| {
@@ -929,28 +937,14 @@ impl GitHubApp {
 
     /// Creates the labels in `names` that `repo` doesn't have yet.
     pub async fn ensure_labels(&self, repo: &str, names: &[&str]) -> anyhow::Result<()> {
-        let mut existing = Vec::new();
-        for page in 1.. {
-            let labels: Vec<Value> = self
-                .repo_get(
-                    repo,
-                    &format!("/labels?per_page=100&page={page}"),
-                    "application/vnd.github+json",
-                )
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            let last = labels.len() < 100;
-            existing.extend(
-                labels
-                    .iter()
-                    .filter_map(|l| l["name"].as_str().map(str::to_lowercase)),
-            );
-            if last {
-                break;
-            }
-        }
+        let mut existing: Vec<String> = all_pages(|page| async move {
+            self.repo_json(repo, &format!("/labels?per_page={PAGE}&page={page}"))
+                .await
+        })
+        .await?
+        .iter()
+        .filter_map(|l| l["name"].as_str().map(str::to_lowercase))
+        .collect();
         for name in names {
             if !existing.contains(&name.to_lowercase()) {
                 self.repo_post(repo, "/labels", &json!({"name": name, "color": "ededed"}))
@@ -1338,6 +1332,20 @@ mod tests {
                 .contains("couldn't be checked")
         );
         assert!(auto_merging(&fake).is_empty());
+    }
+
+    #[tokio::test]
+    async fn reads_every_page_of_a_list() {
+        let pages = [PAGE, PAGE, 5];
+        let fetched = std::sync::Mutex::new(Vec::new());
+        let items = all_pages(|page| {
+            fetched.lock().unwrap().push(page);
+            async move { Ok(vec![json!(page); pages[page - 1]]) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(items.len(), 2 * PAGE + 5);
+        assert_eq!(*fetched.lock().unwrap(), [1, 2, 3]);
     }
 
     #[tokio::test]
