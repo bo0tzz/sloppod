@@ -2,6 +2,7 @@
   import { Button, Select, toastManager } from '@immich/ui';
   import { mdiSend, mdiSteering, mdiStop } from '@mdi/js';
   import { configSelectOptions } from '#lib/presentation.ts';
+  import { ConnectionClosedError } from '#lib/acp/connection.ts';
   import { queuedText, type SessionView } from '#lib/session.svelte.ts';
   import Composer from './Composer.svelte';
 
@@ -45,21 +46,33 @@
     return error instanceof Error ? error.message : String(error);
   }
 
+  /** Puts a message that didn't arrive back in the box, after any draft there. */
+  function putBack(message: { id: string; text: string }) {
+    text = text.trim() ? `${text.trimEnd()}\n\n${message.text}` : message.text;
+    dismiss(message.id);
+    textarea?.focus();
+  }
+
+  function dismiss(id: string) {
+    view.undelivered = view.undelivered.filter((message) => message.id !== id);
+  }
+
   async function send() {
     const message = text.trim();
     if (!message || blockedReason || sending) return;
     sending = true;
     text = '';
-    view.prompt(message).then(
+    const id = crypto.randomUUID();
+    view.prompt(message, id).then(
       (stopReason) => {
         if (stopReason && stopReason in unusualStops) {
           toastManager.warning({ title: 'The turn ended early', description: unusualStops[stopReason] });
         }
       },
       (error) => {
-        // A dropped socket doesn't end the turn; the reload shows what happened.
-        if (view.connection !== 'open') return;
-        if (!text) text = message;
+        // A dropped connection is the session view's to settle once it has reloaded.
+        if (error instanceof ConnectionClosedError) return;
+        if (!view.received(id) && !text) text = message;
         toastManager.danger({ title: "Couldn't send the prompt", description: errorMessage(error) });
       },
     );
@@ -97,6 +110,23 @@
 </script>
 
 <svelte:window onkeydown={onWindowKeydown} />
+
+{#if view.undelivered.length > 0}
+  <div class="border-light-200 shrink-0 border-t px-3 pt-2" data-testid="undelivered-messages">
+    <ul class="mx-auto flex w-full max-w-3xl flex-col gap-1">
+      {#each view.undelivered as message (message.id)}
+        <li class="bg-danger/10 flex items-center gap-2 rounded-xl px-3 py-1.5 text-sm" data-testid="undelivered-message">
+          <span class="text-danger shrink-0 text-xs">Didn't arrive</span>
+          <span class="min-w-0 grow truncate" title={message.text}>{message.text}</span>
+          <Button size="tiny" shape="round" variant="outline" onclick={() => putBack(message)}>Put back</Button>
+          <Button size="tiny" shape="round" variant="ghost" color="secondary" onclick={() => dismiss(message.id)}>
+            Dismiss
+          </Button>
+        </li>
+      {/each}
+    </ul>
+  </div>
+{/if}
 
 {#if view.queue.length > 0}
   <div class="border-light-200 shrink-0 border-t px-3 pt-2" data-testid="queued-messages">

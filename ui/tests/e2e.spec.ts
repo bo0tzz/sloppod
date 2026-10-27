@@ -844,6 +844,71 @@ test('a deleted session can be restored from Settings', async ({ page }) => {
   expect(session.deleted_at).toBeUndefined();
 });
 
+test('a message cut off by a dropped connection is sent again, once', async ({ page }) => {
+  await createSession(page, 'Keep my messages in sloppod');
+  await finishTurn(page);
+  await page.request.post('/_mock/drop-next-prompt?when=before');
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Did this arrive?');
+  await box.press('Enter');
+
+  await expect(userMessages(page).filter({ hasText: 'Did this arrive?' })).toHaveCount(1);
+  await expect(page.getByTestId('reconnecting')).toBeHidden();
+  await expect(box).toHaveValue('');
+  // Still once while the turn it started runs.
+  await expect(phase(page)).not.toHaveAttribute('data-phase', 'idle');
+  await page.waitForTimeout(500);
+  await expect(userMessages(page).filter({ hasText: 'Did this arrive?' })).toHaveCount(1);
+});
+
+test('a message that arrived before the connection dropped is not put back', async ({ page }) => {
+  await createSession(page, 'Do not repeat my messages in sloppod');
+  await finishTurn(page);
+  await page.request.post('/_mock/drop-next-prompt?when=after');
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('This one arrived');
+  await box.press('Enter');
+
+  await expect(page.getByTestId('reconnecting')).toBeVisible();
+  await expect(page.getByTestId('reconnecting')).toBeHidden();
+  await expect(userMessages(page).filter({ hasText: 'This one arrived' })).toHaveCount(1);
+  await expect(box).toHaveValue('');
+});
+
+test('a message taken behind a turn is not sent again after its queue notice was lost', async ({ page }) => {
+  await createSession(page, 'Queue behind a turn in sloppod');
+  // The turn waits on a permission request, so it's still running.
+  await expect(permissionCard(page)).toBeVisible();
+  await page.request.post('/_mock/drop-next-prompt?when=after');
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Behind the turn');
+  await box.press('Enter');
+
+  await expect(page.getByTestId('reconnecting')).toBeHidden();
+  const queued = page.getByTestId('queued-message').filter({ hasText: 'Behind the turn' });
+  await expect(queued).toHaveCount(1);
+  await page.waitForTimeout(500);
+  await expect(queued).toHaveCount(1);
+});
+
+test('a message that fails to arrive is kept apart from the draft', async ({ page }) => {
+  await createSession(page, 'Lose a message in sloppod');
+  await finishTurn(page);
+  await page.request.post('/_mock/drop-next-prompt?when=before');
+  await page.request.post('/_mock/fail-next-prompt');
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Lost one');
+  await box.press('Enter');
+  await box.fill('My draft');
+
+  const undelivered = page.getByTestId('undelivered-message');
+  await expect(undelivered).toContainText('Lost one');
+  await expect(box).toHaveValue('My draft');
+  await undelivered.getByRole('button', { name: 'Put back' }).click();
+  await expect(box).toHaveValue('My draft\n\nLost one');
+  await expect(undelivered).toHaveCount(0);
+});
+
 test('lists the session grants from the session menu', async ({ page }) => {
   await createSession(page, 'Fix the build in bo0tzz/sloppod');
   await page.getByRole('button', { name: 'Session actions' }).click();

@@ -133,11 +133,13 @@ impl Conn {
         if let ("session/load" | "session/resume", Some(session)) = (method.as_str(), session) {
             match self.load(session).await {
                 Ok((state, permissions, queue)) => {
+                    // The queue before the response, so a UI that finished loading knows what's waiting, e.g. to
+                    // tell whether a message it sent before reconnecting arrived.
+                    self.send(queue);
                     self.reply(id, Ok(state));
                     for (pid, method, params) in permissions {
                         self.send_permission(session, pid, method, params).await;
                     }
-                    self.send(queue);
                 }
                 Err(e) => self.reply(id, Err(e)),
             }
