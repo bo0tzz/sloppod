@@ -408,9 +408,6 @@ async fn create_session(
     Ok((StatusCode::CREATED, Json(row.to_api())))
 }
 
-/// Makes sure a session's pod and egress policy exist.
-/// Gives a session its memini key when its owner has memini and it has none, e.g. because it was just created, or
-/// its key was lost (ADR 22). Keeps the namespace of an existing memory grant.
 async fn delete_session(
     State(state): State<AppState>,
     User(user): User,
