@@ -118,6 +118,7 @@ export class SessionView {
    * else would fetch them again until a reconnect.
    */
   async refresh() {
+    if (this.#stopped) return;
     clearTimeout(this.#loadRetry);
     try {
       const [session, proposals] = await Promise.all([
@@ -136,6 +137,8 @@ export class SessionView {
       }
       if (this.#stopped) return;
       this.loadError = error instanceof Error ? error.message : String(error);
+      // Overlapping refreshes (a reconnect during a retry) can both fail; only one retry stays scheduled.
+      clearTimeout(this.#loadRetry);
       const delay = Math.min(30_000, 1000 * 2 ** this.#loadFailures++);
       this.#loadRetry = setTimeout(() => void this.refresh(), delay);
     }
