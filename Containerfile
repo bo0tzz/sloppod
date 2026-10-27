@@ -55,6 +55,11 @@ RUN curl -fsSL -o /usr/local/bin/mise \
     && echo "${MISE_SHA256}  /usr/local/bin/mise" | sha256sum -c - \
     && chmod +x /usr/local/bin/mise
 RUN npm install -g @agentclientprotocol/claude-agent-acp@${ADAPTER_VERSION} && npm cache clean --force
+# Steers should land at the next tool boundary, not pre-empt the running generation and tool calls, which is what
+# the adapter's "now" does. Fails the build if a new adapter version moves this line.
+RUN agent=/usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp/dist/acp-agent.js \
+    && grep -q '^const STEER_PRIORITY_NOW = "now";$' "$agent" \
+    && sed -i 's/^const STEER_PRIORITY_NOW = "now";$/const STEER_PRIORITY_NOW = "next";/' "$agent"
 COPY --from=memini /memini/plugin /opt/sloppod/plugins/memini
 COPY --from=build /out/sloppod-supervisor /usr/local/bin/sloppod-supervisor
 # The node image's `node` user is uid 1000, which session pods run as.
