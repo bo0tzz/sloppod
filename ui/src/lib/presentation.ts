@@ -64,6 +64,7 @@ export const proposalStatuses: Record<ProposalStatus, { label: string; color: Co
   rejected: { label: 'Rejected', color: 'secondary' },
   executed: { label: 'Done', color: 'success' },
   failed: { label: 'Failed', color: 'danger' },
+  withdrawn: { label: 'Withdrawn', color: 'secondary' },
 };
 
 const executedLabels: Record<string, string> = {

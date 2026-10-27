@@ -439,6 +439,24 @@ pub async fn approved_proposals(db: &PgPool) -> sqlx::Result<Vec<ProposalRow>> {
     .await
 }
 
+/// Withdraws one of the session's pending proposals; `None` if it isn't one.
+pub async fn withdraw_proposal(
+    db: &PgPool,
+    id: Uuid,
+    session_id: Uuid,
+    reason: Option<&str>,
+) -> sqlx::Result<Option<ProposalRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "update proposals set status = 'withdrawn', reason = $3, decided_by = 'agent', decided_at = now() \
+         where id = $1 and session_id = $2 and status = 'pending' returning {PROPOSAL_COLUMNS}"
+    )))
+    .bind(id)
+    .bind(session_id)
+    .bind(reason)
+    .fetch_optional(db)
+    .await
+}
+
 pub async fn get_proposal(db: &PgPool, id: Uuid) -> sqlx::Result<Option<ProposalRow>> {
     sqlx::query_as(AssertSqlSafe(format!(
         "select {PROPOSAL_COLUMNS} from proposals where id = $1"

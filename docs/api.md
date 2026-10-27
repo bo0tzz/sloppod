@@ -118,7 +118,7 @@ type Proposal = {
   id: string;
   session_id: string;
   kind: "github.pr.create" | "github.issue.create" | "sloppod.repo.grant";
-  status: "pending" | "approved" | "rejected" | "executed" | "failed";
+  status: "pending" | "approved" | "rejected" | "executed" | "failed" | "withdrawn";
   payload: Record<string, unknown>;  // per kind, see above
   result?: Record<string, unknown>;            // when executed; pull requests: {url, number}; issues: {issues: {title, url, number}[], failed: {title, error}[], message}
   error?: string;                              // when failed
@@ -209,6 +209,7 @@ Session pods use three more endpoints, on their own port (8081, `sessions`); tha
   - `propose_issues {issues: {title, body?, labels?}[], repo?}` creates a `github.issue.create` proposal (up to 50 issues; `repo` as for pull requests).
   - `request_repository {repo, reason}` creates a `sloppod.repo.grant` proposal.
   - `get_proposal {id}` returns a proposal's status and result. The agent is also told when its proposals are decided.
+  - `withdraw_proposal {id, reason?}` withdraws one of the session's pending proposals: it becomes `withdrawn` (with the reason) and nothing is carried out.
 - `/memini/*`: memini, for sessions with a `memory` grant, identified by the pod's IP. The runtime forwards each request to the owner's memini with the session's own key and namespace, and refuses memini's administration endpoints. The memini plugin's `MEMINI_BASE_URL` points here.
 
 In the pod, the repository is checked out at `/workspace/repo` on the session branch. `/workspace` is the session's own volume, kept across pod restarts.

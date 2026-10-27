@@ -54,6 +54,18 @@ fn tools(state: &AppState) -> Vec<Value> {
         "description": "Check the status of a proposal you made: pending, approved, rejected (with the reviewer's reason), executed (with the result, e.g. the PR URL) or failed.",
         "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
     }));
+    tools.push(json!({
+        "name": "withdraw_proposal",
+        "description": "Withdraw a proposal of yours that's still pending review, e.g. one that's wrong or that you've replaced. Nothing it proposed is carried out, and it's no longer shown to the reviewer.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "reason": {"type": "string", "description": "Why, kept with the proposal"},
+            },
+            "required": ["id"],
+        },
+    }));
     tools
 }
 
@@ -78,6 +90,30 @@ async fn call(state: &AppState, session: Uuid, params: &Value) -> Value {
                 false,
             ),
             _ => text("no such proposal".into(), true),
+        };
+    }
+    if name == "withdraw_proposal" {
+        let Some(id) = arguments["id"]
+            .as_str()
+            .and_then(|s| s.parse::<Uuid>().ok())
+        else {
+            return text("give the proposal's id".into(), true);
+        };
+        let reason = arguments["reason"]
+            .as_str()
+            .map(str::trim)
+            .filter(|r| !r.is_empty());
+        return match db::withdraw_proposal(&state.db, id, session, reason).await {
+            Ok(Some(row)) => {
+                state.hub.broadcast_proposal(&row.to_api());
+                text(format!("Proposal {id} is withdrawn."), false)
+            }
+            Ok(None) => text(
+                "no pending proposal of yours with that id; only pending ones can be withdrawn"
+                    .into(),
+                true,
+            ),
+            Err(e) => text(format!("couldn't withdraw it: {e}"), true),
         };
     }
     match proposals::propose(state, session, name, arguments).await {
