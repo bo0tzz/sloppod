@@ -235,8 +235,14 @@ test('approves a stack of pull requests', async ({ page }) => {
   await expect(layers.first()).toContainText('1. Back off when reconnecting');
   await expect(layers.last()).toContainText('2. Show the reconnect countdown');
   await expect(layers.last()).toContainText(/-ui → sloppod\/[0-9a-f]+-backoff/);
+  // Layers start folded, so a long stack stays readable.
+  await expect(layers.last().getByTestId('diff')).toBeHidden();
+  await layers.last().getByText('2. Show the reconnect countdown').click();
   await expect(layers.last().getByTestId('diff')).toContainText('Reconnecting in {seconds} s');
+  await layers.last().getByRole('heading', { name: /^Changes/ }).click();
+  await expect(layers.last().getByTestId('diff')).toBeHidden();
 
+  await layers.first().getByText('1. Back off when reconnecting').click();
   await page.getByRole('button', { name: 'Approve', exact: true }).click();
   await expect(page.getByTestId('system-notice')).toContainText('as stack #7');
 });

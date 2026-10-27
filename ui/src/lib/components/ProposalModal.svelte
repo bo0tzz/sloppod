@@ -15,7 +15,7 @@
     Text,
     Textarea,
   } from '@immich/ui';
-  import { mdiOpenInNew } from '@mdi/js';
+  import { mdiChevronRight, mdiOpenInNew } from '@mdi/js';
   import { onMount } from 'svelte';
   import {
     api,
@@ -28,6 +28,7 @@
     type RepoGrantPayload,
     type StackPayload,
   } from '#lib/api.ts';
+  import { parseUnifiedDiff } from '#lib/diff.ts';
   import { absoluteTime } from '#lib/format.ts';
   import { proposalStatus, proposalSummary } from '#lib/presentation.ts';
   import Markdown from './Markdown.svelte';
@@ -82,6 +83,14 @@
       loadError = error instanceof Error ? error.message : String(error);
     }
   });
+
+  function diffCounts(diff: string) {
+    const files = parseUnifiedDiff(diff) ?? [];
+    return {
+      additions: files.reduce((sum, file) => sum + file.additions, 0),
+      deletions: files.reduce((sum, file) => sum + file.deletions, 0),
+    };
+  }
 
   function resetDrafts() {
     if (detail?.kind !== 'github.issue.create') return;
@@ -351,20 +360,32 @@
   </Text>
   {#each stack.pull_requests as layer, index (layer.head)}
     {@const changes = detail.layers?.[index]}
-    <section class="border-light-200 flex flex-col gap-3 rounded-2xl border p-3" data-testid="stack-layer">
-      <div class="flex flex-col gap-1">
-        <Heading tag="h2" size="tiny">{index + 1}. {layer.title}</Heading>
-        <span class="text-muted font-mono text-xs break-all">{layer.head} → {layer.base}</span>
-      </div>
-      {#if layer.body.trim()}
-        <div class="bg-light-100 rounded-xl p-3 text-sm">
-          <Markdown text={layer.body} />
+    {@const counts = changes ? diffCounts(changes.diff) : null}
+    <details class="group/layer border-light-200 rounded-2xl border" data-testid="stack-layer">
+      <summary class="flex cursor-pointer list-none items-start gap-2 p-3">
+        <Icon icon={mdiChevronRight} size="1.25rem" class="text-muted mt-0.5 shrink-0 transition-transform group-open/layer:rotate-90" aria-hidden />
+        <div class="flex min-w-0 grow flex-col gap-1">
+          <Heading tag="h2" size="tiny">{index + 1}. {layer.title}</Heading>
+          <span class="text-muted font-mono text-xs break-all">
+            {layer.head} → {layer.base}{#if counts}
+              <span class="ms-2 font-sans">
+                <span class="text-success-600">+{counts.additions}</span>
+                <span class="text-danger-600">−{counts.deletions}</span>
+              </span>{/if}
+          </span>
         </div>
-      {/if}
-      {#if changes}
-        <PullRequestChanges diff={changes.diff} commits={changes.commits} bind:wrap={wrapLines} />
-      {/if}
-    </section>
+      </summary>
+      <div class="flex flex-col gap-3 px-3 pb-3">
+        {#if layer.body.trim()}
+          <div class="bg-light-100 rounded-xl p-3 text-sm">
+            <Markdown text={layer.body} />
+          </div>
+        {/if}
+        {#if changes}
+          <PullRequestChanges diff={changes.diff} commits={changes.commits} bind:wrap={wrapLines} />
+        {/if}
+      </div>
+    </details>
   {/each}
 {/snippet}
 

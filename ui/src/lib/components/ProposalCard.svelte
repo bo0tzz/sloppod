@@ -42,8 +42,11 @@
     <Icon icon={summary.icon} class="text-primary shrink-0" size="1.5em" aria-hidden />
     <div class="flex min-w-0 grow flex-col gap-0.5">
       <div class="flex items-center gap-2">
-        <span class="text-muted text-xs">{summary.label}</span>
-        <Badge size="tiny" shape="round" color={status.color}>{status.label}</Badge>
+        <span class="text-muted min-w-0 truncate text-xs">{summary.label}</span>
+        <!-- A pending card's Review button already says it's waiting on the user. -->
+        {#if !pending}
+          <Badge size="tiny" shape="round" color={status.color} class="shrink-0 whitespace-nowrap">{status.label}</Badge>
+        {/if}
       </div>
       <span class="truncate text-sm font-medium" title={summary.title}>{summary.title}</span>
       {#if summary.detail && !inline}
