@@ -688,3 +688,32 @@ async fn a_batch_that_can_no_longer_start_in_a_stopped_session_fails() {
     h.hub.clone().run_queued(h.id, agent, None, queued).await;
     assert!(reply.await.unwrap().is_err());
 }
+
+#[tokio::test]
+async fn a_question_from_ask_user_waits_for_its_answer_without_the_agent() {
+    let mut h = Harness::ready().await;
+    let questions = json!([{"question": "Which backoff?", "options": [{"label": "Exponential"}, {"label": "Fixed"}]}]);
+    h.hub.ask(h.id, questions).await.unwrap();
+    // The agent isn't blocked on it, and cancelling a turn leaves it.
+    assert_eq!(h.phase().await, "idle");
+    h.hub.cancel(h.id).await;
+    let replay = h.hub.replay(h.id).await.unwrap();
+    let (pid, method, _) = replay.permissions.first().cloned().expect("the question");
+    assert_eq!(method, "elicitation/create");
+
+    // Answered, it reaches the agent as a notice.
+    let answer = json!({"action": "accept", "content": {"question_0": "Fixed"}});
+    h.hub.answer_permission(h.id, pid, Ok(answer)).await;
+    // Past the cancel the agent was sent.
+    let request = loop {
+        let message = h.next().await;
+        if message["method"] == "session/prompt" {
+            break message;
+        }
+    };
+    assert_eq!(
+        prompt_text(&request),
+        ["sloppod: the user answered your question:\n- Which backoff?: Fixed"]
+    );
+    assert!(h.hub.replay(h.id).await.unwrap().permissions.is_empty());
+}
