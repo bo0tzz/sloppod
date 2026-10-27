@@ -432,8 +432,10 @@ async fn sync_transcript(dir: &str, sink: &mut Sink) {
             })
         })
         .collect();
-    if !files.is_empty() {
-        let _ = send(sink, &FromSupervisor::Transcript { files }).await;
+    if !files.is_empty()
+        && let Err(e) = send(sink, &FromSupervisor::Transcript { files }).await
+    {
+        tracing::warn!(error = %e, "syncing the transcript failed");
     }
 }
 
