@@ -272,6 +272,21 @@ test('shows the review a proposal went through on request', async ({ page }) => 
   await expect(history.getByRole('link', { name: 'Open the review session' })).toHaveAttribute('href', /^\/sessions\/[0-9a-f-]+$/);
 });
 
+test('an open proposal follows a decision made elsewhere', async ({ page }) => {
+  const id = await createSession(page, 'Propose something for sloppod I will approve elsewhere');
+  await finishTurn(page);
+  await page.getByTestId('proposal-card').getByRole('button', { name: 'Review' }).click();
+  await expect(page.getByRole('button', { name: 'Approve', exact: true })).toBeVisible();
+
+  const proposals: { id: string }[] = await (await page.request.get(`/api/v1/proposals?session=${id}`)).json();
+  const approved = await page.request.post(`/api/v1/proposals/${proposals[0].id}/approve`, { data: {} });
+  expect(approved.status()).toBe(200);
+
+  await expect(page.getByRole('button', { name: 'Approve', exact: true })).toBeHidden();
+  await expect(page.getByTestId('proposal-result')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Done' })).toBeVisible();
+});
+
 test('rejects a proposal with a reason', async ({ page }) => {
   await createSession(page, 'Propose something for sloppod I will reject');
   await finishTurn(page);
