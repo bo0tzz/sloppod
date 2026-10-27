@@ -16,7 +16,7 @@ A runtime for coding-agent sessions on Kubernetes. The design lives in the ADRs 
 ## Working here
 
 - Tools come from `mise.toml`. `mise run check` runs the format check, clippy and tests, the same as CI. Tests run against a throwaway Postgres (`dev/with-db.sh`); database tests use `#[sqlx::test]`, which gives each test a fresh migrated database.
-- UI: `cd ui && npm ci`, then `npm run check` and `npm run test:e2e` (Playwright against the mock runtime).
+- UI: `cd ui && npm ci`, then `npm run check` and `npm run test:e2e` (Playwright against the mock runtime); `mise run ui:check` runs all three.
 - End-to-end on a local cluster, where docker and kind are available:
   1. `dev/up.sh` creates a kind cluster with Cilium, agent-sandbox and Postgres, plus the `sloppod-db` and `sloppod-master-key` Secrets.
   2. `dev/deploy.sh` builds both images, loads them and installs the chart.
