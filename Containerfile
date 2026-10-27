@@ -49,6 +49,11 @@ ARG ADAPTER_VERSION=0.97.0
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git gh jq less procps ripgrep unzip xz-utils zstd \
         build-essential pkg-config \
+        # Shared libraries a headless Chromium links against, so sessions can install one (e.g. Playwright's) and
+        # run it. The browser itself is a session's own tool.
+        libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 libcairo2 libcups2t64 libdbus-1-3 \
+        libdrm2 libgbm1 libglib2.0-0t64 libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 \
+        libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 libfontconfig1 libfreetype6 fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 RUN curl -fsSL -o /usr/local/bin/mise \
         https://github.com/jdx/mise/releases/download/v${MISE_VERSION}/mise-v${MISE_VERSION}-linux-x64 \
