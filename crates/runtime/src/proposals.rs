@@ -208,7 +208,15 @@ impl ProposalKind for PullRequest {
                  wasn't opened; propose it again so the new commits get reviewed"
             )));
         }
-        let mut result = app.create_pull(repo, &request).await.map_err(err)?;
+        // A runtime restart can carry out an approved proposal again; reuse the pull request it already opened.
+        let existing = app
+            .open_pull(repo, head, payload["base"].as_str().unwrap_or_default())
+            .await
+            .map_err(err)?;
+        let mut result = match existing {
+            Some(pull) => pull,
+            None => app.create_pull(repo, &request).await.map_err(err)?,
+        };
         if payload["auto_merge"].as_bool() != Some(true) {
             return Ok(result);
         }
@@ -460,7 +468,13 @@ impl ProposalKind for Issues {
         app.ensure_labels(repo, &labels).await.map_err(err)?;
 
         let (mut filed, mut failed) = (Vec::new(), Vec::new());
+        // A runtime restart can carry out an approved proposal again; don't file the same issue twice.
+        let recent = app.recent_issues(repo).await.map_err(err)?;
         for issue in &issues {
+            if let Some(existing) = issue["title"].as_str().and_then(|t| recent.get(t)) {
+                filed.push(json!({"title": issue["title"], "url": existing["url"], "number": existing["number"]}));
+                continue;
+            }
             match app.create_issue(repo, issue).await {
                 Ok(result) => filed.push(json!({
                     "title": issue["title"],
@@ -722,6 +736,39 @@ pub async fn decide(
         }
     });
     Ok(Some(row.to_api()))
+}
+
+/// Carries out proposals that were approved but never finished, e.g. when the runtime restarted in between.
+pub async fn resume_approved(state: &AppState) {
+    let rows = match db::approved_proposals(&state.db).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, "listing approved proposals");
+            return;
+        }
+    };
+    for row in rows {
+        let Some(kind) = state.proposals.get(&row.kind).cloned() else {
+            continue;
+        };
+        tracing::info!(proposal = %row.id, kind = %row.kind, "resuming an approved proposal");
+        let summary = kind.summary(&row.payload);
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = carry_out(
+                &state,
+                row.id,
+                row.session_id,
+                kind.as_ref(),
+                &row.payload,
+                &summary,
+            )
+            .await
+            {
+                tracing::error!(proposal = %row.id, error = %e, "carrying out a resumed proposal");
+            }
+        });
+    }
 }
 
 async fn carry_out(

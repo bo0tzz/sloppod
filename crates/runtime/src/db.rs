@@ -412,6 +412,15 @@ pub async fn insert_proposal(
     .await
 }
 
+/// Proposals that were approved but not carried out, e.g. because the runtime restarted in between.
+pub async fn approved_proposals(db: &PgPool) -> sqlx::Result<Vec<ProposalRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "select {PROPOSAL_COLUMNS} from proposals where status = 'approved' order by decided_at"
+    )))
+    .fetch_all(db)
+    .await
+}
+
 pub async fn get_proposal(db: &PgPool, id: Uuid) -> sqlx::Result<Option<ProposalRow>> {
     sqlx::query_as(AssertSqlSafe(format!(
         "select {PROPOSAL_COLUMNS} from proposals where id = $1"
