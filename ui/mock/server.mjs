@@ -247,7 +247,7 @@ function echoUser(session, text, { steering = false, notice = false } = {}) {
 async function notifyAgent(session, text, ack) {
   echoUser(session, text, { notice: true });
   if (session.turn) {
-    session.turn.steers.push(text);
+    session.turn.steers.push({ text, ack });
     return;
   }
   if (session.data.phase !== 'idle') return;
@@ -338,6 +338,14 @@ async function runTurn(session, text, { echo = true } = {}) {
   }
   try {
     await agentScript(session, turn, text);
+    // Like a real agent, pick up messages that arrived after the last step instead of dropping them.
+    while (turn.steers.length > 0) {
+      const messageId = randomUUID();
+      for (const piece of chunks(steerReply(turn.steers.shift()))) {
+        session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: piece }, messageId });
+        await sleep(session.fast ? 0 : DELAY);
+      }
+    }
     return 'end_turn';
   } catch (error) {
     if (error === CANCELLED) {
@@ -355,6 +363,10 @@ async function runTurn(session, text, { echo = true } = {}) {
     if (sessions.has(session.data.id) && session.data.phase !== 'stopped') session.setPhase('idle');
   }
 }
+
+/** What the agent says to a message steered into its turn: a notice's own reply, or an acknowledgement. */
+const steerReply = ({ text, ack }) =>
+  ack ?? `Got your message mid-turn: “${text}”. I'll take that into account for the rest of this turn.`;
 
 function isFinished(session, toolCallId) {
   return session.log.some(
@@ -381,10 +393,7 @@ async function agentScript(session, turn, prompt) {
   const step = async (n = 1) => {
     await sleep(delay * n);
     checkCancel();
-    while (turn.steers.length > 0) {
-      const steer = turn.steers.shift();
-      await say(`Got your message mid-turn: “${steer}”. I'll take that into account for the rest of this turn.`);
-    }
+    while (turn.steers.length > 0) await say(steerReply(turn.steers.shift()));
   };
   const tool = (fields) => session.emit({ sessionUpdate: 'tool_call', ...fields });
   const update = (toolCallId, fields) => session.emit({ sessionUpdate: 'tool_call_update', toolCallId, ...fields });
@@ -800,7 +809,7 @@ function handleCall(conn, message) {
         return;
       }
       echoUser(session, text, { steering: true });
-      session.turn.steers.push(text);
+      session.turn.steers.push({ text });
       conn.respond(id, { outcome: 'injected' });
       return;
     }
