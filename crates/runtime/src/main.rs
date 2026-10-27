@@ -280,6 +280,7 @@ async fn reconcile(state: &AppState) {
         }
     }
     proposals::resume_approved(state).await;
+    proposals::resume_stack_watches(state).await;
 }
 
 /// Tells an agent whose turn a runtime restart cut off what it lost, so it can carry on without the user.

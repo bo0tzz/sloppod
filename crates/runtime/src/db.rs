@@ -489,6 +489,16 @@ pub async fn approved_proposals(db: &PgPool) -> sqlx::Result<Vec<ProposalRow>> {
     .await
 }
 
+/// Stacks set to merge themselves lately, which may still be waiting on their checks.
+pub async fn merging_stacks(db: &PgPool) -> sqlx::Result<Vec<ProposalRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "select {PROPOSAL_COLUMNS} from proposals where kind = 'github.stack.create' and status = 'executed' \
+         and (result->>'auto_merge')::boolean and decided_at > now() - interval '30 days'"
+    )))
+    .fetch_all(db)
+    .await
+}
+
 /// Withdraws one of the session's pending proposals; `None` if it isn't one.
 pub async fn withdraw_proposal(
     db: &PgPool,

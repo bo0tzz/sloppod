@@ -68,6 +68,17 @@ impl PushLog {
 /// How long a push the authorizer let through may take to land, for work that needs branches to hold still.
 const PUSH_SETTLE: Duration = Duration::from_secs(10 * 60);
 
+/// What [`GitHubApp::check_merging_stack`] found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StackWatch {
+    /// Merged, closed, or no longer set to merge: nothing left to watch.
+    Done,
+    /// Every layer is still at its proposed commit.
+    Holding,
+    /// This layer moved, and the stack's auto-merge is now off.
+    Moved(u64),
+}
+
 /// A linked stack to merge: its number, its pull requests and each layer's branch and proposed commit, bottom to
 /// top, and the top pull request's node id.
 #[derive(Clone, Copy)]
@@ -658,7 +669,11 @@ impl GitHubApp {
         Ok(disabled)
     }
 
-    async fn disable_pull_auto_merge_in(&self, repo: &str, node_id: &str) -> anyhow::Result<()> {
+    pub async fn disable_pull_auto_merge_in(
+        &self,
+        repo: &str,
+        node_id: &str,
+    ) -> anyhow::Result<()> {
         let token = self.token_for(repo).await?;
         let response: Value = self
             .http
@@ -860,6 +875,47 @@ impl GitHubApp {
         Ok(None)
     }
 
+    /// Checks on a stack that's set to merge itself: `Done` once its top pull request is closed, merged or no longer
+    /// set to merge, or the number of the first layer whose head moved from the commit it was proposed at, after
+    /// turning the top's auto-merge off.
+    pub async fn check_merging_stack(
+        &self,
+        repo: &str,
+        top_node_id: &str,
+        layers: &[(u64, &str)],
+    ) -> anyhow::Result<StackWatch> {
+        let mut pulls = Vec::new();
+        for (number, _) in layers {
+            let pull: Value = self
+                .repo_get(
+                    repo,
+                    &format!("/pulls/{number}"),
+                    "application/vnd.github+json",
+                )
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            pulls.push(pull);
+        }
+        let Some(top) = pulls.last() else {
+            return Ok(StackWatch::Done);
+        };
+        if top["state"] != "open" || top["auto_merge"].is_null() {
+            return Ok(StackWatch::Done);
+        }
+        let moved = layers.iter().zip(&pulls).find(|((_, sha), pull)| {
+            pull["state"] == "open" && pull["head"]["sha"].as_str() != Some(*sha)
+        });
+        match moved {
+            Some(((number, _), _)) => {
+                self.disable_pull_auto_merge_in(repo, top_node_id).await?;
+                Ok(StackWatch::Moved(*number))
+            }
+            None => Ok(StackWatch::Holding),
+        }
+    }
+
     /// A stack's pull requests, bottom to top.
     pub async fn stack_members(&self, repo: &str, stack: u64) -> anyhow::Result<Vec<u64>> {
         let stack: Value = self
@@ -996,6 +1052,8 @@ mod tests {
         heads: Mutex<HashMap<String, String>>,
         /// Head lookups fail while any pull request has auto-merge on.
         heads_fail_once_merging: bool,
+        /// Pull requests of `o/r` that are merged.
+        merged: Mutex<Vec<u64>>,
     }
 
     async fn commit(
@@ -1044,12 +1102,22 @@ mod tests {
         State(fake): State<Arc<Fake>>,
         Path((_, _, number)): Path<(String, String, u64)>,
     ) -> Result<Json<Value>, StatusCode> {
-        let pulls = fake.pulls.lock().unwrap();
-        pulls
-            .iter()
-            .find(|p| p.0 == number)
-            .map(|p| Json(pull_json(p)))
-            .ok_or(StatusCode::NOT_FOUND)
+        let mut pull = {
+            let pulls = fake.pulls.lock().unwrap();
+            pulls
+                .iter()
+                .find(|p| p.0 == number)
+                .map(pull_json)
+                .ok_or(StatusCode::NOT_FOUND)?
+        };
+        let branch = pull["head"]["ref"].as_str().unwrap_or_default().to_owned();
+        if let Some(sha) = fake.heads.lock().unwrap().get(&branch) {
+            pull["head"]["sha"] = json!(sha);
+        }
+        if fake.merged.lock().unwrap().contains(&number) {
+            pull["state"] = json!("closed");
+        }
+        Ok(Json(pull))
     }
 
     fn stack_json(number: u64, members: &[u64]) -> Value {
@@ -1338,6 +1406,60 @@ mod tests {
                 .contains("couldn't be checked")
         );
         assert!(auto_merging(&fake).is_empty());
+    }
+
+    const WATCHED: &[(u64, &str)] = &[(1, "a"), (2, "b"), (3, "c")];
+
+    /// The stack #7, its top set to merge it.
+    fn merging() -> Fake {
+        let fake = unmerged();
+        fake.pulls.lock().unwrap()[2].2 = true;
+        fake
+    }
+
+    #[tokio::test]
+    async fn a_merging_stack_holds_while_its_layers_do() {
+        let (_, app) = serve(merging()).await;
+        assert_eq!(
+            app.check_merging_stack("o/r", "PR3", WATCHED)
+                .await
+                .unwrap(),
+            StackWatch::Holding
+        );
+    }
+
+    #[tokio::test]
+    async fn a_moved_layer_stops_the_stack_merging() {
+        let (fake, app) = serve(merging()).await;
+        fake.heads.lock().unwrap().insert("s-1".into(), "a2".into());
+        assert_eq!(
+            app.check_merging_stack("o/r", "PR3", WATCHED)
+                .await
+                .unwrap(),
+            StackWatch::Moved(1)
+        );
+        assert!(auto_merging(&fake).is_empty());
+    }
+
+    #[tokio::test]
+    async fn watching_ends_once_the_stack_merged_or_stopped_merging() {
+        let (fake, app) = serve(merging()).await;
+        fake.merged.lock().unwrap().extend([1, 2, 3]);
+        assert_eq!(
+            app.check_merging_stack("o/r", "PR3", WATCHED)
+                .await
+                .unwrap(),
+            StackWatch::Done
+        );
+
+        let (fake, app) = serve(unmerged()).await;
+        fake.heads.lock().unwrap().insert("s-1".into(), "a2".into());
+        assert_eq!(
+            app.check_merging_stack("o/r", "PR3", WATCHED)
+                .await
+                .unwrap(),
+            StackWatch::Done
+        );
     }
 
     #[tokio::test]
