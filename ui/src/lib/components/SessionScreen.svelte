@@ -35,9 +35,10 @@
   const session = $derived(view.session);
   const title = $derived(session?.title || 'New session');
   const pendingProposals = $derived(view.proposals.filter((proposal) => proposal.status === 'pending'));
-  // Approved proposals are carried out in the background; their cards stay until that's done, or show why it failed.
+  // Approved proposals are carried out in the background; their cards stay until that's done. Failures go to the
+  // agent, not here.
   const openProposals = $derived(
-    view.proposals.filter((proposal) => ['pending', 'approved', 'failed'].includes(proposal.status)),
+    view.proposals.filter((proposal) => proposal.status === 'pending' || proposal.status === 'approved'),
   );
   const showReconnecting = $derived(view.loaded && view.connection !== 'open');
   const activity = $derived.by(() => {
@@ -55,7 +56,8 @@
 
   let openProposalId = $state<string | null>(null);
   const openProposal = $derived(view.proposals.find((proposal) => proposal.id === openProposalId));
-  let showProposalList = $state(false);
+  /** The proposals list: everything (from the menu), or just the open ones (from the bar above the composer). */
+  let proposalList = $state<'all' | 'open' | null>(null);
   let showAddRepo = $state(false);
 
   let scroller = $state<HTMLElement | null>(null);
@@ -132,7 +134,7 @@
           shape="round"
           color="secondary"
           indicator={pendingProposals.length > 0 ? 'warning' : undefined}
-          onclick={() => (showProposalList = true)}
+          onclick={() => (proposalList = 'all')}
         />
         <ContextMenuButton
           aria-label="Session actions"
@@ -215,13 +217,30 @@
               onAnswer={(optionId) => view.answerPermission(request, optionId)}
             />
           {/each}
-          {#each openProposals as proposal (proposal.id)}
+          {#if openProposals.length === 1}
             <ProposalCard
-              {proposal}
-              onOpen={() => (openProposalId = proposal.id)}
+              proposal={openProposals[0]}
+              onOpen={() => (openProposalId = openProposals[0].id)}
               onChange={(proposal) => view.upsertProposal(proposal)}
             />
-          {/each}
+          {:else if openProposals.length > 1}
+            <!-- Several at once would crowd out the chat, especially on a phone. -->
+            <div class="border-primary/40 bg-primary/5 flex items-center gap-3 rounded-2xl border px-3 py-2" data-testid="proposals-bar">
+              <span class="grow text-sm">
+                {#if pendingProposals.length > 0}
+                  <span class="font-medium">{pendingProposals.length} {pendingProposals.length === 1 ? 'proposal' : 'proposals'} to review</span>
+                {/if}
+                {#if openProposals.length > pendingProposals.length}
+                  <span class="text-muted">
+                    {pendingProposals.length > 0 ? ', ' : ''}{openProposals.length - pendingProposals.length} being carried out
+                  </span>
+                {/if}
+              </span>
+              <Button size="small" shape="round" onclick={() => (proposalList = 'open')}>
+                {pendingProposals.length > 0 ? 'Review' : 'View'}
+              </Button>
+            </div>
+          {/if}
         </div>
       </div>
     {/if}
@@ -230,15 +249,15 @@
   </div>
 {/if}
 
-{#if showProposalList}
+{#if proposalList}
   <ProposalListModal
-    proposals={[...view.proposals].reverse()}
+    proposals={[...(proposalList === 'open' ? openProposals : view.proposals)].reverse()}
     onOpen={(proposalId) => {
-      showProposalList = false;
+      proposalList = null;
       openProposalId = proposalId;
     }}
     onChange={(proposal) => view.upsertProposal(proposal)}
-    onClose={() => (showProposalList = false)}
+    onClose={() => (proposalList = null)}
   />
 {/if}
 
