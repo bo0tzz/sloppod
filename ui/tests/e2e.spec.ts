@@ -270,6 +270,11 @@ test('shows the review a proposal went through on request', async ({ page }) => 
   await expect(rounds.last()).toContainText('Passed');
   await expect(rounds.last()).toContainText('Reset it after a successful session/load.');
   await expect(history.getByRole('link', { name: 'Open the review session' })).toHaveAttribute('href', /^\/sessions\/[0-9a-f-]+$/);
+
+  // A review session opens like any other, but the session list doesn't take it in.
+  await history.getByRole('link', { name: 'Open the review session' }).click();
+  await expect(page.getByRole('heading', { level: 1 })).toContainText('Review:');
+  await expect(page.getByRole('navigation', { name: 'Sessions' }).getByText('Review:')).toHaveCount(0);
 });
 
 test('an open proposal follows a decision made elsewhere', async ({ page }) => {
@@ -855,6 +860,42 @@ test('wakes a parked session from the session menu', async ({ page }) => {
   await page.getByRole('button', { name: 'Session actions' }).click();
   await page.getByRole('menuitem', { name: 'Wake' }).click();
   await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+});
+
+test('a list fetched before a delete, arriving late, leaves the session deleted', async ({ page }) => {
+  await createSession(page, 'Remove this while a list is on its way');
+  await finishTurn(page);
+  const rows = page.getByTestId('session-row').filter({ hasText: 'Remove this while' });
+
+  // Hold the next list, fetched while the session still exists, until after a newer one has arrived.
+  let release: (() => void) | undefined;
+  const released = new Promise<void>((resolve) => (release = resolve));
+  let holding = false;
+  await page.route('**/api/v1/sessions', async (route) => {
+    if (holding || route.request().method() !== 'GET') return route.fallback();
+    holding = true;
+    const stale = await (await route.fetch()).json();
+    await released;
+    await route.fulfill({ json: stale });
+  });
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await expect.poll(() => holding).toBe(true);
+
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await page.getByRole('menuitem', { name: 'Delete session' }).click();
+  await page.getByRole('button', { name: 'Delete', exact: true }).click();
+  await expect(page).toHaveURL(/\/$/);
+  const newer = page.waitForResponse((response) => response.url().endsWith('/api/v1/sessions') && response.status() === 200);
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await newer;
+  await expect(rows).toHaveCount(0);
+
+  const late = page.waitForResponse((response) => response.url().endsWith('/api/v1/sessions'));
+  release!();
+  await late;
+  // Checked once, not retried: the next poll would hide a session the late list put back.
+  await page.waitForTimeout(300);
+  expect(await rows.count()).toBe(0);
 });
 
 test('a deleted session can be restored from Settings', async ({ page }) => {
