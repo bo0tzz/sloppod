@@ -276,6 +276,7 @@ async fn launch_for(
         command: agent.command.clone(),
         env,
         cwd: work_dir(session).to_owned(),
+        runtime_build: state.config.build.clone(),
     };
     Ok((launch, agent))
 }

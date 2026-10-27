@@ -9,7 +9,9 @@ use anyhow::{Context, bail};
 use base64::Engine;
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
-use sloppod_protocol::link::{FromSupervisor, Launch, PATH, ToSupervisor, TranscriptFile};
+use sloppod_protocol::link::{
+    FromSupervisor, Launch, PATH, RUNTIME_INFO, ToSupervisor, TranscriptFile,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::signal::unix::{SignalKind, signal};
@@ -282,6 +284,11 @@ async fn prepare(
     ));
     env.push(("GIT_CONFIG_KEY_1".into(), "push.default".into()));
     env.push(("GIT_CONFIG_VALUE_1".into(), "current".into()));
+
+    write_file(
+        &args.workdir.join(RUNTIME_INFO),
+        &serde_json::to_vec_pretty(&serde_json::json!({"build": launch.runtime_build}))?,
+    )?;
 
     if let Some(ca) = &launch.ca_pem {
         let dir = args.workdir.join(".sloppod");

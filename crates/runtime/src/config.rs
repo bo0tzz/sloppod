@@ -95,6 +95,10 @@ pub struct Config {
     #[arg(long, env = "SLOPPOD_MEMINI_NAMESPACE_PREFIX", default_value = "")]
     pub memini_namespace_prefix: String,
 
+    /// What this runtime was built from (a release tag or commit); agents can read it in their pod.
+    #[arg(long, env = "SLOPPOD_BUILD")]
+    pub build: Option<String>,
+
     /// Instructions rendered into every session as the agent's user-level instructions.
     #[arg(long, env = "SLOPPOD_INSTRUCTIONS_FILE")]
     pub instructions_file: Option<PathBuf>,

@@ -129,6 +129,8 @@ pub mod link {
 
     /// Path of the supervisor link WebSocket on the runtime.
     pub const PATH: &str = "/link/v1";
+    /// Where in the session's workdir the supervisor keeps `{"build": ...}` for the runtime it's connected to.
+    pub const RUNTIME_INFO: &str = ".sloppod/runtime.json";
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct File {
@@ -165,6 +167,9 @@ pub mod link {
         pub command: Vec<String>,
         pub env: Vec<(String, String)>,
         pub cwd: String,
+        /// What the runtime was built from; the supervisor writes it where the agent can read it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub runtime_build: Option<String>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
