@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use sloppod_contracts::{Grant, ReviewSubject};
 use uuid::Uuid;
@@ -57,6 +58,7 @@ pub async fn start(
         // Queued first, so the round reaches the reviewer however long waking it takes.
         state.hub.notify(session, prompt).await;
         wake_for_round(state, session);
+        watch_round(state, proposal.id, session, round);
         return Ok(());
     }
     let author = db::get_session(&state.db, proposal.session_id)
@@ -97,7 +99,150 @@ pub async fn start(
     let session = db::get_session(&state.db, id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("the review session vanished"))?;
-    api::place(state, &session).await
+    api::place(state, &session).await?;
+    watch_round(state, proposal.id, id, round);
+    Ok(())
+}
+
+/// The longest a review round may take, from its start to its verdict.
+const ROUND_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Whether a round that started at `started` has run out of time, counted from its stored start so a restart
+/// doesn't reset it.
+fn round_timed_out(started: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now - started > chrono::Duration::from_std(ROUND_TIMEOUT).unwrap_or_default()
+}
+
+/// What's left to do about a review round that hasn't reached a verdict.
+#[derive(Debug, PartialEq, Eq)]
+enum Stall {
+    /// Still going, or not started yet.
+    Wait,
+    /// A turn ended without a verdict: remind the reviewer once.
+    Nudge,
+    /// It won't finish: hand the proposal to the user unreviewed.
+    GiveUp,
+}
+
+/// Decides about a round after a check: `turn_ended` says a reviewer turn ended since the last check.
+fn stall(turn_ended: bool, nudged: bool, timed_out: bool) -> Stall {
+    match (timed_out, turn_ended, nudged) {
+        (true, _, _) | (false, true, true) => Stall::GiveUp,
+        (false, true, false) => Stall::Nudge,
+        (false, false, _) => Stall::Wait,
+    }
+}
+
+/// Follows a review round until it reaches a verdict. A reviewer that ends its turn without calling
+/// `submit_review` is reminded once; one that does so again, or takes longer than [`ROUND_TIMEOUT`], leaves the
+/// proposal to the user unreviewed, so it never sits in review for good.
+fn watch_round(state: &AppState, proposal: Uuid, session: Uuid, round: i32) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let (mut in_turn, mut nudged) = (false, false);
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            // Errors are retried at the next check; only a confirmed outcome ends the watch.
+            let (rounds, current) = match tokio::try_join!(
+                db::reviews(&state.db, proposal),
+                db::get_proposal(&state.db, proposal)
+            ) {
+                Ok(found) => found,
+                Err(e) => {
+                    tracing::warn!(%proposal, error = %e, "checking a review round");
+                    continue;
+                }
+            };
+            let Some(this) = rounds.into_iter().find(|r| r.round == round) else {
+                return;
+            };
+            if this.verdict.is_some() || current.is_none_or(|p| p.status != "in_review") {
+                return;
+            }
+            let timed_out = round_timed_out(this.created_at, Utc::now());
+            let running = state.hub.turn_running(session).await;
+            let turn_ended = in_turn && !running;
+            in_turn = running;
+            match stall(turn_ended, nudged, timed_out) {
+                Stall::Wait => {}
+                Stall::Nudge => {
+                    nudged = true;
+                    state
+                        .hub
+                        .notify(
+                            session,
+                            "sloppod: your turn ended without a verdict. Finish this review round by calling the \
+                             `submit_review` tool; a chat reply doesn't count."
+                                .into(),
+                        )
+                        .await;
+                }
+                Stall::GiveUp => match give_up(&state, proposal, session, round).await {
+                    Ok(()) => return,
+                    Err(e) => {
+                        tracing::warn!(%proposal, error = %e, "handing a stalled review to the user")
+                    }
+                },
+            }
+        }
+    });
+}
+
+/// Watches the review rounds still running, e.g. after the runtime restarted; a round that ran out of time
+/// meanwhile is handed over at the first check.
+pub async fn resume_round_watches(state: &AppState) {
+    let proposals = match db::proposals_with_status(&state.db, "in_review").await {
+        Ok(proposals) => proposals,
+        Err(e) => {
+            tracing::error!(error = %e, "listing proposals in review");
+            return;
+        }
+    };
+    for proposal in proposals {
+        let Some(session) = proposal.review_session_id else {
+            continue;
+        };
+        match db::reviews(&state.db, proposal.id).await {
+            Ok(rounds) => {
+                if let Some(round) = rounds.last().filter(|r| r.verdict.is_none()) {
+                    watch_round(state, proposal.id, session, round.round);
+                }
+            }
+            Err(e) => tracing::error!(proposal = %proposal.id, error = %e, "listing review rounds"),
+        }
+    }
+}
+
+/// Hands a proposal whose review stalled to the user, unreviewed: no standing approval matches it then.
+async fn give_up(
+    state: &AppState,
+    proposal: Uuid,
+    session: Uuid,
+    round: i32,
+) -> anyhow::Result<()> {
+    let Some(row) = db::move_proposal(&state.db, proposal, "in_review", "pending", None).await?
+    else {
+        // It left review meanwhile, which settles it too.
+        return Ok(());
+    };
+    state.hub.broadcast_proposal(&row.to_api());
+    let about = state
+        .proposals
+        .get(&row.kind)
+        .map(|kind| kind.summary(&row.payload))
+        .unwrap_or_else(|| row.kind.clone());
+    state
+        .hub
+        .notify(
+            row.session_id,
+            format!(
+                "sloppod: the review of your proposal ({about}) didn't finish: round {round} got no verdict. It went \
+                 to the user unreviewed."
+            ),
+        )
+        .await;
+    end(state, session);
+    Ok(())
 }
 
 /// A review session's standing instructions, given as its agent's system prompt. Adapted from kritika's
@@ -645,6 +790,28 @@ mod tests {
         assert!(check_findings(&json!([finding(json!({"title": " "}))]), 1, &[]).is_err());
         assert!(check_findings(&json!([finding(json!({"prior": "9.9"}))]), 2, &["1.1"]).is_err());
         assert!(check_findings(&json!({"title": "x"}), 1, &[]).is_err());
+    }
+
+    #[test]
+    fn a_round_times_out_from_its_stored_start() {
+        let now = Utc::now();
+        assert!(!round_timed_out(now - chrono::Duration::minutes(29), now));
+        // Started before a restart and expired meanwhile: given up at the first check after it.
+        let expired = now - chrono::Duration::minutes(31);
+        assert!(round_timed_out(expired, now));
+        assert_eq!(
+            stall(false, false, round_timed_out(expired, now)),
+            Stall::GiveUp
+        );
+    }
+
+    #[test]
+    fn a_stalled_round_is_nudged_once_then_given_up() {
+        assert_eq!(stall(false, false, false), Stall::Wait);
+        assert_eq!(stall(true, false, false), Stall::Nudge);
+        assert_eq!(stall(false, true, false), Stall::Wait);
+        assert_eq!(stall(true, true, false), Stall::GiveUp);
+        assert_eq!(stall(false, false, true), Stall::GiveUp);
     }
 
     #[test]
