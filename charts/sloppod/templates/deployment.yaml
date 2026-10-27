@@ -45,6 +45,8 @@ spec:
                   fieldPath: metadata.namespace
             - name: SLOPPOD_SERVICE
               value: {{ include "sloppod.fullname" . }}
+            - name: SLOPPOD_CLUSTER_DOMAIN
+              value: {{ .Values.clusterDomain | quote }}
             - name: SLOPPOD_RUNTIME_SELECTOR
               value: app.kubernetes.io/name=sloppod,app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=runtime
             - name: SLOPPOD_CA_SECRET

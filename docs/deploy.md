@@ -10,6 +10,7 @@ Releases are `v<version>` tags: chart `<version>` on images tagged `v<version>` 
 ## Cluster prerequisites
 
 - **Cilium with CiliumEnvoyConfig support:** Cilium's own Helm value `envoyConfig.enabled=true` (not a sloppod value). `dev/cilium-values.yaml` is a known-good Cilium configuration. Nodes need `net.ipv4.conf.all.src_valid_mark=0`, or every L7 redirect is dropped ([ADR 11](adr/0011-enforcement-at-the-pod-boundary.md)).
+- **Session DNS:** sessions may look up only the hosts they may reach and names under the cluster domain (`clusterDomain`, default `cluster.local`); Cilium's DNS proxy refuses the rest. Resolvers stop at a refused search-list expansion, so if nodes add search domains of their own to pods' `resolv.conf`, set Cilium's `dnsProxy.dnsRejectResponseCode=nameError`, or sessions can't resolve anything outside the cluster.
 - **agent-sandbox v1.0.8:** `https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v1.0.8/sandbox.yaml`. Only the core `Sandbox` CRD and controller are needed.
 - **Postgres**, e.g. a CloudNativePG `Cluster`. The chart reads a connection URI from a Secret, such as CNPG's `<cluster>-app` Secret, key `uri`.
 - **A default StorageClass** with `ReadWriteOnce` volumes, or set `session.storage.storageClass`. Each session gets its own volume.

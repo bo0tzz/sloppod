@@ -20,6 +20,7 @@ pub struct Cilium {
     envoy_configs: Api<DynamicObject>,
     runtime_labels: Vec<(String, String)>,
     runtime_port: u16,
+    cluster_domain: String,
 }
 
 fn api(client: &kube::Client, namespace: &str, kind: &str, plural: &str) -> Api<DynamicObject> {
@@ -41,6 +42,7 @@ impl Cilium {
         namespace: &str,
         runtime_labels: Vec<(String, String)>,
         runtime_port: u16,
+        cluster_domain: &str,
     ) -> Self {
         Self {
             namespace: namespace.to_owned(),
@@ -53,6 +55,7 @@ impl Cilium {
             envoy_configs: api(client, namespace, "CiliumEnvoyConfig", "ciliumenvoyconfigs"),
             runtime_labels,
             runtime_port,
+            cluster_domain: cluster_domain.to_owned(),
         }
     }
 
@@ -220,6 +223,19 @@ fn fqdn_selector(host: &str) -> Value {
     }
 }
 
+/// Names a session may look up: the hosts it may reach, and in-cluster names, which cluster DNS answers itself. The
+/// latter cover the runtime's Service and the resolver's search-list expansions (`github.com.<ns>.svc.cluster.local`),
+/// which have to come back NXDOMAIN rather than refused, or resolvers give up before trying the name as given.
+fn dns_rules(egress: &EgressSpec, cluster_domain: &str) -> Vec<Value> {
+    egress
+        .intercepted_hosts
+        .iter()
+        .chain(&egress.direct_hosts)
+        .map(|h| fqdn_selector(h))
+        .chain([json!({"matchPattern": format!("**.{cluster_domain}")})])
+        .collect()
+}
+
 #[async_trait]
 impl Enforcer for Cilium {
     fn manifest(&self) -> Manifest {
@@ -236,7 +252,7 @@ impl Enforcer for Cilium {
         let mut rules = vec![
             json!({
                 "toEndpoints": [{"matchLabels": {"k8s:io.kubernetes.pod.namespace": "kube-system", "k8s-app": "kube-dns"}}],
-                "toPorts": [{"ports": [{"port": "53", "protocol": "ANY"}], "rules": {"dns": [{"matchPattern": "*"}]}}],
+                "toPorts": [{"ports": [{"port": "53", "protocol": "ANY"}], "rules": {"dns": dns_rules(egress, &self.cluster_domain)}}],
             }),
             json!({
                 "toEndpoints": [{"matchLabels": runtime}],
@@ -303,6 +319,24 @@ mod tests {
         assert_eq!(
             fqdn_selector("productionresultssa*.blob.core.windows.net"),
             json!({"matchPattern": "productionresultssa*.blob.core.windows.net"})
+        );
+    }
+
+    #[test]
+    fn resolves_only_reachable_and_cluster_names() {
+        let egress = EgressSpec {
+            session_id: "s".into(),
+            pod_labels: Default::default(),
+            intercepted_hosts: vec!["api.anthropic.com".into()],
+            direct_hosts: vec!["crates.io".into()],
+        };
+        assert_eq!(
+            dns_rules(&egress, "cluster.local"),
+            vec![
+                json!({"matchName": "api.anthropic.com"}),
+                json!({"matchName": "crates.io"}),
+                json!({"matchPattern": "**.cluster.local"}),
+            ]
         );
     }
 }

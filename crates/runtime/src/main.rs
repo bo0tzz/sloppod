@@ -148,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
         &config.namespace,
         config.runtime_labels(),
         config.sessions_listen.port(),
+        &config.cluster_domain,
     ));
     let authz_addr = SocketAddr::new(cluster_ip.parse()?, config.authz_listen.port());
 
