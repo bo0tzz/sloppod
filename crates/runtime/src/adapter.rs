@@ -90,7 +90,8 @@ fn session_prompt(context: &AgentContext) -> String {
     }
     workspace.push_str(
         "- In each repository, you can push only your session branch and branches named after it \
-         (`<session branch>-<name>`, e.g. for a second pull request). For write access to another repository, \
+         (`<session branch>-<name>`, e.g. for a second pull request; the name has only letters, digits, `.`, `_` \
+         and `-`). For write access to another repository, \
          call the `request_repository` tool.\n\
          - Outward actions are proposals that a human reviews. To open a pull request, push your branch and call \
          the `propose_pull_request` tool; sloppod opens the PR once it's approved. To file issues, call the \

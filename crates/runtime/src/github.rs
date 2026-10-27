@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::OnceCell;
@@ -96,6 +97,16 @@ pub struct StackMerge<'a> {
     pub pulls: &'a [u64],
     pub top_node_id: &'a str,
     pub layers: &'a [(&'a str, &'a str)],
+}
+
+/// A branch name as a URL path segment: its `/`s stay, since GitHub reads them as part of the name there.
+fn branch_in_path(branch: &str) -> String {
+    const KEEP: &AsciiSet = &NON_ALPHANUMERIC
+        .remove(b'/')
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_');
+    utf8_percent_encode(branch, KEEP).to_string()
 }
 
 /// One cached token, minted by whichever caller gets the slot first; the others wait for it.
@@ -594,7 +605,11 @@ impl GitHubApp {
     }
 
     pub async fn compare(&self, repo: &str, base: &str, head: &str) -> anyhow::Result<Comparison> {
-        let range = format!("/compare/{base}...{head}");
+        let range = format!(
+            "/compare/{}...{}",
+            branch_in_path(base),
+            branch_in_path(head)
+        );
         let response = self
             .repo_get(repo, &range, "application/vnd.github+json")
             .await?;
@@ -646,7 +661,13 @@ impl GitHubApp {
     pub async fn disable_auto_merge(&self, repo: &str, branch: &str) -> anyhow::Result<Vec<u64>> {
         let owner = repo.split('/').next().unwrap_or_default();
         let headed: Vec<Value> = self
-            .repo_json(repo, &format!("/pulls?state=open&head={owner}:{branch}"))
+            .repo_json(
+                repo,
+                &format!(
+                    "/pulls?state=open&head={}",
+                    utf8_percent_encode(&format!("{owner}:{branch}"), NON_ALPHANUMERIC)
+                ),
+            )
             .await?;
         // A stack merges through auto-merge on its top pull request, so a push to any layer turns that off too.
         let mut numbers: Vec<u64> = Vec::new();
@@ -1356,6 +1377,15 @@ mod tests {
         let tokens = futures::future::join_all((0..10).map(|_| app.token_for("o/r"))).await;
         assert!(tokens.iter().all(|t| t.as_deref().ok() == Some("token-1")));
         assert_eq!(fake.mints.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn branches_keep_their_meaning_in_urls() {
+        assert_eq!(
+            branch_in_path("sloppod/abcd1234-v1.2_x"),
+            "sloppod/abcd1234-v1.2_x"
+        );
+        assert_eq!(branch_in_path("a#b+c d"), "a%23b%2Bc%20d");
     }
 
     #[tokio::test]
