@@ -40,6 +40,8 @@ const CANCELLED = Symbol('cancelled');
 /** @type {Map<string, MockSession>} */
 const sessions = new Map();
 const proposals = new Map();
+/** Review rounds by proposal id (ADR 24). */
+const reviews = new Map();
 const connections = new Set();
 const credentials = [];
 
@@ -621,6 +623,40 @@ async function agentScript(session, turn, prompt) {
   );
 }
 
+/** A review that asked for changes once, then passed: what a proposal looks like when it reaches the user. */
+function addReview(proposal) {
+  proposal.review_session_id = randomUUID();
+  reviews.set(proposal.id, [
+    {
+      round: 1,
+      head_sha: sha(),
+      verdict: 'changes',
+      summary: 'The backoff works, but it never resets.',
+      findings: [
+        {
+          path: FILE,
+          line: 12,
+          severity: 'high',
+          comment: 'The attempt counter is never reset, so after one flaky night every reconnect waits 10 s.',
+        },
+        { severity: 'low', comment: 'No test covers the cap.' },
+      ],
+      created_at: now(),
+      finished_at: now(),
+    },
+    {
+      round: 2,
+      head_sha: sha(),
+      replies: 'Reset it after a successful session/load. The cap is a constant; a test would only restate it.',
+      verdict: 'pass',
+      summary: 'The reset is in place, and the reply about the cap is fair.',
+      findings: [],
+      created_at: now(),
+      finished_at: now(),
+    },
+  ]);
+}
+
 function createProposal(session) {
   const oldFile = `export class AcpConnection {\n  #timer: ReturnType<typeof setTimeout> | undefined;\n\n  connect() {\n    // …\n  }\n\n${OLD_SNIPPET}\n}\n`;
   const newFile = `const MAX_BACKOFF_MS = 10_000;\n\nexport class AcpConnection {\n  #timer: ReturnType<typeof setTimeout> | undefined;\n  #attempt = 0;\n\n  connect() {\n    // …\n  }\n\n${NEW_SNIPPET}\n}\n`;
@@ -656,6 +692,7 @@ function createProposal(session) {
       { sha: sha(), message: 'Test reconnecting after the socket drops' },
     ],
   };
+  if (session.data.review === 'required') addReview(proposal);
   proposals.set(id, proposal);
   broadcastProposal(proposal);
   applyStandingApproval(proposal);
@@ -1098,6 +1135,7 @@ async function handleApi(req, res, url) {
     const proposal = proposals.get(parts[1]);
     if (!proposal) return json(res, 404, { error: 'proposal not found' });
     if (parts.length === 2 && method === 'GET') return json(res, 200, proposal);
+    if (parts.length === 3 && parts[2] === 'reviews' && method === 'GET') return json(res, 200, reviews.get(proposal.id) ?? []);
     if (parts.length === 3 && method === 'POST' && (parts[2] === 'approve' || parts[2] === 'reject')) {
       if (proposal.status !== 'pending') return json(res, 409, { error: `proposal is already ${proposal.status}` });
       const body = await readBody(req);

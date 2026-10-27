@@ -241,6 +241,26 @@ test('approves a stack of pull requests', async ({ page }) => {
   await expect(page.getByTestId('system-notice')).toContainText('as stack #7');
 });
 
+test('shows the review a proposal went through on request', async ({ page }) => {
+  const id = await createSession(page, 'Propose a reviewed PR for sloppod');
+  const put = await page.request.put(`/api/v1/sessions/${id}/review`, { data: { review: 'required' } });
+  expect(put.status()).toBe(200);
+  await finishTurn(page);
+  await page.getByTestId('proposal-card').getByRole('button', { name: 'Review' }).click();
+
+  const history = page.getByTestId('review-history');
+  await expect(page.getByTestId('review-round')).toHaveCount(0);
+  await history.getByText('Review by Codex').click();
+  const rounds = history.getByTestId('review-round');
+  await expect(rounds).toHaveCount(2);
+  await expect(rounds.first()).toContainText('Changes requested');
+  await expect(rounds.first().getByTestId('review-finding')).toHaveCount(2);
+  await expect(rounds.first()).toContainText('ui/src/lib/acp/connection.ts:12');
+  await expect(rounds.last()).toContainText('Passed');
+  await expect(rounds.last()).toContainText('Reset it after a successful session/load.');
+  await expect(history.getByRole('link', { name: 'Open the review session' })).toHaveAttribute('href', /^\/sessions\/[0-9a-f-]+$/);
+});
+
 test('rejects a proposal with a reason', async ({ page }) => {
   await createSession(page, 'Propose something for sloppod I will reject');
   await finishTurn(page);

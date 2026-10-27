@@ -32,6 +32,7 @@
   import { proposalStatus, proposalSummary } from '#lib/presentation.ts';
   import Markdown from './Markdown.svelte';
   import PullRequestChanges from './PullRequestChanges.svelte';
+  import ReviewHistory from './ReviewHistory.svelte';
 
   let {
     proposal,
@@ -212,6 +213,10 @@
           <Alert color="danger" size="small" title="Execution failed">{detail.error ?? 'Unknown error'}</Alert>
         {:else if detail.status === 'rejected'}
           <Alert color="secondary" size="small" title="Rejected">{detail.reason || 'No reason given.'}</Alert>
+        {/if}
+
+        {#if detail.review_session_id}
+          <ReviewHistory proposalId={detail.id} reviewSessionId={detail.review_session_id} />
         {/if}
 
         {#if pr}
