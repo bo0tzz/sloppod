@@ -111,6 +111,14 @@ struct TokenScope {
 }
 
 impl TokenScope {
+    fn full(installation: u64) -> Self {
+        TokenScope {
+            installation,
+            repositories: None,
+            permissions: None,
+        }
+    }
+
     fn body(&self) -> Value {
         let mut body = json!({});
         if let Some(repositories) = &self.repositories {
@@ -407,27 +415,37 @@ impl GitHubApp {
         Ok(Some(value))
     }
 
-    /// A token with everything the installation on `repo` has. Only for the runtime's own calls, never sessions.
-    pub async fn token_for(&self, repo: &str) -> anyhow::Result<String> {
-        // A second try looks the installation up afresh, in case the cached one was removed.
+    /// Mints a token for the scope `scope` works out, or `None` if its installation is gone. A second try works the
+    /// scope out afresh, since a gone installation is forgotten.
+    async fn mint_scoped<F, Fut>(&self, scope: F) -> anyhow::Result<Option<String>>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = anyhow::Result<Option<TokenScope>>>,
+    {
         for _ in 0..2 {
-            let installation = self.installation_for(repo).await?;
-            let scope = TokenScope {
-                installation,
-                repositories: None,
-                permissions: None,
+            let Some(scope) = scope().await? else {
+                continue;
             };
             if let Some(token) = self.mint(scope).await? {
-                return Ok(token);
+                return Ok(Some(token));
             }
         }
-        bail!("the GitHub App's installation on {repo} keeps disappearing")
+        Ok(None)
+    }
+
+    /// A token with everything the installation on `repo` has. Only for the runtime's own calls, never sessions.
+    pub async fn token_for(&self, repo: &str) -> anyhow::Result<String> {
+        self.mint_scoped(|| async move {
+            Ok(Some(TokenScope::full(self.installation_for(repo).await?)))
+        })
+        .await?
+        .with_context(|| format!("the GitHub App's installation on {repo} keeps disappearing"))
     }
 
     /// A session's read-only token, through the installation on `repo`: it covers the repositories in `granted`
     /// that share that installation (`repo` among them), with [`READ_PERMISSIONS`].
     pub async fn read_token(&self, repo: &str, granted: &[&str]) -> anyhow::Result<String> {
-        for _ in 0..2 {
+        self.mint_scoped(|| async move {
             let installation = self.installation_for(repo).await?;
             let mut covered = vec![repo];
             for other in granted {
@@ -438,42 +456,37 @@ impl GitHubApp {
                 }
             }
             let Some(permissions) = self.installation_permissions(installation).await? else {
-                continue;
+                return Ok(None);
             };
-            let scope = TokenScope {
+            Ok(Some(TokenScope {
                 installation,
                 repositories: Some(repository_names(covered)),
                 permissions: Some(read_permissions(&permissions)),
-            };
-            if let Some(token) = self.mint(scope).await? {
-                return Ok(token);
-            }
-        }
-        bail!("the GitHub App's installation on {repo} keeps disappearing")
+            }))
+        })
+        .await?
+        .with_context(|| format!("the GitHub App's installation on {repo} keeps disappearing"))
     }
 
     /// A session's token for pushing to `repo`: that repository only, with `contents: write`.
     pub async fn push_token(&self, repo: &str) -> anyhow::Result<String> {
-        for _ in 0..2 {
-            let installation = self.installation_for(repo).await?;
-            let scope = TokenScope {
-                installation,
+        self.mint_scoped(|| async move {
+            Ok(Some(TokenScope {
+                installation: self.installation_for(repo).await?,
                 repositories: Some(repository_names([repo])),
                 permissions: Some(BTreeMap::from([
                     ("contents".to_owned(), "write".to_owned()),
                     ("metadata".to_owned(), "read".to_owned()),
                 ])),
-            };
-            if let Some(token) = self.mint(scope).await? {
-                return Ok(token);
-            }
-        }
-        bail!("the GitHub App's installation on {repo} keeps disappearing")
+            }))
+        })
+        .await?
+        .with_context(|| format!("the GitHub App's installation on {repo} keeps disappearing"))
     }
 
     /// A token from any of the app's installations, for the runtime's reads that aren't tied to one repository.
     pub async fn any_token(&self) -> anyhow::Result<String> {
-        for _ in 0..2 {
+        self.mint_scoped(|| async move {
             let cached = self
                 .installations
                 .lock()
@@ -495,16 +508,10 @@ impl GitHubApp {
                         .context("the GitHub App has no installations")?
                 }
             };
-            let scope = TokenScope {
-                installation,
-                repositories: None,
-                permissions: None,
-            };
-            if let Some(token) = self.mint(scope).await? {
-                return Ok(token);
-            }
-        }
-        bail!("the GitHub App's installations keep disappearing")
+            Ok(Some(TokenScope::full(installation)))
+        })
+        .await?
+        .context("the GitHub App's installations keep disappearing")
     }
 
     /// Repositories the app is installed on.
@@ -523,12 +530,7 @@ impl GitHubApp {
             let Some(id) = installation["id"].as_u64() else {
                 continue;
             };
-            let scope = TokenScope {
-                installation: id,
-                repositories: None,
-                permissions: None,
-            };
-            let Some(token) = self.mint(scope).await? else {
+            let Some(token) = self.mint(TokenScope::full(id)).await? else {
                 continue;
             };
             let token = &token;
