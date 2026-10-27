@@ -22,7 +22,7 @@ impl FromRequestParts<AppState> for User {
     ) -> Result<Self, Self::Rejection> {
         // Session pods only get the sessions port, but never let them act as a user even if they got through.
         if let Some(ConnectInfo(peer)) = parts.extensions.get::<ConnectInfo<SocketAddr>>()
-            && state.pods.session_for_ip(&peer.ip().to_string()).is_some()
+            && state.pods.is_session_ip(&peer.ip().to_string())
         {
             return Err((
                 StatusCode::FORBIDDEN,
