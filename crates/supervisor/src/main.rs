@@ -379,11 +379,22 @@ async fn prepare(
             send(FromSupervisor::Status {
                 message: "installing tools with mise".into(),
             });
-            let result = async {
-                run_cmd(&env, &repo.path, "mise", &["trust", "--yes", "--all"]).await?;
-                run_cmd(&env, &repo.path, "mise", &["install"]).await
-            }
-            .await;
+            // Only locked versions, verified against the lockfile's checksums and provenance (ADR 12). Only for this
+            // install: the agent may still add tools and lock them.
+            let mut install_env = env.clone();
+            install_env.push(("MISE_LOCKED".into(), "1".into()));
+            install_env.push(("MISE_LOCKED_VERIFY_PROVENANCE".into(), "1".into()));
+            let result = if dir.join("mise.lock").exists() {
+                async {
+                    run_cmd(&env, &repo.path, "mise", &["trust", "--yes", "--all"]).await?;
+                    run_cmd(&install_env, &repo.path, "mise", &["install"]).await
+                }
+                .await
+            } else {
+                Err(anyhow::anyhow!(
+                    "the repository has no mise.lock, so its tools weren't installed; add one with `mise lock`"
+                ))
+            };
             if let Err(e) = result {
                 send(FromSupervisor::Status {
                     message: format!("mise install failed: {e:#}"),
