@@ -72,6 +72,8 @@ export type Proposal = {
   decided_at?: string;
   /** The user who decided, or `standing-approval:<id>`. */
   decided_by?: string;
+  /** The session reviewing it, or that did. */
+  review_session_id?: string;
 };
 
 /** A pre-approved proposal pattern: matching proposals are approved as they're made. */
@@ -87,6 +89,20 @@ export type StandingApproval = {
 };
 
 export type NewStandingApproval = Omit<StandingApproval, 'id' | 'created_at'>;
+
+/** One round of a proposal's review by another model (ADR 24). */
+export type Review = {
+  round: number;
+  head_sha: string;
+  /** The author's replies to the previous round's findings. */
+  replies?: string;
+  /** Absent while the round runs. */
+  verdict?: 'pass' | 'changes';
+  summary?: string;
+  findings: { path?: string; line?: number; severity?: 'high' | 'medium' | 'low'; comment: string }[];
+  created_at: string;
+  finished_at?: string;
+};
 
 /** Pull requests add their diff and commits; other kinds add nothing. */
 export type ProposalDetail = Proposal & {
@@ -192,6 +208,7 @@ export const api = {
     return call<Proposal[]>('GET', `/proposals?${params}`);
   },
   getProposal: (id: string) => call<ProposalDetail>('GET', `/proposals/${encodeURIComponent(id)}`),
+  listReviews: (id: string) => call<Review[]>('GET', `/proposals/${encodeURIComponent(id)}/reviews`),
   approveProposal: (id: string, edits: ProposalEdits = {}) =>
     call<Proposal>('POST', `/proposals/${encodeURIComponent(id)}/approve`, edits),
   rejectProposal: (id: string, reason?: string) =>
