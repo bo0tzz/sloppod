@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import type { Proposal } from '../src/lib/api.ts';
 
 const FINAL = /Done\. The tests pass/;
 
@@ -129,7 +130,7 @@ test('stops a running turn', async ({ page }) => {
 });
 
 test('approves a proposal with an edited title', async ({ page }) => {
-  await createSession(page, 'Propose a PR for sloppod');
+  const id = await createSession(page, 'Propose a PR for sloppod');
   await finishTurn(page);
 
   const card = page.getByTestId('proposal-card');
@@ -149,13 +150,13 @@ test('approves a proposal with an edited title', async ({ page }) => {
   await page.getByRole('textbox', { name: 'Title' }).fill('Back off when reconnecting the ACP socket');
   await page.getByRole('button', { name: 'Approve with edits' }).click();
 
-  await expect(detail.getByTestId('proposal-status')).toHaveText('Opened');
-  await expect(detail.getByTestId('proposal-result')).toHaveAttribute('href', /github\.com\/bo0tzz\/sloppod\/pull\/\d+/);
-  await expect(detail.getByTestId('proposal-title')).toHaveText('Back off when reconnecting the ACP socket');
-  await expect(detail.getByTestId('proposal-auto-merge')).toBeHidden();
-
-  await page.getByRole('button', { name: 'Close' }).click();
+  await expect(detail).toBeHidden();
   await expect(page.getByTestId('proposal-card')).toBeHidden();
+  await expect(page.getByTestId('system-notice')).toContainText(/github\.com\/bo0tzz\/sloppod\/pull\/\d+/);
+  const proposals: Proposal[] = await (await page.request.get(`/api/v1/proposals?session=${id}`)).json();
+  const pr = proposals.find((p) => p.kind === 'github.pr.create');
+  expect(pr?.payload.title).toBe('Back off when reconnecting the ACP socket');
+  expect(pr?.payload.auto_merge).toBe(false);
 });
 
 test('rejects a proposal with a reason', async ({ page }) => {
@@ -167,9 +168,8 @@ test('rejects a proposal with a reason', async ({ page }) => {
   await page.getByRole('textbox', { name: 'Reason (optional)' }).fill('Not now');
   await page.getByRole('button', { name: 'Reject', exact: true }).click();
 
-  const detail = page.getByTestId('proposal-detail');
-  await expect(detail.getByTestId('proposal-status')).toHaveText('Rejected');
-  await expect(detail).toContainText('Not now');
+  await expect(page.getByTestId('proposal-detail')).toBeHidden();
+  await expect(page.getByTestId('system-notice')).toContainText('Your proposal was rejected: Not now');
 });
 
 async function expectTranscriptOnce(page: Page, prompt: string) {
@@ -345,8 +345,7 @@ test('shows a proposal of an unknown kind generically', async ({ page }) => {
   await expect(page.getByTestId('proposal-payload')).toContainText('"cluster": "home"');
   await page.getByRole('button', { name: 'Reject…' }).click();
   await page.getByRole('button', { name: 'Reject', exact: true }).click();
-  await expect(page.getByTestId('proposal-status')).toHaveText('Rejected');
-  await page.getByRole('button', { name: 'Done' }).click();
+  await expect(page.getByTestId('proposal-detail')).toBeHidden();
   await expect(page.getByTestId('system-notice')).toContainText('Your proposal was rejected');
 });
 
