@@ -2,19 +2,15 @@
   import { Alert, Button, Heading, LoadingSpinner, Text } from '@immich/ui';
   import { onMount } from 'svelte';
   import { api, type StandingApproval } from '#lib/api.ts';
+  import { proposalKinds } from '#lib/presentation.ts';
   import { sessions } from '#lib/sessions.svelte.ts';
 
-  const kinds = [
-    { value: 'github.pr.create', label: 'Pull requests' },
-    { value: 'github.issue.create', label: 'Issues' },
-    { value: 'sloppod.repo.grant', label: 'Repository access' },
-  ];
 
   let approvals = $state<StandingApproval[] | null>(null);
   let loadError = $state<string | null>(null);
   let actionError = $state<string | null>(null);
 
-  const kindLabel = (value: string) => kinds.find((k) => k.value === value)?.label ?? value;
+  const kindLabel = (kind: string) => proposalKinds[kind]?.plural ?? kind;
   const sessionTitle = (id?: string) => sessions.list.find((session) => session.id === id)?.title || 'a session';
   const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
