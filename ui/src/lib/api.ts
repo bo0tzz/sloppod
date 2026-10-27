@@ -18,7 +18,7 @@ export type NewSession = {
   title?: string;
 };
 
-export type Grant = { capability: string; params: Record<string, unknown> };
+export type Grant = { capability: string; params: Record<string, unknown>; description?: string };
 
 export type ProposalStatus = 'pending' | 'approved' | 'rejected' | 'executed' | 'failed' | 'withdrawn';
 

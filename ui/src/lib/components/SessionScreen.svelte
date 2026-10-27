@@ -10,13 +10,21 @@
     modalManager,
     toastManager,
   } from '@immich/ui';
-  import { mdiArrowDown, mdiCogOutline, mdiSourcePull, mdiSourceRepository, mdiTrashCanOutline } from '@mdi/js';
+  import {
+    mdiArrowDown,
+    mdiCogOutline,
+    mdiShieldKeyOutline,
+    mdiSourcePull,
+    mdiSourceRepository,
+    mdiTrashCanOutline,
+  } from '@mdi/js';
   import { onMount } from 'svelte';
   import { api } from '#lib/api.ts';
   import { SessionView } from '#lib/session.svelte.ts';
   import { sessions } from '#lib/sessions.svelte.ts';
   import AddRepoModal from './AddRepoModal.svelte';
   import ChatHeader from './ChatHeader.svelte';
+  import GrantsModal from './GrantsModal.svelte';
   import PermissionCard from './PermissionCard.svelte';
   import QuestionCard from './QuestionCard.svelte';
   import PhaseBadge from './PhaseBadge.svelte';
@@ -59,6 +67,7 @@
   /** The proposals list: everything (from the menu), or just the open ones (from the bar above the composer). */
   let proposalList = $state<'all' | 'open' | null>(null);
   let showAddRepo = $state(false);
+  let showGrants = $state(false);
 
   let scroller = $state<HTMLElement | null>(null);
   let content = $state<HTMLElement | null>(null);
@@ -139,6 +148,12 @@
         <ContextMenuButton
           aria-label="Session actions"
           items={[
+            {
+              title: 'Grants',
+              icon: mdiShieldKeyOutline,
+              $if: () => Boolean(session),
+              onAction: () => (showGrants = true),
+            },
             {
               title: 'Add repository…',
               icon: mdiSourceRepository,
@@ -259,6 +274,10 @@
     onChange={(proposal) => view.upsertProposal(proposal)}
     onClose={() => (proposalList = null)}
   />
+{/if}
+
+{#if showGrants && session}
+  <GrantsModal grants={session.grants} onClose={() => (showGrants = false)} />
 {/if}
 
 {#if showAddRepo && session}

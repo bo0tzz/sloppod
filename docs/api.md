@@ -52,8 +52,10 @@ type Session = {
 };
 
 // What the session may do (ADR 2). Capabilities so far: "model", "github" (read: public data, plus the "repo"
-// grants), "packages" (package registries), "repo" {repo, access: "rw", branch}, "memory" {namespace, access: "rw"}.
-type Grant = { capability: string; params: Record<string, unknown> };
+// grants), "packages" (package registries), "codex" (Codex through the owner's ChatGPT login), "repo"
+// {repo, access: "rw", branch}, "memory" {namespace, access: "rw"}. `description` says what the grant allows in plain
+// terms, in the same words the agent's `list_grants` tool uses.
+type Grant = { capability: string; params: Record<string, unknown>; description?: string };
 
 type Phase =
   | "starting"           // pod being created or agent not connected yet

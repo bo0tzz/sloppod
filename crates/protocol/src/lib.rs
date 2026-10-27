@@ -70,6 +70,9 @@ pub mod api {
         pub capability: String,
         #[serde(default)]
         pub params: Value,
+        /// What the grant lets the session do; set by the runtime, ignored on input.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub description: Option<String>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]

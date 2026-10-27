@@ -648,3 +648,12 @@ test('the sidebar folds away on narrow screens', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 800 });
   await expect(sidebar).toBeVisible();
 });
+
+test('lists the session grants from the session menu', async ({ page }) => {
+  await createSession(page, 'Fix the build in bo0tzz/sloppod');
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await page.getByRole('menuitem', { name: 'Grants' }).click();
+  const grants = page.getByTestId('grants');
+  await expect(grants.getByText("Claude's API, with the owner's Claude account.")).toBeVisible();
+  await expect(grants.getByText(/^bo0tzz\/sloppod: read, and push the session branch `sloppod\//)).toBeVisible();
+});

@@ -85,6 +85,7 @@ impl SessionRow {
                 .map(|g| api::Grant {
                     capability: g.capability.clone(),
                     params: g.params.clone(),
+                    description: Some(crate::grants::describe(g)),
                 })
                 .collect(),
             phase: Phase::parse(&self.phase),

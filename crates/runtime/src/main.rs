@@ -7,6 +7,7 @@ mod credentials;
 mod db;
 mod enforcer;
 mod github;
+mod grants;
 mod link;
 mod mcp;
 mod memini;
