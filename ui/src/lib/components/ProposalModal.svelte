@@ -66,9 +66,11 @@
     }
   });
 
+  /** Records the decision; the modal only stays open to show a failure. */
   function applyResult(proposal: Proposal) {
     if (detail) detail = { ...detail, ...proposal };
     onChange(proposal);
+    if (proposal.status !== 'failed') onClose();
   }
 
   async function approve() {
