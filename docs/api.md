@@ -11,7 +11,7 @@ All bodies are JSON. Errors are `{"error": "<message>"}` with a 4xx/5xx status.
 ### Sessions
 
 ```
-GET    /api/v1/sessions             -> Session[]   (most recently updated first)
+GET    /api/v1/sessions             -> Session[]   (most recently active first)
 POST   /api/v1/sessions             -> Session     body: NewSession
 GET    /api/v1/sessions/{id}        -> Session
 DELETE /api/v1/sessions/{id}        -> 204         parks the session (cancelling its turn) and marks it deleted; restorable for 7 days, then purged with its pod, volume and keys
@@ -163,13 +163,15 @@ type Review = {
 };
 
 type ProposalDetail = Proposal & {
-  // github.pr.create only:
+  // github.pr.create:
   diff?: string;          // unified diff of base...head
   commits?: { sha: string; message: string }[];
+  // github.stack.create: each pull request's, from the base up
+  layers?: { diff: string; commits: { sha: string; message: string }[] }[];
 };
 ```
 
-Approving returns as soon as the decision is recorded, with status `approved`; the proposal is carried out in the background and its outcome (`executed` or `failed`) follows as a `_sloppod/proposal` update, and in `GET /api/v1/proposals/{id}`. A proposal still `approved` when the runtime restarts is carried out again on startup; executors don't repeat work already done (an open pull request from the same head into the same base is reused, and issues with the same title filed in the last day aren't filed again). Approving with edits changes the payload first: `github.pr.create` takes `{title?, body?, auto_merge?}`; `github.issue.create` takes `{issues}`, the issues to file, so leaving one out drops it. Other kinds take no edits. A proposal's status only moves forward (`in_review` and `changes_requested`, back and forth between review rounds; then `pending`; then `approved` or `rejected`; then `executed` or `failed`), so a UI can ignore a copy, e.g. from a slow refetch, that is behind the one it has. Undecided proposals, in review or not, can be withdrawn.
+Approving returns as soon as the decision is recorded, with status `approved`; the proposal is carried out in the background and its outcome (`executed` or `failed`) follows as a `_sloppod/proposal` update, and in `GET /api/v1/proposals/{id}`. A proposal still `approved` when the runtime restarts is carried out again on startup; executors don't repeat work already done (an open pull request from the same head into the same base is reused, and issues with the same title filed in the last day aren't filed again). Approving with edits changes the payload first: `github.pr.create` takes `{title?, body?, auto_merge?}`; `github.stack.create` takes `{pull_requests?: {title?, body?}[], auto_merge?}`, the pull requests' edits by position; `github.issue.create` takes `{issues}`, the issues to file, so leaving one out drops it. `sloppod.repo.grant` takes no edits. A proposal's status only moves forward (`in_review` and `changes_requested`, back and forth between review rounds; then `pending`; then `approved` or `rejected`; then `executed` or `failed`), so a UI can ignore a copy, e.g. from a slow refetch, that is behind the one it has. Undecided proposals, in review or not, can be withdrawn.
 
 ### Standing approvals
 
