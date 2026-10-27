@@ -585,10 +585,15 @@ async fn create_standing_approval(
     if target.is_some_and(|t| t.split('/').count() != 2) {
         return Err(bad_request("give the target repository as owner/name"));
     }
-    if let Some(session) = new.session_id
-        && db::owned_session(&state.db, session, &user)
-            .await?
-            .is_none()
+    // Each session's autonomy is its own call, so a standing approval covers one session.
+    let Some(session) = new.session_id else {
+        return Err(bad_request(
+            "a standing approval is for one session; give its session_id",
+        ));
+    };
+    if db::owned_session(&state.db, session, &user)
+        .await?
+        .is_none()
     {
         return Err(bad_request("unknown session"));
     }

@@ -1227,6 +1227,7 @@ function applyStandingApproval(proposal) {
   const match = standingApprovals.find(
     (a) =>
       a.kind === proposal.kind &&
+      a.session_id === proposal.session_id &&
       (!a.target || a.target.toLowerCase() === String(proposal.payload.repo ?? '').toLowerCase()) &&
       (!a.expires_at || Date.parse(a.expires_at) > Date.now()),
   );
@@ -1238,7 +1239,8 @@ function handleStandingApprovals(req, res, parts) {
   if (parts.length === 1 && method === 'GET') return json(res, 200, standingApprovals);
   if (parts.length === 1 && method === 'POST') {
     return readBody(req).then((body) => {
-      const approval = { id: randomUUID(), kind: body.kind, target: body.target, edits: body.edits ?? {}, expires_at: body.expires_at, created_at: now() };
+      if (!body.session_id) return json(res, 400, { error: 'a standing approval is for one session; give its session_id' });
+      const approval = { id: randomUUID(), kind: body.kind, session_id: body.session_id, target: body.target, edits: body.edits ?? {}, expires_at: body.expires_at, created_at: now() };
       standingApprovals.push(approval);
       return json(res, 201, approval);
     });

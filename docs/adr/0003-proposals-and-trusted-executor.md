@@ -52,3 +52,5 @@ Prior art:
 - Atlantis plans terraform changes for review and applies them only after approval.
 
 2026-10-27: two relaxations are built. Approving a PR can turn on GitHub's auto-merge, so "merging stays a human decision" now means the human decides at approval: auto-merge only merges the commit that was reviewed, and new commits pushed to its branch turn it off. Standing approvals match a proposal's kind, its target (the repository, for every built-in kind), optionally one session, and an expiry; they can only add the auto-merge edit. A matching proposal is approved as it's made and goes through the same executor, and its record names the standing approval that decided it.
+
+2026-10-27: standing approvals now cover one session each, set from that session's menu ("Approve its pull requests automatically"); ones covering all of an owner's sessions were revoked. How much a session may do unattended is decided per session, alongside its review policy ([ADR 24](0024-automated-review-before-human-review.md)), under which a proposal only reaches a standing approval after it passes review.

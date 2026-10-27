@@ -12,6 +12,7 @@
   } from '@immich/ui';
   import {
     mdiArrowDown,
+    mdiCheckDecagramOutline,
     mdiCogOutline,
     mdiMagnifyScan,
     mdiShieldKeyOutline,
@@ -69,6 +70,8 @@
   let proposalList = $state<'all' | 'open' | null>(null);
   let showAddRepo = $state(false);
   let showGrants = $state(false);
+  /** This session's standing approval for pull requests, if its pull requests are approved automatically. */
+  let autoApproval = $state<string | null>(null);
 
   const waiting = $derived(view.permissions.length > 0 || view.questions.length > 0 || openProposals.length > 0);
   let width = $state(0);
@@ -80,6 +83,11 @@
   let atBottom = $state(true);
 
   onMount(() => {
+    api.listStandingApprovals().then(
+      (approvals) =>
+        (autoApproval = approvals.find((a) => a.session_id === id && a.kind === 'github.pr.create')?.id ?? null),
+      () => {},
+    );
     view.start();
     return () => view.stop();
   });
@@ -111,6 +119,27 @@
     } catch (error) {
       toastManager.danger({
         title: "Couldn't change the review setting",
+        description: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  async function toggleAutoApproval() {
+    try {
+      if (autoApproval) {
+        await api.revokeStandingApproval(autoApproval);
+        autoApproval = null;
+      } else {
+        const approval = await api.createStandingApproval({
+          kind: 'github.pr.create',
+          session_id: id,
+          edits: { auto_merge: true },
+        });
+        autoApproval = approval.id;
+      }
+    } catch (error) {
+      toastManager.danger({
+        title: "Couldn't change automatic approval",
         description: error instanceof Error ? error.message : String(error),
       });
     }
@@ -229,6 +258,12 @@
               icon: mdiMagnifyScan,
               $if: () => session?.kind === 'work',
               onAction: toggleReview,
+            },
+            {
+              title: autoApproval ? 'Stop approving its pull requests' : 'Approve its pull requests automatically',
+              icon: mdiCheckDecagramOutline,
+              $if: () => session?.kind === 'work',
+              onAction: toggleAutoApproval,
             },
             { title: 'Settings', icon: mdiCogOutline, href: '/settings' },
             { title: 'Delete session', icon: mdiTrashCanOutline, color: 'danger', onAction: deleteSession },
