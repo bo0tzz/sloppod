@@ -675,6 +675,61 @@ impl GitHubApp {
         Ok(())
     }
 
+    /// An open pull request from `head` into `base`, if there is one, in `create_pull`'s result shape.
+    pub async fn open_pull(
+        &self,
+        repo: &str,
+        head: &str,
+        base: &str,
+    ) -> anyhow::Result<Option<Value>> {
+        let owner = repo.split('/').next().unwrap_or_default();
+        let pulls: Vec<Value> = self
+            .repo_get(
+                repo,
+                &format!("/pulls?state=open&head={owner}:{head}&base={base}"),
+                "application/vnd.github+json",
+            )
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(pulls.first().map(|body| {
+            json!({"url": body["html_url"], "number": body["number"], "node_id": body["node_id"]})
+        }))
+    }
+
+    /// Issues created in the last day, by title, in `create_issue`'s result shape.
+    pub async fn recent_issues(&self, repo: &str) -> anyhow::Result<HashMap<String, Value>> {
+        let since = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        let issues: Vec<Value> = self
+            .repo_get(
+                repo,
+                &format!("/issues?state=all&since={since}&per_page=100"),
+                "application/vnd.github+json",
+            )
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(issues
+            .into_iter()
+            .filter(|issue| {
+                issue["pull_request"].is_null()
+                    && issue["created_at"]
+                        .as_str()
+                        .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+                        .is_some_and(|at| at > Utc::now() - chrono::Duration::days(1))
+            })
+            .filter_map(|issue| {
+                let title = issue["title"].as_str()?.to_owned();
+                Some((
+                    title,
+                    json!({"url": issue["html_url"], "number": issue["number"]}),
+                ))
+            })
+            .collect())
+    }
+
     pub async fn create_issue(&self, repo: &str, payload: &Value) -> anyhow::Result<Value> {
         let body = self.repo_post(repo, "/issues", payload).await?;
         Ok(json!({"url": body["html_url"], "number": body["number"]}))
