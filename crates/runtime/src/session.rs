@@ -1,6 +1,8 @@
 //! Live session state between the agent (over the supervisor link) and any number of UIs (over `/acp`).
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use serde_json::{Value, json};
@@ -28,8 +30,12 @@ pub enum UiEvent {
     },
 }
 
-/// A prompt sent before the agent was ready; it runs with the rest of the queue once it is.
+/// A prompt waiting for the agent to be up or for the running turn to end; it runs with the rest of the queue
+/// as the next turn.
 struct Queued {
+    /// Messages queued behind a running turn have an id, so UIs can show them and steer them in; they're
+    /// recorded when they run.
+    id: Option<Uuid>,
     blocks: Vec<Value>,
     reply: Option<oneshot::Sender<Result<Value, RpcError>>>,
 }
@@ -82,6 +88,8 @@ pub struct Replay {
     pub agent_state: Value,
     /// Open permission requests and questions: id, method, params.
     pub permissions: Vec<(u64, String, Value)>,
+    /// The `_sloppod/queue` notification for messages waiting for the running turn to end.
+    pub queue: Value,
 }
 
 impl Hub {
@@ -211,21 +219,55 @@ impl Hub {
             self.set_phase(id, Phase::Idle).await;
             return;
         }
-        let hub = self.clone();
-        tokio::spawn(async move {
+        tokio::spawn(self.clone().run_queued(id, pending, queued));
+    }
+
+    /// Runs queued prompts (and a prompt the agent was holding, if any) as one turn, and answers each prompt
+    /// with its outcome. Boxed because a turn ending starts the next queued one.
+    fn run_queued(
+        self: Arc<Self>,
+        id: Uuid,
+        pending: Option<String>,
+        queued: Vec<Queued>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(async move {
+            for q in queued.iter().filter(|q| q.id.is_some()) {
+                self.record_user_message(id, &json!(q.blocks), false).await;
+            }
             let mut blocks: Vec<Value> = pending
                 .into_iter()
                 .map(|text| json!({"type": "text", "text": text}))
                 .collect();
             blocks.extend(queued.iter().flat_map(|q| q.blocks.iter().cloned()));
-            let result = hub.run_turn(id, blocks).await;
+            let result = self.run_turn(id, blocks).await;
             if let Err(e) = &result {
                 tracing::warn!(session = %id, error = %e, "queued prompt failed");
             }
             for reply in queued.into_iter().filter_map(|q| q.reply) {
                 let _ = reply.send(result.clone());
             }
-        });
+        })
+    }
+
+    /// The `_sloppod/queue` notification for the messages waiting behind the running turn.
+    fn queue_notification(id: Uuid, queue: &[Queued]) -> Value {
+        let messages: Vec<Value> = queue
+            .iter()
+            .filter_map(|q| q.id.map(|qid| json!({"id": qid, "prompt": q.blocks})))
+            .collect();
+        notification(
+            "_sloppod/queue",
+            json!({"sessionId": id, "messages": messages}),
+        )
+    }
+
+    async fn broadcast_queue(&self, id: Uuid) {
+        let message = {
+            let live = self.live(id);
+            let state = live.state.lock().await;
+            Self::queue_notification(id, &state.queue)
+        };
+        self.broadcast(id, UiEvent::Notification { seq: None, message });
     }
 
     pub async fn set_loading(&self, id: Uuid, loading: bool) {
@@ -396,31 +438,32 @@ impl Hub {
         }
     }
 
-    /// Starts a turn, or queues the prompt until the agent is up; resolves when its turn ends.
-    pub async fn prompt(&self, id: Uuid, params: Value) -> Result<Value, RpcError> {
+    /// Starts a turn, or queues the prompt until the agent is up or the running turn ends; resolves when its
+    /// turn ends.
+    pub async fn prompt(self: &Arc<Self>, id: Uuid, params: Value) -> Result<Value, RpcError> {
         let blocks = params["prompt"].as_array().cloned().unwrap_or_default();
-        let queued = {
+        let (queued, behind_turn) = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
-            if state.agent.is_some() && state.agent_session_id.is_some() {
-                if state.turn_running {
-                    return Err(RpcError::new(
-                        -32002,
-                        "a turn is already running; steer it instead",
-                    ));
-                }
+            let agent_up = state.agent.is_some() && state.agent_session_id.is_some();
+            if agent_up && !state.turn_running {
                 state.turn_running = true;
-                None
+                (None, false)
             } else {
                 let (reply, receiver) = oneshot::channel();
                 state.queue.push(Queued {
+                    id: agent_up.then(Uuid::new_v4),
                     blocks: blocks.clone(),
                     reply: Some(reply),
                 });
-                Some(receiver)
+                (Some(receiver), agent_up)
             }
         };
-        self.record_user_message(id, &params["prompt"], false).await;
+        if behind_turn {
+            self.broadcast_queue(id).await;
+        } else {
+            self.record_user_message(id, &params["prompt"], false).await;
+        }
         match queued {
             Some(receiver) => receiver.await.unwrap_or_else(|_| {
                 Err(RpcError::new(
@@ -432,8 +475,8 @@ impl Hub {
         }
     }
 
-    /// Runs one turn; the caller has set `turn_running`.
-    async fn run_turn(&self, id: Uuid, blocks: Vec<Value>) -> Result<Value, RpcError> {
+    /// Runs one turn; the caller has set `turn_running`. Messages queued behind it run as the next turn.
+    async fn run_turn(self: &Arc<Self>, id: Uuid, blocks: Vec<Value>) -> Result<Value, RpcError> {
         let (agent, agent_session_id) = match self.agent_for(id).await {
             Ok(agent) => agent,
             Err(e) => {
@@ -448,10 +491,52 @@ impl Hub {
                 json!({"sessionId": agent_session_id, "prompt": blocks}),
             )
             .await;
-        self.live(id).state.lock().await.turn_running = false;
+        let next = {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            let agent_up = state.agent.is_some() && state.agent_session_id.is_some();
+            state.turn_running = agent_up && !state.queue.is_empty();
+            state.turn_running.then(|| std::mem::take(&mut state.queue))
+        };
         if self.agent_for(id).await.is_ok() {
-            self.set_phase(id, Phase::Idle).await;
             agent.sync_transcript();
+            match next {
+                Some(queued) => {
+                    self.broadcast_queue(id).await;
+                    tokio::spawn(self.clone().run_queued(id, None, queued));
+                }
+                None => self.set_phase(id, Phase::Idle).await,
+            }
+        }
+        result
+    }
+
+    /// Moves a message waiting behind the running turn into it.
+    pub async fn steer_queued(
+        self: &Arc<Self>,
+        id: Uuid,
+        params: Value,
+    ) -> Result<Value, RpcError> {
+        let qid = params["id"]
+            .as_str()
+            .and_then(|q| q.parse::<Uuid>().ok())
+            .ok_or_else(|| RpcError::new(-32602, "missing or invalid id"))?;
+        let queued = {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            let index = state
+                .queue
+                .iter()
+                .position(|q| q.id == Some(qid))
+                .ok_or_else(|| RpcError::new(-32002, "that message isn't queued any more"))?;
+            state.queue.remove(index)
+        };
+        self.broadcast_queue(id).await;
+        self.record_user_message(id, &json!(queued.blocks), true)
+            .await;
+        let result = self.steer_in(id, queued.blocks).await;
+        if let Some(reply) = queued.reply {
+            let _ = reply.send(result.clone());
         }
         result
     }
@@ -465,6 +550,7 @@ impl Hub {
             let mut state = live.state.lock().await;
             if state.agent.is_none() || state.agent_session_id.is_none() {
                 state.queue.push(Queued {
+                    id: None,
                     blocks: blocks.clone(),
                     reply: None,
                 });
@@ -550,6 +636,7 @@ impl Hub {
         let blocks = params["prompt"].as_array().cloned().unwrap_or_default();
         if self.agent_for(id).await.is_err() {
             self.live(id).state.lock().await.queue.push(Queued {
+                id: None,
                 blocks,
                 reply: None,
             });
@@ -629,6 +716,7 @@ impl Hub {
             events,
             agent_state,
             permissions,
+            queue: Self::queue_notification(id, &state.queue),
         })
     }
 

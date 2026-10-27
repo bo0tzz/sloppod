@@ -96,15 +96,21 @@ test('a permission answered elsewhere disappears', async ({ page, context }) => 
   await expect(agentMessages(page).filter({ hasText: FINAL })).toBeVisible();
 });
 
-test('steers the agent during a turn', async ({ page }) => {
+test('steers a queued message into the running turn', async ({ page }) => {
   await createSession(page, 'Steer me in sloppod');
   await expect(permissionCard(page)).toBeVisible();
 
+  // Sending during a turn queues the message; Steer moves it into the turn.
   const steer = 'Use 250 ms as the base delay';
-  const box = page.getByRole('textbox', { name: 'Steering message' });
+  const box = page.getByRole('textbox', { name: 'Prompt' });
   await box.fill(steer);
-  await page.getByRole('button', { name: 'Steer' }).click();
+  await page.getByRole('button', { name: 'Send' }).click();
   await expect(box).toHaveValue('');
+  const queued = page.getByTestId('queued-message').filter({ hasText: steer });
+  await expect(queued).toBeVisible();
+  await expect(userMessages(page).filter({ hasText: steer })).toHaveCount(0);
+  await queued.getByRole('button', { name: 'Steer' }).click();
+  await expect(page.getByTestId('queued-messages')).toBeHidden();
   await expect(userMessages(page).filter({ hasText: steer })).toHaveCount(1);
   await expect(userMessages(page).filter({ hasText: steer })).toHaveAttribute('data-steering', 'true');
 
@@ -112,8 +118,27 @@ test('steers the agent during a turn', async ({ page }) => {
   await expect(agentMessages(page).filter({ hasText: `Got your message mid-turn: “${steer}”` })).toBeVisible();
   await expect(agentMessages(page).filter({ hasText: FINAL })).toBeVisible();
 
-  // Once the turn is over the same box sends a normal prompt again.
-  await expect(page.getByRole('button', { name: 'Send' })).toBeVisible();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+});
+
+test('runs a queued message as the next turn', async ({ page }) => {
+  await createSession(page, 'Queue behind me in sloppod');
+  await expect(permissionCard(page)).toBeVisible();
+
+  const next = 'Then ask me something';
+  await page.getByRole('textbox', { name: 'Prompt' }).fill(next);
+  await page.getByRole('button', { name: 'Send' }).click();
+  await expect(page.getByTestId('queued-message').filter({ hasText: next })).toBeVisible();
+
+  // Survives a reload while it waits.
+  await page.reload();
+  await expect(page.getByTestId('queued-message').filter({ hasText: next })).toBeVisible();
+
+  await permissionCard(page).getByRole('button', { name: 'Allow', exact: true }).click();
+  await expect(agentMessages(page).filter({ hasText: FINAL })).toBeVisible();
+  await expect(page.getByTestId('queued-messages')).toBeHidden();
+  await expect(userMessages(page).filter({ hasText: next })).not.toHaveAttribute('data-steering');
+  await expect(page.getByTestId('question-card')).toBeVisible();
 });
 
 test('stops a running turn', async ({ page }) => {

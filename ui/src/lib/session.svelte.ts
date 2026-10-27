@@ -17,6 +17,11 @@ import { sessions } from './sessions.svelte.ts';
 
 export type PendingPermission = RequestPermissionRequest & { rpcId: RequestId };
 export type PendingQuestion = ElicitationRequest & { rpcId: RequestId };
+/** A message waiting for the running turn to end (`_sloppod/queue`). */
+export type QueuedMessage = { id: string; prompt: ContentBlock[] };
+
+export const queuedText = (message: QueuedMessage) =>
+  message.prompt.map((block) => (block.type === 'text' ? block.text : '')).join('');
 
 const textPrompt = (text: string): ContentBlock[] => [{ type: 'text', text }];
 
@@ -44,6 +49,8 @@ export class SessionView {
 
   /** Prompts sent from here whose turn hasn't ended. Queued prompts all resolve when their shared turn ends. */
   promptsInFlight = $state(0);
+  /** Messages waiting for the running turn to end. */
+  queue = $state<QueuedMessage[]>([]);
 
   turnRunning = $derived(
     this.promptsInFlight > 0 || this.session?.phase === 'working' || this.session?.phase === 'waiting',
@@ -142,6 +149,11 @@ export class SessionView {
         if (session.id === this.id) this.setSession(session);
         break;
       }
+      case '_sloppod/queue': {
+        const { sessionId, messages } = params as { sessionId: string; messages: QueuedMessage[] };
+        if (sessionId === this.id) this.queue = messages;
+        break;
+      }
       case '_sloppod/proposal': {
         const { proposal } = params as { proposal: Proposal };
         if (proposal.session_id === this.id) this.upsertProposal(proposal);
@@ -228,8 +240,9 @@ export class SessionView {
     }
   }
 
-  steer(text: string) {
-    return this.#conn.request('_session/steering', { sessionId: this.id, prompt: textPrompt(text) });
+  /** Moves a queued message into the running turn. */
+  steerQueued(id: string) {
+    return this.#conn.request('_sloppod/steer_queued', { sessionId: this.id, id });
   }
 
   cancel() {
