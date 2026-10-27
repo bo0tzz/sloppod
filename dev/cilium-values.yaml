@@ -18,3 +18,5 @@ bpf:
   hostLegacyRouting: true
 socketLB:
   enabled: true
+# Refused egress gets an ICMP Destination Unreachable instead of a silent drop, so clients fail fast (sloppod#33).
+policyDenyResponse: icmp

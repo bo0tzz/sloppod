@@ -63,7 +63,9 @@ impl ClaudeCode {
         format!(
             "You are running in a sloppod session: a sandboxed Kubernetes pod.\n\
              {workspace}\
-             - Network access is limited to the model API, GitHub, memory and package registries. Credentials are \
+             - Network access is limited to the model API, GitHub, memory and package registries. Other hosts don't \
+             resolve, so a DNS lookup failure (e.g. `EAI_FAIL`, `ENOTFOUND`) means the host is blocked, not down; \
+             don't retry it. Credentials are \
              attached outside the pod, so the tokens you see in the environment are placeholders; don't try to use \
              or replace them.\n\
              - Install tools through mise (`mise use`, `mise install`, `mise exec`) rather than apt or curl-to-shell.\n\

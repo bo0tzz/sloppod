@@ -280,6 +280,15 @@ impl Enforcer for Cilium {
                 "endpointSelector": {"matchLabels": egress.pod_labels},
                 "enableDefaultDeny": {"egress": true, "ingress": true},
                 "egress": rules,
+                // With Cilium's `policyDenyResponse: icmp`, refused connections get a Destination Unreachable that
+                // has to pass ingress policy; otherwise they still hang until the client times out.
+                "ingress": [{
+                    "fromEntities": ["all"],
+                    "icmps": [{"fields": [
+                        {"family": "IPv4", "type": "DestinationUnreachable"},
+                        {"family": "IPv6", "type": "DestinationUnreachable"},
+                    ]}],
+                }],
             },
         });
         self.policies
