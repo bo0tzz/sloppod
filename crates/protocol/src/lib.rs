@@ -15,6 +15,9 @@ pub mod api {
         pub repo: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub title: Option<String>,
+        /// The agent to run, e.g. `claude-code` (the default) or `codex`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent: Option<String>,
     }
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -61,6 +64,7 @@ pub mod api {
         pub branch: Option<String>,
         pub grants: Vec<Grant>,
         pub phase: Phase,
+        pub agent: String,
         pub created_at: String,
         pub updated_at: String,
         /// When something last happened in the session; the session list is ordered by it.

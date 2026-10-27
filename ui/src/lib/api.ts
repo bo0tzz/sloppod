@@ -7,6 +7,7 @@ export type Session = {
   branch: string | null;
   grants: Grant[];
   phase: Phase;
+  agent: string;
   created_at: string;
   updated_at: string;
   /** When something last happened in the session; the session list is ordered by it. */

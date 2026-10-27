@@ -17,6 +17,7 @@ async fn session(db: &PgPool, owner: &str) -> Uuid {
             title: "test",
             custom_title: false,
             pending_prompt: "",
+            agent: "claude-code",
             model: None,
             repo: None,
             grants: &[],

@@ -782,6 +782,7 @@ function createSession({ prompt, repo, title }) {
       },
     ],
     phase: 'starting',
+    agent: 'claude-code',
     created_at: created,
     updated_at: created,
     active_at: created,

@@ -46,6 +46,7 @@ FROM node:24.22.1-trixie-slim AS session
 ARG MISE_VERSION=2026.10.18
 ARG MISE_SHA256=e97c38973336aa2ff350fea50f47b412b266fe263b102b7200ff1e9b118c6942
 ARG ADAPTER_VERSION=0.97.0
+ARG CODEX_ADAPTER_VERSION=2.3.0
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git gh jq less procps ripgrep tini unzip xz-utils zstd \
         build-essential pkg-config \
@@ -66,7 +67,9 @@ RUN curl -fsSL -o /usr/local/bin/gh-stack \
         https://github.com/github/gh-stack/releases/download/v${GH_STACK_VERSION}/linux-amd64 \
     && echo "${GH_STACK_SHA256}  /usr/local/bin/gh-stack" | sha256sum -c - \
     && chmod +x /usr/local/bin/gh-stack
-RUN npm install -g @agentclientprotocol/claude-agent-acp@${ADAPTER_VERSION} && npm cache clean --force
+RUN npm install -g @agentclientprotocol/claude-agent-acp@${ADAPTER_VERSION} \
+        @agentclientprotocol/codex-acp@${CODEX_ADAPTER_VERSION} \
+    && npm cache clean --force
 COPY --from=memini /memini/plugin /opt/sloppod/plugins/memini
 COPY --from=build /out/sloppod-supervisor /usr/local/bin/sloppod-supervisor
 # The node image's `node` user is uid 1000, which session pods run as.

@@ -1,6 +1,6 @@
 # 24. Proposals are reviewed by another model before a human sees them
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-10-27
 
 ## Context and Problem Statement
@@ -40,3 +40,5 @@ Keeping one review session per proposal trades some independence for continuity:
 ## More Information
 
 Spikes needed before building: run `@zed-industries/codex-acp` with a ChatGPT login behind the authorizer (which hosts and headers Codex uses, and how its tokens refresh), and check that Codex follows the instruction to finish with `submit_review` rather than chat.
+
+2026-10-27: spike results (#32). Codex works through the authorizer with a custom model provider (`base_url = "https://chatgpt.com/backend-api/codex"`, `wire_api = "responses"`, a placeholder `experimental_bearer_token`); it only calls `POST /backend-api/codex/responses`, and the policy adds the token and `chatgpt-account-id`. The adapter is `@agentclientprotocol/codex-acp` (the `@zed-industries` package is deprecated), run in its `agent-full-access` mode: Codex's own sandbox and approvals are off, like Claude Code's auto mode, because the pod and its grants are the boundary. Codex 0.164 keeps its threads in SQLite under `CODEX_HOME` rather than in transcript files, so a Codex session's history lives on its volume only and isn't synced to the runtime ([ADR 1](0001-sessions-decoupled-from-directories.md)); that's acceptable for review sessions, which are short-lived.

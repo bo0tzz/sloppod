@@ -36,7 +36,7 @@ use axum::routing::{any, get, post};
 use clap::Parser;
 use k8s_openapi::api::core::v1::Service;
 use kube::api::Api;
-use sloppod_contracts::{AgentAdapter, Enforcer, PlacementBackend};
+use sloppod_contracts::{Enforcer, PlacementBackend};
 use sloppod_protocol::api::Phase;
 use sqlx::PgPool;
 use tower_http::services::{ServeDir, ServeFile};
@@ -65,7 +65,7 @@ pub struct Inner {
     pub cilium: Arc<Cilium>,
     pub ca: tls::Ca,
     pub authz_addr: SocketAddr,
-    pub adapter: Arc<dyn AgentAdapter>,
+    pub agents: adapter::Agents,
     pub instructions: Option<String>,
 }
 
@@ -142,6 +142,10 @@ async fn main() -> anyhow::Result<()> {
         credentials.clone(),
     )));
 
+    let mut agents = adapter::Agents::default();
+    agents.register(Arc::new(adapter::ClaudeCode));
+    agents.register(Arc::new(adapter::Codex));
+
     let ca = tls::Ca::load_or_create(kube.clone(), &config.namespace, &config.ca_secret).await?;
     let service: Service = Api::namespaced(kube.clone(), &config.namespace)
         .get(&config.service)
@@ -186,7 +190,7 @@ async fn main() -> anyhow::Result<()> {
         cilium,
         ca,
         authz_addr,
-        adapter: Arc::new(adapter::ClaudeCode),
+        agents,
         instructions,
     }));
     state
