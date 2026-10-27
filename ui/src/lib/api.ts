@@ -20,7 +20,7 @@ export type NewSession = {
 
 export type Grant = { capability: string; params: Record<string, unknown> };
 
-export type ProposalStatus = 'pending' | 'approved' | 'rejected' | 'executed' | 'failed';
+export type ProposalStatus = 'pending' | 'approved' | 'rejected' | 'executed' | 'failed' | 'withdrawn';
 
 export type PullRequestPayload = {
   repo: string;
@@ -176,7 +176,7 @@ export function newerSession(current: Session | null | undefined, incoming: Sess
 }
 
 /** How far along a proposal is; it only ever moves forward. */
-const proposalStage: Record<ProposalStatus, number> = { pending: 0, approved: 1, rejected: 2, executed: 2, failed: 2 };
+const proposalStage: Record<ProposalStatus, number> = { pending: 0, approved: 1, rejected: 2, executed: 2, failed: 2, withdrawn: 2 };
 
 /** Keeps whichever copy of a proposal is further along, so a stale copy (e.g. a slow refetch) can't undo a decision. */
 export function newerProposal(current: Proposal | undefined, incoming: Proposal): Proposal {
