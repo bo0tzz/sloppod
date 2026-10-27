@@ -1,6 +1,6 @@
 <script lang="ts">
   import { Checkbox, Heading, Icon, Text } from '@immich/ui';
-  import { mdiSourceCommit } from '@mdi/js';
+  import { mdiChevronRight, mdiSourceCommit } from '@mdi/js';
   import { parseUnifiedDiff } from '#lib/diff.ts';
   import DiffView from './DiffView.svelte';
 
@@ -12,7 +12,6 @@
 
   const parsed = $derived(parseUnifiedDiff(diff));
   const files = $derived(parsed ?? []);
-  const totalLines = $derived(files.reduce((sum, file) => sum + file.lines.length, 0));
 </script>
 
 <section class="flex flex-col gap-2">
@@ -30,8 +29,9 @@
   </ul>
 </section>
 
-<section class="flex flex-col gap-2">
-  <div class="flex items-center justify-between gap-3">
+<details class="group/changes flex flex-col gap-2" open data-testid="changes">
+  <summary class="flex cursor-pointer list-none items-center gap-1">
+    <Icon icon={mdiChevronRight} size="1.1rem" class="text-muted transition-transform group-open/changes:rotate-90" aria-hidden />
     <Heading tag="h3" size="tiny">
       Changes
       {#if parsed}
@@ -42,18 +42,20 @@
         </span>
       {/if}
     </Heading>
+  </summary>
+  <div class="mt-2 flex justify-end">
     <label class="text-muted flex shrink-0 items-center gap-2 text-xs">
       <Checkbox bind:checked={wrap} aria-label="Wrap lines" size="tiny" />
       Wrap lines
     </label>
   </div>
   {#if parsed === null}
-    <pre class="bg-light-100 max-h-[60dvh] overflow-auto rounded-lg p-3 font-mono text-xs">{diff}</pre>
+    <pre class="bg-light-100 mt-2 max-h-[60dvh] overflow-auto rounded-lg p-3 font-mono text-xs">{diff}</pre>
   {:else}
     {#each files as file, index (index)}
-      <DiffView diff={file} open={totalLines < 1500} {wrap} />
+      <div class="mt-2"><DiffView diff={file} {wrap} /></div>
     {:else}
       <Text color="muted" size="small">Empty diff.</Text>
     {/each}
   {/if}
-</section>
+</details>

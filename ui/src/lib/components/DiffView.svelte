@@ -24,11 +24,11 @@
   const marker = { add: '+', del: '-', ctx: ' ', hunk: '', meta: '' } as const;
 </script>
 
-<details class="group border-light-200 overflow-hidden rounded-lg border" {open} data-testid="diff">
+<details class="group/file border-light-200 overflow-hidden rounded-lg border" {open} data-testid="diff">
   <summary
     class="bg-light-100 flex cursor-pointer list-none items-center gap-2 px-3 py-1.5 text-xs select-none [&::-webkit-details-marker]:hidden"
   >
-    <Icon icon={mdiChevronRight} class="shrink-0 transition-transform group-open:rotate-90" aria-hidden />
+    <Icon icon={mdiChevronRight} class="shrink-0 transition-transform group-open/file:rotate-90" aria-hidden />
     <span class="min-w-0 grow truncate font-mono" title={diff.path}>
       {#if diff.oldPath}{diff.oldPath} → {/if}{diff.path}
     </span>
