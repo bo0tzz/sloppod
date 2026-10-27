@@ -264,6 +264,8 @@ pub struct AgentContext {
     pub instructions: Option<String>,
     pub model: Option<String>,
     pub memory: Option<MemoryContext>,
+    /// What the runtime was built from (a release tag or commit), if it knows.
+    pub runtime_build: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

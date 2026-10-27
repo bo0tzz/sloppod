@@ -306,6 +306,7 @@ pub async fn agent_context(state: &AppState, session: &db::SessionRow) -> AgentC
         instructions: state.instructions.clone(),
         model: session.model.clone(),
         memory,
+        runtime_build: state.config.build.clone(),
     }
 }
 

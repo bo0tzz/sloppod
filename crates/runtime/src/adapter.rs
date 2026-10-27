@@ -58,13 +58,21 @@ impl ClaudeCode {
              the `propose_pull_request` tool; sloppod opens the PR once it's approved. You're told when your \
              proposals are decided. Direct writes to GitHub (gh pr create, comments, API POSTs) are refused.\n",
         );
+        // Rendered on every agent launch, and a runtime restart relaunches the agent, so this is always current.
+        let build = match &context.runtime_build {
+            Some(build) => format!(
+                "- The sloppod runtime is build `{build}`. Your session image only changes when your pod is recreated."
+            ),
+            None => "- The sloppod runtime's build is unknown.".to_owned(),
+        };
         format!(
             "You are running in a sloppod session: a sandboxed Kubernetes pod.\n\
              {workspace}\
              - Network access is limited to the model API, GitHub, memory and package registries. Credentials are \
              attached outside the pod, so the tokens you see in the environment are placeholders; don't try to use \
              or replace them.\n\
-             - Install tools through mise (`mise use`, `mise install`, `mise exec`) rather than apt or curl-to-shell."
+             - Install tools through mise (`mise use`, `mise install`, `mise exec`) rather than apt or curl-to-shell.\n\
+             {build}"
         )
     }
 }
