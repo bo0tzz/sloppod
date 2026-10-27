@@ -7,7 +7,7 @@ use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use serde::Deserialize;
 use serde_json::json;
 use sloppod_contracts::{EgressSpec, Grant, PlacementSpec};
@@ -21,7 +21,7 @@ use crate::pods::SESSION_LABEL;
 use crate::policies::SESSION_KEY;
 use crate::proposals::{self, Verdict};
 use crate::users::User;
-use crate::{AppState, db};
+use crate::{AppState, db, reviews};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -30,6 +30,7 @@ pub fn routes() -> Router<AppState> {
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}", get(get_session).delete(delete_session))
         .route("/sessions/{id}/repos", post(add_repo))
+        .route("/sessions/{id}/review", put(set_review))
         .route("/repos", get(repos))
         .route(
             "/credentials",
@@ -106,7 +107,28 @@ async fn settings(state: &AppState, user: &str) -> ApiResult<serde_json::Value> 
         .await?
         .map(|s| offered_models(&s))
         .unwrap_or_default();
-    Ok(json!({"model": model, "models": models}))
+    let review = db::user_review(&state.db, user).await?;
+    Ok(json!({"model": model, "models": models, "review": review}))
+}
+
+/// Deserializes a field that's present, so `Option<Option<T>>` tells an absent field from a null one.
+fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
+}
+
+fn review_policy(review: &str) -> ApiResult<&str> {
+    reviews::POLICIES
+        .iter()
+        .copied()
+        .find(|p| *p == review)
+        .ok_or_else(|| {
+            bad_request(format!(
+                "review must be one of {}",
+                reviews::POLICIES.join(", ")
+            ))
+        })
 }
 
 async fn get_settings(
@@ -116,9 +138,12 @@ async fn get_settings(
     Ok(Json(settings(&state, &user).await?))
 }
 
+/// Fields left out stay as they are.
 #[derive(Deserialize)]
 struct SettingsUpdate {
-    model: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    model: Option<Option<String>>,
+    review: Option<String>,
 }
 
 async fn put_settings(
@@ -126,12 +151,13 @@ async fn put_settings(
     User(user): User,
     Json(update): Json<SettingsUpdate>,
 ) -> ApiResult<impl IntoResponse> {
-    let model = update
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|m| !m.is_empty());
-    db::set_user_model(&state.db, &user, model).await?;
+    if let Some(model) = &update.model {
+        let model = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+        db::set_user_model(&state.db, &user, model).await?;
+    }
+    if let Some(review) = &update.review {
+        db::set_user_review(&state.db, &user, review_policy(review)?).await?;
+    }
     Ok(Json(settings(&state, &user).await?))
 }
 
@@ -162,6 +188,29 @@ async fn get_session(
 #[derive(Deserialize)]
 struct AddRepo {
     repo: String,
+}
+
+#[derive(Deserialize)]
+struct SetReview {
+    review: String,
+}
+
+/// Sets whether a session's proposals are reviewed by another model first (ADR 24).
+async fn set_review(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetReview>,
+) -> ApiResult<impl IntoResponse> {
+    db::owned_session(&state.db, id, &user)
+        .await?
+        .ok_or_else(not_found)?;
+    db::set_session_review(&state.db, id, review_policy(&body.review)?).await?;
+    state.hub.broadcast_session(id).await;
+    let session = db::get_session(&state.db, id)
+        .await?
+        .ok_or_else(not_found)?;
+    Ok(Json(session.to_api()))
 }
 
 /// Gives a session write access to another repository and tells its agent.
@@ -310,6 +359,7 @@ async fn create_session(
         ));
     }
     let model = db::user_model(&state.db, &user).await?;
+    let review = db::user_review(&state.db, &user).await?;
     let custom = new
         .title
         .as_deref()
@@ -328,6 +378,7 @@ async fn create_session(
             pending_prompt: prompt,
             agent,
             kind: "work",
+            review: &review,
             model: model.as_deref(),
             repo: repo.as_deref(),
             grants: &grants,

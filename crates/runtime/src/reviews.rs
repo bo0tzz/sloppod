@@ -13,6 +13,9 @@ pub const MAX_ROUNDS: i32 = 3;
 /// The agent review sessions run: a different model from the authoring agent's.
 pub const REVIEWER: &str = "codex";
 
+/// A session's review policy: `off`, or `required` for every proposal of a kind that's reviewed.
+pub const POLICIES: &[&str] = &["off", "required"];
+
 /// Whether `owner` has what the reviewer's model needs.
 pub async fn available(state: &AppState, owner: &str) -> anyhow::Result<bool> {
     let Some(reviewer) = state.agents.get(REVIEWER) else {
@@ -66,6 +69,7 @@ pub async fn start(
             pending_prompt: &prompt,
             agent: REVIEWER,
             kind: "review",
+            review: "off",
             model: None,
             repo: Some(&subject.repo),
             grants: &grants,
