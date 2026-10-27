@@ -530,7 +530,7 @@ fn head_branch<'a>(session_branch: &'a str, named: Option<&'a str>) -> Result<&'
     } else {
         Err(Error::new(format!(
             "pull requests come from your session branch `{session_branch}` or one named after it, like \
-             `{session_branch}-<name>`"
+             `{session_branch}-<name>`, where the name has only letters, digits, `.`, `_` and `-`"
         )))
     }
 }
@@ -644,5 +644,12 @@ mod tests {
         assert!(head_branch(branch, Some("sloppod/00000000/issues")).is_err());
         assert!(head_branch(branch, Some("sloppod/000000001")).is_err());
         assert!(head_branch(branch, Some("main")).is_err());
+        assert!(head_branch(branch, Some("sloppod/00000000-fix+1")).is_err());
+        assert!(head_branch(branch, Some("sloppod/00000000-a#b")).is_err());
+        assert!(head_branch(branch, Some("sloppod/00000000-a b")).is_err());
+        assert_eq!(
+            head_branch(branch, Some("sloppod/00000000-v1.2_x")).unwrap(),
+            "sloppod/00000000-v1.2_x"
+        );
     }
 }

@@ -54,12 +54,19 @@ pub fn session_branch(session: Uuid) -> String {
 
 /// Whether a session may push `branch`: its session branch, or one named after it (`<session branch>-<name>`).
 /// Not `<session branch>/<name>`, which git can't have next to the session branch itself.
+/// The name may only have letters, digits, `.`, `_` and `-`, so it means the same in a URL as in git: a `+` or `#` in
+/// it would change which branch the GitHub API is asked about, e.g. when turning off auto-merge after a push.
 pub fn is_session_branch(session_branch: &str, branch: &str) -> bool {
     branch == session_branch
         || branch
             .strip_prefix(session_branch)
             .and_then(|rest| rest.strip_prefix('-'))
-            .is_some_and(|name| !name.is_empty())
+            .is_some_and(|name| {
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            })
 }
 
 /// The repository a pull request or issue is for: the one named, or the only one the session can push to.
