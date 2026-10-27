@@ -15,7 +15,7 @@ use serde_json::Value;
 use sloppod_protocol::link::{
     AgentReady, FromSupervisor, Launch, PATH, RUNTIME_INFO, RunningAgent, ToSupervisor,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::TcpStream;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::signal::unix::{SignalKind, signal};
@@ -433,36 +433,51 @@ fn sync_from(len: u64, synced: Option<u64>) -> Option<u64> {
     }
 }
 
-/// Sends the runtime what was appended to each transcript file since the last sync (ADR 1).
+/// Sends the runtime what was appended to each transcript file since the last sync (ADR 1). It stops at the first
+/// send that fails, since the link is gone then.
 async fn sync_transcript(dir: &str, synced: &mut HashMap<String, u64>, sink: &mut Sink) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return;
     };
-    for entry in entries.flatten() {
+    while let Ok(Some(entry)) = entries.next_entry().await {
         if entry.path().extension().is_none_or(|x| x != "jsonl") {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Ok(content) = std::fs::read(entry.path()) else {
+        let Ok(appended) = read_appended(&entry.path(), synced.get(&name).copied()).await else {
             continue;
         };
-        let len = content.len() as u64;
-        let Some(offset) = sync_from(len, synced.get(&name).copied()) else {
+        let Some((offset, content)) = appended else {
             continue;
         };
         let message = FromSupervisor::TranscriptAppend {
             name: name.clone(),
             offset,
-            content_b64: base64::engine::general_purpose::STANDARD
-                .encode(&content[offset as usize..]),
+            content_b64: base64::engine::general_purpose::STANDARD.encode(&content),
         };
-        match send(sink, &message).await {
-            Ok(()) => {
-                synced.insert(name, len);
-            }
-            Err(e) => tracing::warn!(error = %e, file = %name, "syncing the transcript failed"),
+        if let Err(e) = send(sink, &message).await {
+            tracing::warn!(error = %e, file = %name, "syncing the transcript failed");
+            return;
         }
+        synced.insert(name, offset + content.len() as u64);
     }
+}
+
+/// What was appended to `path` since `synced` bytes of it were sent, with the offset it starts at; `None` if
+/// nothing was. Only that part is read.
+async fn read_appended(
+    path: &Path,
+    synced: Option<u64>,
+) -> std::io::Result<Option<(u64, Vec<u8>)>> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let len = file.metadata().await?.len();
+    let Some(offset) = sync_from(len, synced) else {
+        return Ok(None);
+    };
+    file.seek(std::io::SeekFrom::Start(offset)).await?;
+    let mut content = Vec::new();
+    file.read_to_end(&mut content).await?;
+    Ok(Some((offset, content)))
 }
 
 fn write_runtime_info(args: &Args, build: Option<&str>) -> anyhow::Result<()> {
@@ -771,7 +786,7 @@ mod gh_extension_tests {
 
 #[cfg(test)]
 mod sync_tests {
-    use super::sync_from;
+    use super::{read_appended, sync_from};
 
     #[test]
     fn syncs_only_what_was_appended() {
@@ -780,5 +795,25 @@ mod sync_tests {
         assert_eq!(sync_from(150, Some(100)), Some(100));
         assert_eq!(sync_from(80, Some(100)), Some(0));
         assert_eq!(sync_from(0, Some(0)), None);
+    }
+
+    #[tokio::test]
+    async fn reads_only_what_was_appended() {
+        let path = std::env::temp_dir().join(format!("sloppod-sync-{}.jsonl", std::process::id()));
+        std::fs::write(&path, b"one\ntwo\n").unwrap();
+        assert_eq!(
+            read_appended(&path, None).await.unwrap(),
+            Some((0, b"one\ntwo\n".to_vec()))
+        );
+        assert_eq!(
+            read_appended(&path, Some(4)).await.unwrap(),
+            Some((4, b"two\n".to_vec()))
+        );
+        assert_eq!(read_appended(&path, Some(8)).await.unwrap(), None);
+        assert_eq!(
+            read_appended(&path, Some(20)).await.unwrap(),
+            Some((0, b"one\ntwo\n".to_vec()))
+        );
+        std::fs::remove_file(&path).unwrap();
     }
 }
