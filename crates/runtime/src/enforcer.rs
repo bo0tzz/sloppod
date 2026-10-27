@@ -184,6 +184,9 @@ fn envoy_config(
                     "typed_config": {
                         "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
                         "common_tls_context": {"validation_context": {"trusted_ca": {"filename": trusted_ca}}},
+                        // One context serves every upstream, and its session cache isn't keyed by SNI: a resumed
+                        // session can carry another host's certificate, which then fails the SAN check.
+                        "max_session_keys": 0,
                     },
                 },
             },
@@ -346,6 +349,27 @@ mod tests {
                 json!({"matchName": "crates.io"}),
                 json!({"matchPattern": "**.cluster.local"}),
             ]
+        );
+    }
+
+    #[test]
+    fn upstream_connections_never_resume_tls_sessions() {
+        let config = envoy_config(
+            "slop",
+            "cert",
+            "key",
+            "127.0.0.1:9001".parse().unwrap(),
+            "/ca.crt",
+        );
+        let upstream = config["spec"]["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "sloppod-upstream")
+            .unwrap();
+        assert_eq!(
+            upstream["transport_socket"]["typed_config"]["max_session_keys"],
+            0
         );
     }
 }
