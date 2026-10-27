@@ -32,12 +32,12 @@ pub enum UiEvent {
 
 /// A prompt waiting for the agent to be up or for the running turn to end; it runs with the rest of the queue
 /// as the next turn.
-struct Queued {
+pub(crate) struct Queued {
     /// Messages queued behind a running turn have an id, so UIs can show them and steer them in; they're
     /// recorded when they run.
-    id: Option<Uuid>,
-    blocks: Vec<Value>,
-    reply: Option<oneshot::Sender<Result<Value, RpcError>>>,
+    pub(crate) id: Option<Uuid>,
+    pub(crate) blocks: Vec<Value>,
+    pub(crate) reply: Option<oneshot::Sender<Result<Value, RpcError>>>,
 }
 
 struct Permission {
@@ -60,6 +60,8 @@ struct LiveState {
     queue: Vec<Queued>,
     /// For an agent a runtime restart cut off, if it has to be launched again rather than attached to.
     restart_notice: Option<String>,
+    /// The session was stopped: nothing queued for it runs any more.
+    stopped: bool,
 }
 
 pub struct Live {
@@ -68,6 +70,16 @@ pub struct Live {
     state: Mutex<LiveState>,
     /// Held while the session is parked or woken, so the two never overlap.
     transition: Mutex<()>,
+}
+
+/// What `run_queued` does with its batch.
+enum Start {
+    /// Runs it on the agent it was taken for, in this agent session.
+    Run(String, Vec<Queued>),
+    /// The session was stopped: its callers get an error.
+    Stopped(Vec<Queued>),
+    /// Back in the queue, and run on a newer agent that was up and idle.
+    Requeued(Option<(Arc<AgentConn>, Vec<Queued>)>),
 }
 
 /// Why a session couldn't be parked.
@@ -284,8 +296,8 @@ impl Hub {
                     state.agent_state = agent_state;
                     state.loading = false;
                     state.turn_running = true;
+                    self.set_phase(id, Phase::Working).await;
                 }
-                self.set_phase(id, Phase::Working).await;
                 let (hub, agent) = (self.clone(), agent.clone());
                 tokio::spawn(async move {
                     if let Ok(Err(e)) = turn.await {
@@ -321,21 +333,23 @@ impl Hub {
             let queued = std::mem::take(&mut state.queue);
             if pending.is_some() || !queued.is_empty() {
                 state.turn_running = true;
+            } else {
+                self.set_phase(id, Phase::Idle).await;
             }
             queued
         };
         if pending.is_none() && queued.is_empty() {
-            self.set_phase(id, Phase::Idle).await;
             return;
         }
-        tokio::spawn(self.clone().run_queued(id, pending, queued));
+        tokio::spawn(self.clone().run_queued(id, agent.clone(), pending, queued));
     }
 
     /// Runs queued prompts (and a prompt the agent was holding, if any) as one turn, and answers each prompt
     /// with its outcome. Boxed because a turn ending starts the next queued one.
-    fn run_queued(
+    pub(crate) fn run_queued(
         self: Arc<Self>,
         id: Uuid,
+        taken_for: Arc<AgentConn>,
         pending: Option<String>,
         queued: Vec<Queued>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
@@ -345,11 +359,65 @@ impl Hub {
                     .await;
             }
             let mut blocks: Vec<Value> = pending
-                .into_iter()
+                .iter()
                 .map(|text| json!({"type": "text", "text": text}))
                 .collect();
             blocks.extend(queued.iter().flat_map(|q| q.blocks.iter().cloned()));
-            let result = self.run_turn(id, blocks).await;
+            // One decision under the lock, so no other agent's readiness or turn can slip in between.
+            let started = {
+                let live = self.live(id);
+                let mut state = live.state.lock().await;
+                let current = state
+                    .agent
+                    .as_ref()
+                    .is_some_and(|a| Arc::ptr_eq(a, &taken_for));
+                match (&state.agent_session_id, current) {
+                    (Some(agent_session_id), true) => {
+                        let agent_session_id = agent_session_id.clone();
+                        self.set_phase(id, Phase::Working).await;
+                        Start::Run(agent_session_id, queued)
+                    }
+                    _ if state.stopped => Start::Stopped(queued),
+                    _ => {
+                        // Taken for an agent that's gone: everything goes back, ahead of what's queued since,
+                        // recorded already so not shown as waiting behind a turn. A newer agent that's up and idle
+                        // runs it now.
+                        let requeued = queued.into_iter().map(|q| Queued { id: None, ..q });
+                        let pending = pending.map(|text| Queued {
+                            id: None,
+                            blocks: vec![json!({"type": "text", "text": text})],
+                            reply: None,
+                        });
+                        let rest = std::mem::take(&mut state.queue);
+                        state.queue = pending.into_iter().chain(requeued).chain(rest).collect();
+                        let idle = state.agent_session_id.is_some() && !state.turn_running;
+                        match (state.agent.clone(), idle) {
+                            (Some(agent), true) => {
+                                state.turn_running = true;
+                                Start::Requeued(Some((agent, std::mem::take(&mut state.queue))))
+                            }
+                            _ => Start::Requeued(None),
+                        }
+                    }
+                }
+            };
+            let (agent_session_id, queued) = match started {
+                Start::Run(agent_session_id, queued) => (agent_session_id, queued),
+                Start::Stopped(queued) => {
+                    for reply in queued.into_iter().filter_map(|q| q.reply) {
+                        let _ = reply.send(Err(RpcError::new(-32002, "the session was stopped")));
+                    }
+                    return;
+                }
+                Start::Requeued(next) => {
+                    if let Some((agent, queued)) = next {
+                        tokio::spawn(self.clone().run_queued(id, agent, None, queued));
+                    }
+                    return;
+                }
+            };
+            let agent = taken_for;
+            let result = self.turn_on(id, &agent, &agent_session_id, blocks).await;
             if let Err(e) = &result {
                 tracing::warn!(session = %id, error = %e, "queued prompt failed");
             }
@@ -394,6 +462,7 @@ impl Hub {
             state.agent = None;
             state.agent_session_id = None;
             state.turn_running = false;
+            self.set_phase(id, Phase::Disconnected).await;
             state
                 .permissions
                 .drain()
@@ -409,7 +478,6 @@ impl Hub {
                 },
             );
         }
-        self.set_phase(id, Phase::Disconnected).await;
     }
 
     pub async fn on_agent_notification(&self, id: Uuid, message: Value) {
@@ -464,6 +532,13 @@ impl Hub {
         let pid = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
+            if !state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
+                agent.respond(
+                    request_id,
+                    Err(RpcError::new(-32002, "this agent connection was replaced")),
+                );
+                return;
+            }
             state.next_permission += 1;
             let pid = state.next_permission;
             state.permissions.insert(
@@ -475,9 +550,9 @@ impl Hub {
                     agent: agent.clone(),
                 },
             );
+            self.set_phase(id, Phase::Waiting).await;
             pid
         };
-        self.set_phase(id, Phase::Waiting).await;
         self.broadcast(
             id,
             UiEvent::PermissionRequest {
@@ -490,15 +565,19 @@ impl Hub {
 
     /// The first answer to a permission request wins; later ones are ignored.
     pub async fn answer_permission(&self, id: Uuid, pid: u64, result: Result<Value, RpcError>) {
-        let (permission, still_waiting, turn_running) = {
+        let permission = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
             let permission = state.permissions.remove(&pid);
-            (
-                permission,
-                !state.permissions.is_empty(),
-                state.turn_running,
-            )
+            if permission.is_some() && state.permissions.is_empty() && state.agent.is_some() {
+                let phase = if state.turn_running {
+                    Phase::Working
+                } else {
+                    Phase::Idle
+                };
+                self.set_phase(id, phase).await;
+            }
+            permission
         };
         let Some(permission) = permission else { return };
         let tool_call_id = tool_call_id(&permission.params);
@@ -512,17 +591,6 @@ impl Hub {
                 tool_call_id,
             },
         );
-        if !still_waiting {
-            self.set_phase(
-                id,
-                if turn_running {
-                    Phase::Working
-                } else {
-                    Phase::Idle
-                },
-            )
-            .await;
-        }
     }
 
     async fn agent_for(&self, id: Uuid) -> Result<(Arc<AgentConn>, String), RpcError> {
@@ -600,42 +668,70 @@ impl Hub {
 
     /// Runs one turn; the caller has set `turn_running`. Messages queued behind it run as the next turn.
     async fn run_turn(self: &Arc<Self>, id: Uuid, blocks: Vec<Value>) -> Result<Value, RpcError> {
-        let (agent, agent_session_id) = match self.agent_for(id).await {
-            Ok(agent) => agent,
-            Err(e) => {
-                self.live(id).state.lock().await.turn_running = false;
-                return Err(e);
-            }
+        let Some((agent, agent_session_id)) = self.begin_turn(id).await else {
+            self.live(id).state.lock().await.turn_running = false;
+            return Err(RpcError::new(
+                -32002,
+                "the session's agent isn't running yet; try again shortly",
+            ));
         };
+        self.turn_on(id, &agent, &agent_session_id, blocks).await
+    }
+
+    /// Marks a turn working on the session's current agent, which it returns; `None` if there isn't one up.
+    /// The turn and agent paths (starting and ending turns, an agent getting ready, adopted or detached, permission
+    /// requests and answers) write phase under the state lock, so their writes follow the state they're derived
+    /// from rather than racing each other. Park and wake write it under the session's transition lock instead,
+    /// and stop writes it last, once nothing can run any more.
+    async fn begin_turn(&self, id: Uuid) -> Option<(Arc<AgentConn>, String)> {
+        let live = self.live(id);
+        let state = live.state.lock().await;
+        let (Some(agent), Some(agent_session_id)) = (&state.agent, &state.agent_session_id) else {
+            return None;
+        };
+        let started = (agent.clone(), agent_session_id.clone());
         self.set_phase(id, Phase::Working).await;
+        Some(started)
+    }
+
+    async fn turn_on(
+        self: &Arc<Self>,
+        id: Uuid,
+        agent: &Arc<AgentConn>,
+        agent_session_id: &str,
+        blocks: Vec<Value>,
+    ) -> Result<Value, RpcError> {
         let result = agent
             .request(
                 "session/prompt",
                 json!({"sessionId": agent_session_id, "prompt": blocks}),
             )
             .await;
-        self.end_turn(id, &agent).await;
+        self.end_turn(id, agent).await;
         result
     }
 
-    /// Syncs the transcript after a turn and runs the messages queued behind it as the next one.
-    async fn end_turn(self: &Arc<Self>, id: Uuid, agent: &Arc<AgentConn>) {
+    /// Syncs the transcript after a turn and runs the messages queued behind it as the next one. A turn that ran
+    /// on an agent since replaced leaves the session to the new one.
+    pub(crate) async fn end_turn(self: &Arc<Self>, id: Uuid, agent: &Arc<AgentConn>) {
         let next = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
-            let agent_up = state.agent.is_some() && state.agent_session_id.is_some();
-            state.turn_running = agent_up && !state.queue.is_empty();
-            state.turn_running.then(|| std::mem::take(&mut state.queue))
-        };
-        if self.agent_for(id).await.is_ok() {
-            agent.sync_transcript();
-            match next {
-                Some(queued) => {
-                    self.broadcast_queue(id).await;
-                    tokio::spawn(self.clone().run_queued(id, None, queued));
-                }
-                None => self.set_phase(id, Phase::Idle).await,
+            if !state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
+                return;
             }
+            let agent_up = state.agent_session_id.is_some();
+            state.turn_running = agent_up && !state.queue.is_empty();
+            let next = state.turn_running.then(|| std::mem::take(&mut state.queue));
+            if next.is_none() && agent_up {
+                self.set_phase(id, Phase::Idle).await;
+            }
+            next
+        };
+        agent.sync_transcript();
+        if let Some(queued) = next {
+            self.broadcast_queue(id).await;
+            tokio::spawn(self.clone().run_queued(id, agent.clone(), None, queued));
         }
     }
 
@@ -903,24 +999,17 @@ impl Hub {
         agent: Option<Arc<AgentConn>>,
         agent_session_id: Option<String>,
     ) {
-        let queued = {
-            let live = self.live(id);
-            let mut state = live.state.lock().await;
-            let up = agent.is_some() && agent_session_id.is_some();
-            state.agent = agent;
-            state.agent_session_id = agent_session_id;
-            if !up {
-                None
-            } else {
+        let live = self.live(id);
+        let mut state = live.state.lock().await;
+        let up = agent.is_some() && agent_session_id.is_some();
+        state.agent = agent.clone();
+        state.agent_session_id = agent_session_id;
+        match agent.filter(|_| up) {
+            Some(agent) if !state.queue.is_empty() => {
                 let queued = std::mem::take(&mut state.queue);
-                state.turn_running = !queued.is_empty();
-                Some(queued)
-            }
-        };
-        match queued {
-            Some(queued) if !queued.is_empty() => {
+                state.turn_running = true;
                 self.set_phase(id, Phase::Working).await;
-                tokio::spawn(self.clone().run_queued(id, None, queued));
+                tokio::spawn(self.clone().run_queued(id, agent, None, queued));
             }
             Some(_) => self.set_phase(id, Phase::Idle).await,
             None => self.set_phase(id, Phase::Disconnected).await,
@@ -956,6 +1045,7 @@ impl Hub {
         let (agent, queued) = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
+            state.stopped = true;
             (state.agent.take(), std::mem::take(&mut state.queue))
         };
         for reply in queued.into_iter().filter_map(|q| q.reply) {
