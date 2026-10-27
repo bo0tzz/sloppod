@@ -327,33 +327,6 @@ async fn create_session(
     )
     .await?;
 
-    if let Some((admin, memini)) = state.credentials.memini(&user).await? {
-        let home = memini
-            .config("home")
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("personal/{user}"));
-        let namespace = state.memory_namespace(repo.as_deref(), &home);
-        match admin
-            .create_session_key(&id.to_string(), memini.config("home"), &namespace, false)
-            .await
-        {
-            Ok(key) => {
-                state
-                    .credentials
-                    .put_session_secret(id, SESSION_KEY, &key.secret)
-                    .await?;
-                let grant = Grant::new(
-                    "memory",
-                    json!({"namespace": namespace, "access": "rw", "key": key.name}),
-                );
-                db::add_grant(&state.db, id, &grant).await?;
-            }
-            Err(e) => {
-                tracing::warn!(session = %id, error = %e, "minting the session's memini key; no memory")
-            }
-        }
-    }
-
     state
         .hub
         .record_user_message(id, &json!([{"type": "text", "text": prompt}]), false)
@@ -372,7 +345,62 @@ async fn create_session(
 }
 
 /// Makes sure a session's pod and egress policy exist.
+/// Gives a session its memini key when its owner has memini and it has none, e.g. because it was just created, or
+/// its key was lost (ADR 22). Keeps the namespace of an existing memory grant.
+async fn ensure_memini_key(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
+    let Some((admin, memini)) = state.credentials.memini(&session.owner).await? else {
+        return Ok(());
+    };
+    if state
+        .credentials
+        .session_secret(session.id, SESSION_KEY)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let context = session.context();
+    let granted = context
+        .grant("memory")
+        .and_then(|g| g.param("namespace"))
+        .map(str::to_owned);
+    let home = memini
+        .config("home")
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("personal/{}", session.owner));
+    let namespace = granted
+        .clone()
+        .unwrap_or_else(|| state.memory_namespace(session.repo.as_deref(), &home));
+    let key = admin
+        .create_session_key(
+            &session.id.to_string(),
+            memini.config("home"),
+            &namespace,
+            false,
+        )
+        .await?;
+    state
+        .credentials
+        .put_session_secret(session.id, SESSION_KEY, &key.secret)
+        .await?;
+    if granted.is_none() {
+        let grant = Grant::new(
+            "memory",
+            json!({"namespace": namespace, "access": "rw", "key": key.name}),
+        );
+        db::add_grant(&state.db, session.id, &grant).await?;
+    }
+    Ok(())
+}
+
 pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
+    if let Err(e) = ensure_memini_key(state, session).await {
+        tracing::warn!(session = %session.id, error = %e, "minting the session's memini key; no memory");
+    }
+    // Minting may have added a memory grant, which the placement below must see.
+    let session = &db::get_session(&state.db, session.id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("session {} is gone", session.id))?;
     let id = session.id.to_string();
     let context = session.context();
     let labels = BTreeMap::from([
