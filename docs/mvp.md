@@ -30,6 +30,7 @@ A sloppod session can take a change to this repository from prompt to reviewed P
 | Repositories | Fresh clone into the session's volume, through the authorizer | Runtime-managed mirrors that sessions clone from, work-in-progress snapshots |
 | Containers ([13](adr/0013-container-workloads.md)) | Not in the MVP | Everything |
 | UI ([18](adr/0018-ui.md)) | Session list, chat (streaming, tool calls, permission requests, steering), PR proposal review | Board, approval queue, grants, config |
+| Agent permissions ([11](adr/0011-enforcement-at-the-pod-boundary.md)) | Sessions always run in Claude Code's auto mode; its permission prompts are judgment calls, while the sandbox and grants are the boundary. Users pick a default model in settings and switch a session's model in the session | Per-project defaults |
 | Credentials ([21](adr/0021-credentials-live-in-the-runtime.md)) | Claude accounts, GitHub Apps and memini in the database, encrypted, added in the UI; the owner's default is used | Choosing per grant, switching under a running session |
 | Users ([23](adr/0023-users-and-ownership.md)) | A user per request from the proxy's header; owners on sessions and credentials; users see only their own | Sharing, teams, roles |
 | Storage ([15](adr/0015-postgres.md)) | Postgres with migrations | — |
