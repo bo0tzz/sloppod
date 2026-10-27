@@ -299,7 +299,10 @@ async fn findings_from_before_severities_still_read(db: PgPool) {
              "explanation": "Off by one.\nThe last item is skipped.", "path": "src/a.rs", "line": 3},
             {"id": "1.2", "severity": "p2", "category": "correctness", "title": "No test.", "explanation": "No test."},
         ])
+    );
+}
 
+#[sqlx::test(migrator = "db::MIGRATOR")]
 async fn parked_sessions_are_left_alone_on_startup(db: PgPool) {
     use sloppod_protocol::api::Phase;
 
