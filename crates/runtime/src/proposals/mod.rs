@@ -21,7 +21,7 @@ use crate::github::{GitHubApp, StackWatch};
 use crate::{AppState, db, lifecycle, reviews};
 
 pub use act_as::ActAsOwner;
-pub use code_review::CodeReview;
+pub use code_review::{CODE_REVIEW, CodeReview};
 pub use issue_updates::IssueUpdates;
 pub use issues::Issues;
 use pull_request::stack_layers;
@@ -167,19 +167,30 @@ fn same_identity(session: &SessionContext, target: Option<&str>, payload: &Value
     )))
 }
 
+/// How a refusal for a repository the session can't push to ends: what to do about it, if anything.
+fn next_step(session: &SessionContext) -> String {
+    session
+        .repo_requests
+        .advice()
+        .map(|advice| format!("; {advice}"))
+        .unwrap_or_default()
+}
+
 fn target_repo<'a>(session: &'a SessionContext, named: Option<&str>) -> Result<RepoGrant<'a>> {
     if let Some(repo) = named {
         return session.writable_repo_for(repo).ok_or_else(|| {
             Error::new(format!(
-                "this session can't push to {repo}; ask for write access with request_repository first"
+                "this session can't push to {repo}{}",
+                next_step(session)
             ))
         });
     }
     let writable: Vec<RepoGrant> = session.writable_repos().collect();
     match writable.as_slice() {
-        [] => Err(Error::new(
-            "this session can't push to any repository; ask for write access with request_repository first",
-        )),
+        [] => Err(Error::new(format!(
+            "this session can't push to any repository{}",
+            next_step(session)
+        ))),
         [only] => Ok(only.clone()),
         several => Err(Error::new(format!(
             "this session can push to {}; say which one with `repo`",
@@ -665,8 +676,11 @@ pub fn watch_stack(state: &AppState, proposal: &db::ProposalRow) {
                         .notify(
                             session_id,
                             format!(
-                                "sloppod: #{number} in your stack on {repo} has new commits since it was approved, so \
-                                 the stack's auto-merge is now off and it needs merging by hand."
+                                "sloppod: {} in your stack has new commits since it was approved, so the stack's \
+                                 auto-merge is now off and it needs merging by hand. {} It's at {}.",
+                                crate::pulls::pull_ref(&repo, number),
+                                crate::pulls::TELL_THE_USER,
+                                crate::pulls::pull_url(&repo, number)
                             ),
                         )
                         .await;
@@ -730,6 +744,7 @@ mod tests {
         SessionContext {
             session_id: Uuid::nil().to_string(),
             owner: "dev".into(),
+            repo_requests: Default::default(),
             grants: repos
                 .iter()
                 .map(|r| {

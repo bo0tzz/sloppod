@@ -15,6 +15,19 @@ use crate::{AppState, db};
 
 pub const POLL: Duration = Duration::from_secs(60);
 
+/// A pull request as a notice names it: the repository too, since a session can push to several.
+pub fn pull_ref(repo: &str, number: u64) -> String {
+    format!("{repo}#{number}")
+}
+
+/// Where the user finds a pull request.
+pub fn pull_url(repo: &str, number: u64) -> String {
+    format!("https://github.com/{repo}/pull/{number}")
+}
+
+/// What ends a notice that a pull request needs merging by hand: the agent can't merge, so the next step is the user's.
+pub const TELL_THE_USER: &str = "Tell the user, with the link, since you can't merge it yourself.";
+
 /// What a pull request looked like when last polled. Checks and mergeability keep their last settled value, so
 /// a re-run or a recomputation in progress isn't a change.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -96,15 +109,16 @@ fn failed(checks: &str) -> bool {
 
 /// What to tell the session about pull request `number` going from `before` to `now`. The first sight of it says
 /// nothing: there's no change to report.
-fn changes(number: u64, before: Option<&Seen>, now: &Seen) -> Vec<String> {
+fn changes(repo: &str, number: u64, before: Option<&Seen>, now: &Seen) -> Vec<String> {
     let Some(before) = before else {
         return Vec::new();
     };
+    let pull = pull_ref(repo, number);
     let mut changes = Vec::new();
     match now.state.as_str() {
-        "MERGED" if before.state != "MERGED" => changes.push(format!("#{number} was merged.")),
+        "MERGED" if before.state != "MERGED" => changes.push(format!("{pull} was merged.")),
         "CLOSED" if before.state != "CLOSED" => {
-            changes.push(format!("#{number} was closed without being merged."))
+            changes.push(format!("{pull} was closed without being merged."))
         }
         _ => {}
     }
@@ -116,20 +130,20 @@ fn changes(number: u64, before: Option<&Seen>, now: &Seen) -> Vec<String> {
                 format!(" ({})", now.failing.join(", "))
             };
             changes.push(format!(
-                "#{number}'s checks failed{which}; see them with `gh pr checks {number}` and the logs with \
-                 `gh run view <run> --log-failed`."
+                "{pull}'s checks failed{which}; see them with `gh pr checks {number} --repo {repo}` and the logs \
+                 with `gh run view <run> --repo {repo} --log-failed`."
             ));
         } else if now.checks == "SUCCESS" && failed(&before.checks) {
-            changes.push(format!("#{number}'s checks pass again."));
+            changes.push(format!("{pull}'s checks pass again."));
         }
         if now.mergeable == "CONFLICTING" && before.mergeable != "CONFLICTING" {
             changes.push(format!(
-                "#{number} conflicts with its base branch; merge the base into it, or rebase, and push."
+                "{pull} conflicts with its base branch; merge the base into it, or rebase, and push."
             ));
         }
         if now.feedback > before.feedback {
             changes.push(format!(
-                "#{number} has new reviews or comments; read them with `gh pr view {number} --comments`."
+                "{pull} has new reviews or comments; read them with `gh pr view {number} --repo {repo} --comments`."
             ));
         }
     }
@@ -194,7 +208,7 @@ async fn check(state: &AppState, pull: &db::WatchedPull) -> anyhow::Result<()> {
         before.as_ref(),
         &response["data"]["repository"]["pullRequest"],
     );
-    let changes = changes(pull.number as u64, before.as_ref(), &now);
+    let changes = changes(&pull.repo, pull.number as u64, before.as_ref(), &now);
     // Told before it's saved: a restart in between tells it again rather than never.
     if !changes.is_empty() {
         let text = format!("sloppod: {}", changes.join(" "));
@@ -261,31 +275,34 @@ mod tests {
     #[test]
     fn tells_what_changed_and_nothing_else() {
         let ok = seen("SUCCESS", "MERGEABLE", 0);
-        assert!(changes(7, None, &ok).is_empty(), "first sight");
-        assert!(changes(7, Some(&ok), &ok).is_empty());
+        assert!(changes("o/r", 7, None, &ok).is_empty(), "first sight");
+        assert!(changes("o/r", 7, Some(&ok), &ok).is_empty());
 
         let mut red = ok.clone();
         red.checks = "FAILURE".into();
         red.failing = vec!["check".into()];
-        let told = changes(7, Some(&ok), &red);
+        let told = changes("o/r", 7, Some(&ok), &red);
         assert_eq!(told.len(), 1);
-        assert!(told[0].starts_with("#7's checks failed (check)"));
-        assert!(changes(7, Some(&red), &red).is_empty(), "said once");
-        assert_eq!(changes(7, Some(&red), &ok), ["#7's checks pass again."]);
+        assert!(told[0].starts_with("o/r#7's checks failed (check)"));
+        assert!(changes("o/r", 7, Some(&red), &red).is_empty(), "said once");
+        assert_eq!(
+            changes("o/r", 7, Some(&red), &ok),
+            ["o/r#7's checks pass again."]
+        );
 
         let conflicting = seen("SUCCESS", "CONFLICTING", 0);
-        assert!(changes(7, Some(&ok), &conflicting)[0].contains("conflicts with its base"));
+        assert!(changes("o/r", 7, Some(&ok), &conflicting)[0].contains("conflicts with its base"));
         let reviewed = seen("SUCCESS", "MERGEABLE", 2);
-        assert!(changes(7, Some(&ok), &reviewed)[0].contains("new reviews or comments"));
+        assert!(changes("o/r", 7, Some(&ok), &reviewed)[0].contains("new reviews or comments"));
 
         let mut merged = ok.clone();
         merged.state = "MERGED".into();
-        assert_eq!(changes(7, Some(&ok), &merged), ["#7 was merged."]);
+        assert_eq!(changes("o/r", 7, Some(&ok), &merged), ["o/r#7 was merged."]);
         let mut closed = red.clone();
         closed.state = "CLOSED".into();
         assert_eq!(
-            changes(7, Some(&ok), &closed),
-            ["#7 was closed without being merged."],
+            changes("o/r", 7, Some(&ok), &closed),
+            ["o/r#7 was closed without being merged."],
             "only the closing, not the checks of a closed pull request"
         );
     }

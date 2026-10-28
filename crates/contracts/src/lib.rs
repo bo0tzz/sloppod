@@ -62,6 +62,33 @@ impl Grant {
     }
 }
 
+/// Whether a session can call `request_repository`, which decides what a refusal tells it to do about a repository it
+/// can't push to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoRequests {
+    /// A work session of its own: it asks the user itself.
+    #[default]
+    Itself,
+    /// A sub-session works where its parent can push, so it has to ask its parent through its report (ADR 27).
+    ViaParent,
+    /// A review session has no such tool.
+    Never,
+}
+
+impl RepoRequests {
+    /// What to do about a repository the session can't push to, to follow a semicolon; none if there's nothing.
+    pub fn advice(self) -> Option<&'static str> {
+        match self {
+            Self::Itself => Some("ask for write access with the request_repository tool"),
+            Self::ViaParent => {
+                Some("say in your report that you need it, and your parent session can request it")
+            }
+            Self::Never => None,
+        }
+    }
+}
+
 /// What extension points know about the session they act for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionContext {
@@ -69,6 +96,8 @@ pub struct SessionContext {
     /// The user the session belongs to; credentials are theirs (ADR 23).
     pub owner: String,
     pub grants: Vec<Grant>,
+    #[serde(default)]
+    pub repo_requests: RepoRequests,
 }
 
 /// A writable repository grant: the repository and the session branch, the only ref it may push.
@@ -565,6 +594,7 @@ mod repo_tests {
         let session = SessionContext {
             session_id: "s".into(),
             owner: "o".into(),
+            repo_requests: RepoRequests::default(),
             grants: vec![
                 Grant::new(
                     capability::REPO,
@@ -591,6 +621,25 @@ mod repo_tests {
         assert_eq!(repo_from_git_path("sloppod.git"), "sloppod");
         assert_eq!(repo_from_git_path("sloppod.git.git"), "sloppod.git");
         assert_eq!(repo_from_git_path("sloppod"), "sloppod");
+    }
+}
+
+#[cfg(test)]
+mod repo_requests_tests {
+    use super::*;
+
+    #[test]
+    fn a_refusal_only_names_tools_the_session_has() {
+        assert!(
+            RepoRequests::Itself
+                .advice()
+                .unwrap()
+                .contains("request_repository")
+        );
+        let via_parent = RepoRequests::ViaParent.advice().unwrap();
+        assert!(!via_parent.contains("request_repository"));
+        assert!(via_parent.contains("your report"));
+        assert_eq!(RepoRequests::Never.advice(), None);
     }
 }
 

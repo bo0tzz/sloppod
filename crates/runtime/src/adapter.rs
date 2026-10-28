@@ -412,6 +412,7 @@ mod tests {
                 session_id: "s".into(),
                 owner: "dev".into(),
                 grants: vec![],
+                repo_requests: Default::default(),
             },
             workdir: "/workspace".into(),
             repo: None,

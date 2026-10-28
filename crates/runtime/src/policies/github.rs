@@ -109,9 +109,13 @@ impl GitHubPolicy {
                     } else {
                         format!(" (it can push to {})", writable.join(", "))
                     };
+                    let next = session
+                        .repo_requests
+                        .advice()
+                        .map(|advice| format!("; {advice}"))
+                        .unwrap_or_default();
                     return Ok(Decision::deny(format!(
-                        "sloppod: this session can't push to {}{can}. Ask for write access with the \
-                         request_repository tool.\n",
+                        "sloppod: this session can't push to {}{can}{next}.\n",
                         git.repo
                     )));
                 };
@@ -192,13 +196,16 @@ impl GitHubPolicy {
                                     affected.extend(waiting.iter().copied());
                                     affected.sort_unstable();
                                     affected.dedup();
-                                    let pulls: Vec<String> =
-                                        affected.iter().map(|n| format!("#{n}")).collect();
+                                    let pulls: Vec<String> = affected
+                                        .iter()
+                                        .map(|n| crate::pulls::pull_ref(repo, *n))
+                                        .collect();
                                     let message = format!(
                                         "sloppod: `{pushed}` is the head of {}, which was set to merge once its checks \
                                          pass. New commits there haven't been reviewed, so auto-merge is now off and it \
-                                         needs merging by hand. Push again to go ahead.",
-                                        pulls.join(", ")
+                                         needs merging by hand. Push again to go ahead. {}",
+                                        pulls.join(", "),
+                                        crate::pulls::TELL_THE_USER
                                     );
                                     return Ok(push.reject(&message));
                                 }
@@ -341,18 +348,27 @@ impl RequestPolicy for GitHubPolicy {
 }
 
 fn proposal_hint(what: &str, session: &SessionContext) -> String {
+    // A review session has none of the proposal tools, so there's nothing to point it to.
+    if session.repo_requests == sloppod_contracts::RepoRequests::Never {
+        return format!(
+            "sloppod: {what}. This session can't make GitHub writes or propose them.\n"
+        );
+    }
     let pull_request = match session.writable_repo() {
         Some(grant) => format!(
             "to open a pull request, push to your session branch `{}` and call the propose_pull_request tool",
             grant.branch
         ),
-        None => "to change a repository, ask for write access with the request_repository tool, then push to your \
-                 session branch and call propose_pull_request"
-            .to_owned(),
+        None => format!(
+            "to change a repository, {}, then push to your session branch and call propose_pull_request",
+            session.repo_requests.advice().unwrap_or_default()
+        ),
     };
     format!(
-        "sloppod: {what}. Outward actions go through human review: {pull_request}. To file issues, call the \
-         propose_issues tool. Other GitHub writes (comments, reviews, releases) aren't available to sessions yet.\n"
+        "sloppod: {what}. Outward actions go through human review: {pull_request}. Issues are filed with \
+         propose_issues, and comments on them with propose_issue_updates; propose_stack opens pull requests that \
+         build on each other, and request_code_review has a branch reviewed without proposing anything. Other \
+         GitHub writes (reviews, releases) aren't available to sessions yet.\n"
     )
 }
 
@@ -611,6 +627,45 @@ fn graphql_is_read_only(body: &[u8]) -> std::result::Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn context(repo_requests: sloppod_contracts::RepoRequests) -> SessionContext {
+        SessionContext {
+            session_id: "s".into(),
+            owner: "dev".into(),
+            grants: vec![],
+            repo_requests,
+        }
+    }
+
+    #[test]
+    fn the_proposal_hint_names_what_exists_and_what_the_session_has() {
+        let hint = proposal_hint("that's refused", &context(Default::default()));
+        assert!(hint.contains("request_repository"));
+        for tool in [
+            "propose_issues",
+            "propose_issue_updates",
+            "propose_stack",
+            "request_code_review",
+        ] {
+            assert!(hint.contains(tool), "{tool}");
+        }
+        assert!(!hint.contains("comments (reviews"), "{hint}");
+
+        let hint = proposal_hint(
+            "that's refused",
+            &context(sloppod_contracts::RepoRequests::ViaParent),
+        );
+        assert!(!hint.contains("request_repository"), "{hint}");
+        assert!(hint.contains("your report"), "{hint}");
+
+        let hint = proposal_hint(
+            "that's refused",
+            &context(sloppod_contracts::RepoRequests::Never),
+        );
+        for tool in ["propose_", "request_"] {
+            assert!(!hint.contains(tool), "{hint}");
+        }
+    }
 
     fn pkt(line: &str) -> Vec<u8> {
         let mut out = format!("{:04x}", line.len() + 4).into_bytes();

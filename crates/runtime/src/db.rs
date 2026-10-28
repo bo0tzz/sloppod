@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sloppod_contracts::{Grant, SessionContext};
+use sloppod_contracts::{Grant, RepoRequests, SessionContext};
 use sloppod_protocol::api::{
     self, Phase, Proposal, ProposalStatus, ReviewPolicy, Session, SessionKind,
 };
@@ -89,6 +89,17 @@ impl SessionRow {
             session_id: self.id.to_string(),
             owner: self.owner.clone(),
             grants: self.grants(),
+            repo_requests: self.repo_requests(),
+        }
+    }
+
+    /// Whether the session can call `request_repository`: a work session can (see `mcp::tools`), unless it's a
+    /// sub-session, which is refused and told to say so in its report.
+    pub fn repo_requests(&self) -> RepoRequests {
+        match (self.kind, self.parent_id) {
+            (SessionKind::Work, None) => RepoRequests::Itself,
+            (SessionKind::Work, Some(_)) => RepoRequests::ViaParent,
+            _ => RepoRequests::Never,
         }
     }
 

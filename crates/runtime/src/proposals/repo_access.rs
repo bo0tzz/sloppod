@@ -5,10 +5,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use sloppod_contracts::capability;
-use sloppod_contracts::find_repo;
 use sloppod_contracts::{
     Error, Grant, Manifest, ProposalKind, READ_WRITE, Result, SessionContext, ToolSpec,
 };
+use sloppod_contracts::{RepoRequests, find_repo};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -142,9 +142,10 @@ impl ProposalKind for RepoAccess {
             .map_err(err)?
             .is_some_and(|row| row.parent_id.is_some())
         {
-            return Err(Error::new(
-                "a sub-session can't get write access to another repository: say in your report that you need                  it, and your parent session can request it",
-            ));
+            return Err(Error::new(format!(
+                "a sub-session can't get write access to another repository: {}",
+                RepoRequests::ViaParent.advice().unwrap_or_default()
+            )));
         }
         let repos = self
             .credentials

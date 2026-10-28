@@ -217,8 +217,16 @@ pub async fn run(state: AppState, mut rechecks: mpsc::UnboundedReceiver<Recheck>
                             recheck.session,
                             format!(
                                 "sloppod: your push to `{}` turned auto-merge off, and it couldn't be checked to turn it \
-                                 back on ({e}), so it needs merging by hand. Tell the user.",
-                                recheck.branch
+                                 back on ({e}), so {} need{} merging by hand. {}",
+                                recheck.branch,
+                                recheck
+                                    .pulls
+                                    .iter()
+                                    .map(|(n, _)| crate::pulls::pull_ref(&recheck.repo, *n))
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                                if recheck.pulls.len() == 1 { "s" } else { "" },
+                                crate::pulls::TELL_THE_USER
                             ),
                         )
                         .await;
@@ -229,7 +237,7 @@ pub async fn run(state: AppState, mut rechecks: mpsc::UnboundedReceiver<Recheck>
                 .instrument(span)
                 .await;
             for (pull, outcome) in outcomes {
-                if let Some(text) = notice(&recheck.branch, pull, &outcome) {
+                if let Some(text) = notice(&recheck.repo, &recheck.branch, pull, &outcome) {
                     state.hub.notify(recheck.session, text).await;
                 }
             }
@@ -247,15 +255,18 @@ enum Outcome {
     Superseded,
 }
 
-fn notice(branch: &str, pull: u64, outcome: &Outcome) -> Option<String> {
+fn notice(repo: &str, branch: &str, pull: u64, outcome: &Outcome) -> Option<String> {
+    let pull_ref = crate::pulls::pull_ref(repo, pull);
     match outcome {
         Outcome::Kept => Some(format!(
-            "sloppod: your push to `{branch}` only brought #{pull} up to date: the change it makes is the one that \
+            "sloppod: your push to `{branch}` only brought {pull_ref} up to date: the change it makes is the one that \
              was reviewed, so it's set to merge once its checks pass again."
         )),
         Outcome::Off(why) => Some(format!(
-            "sloppod: `{branch}` is the head of #{pull}, which was set to merge once its checks pass. After your \
-             push {why}, so auto-merge is off and it needs merging by hand."
+            "sloppod: `{branch}` is the head of {pull_ref}, which was set to merge once its checks pass. After \
+             your push {why}, so auto-merge is off and it needs merging by hand. {} It's at {}.",
+            crate::pulls::TELL_THE_USER,
+            crate::pulls::pull_url(repo, pull)
         )),
         Outcome::Superseded => None,
     }
@@ -423,16 +434,16 @@ index 3333333..4444444 100644
     #[test]
     fn the_agent_hears_why() {
         assert!(
-            notice("s", 7, &Outcome::Kept)
+            notice("o/r", "s", 7, &Outcome::Kept)
                 .unwrap()
-                .contains("#7 up to date")
+                .contains("o/r#7 up to date")
         );
         assert!(
-            notice("s", 7, &Outcome::Off("it's no longer open".into()))
+            notice("o/r", "s", 7, &Outcome::Off("it's no longer open".into()))
                 .unwrap()
                 .contains("After your push it's no longer open, so auto-merge is off")
         );
-        assert_eq!(notice("s", 7, &Outcome::Superseded), None);
+        assert_eq!(notice("o/r", "s", 7, &Outcome::Superseded), None);
     }
 
     /// A fake GitHub with one pull request, #7, whose head moves to whatever `heads` says next on each lookup.
