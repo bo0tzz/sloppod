@@ -1286,7 +1286,16 @@ test('reviews and approves updates to existing issues', async ({ page }) => {
   await expect(updates.nth(0)).toContainText('close as completed');
   await expect(updates.nth(0)).toContainText('Remove labels: priority');
   await expect(updates.nth(1)).toContainText('close as a duplicate');
-  await expect(updates.nth(2)).toContainText('New title: Startup failures show in the UI');
+  // A rewrite shows against what the issue says now.
+  await expect(updates.nth(2).getByTestId('issue-update-title')).toHaveText(
+    'Title: Startup failures are only in the logs → Startup failures show in the UI',
+  );
+  const bodyDiff = updates.nth(2).getByTestId('diff');
+  await expect(bodyDiff).toContainText('Body of #59');
+  await expect(bodyDiff).toContainText('+1');
+  await expect(bodyDiff).toContainText('−1');
+  await expect(bodyDiff.getByText('A pod that fails to start says nothing.')).toBeVisible();
+  await expect(bodyDiff.getByText('A pod that fails to start says why in the UI.')).toBeVisible();
 
   // Drop the duplicate close, and reword the first comment.
   await updates.nth(1).getByRole('checkbox', { name: 'Make this update' }).click();

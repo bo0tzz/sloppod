@@ -144,12 +144,14 @@ export type Review = {
   finished_at?: string;
 };
 
-/** Pull requests add their diff and commits; other kinds add nothing. */
+/** Pull requests add their diff and commits, issue updates the current text of the issues they rewrite. */
 export type ProposalDetail = Proposal & {
   diff?: string;
   commits?: { sha: string; message: string }[];
   /** Stacks: each pull request's diff and commits, bottom first. */
   layers?: { diff: string; commits: { sha: string; message: string }[] }[];
+  /** Issue updates: each issue whose title or body they replace, as it is now. */
+  current?: { number: number; title: string; body: string }[];
 };
 
 /** Pull requests that build on each other, bottom first; each merges into the one below it. */

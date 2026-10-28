@@ -123,6 +123,20 @@ fn edit_updates(payload: &Value, edits: &Value) -> Result<Value> {
     Ok(payload)
 }
 
+/// The issues whose title or body the updates replace, each once, for the reviewer to compare with what they are now.
+fn rewritten(payload: &Value) -> Vec<u64> {
+    let mut numbers: Vec<u64> = payload["updates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|u| u.get("title").is_some() || u.get("body").is_some())
+        .filter_map(|u| u["number"].as_u64())
+        .collect();
+    numbers.sort_unstable();
+    numbers.dedup();
+    numbers
+}
+
 /// What an update changes, in a few words, for the result and the agent's notice.
 fn describe(update: &Value) -> String {
     let mut parts = Vec::new();
@@ -215,8 +229,20 @@ impl ProposalKind for IssueUpdates {
         Ok(json!({"repo": repo, "updates": update_list(&arguments["updates"])?}))
     }
 
-    async fn detail(&self, _session: &SessionContext, _payload: &Value) -> Result<Value> {
-        Ok(json!({}))
+    async fn detail(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
+        let repo = payload["repo"].as_str().unwrap_or_default();
+        let numbers = rewritten(payload);
+        if numbers.is_empty() {
+            return Ok(json!({}));
+        }
+        let app = self.credentials.github(&session.owner).await.map_err(err)?;
+        let mut current = Vec::new();
+        for number in numbers {
+            let mut issue = app.issue(repo, number).await.map_err(err)?;
+            issue["number"] = json!(number);
+            current.push(issue);
+        }
+        Ok(json!({"current": current}))
     }
 
     fn edit(&self, payload: &Value, edits: &Value) -> Result<Value> {
@@ -356,6 +382,18 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn finds_the_issues_whose_text_is_replaced() {
+        let payload = json!({"repo": "a/one", "updates": [
+            {"number": 9, "body": "New"},
+            {"number": 3, "comment": "Only a comment"},
+            {"number": 4, "title": "Clearer"},
+            {"number": 9, "body": ""},
+        ]});
+        assert_eq!(rewritten(&payload), [4, 9]);
+        assert!(rewritten(&json!({"updates": [{"number": 1, "close": "completed"}]})).is_empty());
     }
 
     #[test]
