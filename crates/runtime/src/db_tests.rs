@@ -1049,3 +1049,56 @@ async fn a_review_round_counts_its_wait_for_the_usage_limit_across_a_restart(db:
         at(21)
     ));
 }
+
+#[sqlx::test]
+async fn a_review_round_keeps_a_wait_the_runtime_went_down_in_before_its_watcher_saw_it(
+    db: PgPool,
+) {
+    use crate::reviews::{paused, round_timed_out};
+
+    let author = session(&db, "dev").await;
+    let reviewer = session_of_kind(&db, "dev", SessionKind::Review).await;
+    let p = db::insert_proposal(
+        &db,
+        author,
+        "github.pr.create",
+        ProposalStatus::InReview,
+        &json!({"n": 1}),
+    )
+    .await
+    .unwrap()
+    .id;
+    db::set_review_session(&db, p, reviewer).await.unwrap();
+    let round = db::start_review_round(&db, p, "aaa", None).await.unwrap();
+    let started = db::reviews(&db, p).await.unwrap()[0].created_at;
+
+    // The reviewer hits its limit after 10 minutes, and the runtime stops before the round's watcher looks again.
+    let hit = started + Duration::minutes(10);
+    db::pause_reviewer(&db, reviewer, hit).await.unwrap();
+    // An hour later it's back, the limit reset meanwhile: the watcher's first check ends the wait.
+    let back = hit + Duration::minutes(60);
+    db::unpause_review(&db, p, round, back).await.unwrap();
+    let row = &db::reviews(&db, p).await.unwrap()[0];
+    assert_eq!(row.paused_seconds, 60 * 60);
+    // The reviewer keeps the 20 minutes of its 30 it hadn't used.
+    let at = |minutes| back + Duration::minutes(minutes);
+    assert!(!round_timed_out(
+        row.created_at,
+        paused(row, at(20)),
+        false,
+        at(20)
+    ));
+    assert!(round_timed_out(
+        row.created_at,
+        paused(row, at(21)),
+        false,
+        at(21)
+    ));
+
+    // A round that has its verdict isn't paused.
+    db::finish_review_round(&db, p, "approve", "Fine.", &json!([]), &json!([]))
+        .await
+        .unwrap();
+    db::pause_reviewer(&db, reviewer, back).await.unwrap();
+    assert_eq!(db::reviews(&db, p).await.unwrap()[0].paused_since, None);
+}

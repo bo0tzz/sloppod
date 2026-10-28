@@ -246,8 +246,10 @@ pub type TurnEnded = Arc<dyn Fn(Uuid) -> Pin<Box<dyn Future<Output = ()> + Send>
 /// Called with each `usage_update` an agent sends, e.g. to keep the rate limits it reports (#140).
 pub type UsageSeen =
     Arc<dyn Fn(Uuid, Value) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
-/// When the usage limit a session's account is at resets, if that's known (#140's quotas).
-pub type LimitReset =
+
+/// Called when a session's turn hits its usage limit, to keep what depends on it (a review round's pause); says when
+/// the limit resets, if that's known (#140's quotas).
+pub type LimitHit =
     Arc<dyn Fn(Uuid) -> Pin<Box<dyn Future<Output = Option<DateTime<Utc>>> + Send>> + Send + Sync>;
 
 pub struct Hub {
@@ -259,7 +261,7 @@ pub struct Hub {
     agent_capabilities: StdMutex<Option<Value>>,
     /// The time the tests say it is, instead of the clock's.
     now: StdMutex<Option<DateTime<Utc>>>,
-    limit_reset: StdMutex<Option<LimitReset>>,
+    limit_hit: StdMutex<Option<LimitHit>>,
 }
 
 fn notification(method: &str, params: Value) -> Value {
@@ -290,7 +292,7 @@ impl Hub {
             usage_seen: StdMutex::default(),
             sessions: StdMutex::default(),
             agent_capabilities: StdMutex::default(),
-            limit_reset: StdMutex::default(),
+            limit_hit: StdMutex::default(),
             now: StdMutex::default(),
         }
     }
@@ -331,8 +333,8 @@ impl Hub {
         *self.usage_seen.lock().unwrap() = Some(usage_seen);
     }
 
-    pub fn set_limit_reset(&self, limit_reset: LimitReset) {
-        *self.limit_reset.lock().unwrap() = Some(limit_reset);
+    pub fn set_limit_hit(&self, limit_hit: LimitHit) {
+        *self.limit_hit.lock().unwrap() = Some(limit_hit);
     }
 
     /// The session's agent, if it's up.
@@ -1760,9 +1762,9 @@ impl Hub {
     async fn turn_finished(self: &Arc<Self>, id: Uuid, end: TurnEnd) {
         self.heard_from_agent(id);
         let now = self.now();
-        let limit_reset = self.limit_reset.lock().unwrap().clone();
-        let reset = match (&end, limit_reset) {
-            (TurnEnd::Limited, Some(limit_reset)) => limit_reset(id).await,
+        let limit_hit = self.limit_hit.lock().unwrap().clone();
+        let reset = match (&end, limit_hit) {
+            (TurnEnd::Limited, Some(limit_hit)) => limit_hit(id).await,
             _ => None,
         };
         let limited = {
