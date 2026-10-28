@@ -178,23 +178,27 @@ const NUDGE_AFTER: chrono::Duration = chrono::Duration::hours(24);
 pub struct ImageNudges(std::sync::Mutex<std::collections::HashSet<(Uuid, String)>>);
 
 impl ImageNudges {
-    /// Whether to nudge the session about `image` now; true only the first time.
-    fn first(&self, session: Uuid, image: &str) -> bool {
-        self.0.lock().unwrap().insert((session, image.to_owned()))
+    fn sent(&self, session: Uuid, image: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .contains(&(session, image.to_owned()))
+    }
+
+    fn record(&self, session: Uuid, image: &str) {
+        self.0.lock().unwrap().insert((session, image.to_owned()));
     }
 }
 
 /// Whether a session that can't be given a new pod yet should be asked to find a quiet moment: its pod has run an
-/// older image for long enough, and no turn is running for the notice to interrupt.
+/// older image for long enough. The notice only goes while no turn is running, so it interrupts none.
 fn due_for_nudge(
     pod_made: Option<chrono::DateTime<chrono::Utc>>,
     running: Option<&str>,
     current: &str,
-    in_turn: bool,
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
-    !in_turn
-        && running.is_some_and(|image| image != current)
+    running.is_some_and(|image| image != current)
         && pod_made.is_some_and(|made| now - made >= NUDGE_AFTER)
 }
 
@@ -241,16 +245,19 @@ pub async fn roll_images(state: &AppState) {
         let busy = state.hub.busy(session.id).await;
         let now = chrono::Utc::now();
         if !due_for_image(&session, running.as_deref(), current, busy, now) {
-            let in_turn = state.hub.turn_running(session.id).await;
+            // Recorded only once it's sent: a session busy with a turn now is asked at a later sweep.
             if due_for_nudge(
                 pod.and_then(|pod| pod.made),
                 running.as_deref(),
                 current,
-                in_turn,
                 now,
-            ) && state.image_nudges.first(session.id, current)
+            ) && !state.image_nudges.sent(session.id, current)
+                && state
+                    .hub
+                    .notify_when_idle(session.id, None, NUDGE.to_owned())
+                    .await
             {
-                state.hub.notify(session.id, NUDGE.to_owned()).await;
+                state.image_nudges.record(session.id, current);
             }
             continue;
         }
@@ -324,39 +331,30 @@ mod tests {
             day_ago,
             Some("session:old"),
             "session:new",
-            false,
             now
         ));
-        // Not before a day, not on the current image, not mid-turn, not without a pod.
+        // Not before a day, not on the current image, not without a pod.
         assert!(!due_for_nudge(
             Some(now - chrono::Duration::hours(2)),
             Some("session:old"),
             "session:new",
-            false,
             now
         ));
         assert!(!due_for_nudge(
             day_ago,
             Some("session:new"),
             "session:new",
-            false,
             now
         ));
-        assert!(!due_for_nudge(
-            day_ago,
-            Some("session:old"),
-            "session:new",
-            true,
-            now
-        ));
-        assert!(!due_for_nudge(day_ago, None, "session:new", false, now));
+        assert!(!due_for_nudge(day_ago, None, "session:new", now));
 
         let nudges = ImageNudges::default();
         let session = Uuid::now_v7();
-        assert!(nudges.first(session, "session:new"));
-        assert!(!nudges.first(session, "session:new"));
+        assert!(!nudges.sent(session, "session:new"));
+        nudges.record(session, "session:new");
+        assert!(nudges.sent(session, "session:new"));
         assert!(
-            nudges.first(session, "session:newer"),
+            !nudges.sent(session, "session:newer"),
             "again for the next image"
         );
     }

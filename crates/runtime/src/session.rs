@@ -982,6 +982,51 @@ impl Hub {
         }
     }
 
+    /// How many of the session's turns have ended, and whether one is running, read together.
+    pub async fn turn_state(&self, id: Uuid) -> (u64, bool) {
+        let live = self.live(id);
+        let state = live.state.lock().await;
+        (state.turns_ended, state.turn_running)
+    }
+
+    /// Sends a notice as a new turn, but only while the session is idle: the agent up, no turn running, and, if
+    /// given, `turns_ended` turns ended, as the sender last saw it. Checked and the turn reserved under one lock,
+    /// so nothing can start in between; says whether it was sent.
+    pub async fn notify_when_idle(
+        self: &Arc<Self>,
+        id: Uuid,
+        turns_ended: Option<u64>,
+        text: String,
+    ) -> bool {
+        let blocks = vec![json!({"type": "text", "text": text})];
+        {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            let up = state.agent.is_some() && state.agent_session_id.is_some();
+            if !up || state.turn_running || turns_ended.is_some_and(|n| n != state.turns_ended) {
+                return false;
+            }
+            state.turn_running = true;
+        }
+        self.record(
+            id,
+            json!({
+                "sessionUpdate": "user_message_chunk",
+                "messageId": Uuid::new_v4(),
+                "content": blocks[0],
+                "_meta": {"sloppod": {"notice": true}},
+            }),
+        )
+        .await;
+        let hub = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = hub.run_turn(id, blocks).await {
+                tracing::warn!(session = %id, error = %e, "notice turn failed");
+            }
+        });
+        true
+    }
+
     pub async fn notify(self: &Arc<Self>, id: Uuid, text: String) {
         let blocks = vec![json!({"type": "text", "text": text})];
         let delivery = {
