@@ -1269,7 +1269,10 @@ async function handleApi(req, res, url) {
     }
     const session = sessions.get(parts[1]);
     if (!session) return json(res, 404, { error: 'session not found' });
-    if (parts.length === 2 && method === 'GET') return json(res, 200, session.data);
+    if (parts.length === 2 && method === 'GET') {
+      if (Date.now() < slowSessionsUntil) await sleep(slowSessionsUntil - Date.now());
+      return json(res, 200, session.data);
+    }
     if (parts.length === 3 && parts[2] === 'review' && method === 'PUT') {
       const body = await readBody(req);
       if (!['off', 'required'].includes(body.review)) return json(res, 400, { error: 'review must be one of off, required' });
@@ -1660,6 +1663,9 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, {});
     }
     if (url.pathname === '/_mock/drop' && req.method === 'POST') {
+      // With `?for=<ms>`, new connections are refused that long, so a UI stays disconnected for a while.
+      refuseConnectionsUntil = Date.now() + Number(url.searchParams.get('for') ?? 0);
+      slowSessionsUntil = Date.now() + Number(url.searchParams.get('slow') ?? 0);
       for (const conn of connections) conn.ws.terminate();
       return json(res, 200, { dropped: connections.size });
     }
@@ -1671,9 +1677,14 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+/** Set by `/_mock/drop?for=<ms>`: until then, UIs can't connect. */
+let refuseConnectionsUntil = 0;
+/** Set by `/_mock/drop?slow=<ms>`: until then, reading a session waits, as a slow runtime's REST does. */
+let slowSessionsUntil = 0;
+
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
-  if (new URL(req.url ?? '/', 'http://localhost').pathname !== '/acp') {
+  if (new URL(req.url ?? '/', 'http://localhost').pathname !== '/acp' || Date.now() < refuseConnectionsUntil) {
     socket.destroy();
     return;
   }

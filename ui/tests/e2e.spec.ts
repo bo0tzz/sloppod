@@ -382,6 +382,40 @@ test('reconnects after the socket drops without duplicating history', async ({ p
   await expect(permissionCard(page)).toBeVisible();
 });
 
+test('a message written while reconnecting is sent once the connection is back', async ({ page }) => {
+  await createSession(page, 'Reconnect me in sloppod');
+  await finishTurn(page);
+
+  await page.request.post('/_mock/drop?for=3000');
+  await expect(page.getByTestId('composer-hint')).toHaveText("Reconnecting… messages send once it's back.");
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Written offline');
+  await box.press('Enter');
+  await expect(box).toHaveValue('');
+  await expect(page.getByTestId('unsent-message')).toContainText('Written offline');
+
+  await expect(userMessages(page).filter({ hasText: 'Written offline' })).toHaveCount(1, { timeout: 15_000 });
+  await expect(page.getByTestId('unsent-messages')).toBeHidden();
+});
+
+test('a message written while the reconnect finishes loading is sent too', async ({ page }) => {
+  await createSession(page, 'Reconnect me in sloppod');
+  await finishTurn(page);
+
+  // The socket comes back at once, but reading the session takes 3 s: the session loads and the view stays
+  // reconnecting meanwhile.
+  await page.request.post('/_mock/drop?slow=3000');
+  await expect(page.getByTestId('composer-hint')).toHaveText("Reconnecting… messages send once it's back.");
+  await page.waitForTimeout(500);
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Written while loading');
+  await box.press('Enter');
+  await expect(page.getByTestId('unsent-message')).toContainText('Written while loading');
+
+  await expect(userMessages(page).filter({ hasText: 'Written while loading' })).toHaveCount(1, { timeout: 15_000 });
+  await expect(page.getByTestId('unsent-messages')).toBeHidden();
+});
+
 test('switches the model of a session', async ({ page, context }) => {
   const sent: string[] = [];
   page.on('websocket', (socket) => socket.on('framesent', ({ payload }) => sent.push(String(payload))));
