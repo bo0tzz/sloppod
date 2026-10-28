@@ -31,11 +31,12 @@ jobs:
           fetch-depth: 2
       - id: scope
         run: |
-          # On a pull request HEAD is its merge into the base, so the first parent is the base. Renames count as a delete and
-          # an add, so moving a file out of a directory still counts as touching it.
+          # On a pull request HEAD is its merge into the base, so the first parent is the base. Renames count as a
+          # delete and an add, so moving a file out of a directory still counts as touching it. quotePath is off so a
+          # non-ASCII name comes out raw, not as a quoted escape the anchored patterns would miss.
           files=
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            files=$(git diff --no-renames --name-only HEAD^1 HEAD)
+            files=$(git -c core.quotePath=false diff --no-renames --name-only HEAD^1 HEAD)
           fi
           scope() {
             if [ -z "$files" ] || printf '%s\n' "$files" | grep -Eq "$2"; then
