@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::Instrument;
 
 use crate::{AppState, db};
 
@@ -152,14 +153,28 @@ async fn poll(state: &AppState) {
         }
     };
     for pull in watched {
-        if let Err(e) = check(state, &pull).await {
+        let span = crate::github::acting_span(&pull.session_id.to_string(), None);
+        if let Err(e) = check(state, &pull).instrument(span).await {
             tracing::debug!(repo = %pull.repo, number = pull.number, error = %e, "checking a pull request");
         }
     }
 }
 
 async fn check(state: &AppState, pull: &db::WatchedPull) -> anyhow::Result<()> {
-    let app = state.credentials.github(&pull.owner).await?;
+    // Watched as whoever the session acts as on the repository (ADR 29), which can read it.
+    let credential = db::get_session(&state.db, pull.session_id)
+        .await?
+        .and_then(|session| {
+            session
+                .context()
+                .repo_credential(&pull.repo)
+                .map(str::to_owned)
+        });
+    crate::github::record_credential(credential.as_deref());
+    let app = state
+        .credentials
+        .github_as(&pull.owner, credential.as_deref())
+        .await?;
     let (owner, name) = pull
         .repo
         .split_once('/')

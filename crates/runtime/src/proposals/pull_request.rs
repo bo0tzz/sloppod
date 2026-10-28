@@ -21,9 +21,9 @@ impl PullRequest {
         Self { credentials }
     }
 
-    /// The session owner's GitHub App, which both reads the comparison and opens the PR.
-    async fn app(&self, session: &SessionContext) -> Result<Arc<GitHubApp>> {
-        self.credentials.github(&session.owner).await.map_err(err)
+    /// What reads the comparison and opens the PR: the identity the session acts with on `repo` (ADR 29).
+    async fn app(&self, session: &SessionContext, repo: &str) -> Result<Arc<GitHubApp>> {
+        super::github_for(&self.credentials, session, repo).await
     }
 }
 
@@ -90,7 +90,7 @@ impl ProposalKind for PullRequest {
     async fn prepare(&self, session: &SessionContext, arguments: Value) -> Result<Value> {
         let RepoGrant { repo, branch } = target_repo(session, arguments["repo"].as_str())?;
         let head = head_branch(branch, arguments["head"].as_str())?;
-        let app = self.app(session).await?;
+        let app = self.app(session, repo).await?;
         let title = arguments["title"].as_str().filter(|t| !t.trim().is_empty());
         let Some(title) = title else {
             return Err(Error::new("a title is required"));
@@ -118,7 +118,8 @@ impl ProposalKind for PullRequest {
     }
 
     async fn detail(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
-        branch_detail(&*self.app(session).await?, payload).await
+        let repo = payload["repo"].as_str().unwrap_or_default();
+        branch_detail(&*self.app(session, repo).await?, payload).await
     }
 
     fn edit(&self, payload: &Value, edits: &Value) -> Result<Value> {
@@ -135,7 +136,7 @@ impl ProposalKind for PullRequest {
         });
         let repo = payload["repo"].as_str().unwrap_or_default();
         let head = payload["head"].as_str().unwrap_or_default();
-        let app = self.app(session).await?;
+        let app = self.app(session, repo).await?;
         let reviewed = payload["head_sha"].as_str().unwrap_or_default();
         let current = app.branch_sha(repo, head).await.map_err(err)?;
         if current != reviewed {
@@ -205,8 +206,8 @@ impl Stack {
         }
     }
 
-    async fn app(&self, session: &SessionContext) -> Result<Arc<GitHubApp>> {
-        self.credentials.github(&session.owner).await.map_err(err)
+    async fn app(&self, session: &SessionContext, repo: &str) -> Result<Arc<GitHubApp>> {
+        super::github_for(&self.credentials, session, repo).await
     }
 }
 
@@ -350,7 +351,7 @@ impl ProposalKind for Stack {
                 "a stack has at least two pull requests; propose a single one with propose_pull_request",
             ));
         }
-        let app = self.app(session).await?;
+        let app = self.app(session, repo).await?;
         let mut base = match arguments["base"].as_str() {
             Some(base) => base.to_owned(),
             None => app.default_branch(repo).await.map_err(err)?,
@@ -389,8 +390,8 @@ impl ProposalKind for Stack {
     }
 
     async fn detail(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
-        let app = self.app(session).await?;
         let repo = payload["repo"].as_str().unwrap_or_default();
+        let app = self.app(session, repo).await?;
         let mut layers = Vec::new();
         for layer in stack_layers(payload) {
             let comparison = app
@@ -416,7 +417,7 @@ impl ProposalKind for Stack {
     async fn execute(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
         let started = std::time::Instant::now();
         let repo = payload["repo"].as_str().unwrap_or_default();
-        let app = self.app(session).await?;
+        let app = self.app(session, repo).await?;
         let layers = stack_layers(payload);
         // Nothing is opened unless every branch is still at the commit that was reviewed.
         for layer in layers {

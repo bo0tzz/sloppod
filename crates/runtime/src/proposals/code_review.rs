@@ -109,7 +109,7 @@ impl ProposalKind for CodeReview {
     async fn prepare(&self, session: &SessionContext, arguments: Value) -> Result<Value> {
         let RepoGrant { repo, branch } = target_repo(session, arguments["repo"].as_str())?;
         let head = head_branch(branch, arguments["head"].as_str())?;
-        let app = self.credentials.github(&session.owner).await.map_err(err)?;
+        let app = super::github_for(&self.credentials, session, repo).await?;
         let base = match arguments["base"].as_str().filter(|b| !b.trim().is_empty()) {
             Some(base) => base.trim().to_owned(),
             None => app.default_branch(repo).await.map_err(err)?,
@@ -138,7 +138,8 @@ impl ProposalKind for CodeReview {
     }
 
     async fn detail(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
-        let app = self.credentials.github(&session.owner).await.map_err(err)?;
+        let repo = payload["repo"].as_str().unwrap_or_default();
+        let app = super::github_for(&self.credentials, session, repo).await?;
         branch_detail(&app, payload).await
     }
 

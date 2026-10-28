@@ -774,6 +774,12 @@ function addReview(proposal) {
   ]);
 }
 
+/** `{as}` when the session acts on `repo` with one of the user's GitHub tokens (ADR 29), as the runtime adds it. */
+function actingAs(session, repo) {
+  const grant = session.data.grants.find((g) => g.capability === 'repo' && g.params.repo === repo && g.params.as);
+  return grant ? { as: grant.params.as } : {};
+}
+
 function createProposal(session) {
   const oldFile = `export class AcpConnection {\n  #timer: ReturnType<typeof setTimeout> | undefined;\n\n  connect() {\n    // …\n  }\n\n${OLD_SNIPPET}\n}\n`;
   const newFile = `const MAX_BACKOFF_MS = 10_000;\n\nexport class AcpConnection {\n  #timer: ReturnType<typeof setTimeout> | undefined;\n  #attempt = 0;\n\n  connect() {\n    // …\n  }\n\n${NEW_SNIPPET}\n}\n`;
@@ -801,6 +807,7 @@ function createProposal(session) {
       body: 'Reconnects used a fixed one-second delay, which hammers a restarting runtime.\n\n## Changes\n\n- Back off exponentially from 500 ms, capped at 10 s\n- Reset the backoff after a successful `session/load`\n- Add an end-to-end test for reconnecting',
       draft: false,
       auto_merge: true,
+      ...actingAs(session, session.data.repo),
     },
     created_at: now(),
     diff,

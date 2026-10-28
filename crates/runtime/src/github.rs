@@ -204,8 +204,19 @@ fn push_permissions(installation: &BTreeMap<String, String>) -> BTreeMap<String,
 }
 
 /// The span to run a user-token client's calls in, so each logged call names the session and credential it's for.
+/// A credential that's only chosen inside the span (`None`) is recorded there once it is (`record_credential`).
 pub fn acting_span(session: &str, credential: Option<&str>) -> tracing::Span {
-    tracing::info_span!("acting", session = %session, credential = credential.unwrap_or("app"))
+    let span =
+        tracing::info_span!("acting", session = %session, credential = tracing::field::Empty);
+    if let Some(credential) = credential {
+        span.record("credential", credential);
+    }
+    span
+}
+
+/// Records the credential chosen for the calls that follow in the current `acting_span`.
+pub fn record_credential(credential: Option<&str>) {
+    tracing::Span::current().record("credential", credential.unwrap_or("app"));
 }
 
 /// A GitHub client acting with one identity (ADR 29): the owner's GitHub App, through its installations' tokens, or

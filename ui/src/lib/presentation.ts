@@ -93,6 +93,11 @@ export function proposalStatus(proposal: Proposal): { label: string; color: Colo
 
 const payloadText = (value: unknown) => (typeof value === 'string' ? value : '');
 
+/** Whose GitHub token a proposal acts with (ADR 29), by login; none when it acts as the GitHub App. */
+export function actingAs(proposal: Proposal): string | undefined {
+  return typeof proposal.payload.as === 'string' ? proposal.payload.as : undefined;
+}
+
 /** How a proposal reads in cards and the modal, by kind. Unknown kinds fall back to their kind name. */
 export function proposalSummary(proposal: Proposal): { label: string; title: string; detail?: string; icon: string } {
   const payload = proposal.payload;

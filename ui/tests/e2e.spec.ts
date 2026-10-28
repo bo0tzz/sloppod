@@ -410,6 +410,23 @@ test('approves a proposal with an edited title', async ({ page }) => {
   expect(pr?.payload.auto_merge).toBe(false);
 });
 
+test('a proposal made with the user\'s own GitHub token says so', async ({ page }) => {
+  // As the runtime reports a proposal on a repository the session acts on with the user's token (ADR 29).
+  await page.route('**/api/v1/proposals?*', async (route) => {
+    const response = await route.fetch();
+    const proposals: Proposal[] = await response.json();
+    await route.fulfill({ response, json: proposals.map((p) => ({ ...p, payload: { ...p.payload, as: 'bo0tzz' } })) });
+  });
+  await createSession(page, 'Propose a PR for sloppod');
+  await finishTurn(page);
+  await page.reload();
+
+  const card = page.getByTestId('proposal-card');
+  await expect(card.getByTestId('proposal-acts-as')).toHaveText('as bo0tzz');
+  await card.getByRole('button', { name: 'Review' }).click();
+  await expect(page.getByTestId('proposal-detail').getByTestId('proposal-acts-as')).toHaveText('Acts as bo0tzz');
+});
+
 test('approves a stack of pull requests', async ({ page }) => {
   await createSession(page, 'Propose a stack for sloppod');
   const card = page.getByTestId('proposal-card');

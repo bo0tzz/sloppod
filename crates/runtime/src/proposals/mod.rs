@@ -13,6 +13,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use sloppod_contracts::{Error, ProposalKind, RepoGrant, Result, SessionContext, ToolSpec};
 use sloppod_protocol::api::{Proposal, ProposalStatus, ReviewPolicy};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::github::{GitHubApp, StackWatch};
@@ -114,6 +115,56 @@ async fn branch_detail(app: &GitHubApp, payload: &Value) -> Result<Value> {
 }
 
 /// The repository a pull request or issue is for: the one named, or the only one the session can push to.
+/// The client a proposal reads and acts with on `repo` (ADR 29): the identity the session's grant of `repo` names, or
+/// the GitHub App. Every proposal kind gets its client here.
+pub(crate) async fn github_for(
+    credentials: &crate::credentials::Credentials,
+    session: &SessionContext,
+    repo: &str,
+) -> Result<Arc<GitHubApp>> {
+    let credential = session.repo_credential(repo);
+    crate::github::record_credential(credential);
+    credentials
+        .github_as(&session.owner, credential)
+        .await
+        .map_err(|e| Error::new(e.to_string()))
+}
+
+/// Prepares a proposal's payload from the agent's arguments, for its first round and every later one: the kind's own
+/// preparation, under the session's `acting_span`, plus `as`, who it acts as (ADR 29), which is shown wherever it's
+/// reviewed and held to when it's carried out.
+pub(crate) async fn prepared(
+    kind: &dyn ProposalKind,
+    session: &SessionContext,
+    arguments: Value,
+) -> Result<Value> {
+    let span = crate::github::acting_span(&session.session_id, None);
+    let mut payload = kind.prepare(session, arguments).instrument(span).await?;
+    if let Some(login) = kind
+        .target(&payload)
+        .and_then(|repo| session.repo_acting_as(&repo).map(str::to_owned))
+    {
+        payload["as"] = json!(login);
+    }
+    Ok(payload)
+}
+
+/// A proposal is carried out as whoever it said it would act as when it was approved (`as` in its payload, or the
+/// App): if the session's grant of its repository changed identity since, nothing is done.
+fn same_identity(session: &SessionContext, target: Option<&str>, payload: &Value) -> Result<()> {
+    let now = target.and_then(|repo| session.repo_acting_as(repo));
+    let proposed = payload["as"].as_str();
+    if now == proposed {
+        return Ok(());
+    }
+    let who = |login: Option<&str>| login.map_or("the GitHub App".to_owned(), str::to_owned);
+    Err(Error::new(format!(
+        "it was proposed to act as {}, but the session now acts as {} there, so nothing was done; propose it again",
+        who(proposed),
+        who(now)
+    )))
+}
+
 fn target_repo<'a>(session: &'a SessionContext, named: Option<&str>) -> Result<RepoGrant<'a>> {
     if let Some(repo) = named {
         return session.writable_repo_for(repo).ok_or_else(|| {
@@ -160,7 +211,9 @@ pub async fn propose(
     let asked = arguments["review"].as_bool() == Some(true) || kind.is_review();
     let required = session.review == ReviewPolicy::Required;
     let context = session.context();
-    let payload = kind.prepare(&context, arguments).await.map_err(|e| e.0)?;
+    let payload = prepared(kind.as_ref(), &context, arguments)
+        .await
+        .map_err(|e| e.0)?;
     let mut subject = kind.review_subject(&payload).filter(|_| asked || required);
     if asked && subject.is_none() {
         return Err("proposals of this kind aren't reviewed; propose it without review".into());
@@ -453,7 +506,19 @@ async fn carry_out(
     let session = db::get_session(&state.db, session_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("session gone"))?;
-    let finished = match kind.execute(&session.context(), payload).await {
+    let context = session.context();
+    let target = kind.target(payload);
+    let span = crate::github::acting_span(
+        &session_id.to_string(),
+        target
+            .as_deref()
+            .and_then(|repo| context.repo_credential(repo)),
+    );
+    let executed = match same_identity(&context, target.as_deref(), payload) {
+        Ok(()) => kind.execute(&context, payload).instrument(span).await,
+        Err(e) => Err(e),
+    };
+    let finished = match executed {
         Ok(result) => {
             db::finish_proposal(&state.db, id, ProposalStatus::Executed, Some(&result), None)
                 .await?
@@ -550,13 +615,27 @@ pub fn watch_stack(state: &AppState, proposal: &db::ProposalRow) {
         let layers: Vec<(u64, &str)> = layers.iter().map(|(n, sha)| (*n, sha.as_str())).collect();
         loop {
             tokio::time::sleep(STACK_WATCH_EVERY).await;
+            let mut credential = None;
             let app = match db::get_session(&state.db, session_id).await {
-                Ok(Some(session)) => state.credentials.github(&session.owner).await,
+                Ok(Some(session)) => {
+                    let context = session.context();
+                    credential = context.repo_credential(&repo).map(str::to_owned);
+                    state
+                        .credentials
+                        .github_as(&context.owner, credential.as_deref())
+                        .await
+                }
                 Ok(None) => return,
                 Err(e) => Err(e.into()),
             };
             let checked = match app {
-                Ok(app) => app.check_merging_stack(&repo, &top_node_id, &layers).await,
+                Ok(app) => {
+                    let span = crate::github::acting_span(&session_id.to_string(), None);
+                    span.record("credential", credential.as_deref().unwrap_or("app"));
+                    app.check_merging_stack(&repo, &top_node_id, &layers)
+                        .instrument(span)
+                        .await
+                }
                 Err(e) => Err(e),
             };
             match checked {
@@ -603,7 +682,12 @@ pub async fn detail(state: &AppState, id: Uuid, owner: &str) -> anyhow::Result<O
     let session = db::get_session(&state.db, row.session_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("session gone"))?;
-    match kind.detail(&session.context(), &row.payload).await {
+    let span = crate::github::acting_span(&row.session_id.to_string(), None);
+    match kind
+        .detail(&session.context(), &row.payload)
+        .instrument(span)
+        .await
+    {
         Ok(Value::Object(extra)) => {
             for (k, v) in extra {
                 proposal[k] = v;
@@ -638,6 +722,127 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn a_proposal_is_carried_out_as_whoever_it_said_it_would_act_as() {
+        let app = session(&["a/one"]);
+        let mut mine = session(&["a/one"]);
+        mine.grants[0].params["credential"] = json!("c1");
+        mine.grants[0].params["as"] = json!("dev");
+        assert_eq!(mine.repo_acting_as("A/One"), Some("dev"));
+        assert_eq!(app.repo_acting_as("a/one"), None);
+
+        let as_app = json!({"repo": "a/one"});
+        let as_dev = json!({"repo": "a/one", "as": "dev"});
+        assert!(same_identity(&app, Some("a/one"), &as_app).is_ok());
+        assert!(same_identity(&mine, Some("a/one"), &as_dev).is_ok());
+        let switched = same_identity(&mine, Some("a/one"), &as_app).unwrap_err();
+        assert!(
+            switched
+                .0
+                .contains("proposed to act as the GitHub App, but the session now acts as dev"),
+            "{}",
+            switched.0
+        );
+        assert!(same_identity(&app, Some("a/one"), &as_dev).is_err());
+        assert!(
+            same_identity(&mine, None, &json!({})).is_ok(),
+            "nothing on a repository"
+        );
+    }
+
+    /// A kind that proposes on the repository it's given, and logs from inside its preparation as a GitHub client's
+    /// audit does.
+    struct OnRepo;
+
+    #[async_trait::async_trait]
+    impl ProposalKind for OnRepo {
+        fn manifest(&self) -> sloppod_contracts::Manifest {
+            sloppod_contracts::Manifest::builtin("test")
+        }
+        fn kind(&self) -> String {
+            "test.on_repo".into()
+        }
+        fn summary(&self, _: &Value) -> String {
+            String::new()
+        }
+        fn tool(&self) -> ToolSpec {
+            ToolSpec {
+                name: "on_repo".into(),
+                description: String::new(),
+                input_schema: json!({}),
+            }
+        }
+        async fn prepare(&self, session: &SessionContext, arguments: Value) -> Result<Value> {
+            let repo = arguments["repo"].as_str().unwrap_or_default();
+            crate::github::record_credential(session.repo_credential(repo));
+            tracing::info!("a call made while preparing");
+            Ok(json!({"repo": repo}))
+        }
+        async fn detail(&self, _: &SessionContext, _: &Value) -> Result<Value> {
+            Ok(json!({}))
+        }
+        fn target(&self, payload: &Value) -> Option<String> {
+            payload["repo"].as_str().map(str::to_owned)
+        }
+        async fn execute(&self, _: &SessionContext, _: &Value) -> Result<Value> {
+            Ok(json!({}))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_round_s_payload_says_who_it_acts_as_and_its_calls_are_attributed() {
+        let mut mine = session(&["a/one"]);
+        mine.session_id = "s-1".into();
+        mine.grants[0].params["credential"] = json!("c1");
+        mine.grants[0].params["as"] = json!("dev");
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _logging = tracing::subscriber::set_default(subscriber);
+
+        // A first round and a later one (request_review) are prepared the same way.
+        for _round in 0..2 {
+            let payload = prepared(&OnRepo, &mine, json!({"repo": "a/one"}))
+                .await
+                .unwrap();
+            assert_eq!(payload["as"], "dev");
+            assert!(
+                same_identity(&mine, Some("a/one"), &payload).is_ok(),
+                "it can still be carried out"
+            );
+        }
+        let app = prepared(&OnRepo, &session(&["a/one"]), json!({"repo": "a/one"}))
+            .await
+            .unwrap();
+        assert_eq!(app.get("as"), None);
+
+        let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let line = logs
+            .lines()
+            .find(|l| l.contains("a call made while preparing"))
+            .unwrap();
+        assert!(
+            line.contains("session=s-1") && line.contains("credential=\"c1\""),
+            "{line}"
+        );
     }
 
     #[test]

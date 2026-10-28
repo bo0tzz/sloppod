@@ -175,7 +175,7 @@ impl ProposalKind for Report {
         }
         if let Some((repo, session_branch, base)) = branch {
             let head = head_branch(session_branch, named)?;
-            let app = self.credentials.github(&session.owner).await.map_err(err)?;
+            let app = super::github_for(&self.credentials, session, repo).await?;
             // A child spawned before its parent pushed started from the default branch, so that's its base then. A
             // branch that was never pushed has nothing to hand over; a failed comparison is retried.
             let mut base = base.to_owned();
@@ -202,7 +202,8 @@ impl ProposalKind for Report {
     }
 
     async fn detail(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
-        let app = self.credentials.github(&session.owner).await.map_err(err)?;
+        let repo = payload["repo"].as_str().unwrap_or_default();
+        let app = super::github_for(&self.credentials, session, repo).await?;
         branch_detail(&app, payload).await
     }
 

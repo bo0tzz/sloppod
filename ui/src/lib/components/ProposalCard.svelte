@@ -1,7 +1,7 @@
 <script lang="ts">
   import { Badge, Button, Icon, LoadingSpinner } from '@immich/ui';
   import { api, type Proposal } from '#lib/api.ts';
-  import { proposalStatus, proposalSummary } from '#lib/presentation.ts';
+  import { actingAs, proposalStatus, proposalSummary } from '#lib/presentation.ts';
 
   let {
     proposal,
@@ -11,6 +11,7 @@
 
   const status = $derived(proposalStatus(proposal));
   const summary = $derived(proposalSummary(proposal));
+  const as = $derived(actingAs(proposal));
   const pending = $derived(proposal.status === 'pending');
   // Everything there is to review fits on the card; only pull requests need the full review.
   const inline = $derived(pending && proposal.kind === 'sloppod.repo.grant');
@@ -46,6 +47,9 @@
         <!-- A pending card's Review button already says it's waiting on the user. -->
         {#if !pending}
           <Badge size="tiny" shape="round" color={status.color} class="shrink-0 whitespace-nowrap">{status.label}</Badge>
+        {/if}
+        {#if as}
+          <Badge size="tiny" shape="round" color="warning" class="shrink-0 whitespace-nowrap" data-testid="proposal-acts-as">as {as}</Badge>
         {/if}
       </div>
       <span class="truncate text-sm font-medium" title={summary.title}>{summary.title}</span>

@@ -62,4 +62,6 @@ To decide before building:
 
 The order of work: the GitHub half first (a `repo` grant with a `github-user` credential: [#54](https://github.com/bo0tzz/sloppod/issues/54)), since that's where a second identity is needed now. Then the model and codex credentials per grant, with [#276](https://github.com/bo0tzz/sloppod/issues/276).
 
+2026-10-28: the GitHub half is built. A `repo` grant can name one of the owner's `github-user` tokens. The authorizer uses it for git and reads on that repository (#301), and proposals there are read and carried out with it, with the identity fixed when they're proposed. Still to come: choosing a token in the UI, and the agent asking for one. Commits made in the pod still name the App's bot as their author.
+
 This supersedes ADR 28's `as-owner` capability, but not its rules or reasoning, which are the rules for person-held credentials above.

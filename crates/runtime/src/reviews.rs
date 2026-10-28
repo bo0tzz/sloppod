@@ -763,8 +763,7 @@ pub async fn request(state: &AppState, session: Uuid, arguments: &Value) -> Resu
     let edited = kind
         .edit(&proposal.payload, &arguments["update"])
         .map_err(|e| format!("`update`: {}", e.0))?;
-    let payload = kind
-        .prepare(&author.context(), edited)
+    let payload = crate::proposals::prepared(kind.as_ref(), &author.context(), edited)
         .await
         .map_err(|e| e.0)?;
     let subject = kind
