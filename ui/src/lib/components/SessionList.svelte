@@ -11,8 +11,22 @@
     compact = false,
   }: { sessions: Session[]; activeId?: string; compact?: boolean } = $props();
 
-  const running = $derived(sessions.filter((session) => session.phase !== 'parked'));
-  const parked = $derived(sessions.filter((session) => session.phase === 'parked'));
+  // Sub-sessions are listed under their parent, and a tree counts as running while any of it is.
+  const children = $derived.by(() => {
+    const ids = new Set(sessions.map((session) => session.id));
+    const byParent = new Map<string, Session[]>();
+    for (const session of sessions) {
+      if (session.parent_id && ids.has(session.parent_id)) {
+        byParent.set(session.parent_id, [...(byParent.get(session.parent_id) ?? []), session]);
+      }
+    }
+    return byParent;
+  });
+  const roots = $derived(sessions.filter((session) => !session.parent_id || !sessions.some((s) => s.id === session.parent_id)));
+  const isRunning = (session: Session): boolean =>
+    session.phase !== 'parked' || (children.get(session.id) ?? []).some(isRunning);
+  const running = $derived(roots.filter(isRunning));
+  const parked = $derived(roots.filter((session) => !isRunning(session)));
 
   let now = $state(Date.now());
   $effect(() => {
@@ -51,6 +65,13 @@
         </time>
       </div>
     </a>
+    {#if children.get(session.id)?.length}
+      <ul class="border-light-200 mt-0.5 ml-4 flex flex-col border-l pl-2 {compact ? 'gap-0.5' : 'gap-2 pt-2'}" data-testid="sub-sessions">
+        {#each children.get(session.id) ?? [] as child (child.id)}
+          {@render row(child)}
+        {/each}
+      </ul>
+    {/if}
   </li>
 {/snippet}
 

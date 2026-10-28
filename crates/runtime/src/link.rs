@@ -110,12 +110,24 @@ impl AgentConn {
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+        self.send_request(method, params).1.await
+    }
+
+    /// Sends a request and returns its id, which a supervisor reports while it's open, with its answer to come.
+    pub fn send_request(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> (i64, impl Future<Output = Result<Value, RpcError>> + use<>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().expect("pending lock").insert(id, tx);
         self.send_acp(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
-        rx.await
-            .unwrap_or_else(|_| Err(RpcError::new(-32002, "the session's agent disconnected")))
+        let answer = async move {
+            rx.await
+                .unwrap_or_else(|_| Err(RpcError::new(-32002, "the session's agent disconnected")))
+        };
+        (id, answer)
     }
 
     pub fn notify(&self, method: &str, params: Value) {

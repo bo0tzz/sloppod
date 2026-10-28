@@ -182,6 +182,31 @@ pub async fn children(db: &PgPool, parent: Uuid) -> sqlx::Result<Vec<SessionRow>
     .await
 }
 
+/// Whether `session` or any session it's a sub-session of is deleted.
+pub async fn deleted_in_line(db: &PgPool, session: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "with recursive up as (select id, parent_id, deleted_at from sessions where id = $1 \
+           union all select s.id, s.parent_id, s.deleted_at from sessions s join up on s.id = up.parent_id) \
+         select exists(select 1 from up where deleted_at is not null)",
+    )
+    .bind(session)
+    .fetch_one(db)
+    .await
+}
+
+/// Every sub-session below `session` that isn't deleted, at any depth, also below sub-sessions that are.
+pub async fn live_descendants(db: &PgPool, session: Uuid) -> sqlx::Result<Vec<SessionRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "with recursive down as (select id from sessions where parent_id = $1 \
+           union all select s.id from sessions s join down on s.parent_id = down.id) \
+         select {SESSION_COLUMNS} from sessions where id in (select id from down) and deleted_at is null \
+         order by created_at"
+    )))
+    .bind(session)
+    .fetch_all(db)
+    .await
+}
+
 /// How many sub-sessions of `session`'s tree, its root's descendants, are running: what ADR 27's limit counts.
 pub async fn running_in_tree(db: &PgPool, session: Uuid) -> sqlx::Result<i64> {
     sqlx::query_scalar(
@@ -552,6 +577,18 @@ pub async fn has_message(db: &PgPool, id: Uuid, message_id: Uuid) -> sqlx::Resul
     .bind(message_id.to_string())
     .fetch_one(db)
     .await
+}
+
+/// The text of the session's first message, e.g. a sub-session's task.
+pub async fn first_message(db: &PgPool, id: Uuid) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar(
+        "select payload->'content'->>'text' from session_events where session_id = $1 \
+         and payload->>'sessionUpdate' = 'user_message_chunk' order by seq limit 1",
+    )
+    .bind(id)
+    .fetch_optional(db)
+    .await
+    .map(Option::flatten)
 }
 
 /// Up to `limit` of the session's latest events before `before`, in order.

@@ -22,7 +22,7 @@ pub use issues::Issues;
 use pull_request::stack_layers;
 pub use pull_request::{PullRequest, Stack};
 pub use repo_access::{RepoAccess, grant_repo, repo_granted};
-pub use report::Report;
+pub use report::{REPORT, Report};
 
 #[derive(Default, Clone)]
 pub struct ProposalKinds {
