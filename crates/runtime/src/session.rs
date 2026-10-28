@@ -286,6 +286,20 @@ impl Hub {
         }
     }
 
+    /// Whether anything is going on in the session: a turn, messages waiting, a question or permission request the
+    /// user hasn't answered, or commands of the agent's still running. `None` when its supervisor doesn't say
+    /// what's running, so only the rest is known.
+    pub async fn busy(&self, id: Uuid) -> Option<bool> {
+        let live = self.live(id);
+        let state = live.state.lock().await;
+        let busy = state.turn_running || !state.queue.is_empty() || !state.permissions.is_empty();
+        match state.commands {
+            _ if busy => Some(true),
+            Some(running) => Some(running > 0),
+            None => None,
+        }
+    }
+
     /// How many of the agent's commands are running, if its supervisor says.
     pub async fn commands(&self, id: Uuid) -> Option<usize> {
         self.live(id).state.lock().await.commands
@@ -1276,6 +1290,43 @@ impl Hub {
             agent.close();
         }
         Ok(())
+    }
+
+    /// Replaces a quiet session's pod (#28), and says whether it did. Under the session's transition lock, and only
+    /// if it's idle with nothing going on (no turn, nothing queued, no open request, none of the agent's commands
+    /// known to be running), its agent stops getting work: what comes in meanwhile waits for the agent in the new
+    /// pod. Then `replace` ends the pod. If that fails, the agent is given back.
+    pub async fn replace_pod<F, Fut>(self: &Arc<Self>, id: Uuid, replace: F) -> anyhow::Result<bool>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<()>>,
+    {
+        let live = self.live(id);
+        let _transition = live.transition.lock().await;
+        let idle = self
+            .store
+            .get_session(id)
+            .await?
+            .is_some_and(|row| row.phase() == Phase::Idle);
+        if !idle {
+            return Ok(false);
+        }
+        let (agent, agent_session_id) = {
+            let mut state = live.state.lock().await;
+            let busy = state.turn_running
+                || !state.queue.is_empty()
+                || !state.permissions.is_empty()
+                || state.commands.is_some_and(|running| running > 0);
+            if busy || state.agent_session_id.is_none() {
+                return Ok(false);
+            }
+            (state.agent.clone(), state.agent_session_id.take())
+        };
+        if let Err(e) = replace().await {
+            self.unpark(id, agent, agent_session_id).await;
+            return Err(e);
+        }
+        Ok(true)
     }
 
     /// Gives a session whose suspend failed its agent back, and runs what was sent to it meanwhile.

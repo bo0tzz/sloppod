@@ -468,6 +468,61 @@ async fn running_commands_are_known_from_the_current_agent_only() {
 }
 
 #[tokio::test]
+async fn a_prompt_during_a_pod_replacement_waits_for_the_new_agent() {
+    let mut h = Harness::ready().await;
+    // A prompt arrives while the old pod is being deleted.
+    let (hub, id) = (h.hub.clone(), h.id);
+    let prompt = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+    let started = prompt.clone();
+    let replaced = h
+        .hub
+        .replace_pod(h.id, || async move {
+            let params =
+                json!({"sessionId": id, "prompt": [{"type": "text", "text": "Meanwhile"}]});
+            *started.lock().await = Some(tokio::spawn(async move { hub.prompt(id, params).await }));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(replaced);
+    h.agent_sent_nothing();
+
+    h.replace_agent().await;
+    let request = h.next().await;
+    assert_eq!(prompt_text(&request), ["Meanwhile"]);
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    prompt.lock().await.take().unwrap().await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_busy_session_keeps_its_pod() {
+    let mut h = Harness::ready().await;
+    let _turn = h.prompt("Busy");
+    h.next().await;
+    let replaced = h
+        .hub
+        .replace_pod(h.id, || async {
+            panic!("a busy session's pod was replaced")
+        })
+        .await
+        .unwrap();
+    assert!(!replaced);
+
+    // Nor one whose agent has commands running.
+    let h = Harness::ready().await;
+    h.hub.set_commands(h.id, &h.agent, 1).await;
+    let replaced = h
+        .hub
+        .replace_pod(h.id, || async {
+            panic!("a pod with commands running was replaced")
+        })
+        .await
+        .unwrap();
+    assert!(!replaced);
+}
+
+#[tokio::test]
 async fn a_command_run_in_the_pod_gets_its_own_result() {
     let mut h = Harness::ready().await;
     let run = |input: &str| {

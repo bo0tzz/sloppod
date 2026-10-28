@@ -16,6 +16,7 @@ pub fn sandbox_name(session_id: &str) -> String {
 
 pub struct AgentSandbox {
     api: Api<DynamicObject>,
+    pods: Api<k8s_openapi::api::core::v1::Pod>,
     service_account: String,
     pull_policy: String,
 }
@@ -30,7 +31,8 @@ impl AgentSandbox {
         let gvk = GroupVersionKind::gvk("agents.x-k8s.io", "v1beta1", "Sandbox");
         let resource = ApiResource::from_gvk_with_plural(&gvk, "sandboxes");
         Self {
-            api: Api::namespaced_with(client, namespace, &resource),
+            api: Api::namespaced_with(client.clone(), namespace, &resource),
+            pods: Api::namespaced(client, namespace),
             service_account,
             pull_policy,
         }
@@ -151,6 +153,20 @@ impl PlacementBackend for AgentSandbox {
             Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
             Err(e) => Err(err(e)),
         }
+    }
+
+    async fn replace_pod(&self, session_id: &str) -> Result<()> {
+        // The Sandbox stays as it is, so its controller starts a new pod from the current spec in its place.
+        // Deleting gracefully gives the supervisor its shutdown: the report and the transcript sync.
+        let selector = format!("{}={session_id}", crate::pods::SESSION_LABEL);
+        self.pods
+            .delete_collection(
+                &DeleteParams::default(),
+                &kube::api::ListParams::default().labels(&selector),
+            )
+            .await
+            .map_err(err)?;
+        Ok(())
     }
 
     async fn delete(&self, session_id: &str) -> Result<()> {

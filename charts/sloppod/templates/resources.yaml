@@ -50,9 +50,10 @@ rules:
   - apiGroups: [cilium.io]
     resources: [ciliumnetworkpolicies, ciliumenvoyconfigs]
     verbs: [get, list, watch, create, update, patch, delete]
+  # Deleting a session's pod has its Sandbox start a new one, to move it onto a new image (#28).
   - apiGroups: [""]
     resources: [pods]
-    verbs: [get, list, watch]
+    verbs: [get, list, watch, delete, deletecollection]
   - apiGroups: [""]
     resources: [services]
     verbs: [get]
