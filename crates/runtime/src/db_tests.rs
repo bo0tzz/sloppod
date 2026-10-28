@@ -628,7 +628,7 @@ async fn a_replacement_in_pieces_keeps_the_old_copy_until_it_is_whole(db: PgPool
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
-async fn a_session_log_reads_a_page_at_a_time(db: PgPool) {
+async fn a_session_log_reads_back_from_its_latest(db: PgPool) {
     let s = session(&db, "dev").await;
     let other = session(&db, "dev").await;
     let mut seqs = Vec::new();
@@ -638,14 +638,19 @@ async fn a_session_log_reads_a_page_at_a_time(db: PgPool) {
             .await
             .unwrap();
     }
-    let first = db::events(&db, s, 0, 2).await.unwrap();
+    let latest = db::events_before(&db, s, i64::MAX, 2).await.unwrap();
     assert_eq!(
-        first.iter().map(|e| e.1["n"].clone()).collect::<Vec<_>>(),
-        [json!(0), json!(1)]
+        latest.iter().map(|e| e.1["n"].clone()).collect::<Vec<_>>(),
+        [json!(3), json!(4)]
     );
-    let rest = db::events(&db, s, first[1].0, 10).await.unwrap();
-    assert_eq!(rest.iter().map(|e| e.0).collect::<Vec<_>>(), seqs[2..]);
-    assert!(db::events(&db, s, seqs[4], 10).await.unwrap().is_empty());
+    let older = db::events_before(&db, s, latest[0].0, 10).await.unwrap();
+    assert_eq!(older.iter().map(|e| e.0).collect::<Vec<_>>(), seqs[..3]);
+    assert!(
+        db::events_before(&db, s, seqs[0], 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]

@@ -25,6 +25,8 @@ const { values: args } = parseArgs({
 });
 
 const DELAY = Number(args.delay);
+/** How many updates a UI gets at once, as the runtime sends them. */
+const HISTORY_PAGE = 2000;
 const REPOS = ['bo0tzz/sloppod', 'bo0tzz/memini', 'immich-app/static-pages'];
 // The adapter's model picker, as it appears in `configOptions`.
 const MODELS = [
@@ -440,6 +442,16 @@ async function agentScript(session, turn, prompt) {
     await say("I've asked you about the backoff; I'll carry on meanwhile.");
     await step(4);
     await say('Done with the parts that don\'t depend on your answer.');
+    return;
+  }
+
+  if (/long history/i.test(prompt)) {
+    // More updates than one page of history, so a reload starts partway through.
+    const messageId = randomUUID();
+    for (let i = 0; i < HISTORY_PAGE + 100; i++) {
+      session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'word ' }, messageId });
+    }
+    await say('The end.');
     return;
   }
 
@@ -1011,19 +1023,44 @@ function handleCall(conn, message) {
         conn.error(id, -32602, `Unknown session ${params.sessionId}`);
         return;
       }
-      for (const entry of session.log) conn.notify('session/update', entry);
+      // Like the runtime: only the latest of the log, with where to ask for older pages. An update's seq is its
+      // position in the log, from 1.
+      const start = Math.max(0, session.log.length - HISTORY_PAGE);
+      for (const entry of session.log.slice(start)) conn.notify('session/update', entry);
       session.subscribers.add(conn);
       conn.loaded.add(session.data.id);
       // Like the runtime: the queue before the response.
       broadcastQueue(session, [conn]);
-      conn.respond(id, { configOptions: session.configOptions() });
+      conn.respond(id, {
+        configOptions: session.configOptions(),
+        _meta: { sloppod: { historyBefore: start > 0 ? start + 1 : null } },
+      });
       for (const pending of session.pending.values()) sendPending(session, pending, conn);
+      return;
+    }
+
+    case '_sloppod/history': {
+      if (!needLoaded()) return;
+      const end = Math.max(0, Math.min(session.log.length, Number(params.before) - 1));
+      const start = Math.max(0, end - HISTORY_PAGE);
+      conn.respond(id, {
+        updates: session.log.slice(start, end).map((entry) => entry.update),
+        before: start > 0 ? start + 1 : null,
+      });
       return;
     }
 
     case 'session/prompt': {
       if (!needLoaded()) return;
       const messageId = params._meta?.sloppod?.messageId ?? randomUUID();
+      // Like the runtime: a message sent again isn't run twice.
+      const received = session.log.some(
+        (entry) => entry.update.sessionUpdate === 'user_message_chunk' && entry.update.messageId === messageId,
+      );
+      if (received || waitingList(session).some((waiting) => waiting.id === messageId)) {
+        conn.respond(id, { stopReason: 'end_turn', _meta: { sloppod: { alreadyReceived: true } } });
+        return;
+      }
       // Tests drop the connection as a prompt arrives, before or after the runtime takes it.
       const drop = dropNextPrompt;
       dropNextPrompt = null;

@@ -71,6 +71,12 @@ export class SessionView {
   #conn: AcpConnection;
   /** Receives the history replay of a (re)load, and replaces `transcript` once the load completes. */
   #replay: Transcript | null = null;
+  /** The updates `transcript` is built from, oldest first, so older history can go in front of them. */
+  #updates: SessionUpdate[] = [];
+  #replayUpdates: SessionUpdate[] | null = null;
+  /** Where to ask for older history, when the session has more than was loaded; `null` once it's all here. */
+  historyBefore = $state<number | null>(null);
+  loadingHistory = $state(false);
   /** Messages a dropped connection cut off before the runtime confirmed them; the next load settles each. */
   #unconfirmed: { id: string; text: string }[] = [];
   /** Messages that couldn't be delivered, kept until the user puts each back or dismisses it. */
@@ -157,6 +163,7 @@ export class SessionView {
 
     const rest = this.loaded ? this.refresh() : Promise.resolve();
     this.#replay = new Transcript();
+    this.#replayUpdates = [];
     try {
       const response = await connection.request<LoadSessionResponse>('session/load', {
         sessionId: this.id,
@@ -164,9 +171,12 @@ export class SessionView {
         mcpServers: [],
       });
       this.transcript = this.#replay;
+      this.#updates = this.#replayUpdates;
+      this.historyBefore = (response?._meta?.sloppod as { historyBefore?: number | null } | undefined)?.historyBefore ?? null;
       this.configOptions = response?.configOptions ?? [];
     } finally {
       this.#replay = null;
+      this.#replayUpdates = null;
     }
     this.loaded = true;
     this.#settleUnconfirmed();
@@ -246,6 +256,30 @@ export class SessionView {
         return;
     }
     (this.#replay ?? this.transcript).apply(update);
+    (this.#replayUpdates ?? this.#updates).push(update);
+  }
+
+  /** Puts the page of history before what's loaded in front of it. */
+  async loadEarlier() {
+    const before = this.historyBefore;
+    if (before === null || this.loadingHistory || this.#replay) return;
+    this.loadingHistory = true;
+    try {
+      const page = await this.#conn.request<{ updates: SessionUpdate[]; before: number | null }>('_sloppod/history', {
+        sessionId: this.id,
+        before,
+      });
+      // A reload meanwhile has replaced what this page goes in front of.
+      if (this.historyBefore !== before || !page) return;
+      const transcript = new Transcript();
+      const updates = [...page.updates, ...this.#updates];
+      for (const update of updates) transcript.apply(update);
+      this.#updates = updates;
+      this.transcript = transcript;
+      this.historyBefore = page.before;
+    } finally {
+      this.loadingHistory = false;
+    }
   }
 
   setSession(session: Session) {
