@@ -293,6 +293,8 @@ async fn reconcile(state: &AppState) {
     }
     proposals::resume_approved(state).await;
     reviews::resume_round_watches(state).await;
+    // After the pods are placed, so a queue for a running session waits for its agent, and a parked one wakes for it.
+    state.hub.restore_queues().await;
 }
 
 /// Tells an agent whose turn a runtime restart cut off what it lost, so it can carry on without the user.

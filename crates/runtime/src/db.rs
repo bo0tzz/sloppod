@@ -297,6 +297,38 @@ pub async fn set_agent_session(
         .map(|_| ())
 }
 
+/// Replaces a session's kept queue (#39); an empty one is removed.
+pub async fn save_queue(db: &PgPool, id: Uuid, queue: &[Value]) -> sqlx::Result<()> {
+    if queue.is_empty() {
+        sqlx::query("delete from session_queues where session_id = $1")
+            .bind(id)
+            .execute(db)
+            .await?;
+        return Ok(());
+    }
+    sqlx::query(
+        "insert into session_queues (session_id, messages) values ($1, $2) \
+         on conflict (session_id) do update set messages = excluded.messages, updated_at = now()",
+    )
+    .bind(id)
+    .bind(Value::from(queue.to_vec()))
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
+/// Every kept queue, oldest change first.
+pub async fn queues(db: &PgPool) -> sqlx::Result<Vec<(Uuid, Vec<Value>)>> {
+    let rows: Vec<(Uuid, Value)> =
+        sqlx::query_as("select session_id, messages from session_queues order by updated_at")
+            .fetch_all(db)
+            .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, messages)| (id, messages.as_array().cloned().unwrap_or_default()))
+        .collect())
+}
+
 /// The session's first message, until a turn has started with it.
 pub async fn pending_prompt(db: &PgPool, id: Uuid) -> sqlx::Result<Option<String>> {
     let row: Option<(Option<String>,)> =

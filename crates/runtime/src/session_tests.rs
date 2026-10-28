@@ -828,3 +828,38 @@ async fn a_question_from_ask_user_waits_for_its_answer_without_the_agent() {
     );
     assert!(h.hub.replay(h.id).await.unwrap().permissions.is_empty());
 }
+
+#[tokio::test]
+async fn a_queued_message_is_kept_until_its_turn_takes_it() {
+    let mut h = Harness::ready().await;
+    let _busy = h.prompt("Busy");
+    let busy = next_prompt(&mut h.to_agent).await;
+    let _later = h.prompt("Later");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let kept = h.store.queues().await.unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].1[0]["blocks"][0]["text"], "Later");
+
+    h.respond(&busy, json!({"stopReason": "end_turn"})).await;
+    let later = next_prompt(&mut h.to_agent).await;
+    assert_eq!(prompt_text(&later), ["Later"]);
+    assert!(h.store.queues().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_queue_kept_before_a_restart_runs_once_the_agent_is_up() {
+    // A restarted runtime: the store has the queue, the hub has nothing yet.
+    let mut h = Harness::starting().await;
+    h.store
+        .save_queue(
+            h.id,
+            &[json!({"id": null, "blocks": [{"type": "text", "text": "Sent before the restart"}]})],
+        )
+        .await
+        .unwrap();
+    h.hub.restore_queues().await;
+    h.agent_ready().await;
+    let restored = next_prompt(&mut h.to_agent).await;
+    assert_eq!(prompt_text(&restored), ["Sent before the restart"]);
+    assert!(h.store.queues().await.unwrap().is_empty());
+}
