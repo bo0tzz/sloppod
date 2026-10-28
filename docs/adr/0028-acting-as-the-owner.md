@@ -1,0 +1,44 @@
+# 28. Sessions act as their owner only through grants the owner controls
+
+- Status: Proposed
+- Date: 2026-10-28
+
+## Context and Problem Statement
+
+Everything a session does on GitHub today, it does as sloppod's GitHub App ([ADR 21](0021-credentials-live-in-the-runtime.md)): git over the session's grants, `gh` reads, and the pull requests and issues its proposals open. That has two limits:
+
+- **Reach:** the App only reaches repositories it's installed on. A project in someone else's organization, or on an account the owner won't install the App on, is out of reach.
+- **Identity:** some work should be done as the owner, not as a bot: commenting in a discussion as themselves, opening a pull request on a project that only takes contributions from people, or anything where the bot's name is wrong.
+
+The answer to both is the owner's own GitHub credential, a personal access token ([#54](https://github.com/bo0tzz/sloppod/issues/54)). But a session that can act as its owner is a different trust level from one that acts as a bot: what it does is attributed to a person, and it reaches whatever that person can. [ADR 2](0002-capabilities.md) already describes grants with policies, durations and revocation, but sessions today get a fixed set at start, plus repositories through `request_repository`, and the owner can't see or change them while the session runs.
+
+## Decision Outcome
+
+**Acting as the owner is a grant, never ambient, and the owner controls it explicitly.**
+
+- **A user credential.** The owner adds a fine-grained GitHub personal access token in Settings, as a credential of kind `github-user` ([ADR 21](0021-credentials-live-in-the-runtime.md), [ADR 23](0023-users-and-ownership.md)): stored by the runtime, never in the pod. Classic tokens are refused, since they can't be narrowed to repositories.
+- **A grant to act as the owner** (`as-owner`), per repository, with an access level: `read`, `push` (git push to the session's branches), `propose` (pull requests, issues and comments opened as the owner, through proposals as now). It's a capability like any other ([ADR 2](0002-capabilities.md)), with these rules:
+  - Its grant policy is always `ask`: never in a session's starting set, never granted by `auto`, and a standing approval only covers it if it names `as-owner` explicitly.
+  - It's never inherited: a sub-session starts without it whatever its parent holds ([ADR 27](0027-sub-sessions.md)), and has to ask.
+  - It can have an expiry, and the owner can revoke it at any time. Revocation takes effect at the authorizer at once ([ADR 11](0011-enforcement-at-the-pod-boundary.md)).
+- **One identity per repository.** For each repository, a session's requests go out as the owner where it holds an `as-owner` grant, and as the App otherwise. The authorizer attaches the token per request, as it does the App's; the token covers only the repositories the grant names, even if the PAT itself reaches more.
+- **Proposals say who acts.** A proposal on a repository where the session acts as the owner is executed with the owner's token and says so wherever it's shown ("opens as bo0tzz"), so approving it is approving an action in the owner's name. Reviews ([ADR 24](0024-automated-review-before-human-review.md)) are unchanged.
+- **The owner sees and controls a session's grants.** The session view lists every grant: what it allows, as whom, since when and until when ([#112](https://github.com/bo0tzz/sloppod/issues/112)). From there the owner can grant, narrow, extend and revoke ([#70](https://github.com/bo0tzz/sloppod/issues/70)). An agent requests `as-owner` the way it requests a repository today, with a reason, and the request shows what acting as the owner means.
+- **Audit.** Every request made with the owner's token is logged with the session and grant it was made under.
+
+### Consequences
+
+- Good: sloppod can work on repositories the App can't reach, and act as the owner where that's what's wanted, with the owner deciding each time.
+- Good: the grant controls this needs are ones every capability wants anyway; `as-owner` is the first that can't work without them.
+- Bad: fine-grained PATs expire and are managed by hand on GitHub; the owner has to keep one current. A GitHub App user-to-server OAuth flow could replace them later.
+- Bad: two identities per session make it possible to be surprised by which one acted; showing the identity on every grant and proposal is the mitigation.
+
+## More Information
+
+Considered and not chosen:
+
+- **Using the PAT only where the App isn't installed:** simpler, but it conflates reach with identity; acting as the owner on a repository the App can reach would be impossible, and acting as the owner would happen silently wherever the App is missing.
+- **Ambient PAT for the whole session:** the default for most tools (`gh auth login` in a dev container), and the opposite of [ADR 2](0002-capabilities.md).
+- **Classic PATs:** they can't be narrowed to repositories, so every session holding one could reach everything the owner can.
+
+To decide during implementation: whether `propose` as the owner should also post review comments and merge, and whether a session may hold `as-owner` on a repository while its proposals there still open as the App.
