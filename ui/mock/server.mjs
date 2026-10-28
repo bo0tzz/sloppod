@@ -443,6 +443,16 @@ async function agentScript(session, turn, prompt) {
     return;
   }
 
+  if (/long answer/i.test(prompt)) {
+    // Several screens of output in one go, as a long agent message arrives.
+    const messageId = randomUUID();
+    for (let i = 0; i < 2000; i++) {
+      session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'word ' }, messageId });
+    }
+    await say('The end.');
+    return;
+  }
+
   if (/ask me/i.test(prompt)) {
     await step(2);
     await say('Before I start, a couple of questions.');

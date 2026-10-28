@@ -98,8 +98,23 @@
 
   function onScroll() {
     if (!scroller) return;
-    atBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
+    if (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80) {
+      atBottom = true;
+    } else if (performance.now() - lastUserScroll < 1000) {
+      atBottom = false;
+    }
   }
+
+  // Only the reader stops the view following new output. The browser scrolls by itself too, e.g. to keep what's on
+  // screen in place while something above it changes size, and that's no sign they've scrolled up.
+  let lastUserScroll = -Infinity;
+  $effect(() => {
+    if (!scroller) return;
+    const scrolling = () => (lastUserScroll = performance.now());
+    const events = ['wheel', 'touchmove', 'keydown', 'pointerdown'] as const;
+    for (const event of events) scroller.addEventListener(event, scrolling, { passive: true });
+    return () => events.forEach((event) => scroller?.removeEventListener(event, scrolling));
+  });
 
   function scrollToBottom(behavior: ScrollBehavior = 'instant') {
     scroller?.scrollTo({ top: scroller.scrollHeight, behavior });

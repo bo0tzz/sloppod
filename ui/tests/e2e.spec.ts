@@ -497,6 +497,22 @@ test('queues messages while the agent starts', async ({ page }) => {
   await expect(page.getByTestId('composer-hint')).toBeHidden();
 });
 
+test('follows new output while the reader is at the bottom, across a reconnect', async ({ page }) => {
+  await page.setViewportSize({ width: 1000, height: 500 });
+  await createSession(page, 'Give me a long answer in sloppod');
+  const end = page.getByText('The end.');
+  await expect(end).toBeInViewport({ timeout: 20_000 });
+
+  await page.request.post('/_mock/drop');
+  await expect(page.getByTestId('reconnecting')).toBeHidden();
+  await expect(end).toBeInViewport();
+
+  // Scrolling up stops the following; new output then leaves the view where it is.
+  await end.hover();
+  await page.mouse.wheel(0, -2000);
+  await expect(end).not.toBeInViewport();
+});
+
 test('runs a session without a repository', async ({ page }) => {
   const prompt = 'Explain what the runtime does';
   await createSession(page, prompt);
