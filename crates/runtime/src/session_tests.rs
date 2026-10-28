@@ -16,6 +16,9 @@ use crate::session::Hub;
 use crate::store::SessionStore;
 use crate::store::memory::MemoryStore;
 
+/// What the harness's clock says, and when its session was last active.
+const START: &str = "2026-10-27T15:40:00Z";
+
 struct Harness {
     hub: Arc<Hub>,
     store: Arc<MemoryStore>,
@@ -29,8 +32,11 @@ impl Harness {
     async fn starting() -> Self {
         let store = Arc::new(MemoryStore::default());
         let id = Uuid::new_v4();
-        store.add_session(SessionRow::for_test(id, "dev"));
+        let mut row = SessionRow::for_test(id, "dev");
+        row.active_at = START.parse().unwrap();
+        store.add_session(row);
         let hub = Arc::new(Hub::new(store.clone()));
+        hub.set_now(START.parse().unwrap());
         let (tx, to_agent) = mpsc::unbounded_channel();
         let agent = Arc::new(AgentConn::new(tx));
         hub.attach_agent(id, agent.clone()).await;
@@ -144,13 +150,30 @@ impl Harness {
     }
 }
 
+/// The text of what a request sent the agent, without the line telling it the time.
 fn prompt_text(request: &Value) -> Vec<String> {
+    let mut text = all_text(request);
+    if time_line(request).is_some() {
+        text.remove(0);
+    }
+    text
+}
+
+fn all_text(request: &Value) -> Vec<String> {
     request["params"]["prompt"]
         .as_array()
         .into_iter()
         .flatten()
         .map(|block| block["text"].as_str().unwrap_or_default().to_owned())
         .collect()
+}
+
+/// The line telling the agent the time that a request leads with, if it does.
+fn time_line(request: &Value) -> Option<String> {
+    all_text(request)
+        .into_iter()
+        .next()
+        .filter(|text| text.starts_with("[sloppod: it's "))
 }
 
 /// Waits until the hub has queued `n` messages; prompting happens on another task.
@@ -1008,6 +1031,7 @@ fn batch(
     let queued = crate::session::Queued {
         id: None,
         blocks: vec![json!({"type": "text", "text": text})],
+        notice: false,
         reply: Some(reply),
     };
     (vec![queued], receiver)
@@ -1387,6 +1411,7 @@ async fn restarted(
     mpsc::UnboundedReceiver<ToSupervisor>,
 ) {
     let hub = Arc::new(Hub::new(h.store.clone()));
+    hub.set_now(START.parse().unwrap());
     let (tx, to_agent) = mpsc::unbounded_channel();
     let agent = Arc::new(AgentConn::new(tx));
     hub.attach_agent(h.id, agent.clone()).await;
@@ -1566,5 +1591,130 @@ async fn a_steer_a_restart_left_open_and_the_agent_then_refuses_still_delivers_i
     assert_eq!(
         prompt_text(&next_prompt(&mut to_agent).await),
         ["sloppod: approved."]
+    );
+}
+
+/// `START`, moved on by `minutes`.
+fn later(minutes: i64) -> chrono::DateTime<chrono::Utc> {
+    START.parse::<chrono::DateTime<chrono::Utc>>().unwrap() + chrono::Duration::minutes(minutes)
+}
+
+/// Runs a prompt as a turn that ends at once, and returns what the agent was sent.
+async fn prompt_and_answer(h: &mut Harness, text: &str) -> Value {
+    let turn = h.prompt(text);
+    let request = h.next().await;
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+    request
+}
+
+#[tokio::test]
+async fn a_prompt_after_a_gap_tells_the_agent_the_time() {
+    let mut h = Harness::ready().await;
+    let first = prompt_and_answer(&mut h, "First").await;
+    assert_eq!(time_line(&first), None);
+
+    h.hub.set_now(later(20));
+    let soon = prompt_and_answer(&mut h, "Soon after").await;
+    assert_eq!(time_line(&soon), None, "20 minutes isn't a gap");
+
+    h.hub.set_now(later(20 + 3 * 60 + 5));
+    let after_gap = prompt_and_answer(&mut h, "Is CI done?").await;
+    assert_eq!(
+        all_text(&after_gap),
+        [
+            "[sloppod: it's 2026-10-27 19:05 UTC, 3 hours since the last message]",
+            "Is CI done?"
+        ]
+    );
+    // Only the agent gets the line; the log has the message as it was sent.
+    assert_eq!(
+        h.user_messages().last().unwrap(),
+        &("Is CI done?".to_owned(), false)
+    );
+}
+
+#[tokio::test]
+async fn a_prompt_on_a_new_day_tells_the_agent_the_time() {
+    let mut h = Harness::ready().await;
+    h.hub.set_now("2026-10-27T23:55:00Z".parse().unwrap());
+    prompt_and_answer(&mut h, "Late").await;
+    h.hub.set_now("2026-10-28T00:05:00Z".parse().unwrap());
+    let request = prompt_and_answer(&mut h, "Early").await;
+    assert_eq!(
+        time_line(&request).as_deref(),
+        Some("[sloppod: it's 2026-10-28 00:05 UTC, 10 minutes since the last message]")
+    );
+}
+
+#[tokio::test]
+async fn a_gap_counts_from_the_agents_last_output_not_the_turns_start() {
+    let mut h = Harness::ready().await;
+    let turn = h.prompt("Long job");
+    let request = h.next().await;
+    h.hub.set_now(later(2 * 60));
+    let chunk = json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "agent-session", "update": {
+        "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Done."},
+    }}});
+    from_agent(&h.hub, h.id, &h.agent, chunk).await;
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+
+    h.hub.set_now(later(2 * 60 + 10));
+    let next = prompt_and_answer(&mut h, "Thanks").await;
+    assert_eq!(time_line(&next), None);
+}
+
+#[tokio::test]
+async fn a_notice_always_carries_the_time() {
+    let mut h = Harness::ready().await;
+    h.hub.notify(h.id, "sloppod: approved.".into()).await;
+    let request = h.next().await;
+    assert_eq!(
+        all_text(&request),
+        ["[sloppod: it's 2026-10-27 15:40 UTC]", "sloppod: approved."]
+    );
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+
+    // Steered into a running turn, too.
+    let turn = h.prompt("First");
+    let turn_request = h.next().await;
+    h.hub.notify(h.id, "sloppod: merged.".into()).await;
+    let steering = h.next().await;
+    assert_eq!(steering["method"], "_session/steering");
+    assert_eq!(
+        time_line(&steering).as_deref(),
+        Some("[sloppod: it's 2026-10-27 15:40 UTC]")
+    );
+    let recorded: Vec<Value> = h
+        .store
+        .updates(h.id)
+        .into_iter()
+        .filter(|u| u["_meta"]["sloppod"]["notice"] == true)
+        .map(|u| u["content"]["text"].clone())
+        .collect();
+    assert_eq!(recorded, ["sloppod: approved.", "sloppod: merged."]);
+    h.respond(&steering, json!({"outcome": "injected"})).await;
+    h.respond(&turn_request, json!({"stopReason": "end_turn"}))
+        .await;
+    turn.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn after_a_restart_a_gap_counts_from_the_sessions_last_activity() {
+    let h = Harness::ready().await;
+    let (hub, agent, mut to_agent) = restarted(&h).await;
+    hub.set_now(later(2 * 24 * 60 + 30));
+    hub.agent_ready(h.id, &agent, "agent-session".into(), json!({}), None)
+        .await;
+    let (id, prompting) = (h.id, hub.clone());
+    tokio::spawn(async move {
+        let params = json!({"sessionId": id, "prompt": [{"type": "text", "text": "Back"}]});
+        prompting.prompt(id, params).await
+    });
+    let request = next_prompt(&mut to_agent).await;
+    assert_eq!(
+        time_line(&request).as_deref(),
+        Some("[sloppod: it's 2026-10-29 16:10 UTC, 2 days since the last message]")
     );
 }
