@@ -45,6 +45,15 @@ fn stored(q: &Queued) -> Value {
     json!({"id": q.id, "blocks": q.blocks})
 }
 
+/// A queued prompt from how it's kept in the store.
+fn unstored(q: &Value) -> Queued {
+    Queued {
+        id: q["id"].as_str().and_then(|s| s.parse().ok()),
+        blocks: q["blocks"].as_array().cloned().unwrap_or_default(),
+        reply: None,
+    }
+}
+
 /// A notice, as a prompt of its own.
 fn notice_queued(text: &str) -> Queued {
     Queued {
@@ -373,11 +382,12 @@ impl Hub {
         if self.agent_capabilities().is_none() {
             self.set_agent_capabilities(running.ready.capabilities);
         }
-        // What a restart left on its way to the agent: delivered if it's among the agent's open requests, sent again if not.
-        let open: Vec<i64> = running
+        // What a restart left on its way to the agent: a turn the agent has open has it, a steer it has open waits
+        // for its answer, and the rest is sent again.
+        let open: Vec<(i64, bool)> = running
             .open
             .iter()
-            .filter_map(|r| r["id"].as_i64())
+            .filter_map(|r| Some((r["id"].as_i64()?, r["method"] == "_session/steering")))
             .collect();
         {
             let live = self.live(id);
@@ -390,6 +400,14 @@ impl Hub {
                 let reply = agent.adopt(request_id);
                 if request["method"] == "session/prompt" {
                     turn = Some(reply);
+                } else if request["method"] == "_session/steering" {
+                    let hub = self.clone();
+                    tokio::spawn(async move {
+                        let answer = reply.await.unwrap_or_else(|_| {
+                            Err(RpcError::new(-32002, "the session's agent disconnected"))
+                        });
+                        hub.steer_answered(id, request_id, answer).await;
+                    });
                 }
             }
         }
@@ -656,9 +674,10 @@ impl Hub {
         }
     }
 
-    /// Held batches a restart left: those whose request the agent still has open reached it, and the rest go back to
-    /// the front of the queue. Under the state lock, when the agent's open requests are known.
-    async fn settle_restored(&self, id: Uuid, state: &mut LiveState, open: &[i64]) {
+    /// Held batches a restart left, once the agent's open requests are known (`(id, whether it's a steer)`): a turn
+    /// the agent has open has its batch; a steer it has open stays held until it's answered, as it may yet be
+    /// refused; the rest go back to the front of the queue. Under the state lock.
+    async fn settle_restored(&self, id: Uuid, state: &mut LiveState, open: &[(i64, bool)]) {
         if !state.in_flight.iter().any(|h| h.restored) {
             return;
         }
@@ -666,15 +685,23 @@ impl Hub {
             .into_iter()
             .partition(|h| h.restored);
         state.in_flight = current;
-        let resent = restored
+        let open_as = |held: &Held| {
+            held.request
+                .and_then(|r| open.iter().find(|(o, _)| *o == r).map(|(_, steer)| *steer))
+        };
+        let (open_steers, rest): (Vec<Held>, Vec<Held>) =
+            restored.into_iter().partition(|h| open_as(h) == Some(true));
+        state
+            .in_flight
+            .extend(open_steers.into_iter().map(|h| Held {
+                restored: false,
+                ..h
+            }));
+        let resent = rest
             .into_iter()
-            .filter(|h| h.request.is_none_or(|r| !open.contains(&r)))
+            .filter(|h| open_as(h).is_none())
             .flat_map(|h| h.stored)
-            .map(|q| Queued {
-                id: q["id"].as_str().and_then(|s| s.parse().ok()),
-                blocks: q["blocks"].as_array().cloned().unwrap_or_default(),
-                reply: None,
-            });
+            .map(|q| unstored(&q));
         let since = std::mem::take(&mut state.queue);
         state.queue = resent.chain(since).collect();
         self.save_queue(id, state).await;
@@ -694,18 +721,15 @@ impl Hub {
 
     /// A held notice that couldn't be delivered goes back to the queue, and runs now if the agent is idle, e.g.
     /// because the turn it was steered into ended meanwhile.
-    async fn requeue_held(self: &Arc<Self>, id: Uuid, key: Uuid, blocks: Vec<Value>) {
+    async fn requeue_held(self: &Arc<Self>, id: Uuid, key: Uuid) {
         let next = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
-            if !state.in_flight.iter().any(|h| h.key == key) {
+            let Some(held) = state.in_flight.iter().find(|h| h.key == key) else {
                 return;
-            }
-            state.queue.push(Queued {
-                id: None,
-                blocks,
-                reply: None,
-            });
+            };
+            let back: Vec<Queued> = held.stored.iter().map(unstored).collect();
+            state.queue.extend(back);
             self.release(id, &mut state, Some(key)).await;
             let idle = state.agent_session_id.is_some() && !state.turn_running && !state.stopped;
             match (state.agent.clone(), idle) {
@@ -720,6 +744,36 @@ impl Hub {
         };
         if let Some((agent, queued, held)) = next {
             tokio::spawn(self.clone().run_queued(id, agent, None, queued, held));
+        }
+    }
+
+    /// The answer to a steer a restart left open: taken, it's let go; refused or failed, it goes back to the queue,
+    /// as a live steer's would.
+    async fn steer_answered(
+        self: &Arc<Self>,
+        id: Uuid,
+        request: i64,
+        answer: Result<Value, RpcError>,
+    ) {
+        let key = {
+            let live = self.live(id);
+            let state = live.state.lock().await;
+            state
+                .in_flight
+                .iter()
+                .find(|h| h.request == Some(request))
+                .map(|h| h.key)
+        };
+        let Some(key) = key else {
+            return;
+        };
+        match answer {
+            Ok(result) if result["outcome"] != "promptRequired" => {
+                let live = self.live(id);
+                let mut state = live.state.lock().await;
+                self.release(id, &mut state, Some(key)).await;
+            }
+            _ => self.requeue_held(id, key).await,
         }
     }
 
@@ -758,11 +812,7 @@ impl Hub {
                         }),
                     }
                 } else {
-                    restored.push(Queued {
-                        id: q["id"].as_str().and_then(|s| s.parse().ok()),
-                        blocks: q["blocks"].as_array().cloned().unwrap_or_default(),
-                        reply: None,
-                    });
+                    restored.push(unstored(&q));
                 }
             }
             if restored.is_empty() && held.is_empty() {
@@ -1270,7 +1320,7 @@ impl Hub {
                     if let Err(e) = hub.steer_in(id, blocks.clone(), held).await {
                         tracing::warn!(session = %id, error = %e, "steering a notice in");
                         if let Some(key) = held {
-                            hub.requeue_held(id, key, blocks).await;
+                            hub.requeue_held(id, key).await;
                         }
                     }
                 });

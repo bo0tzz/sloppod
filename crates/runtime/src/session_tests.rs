@@ -1520,3 +1520,51 @@ async fn a_notice_whose_steer_failed_after_the_turn_ended_starts_a_turn() {
         ["sloppod: approved."]
     );
 }
+
+#[tokio::test]
+async fn a_steer_a_restart_left_open_and_the_agent_then_refuses_still_delivers_its_notice() {
+    let mut h = Harness::ready().await;
+    let _turn = h.prompt("Busy");
+    let turn_request = next_prompt(&mut h.to_agent).await;
+    h.hub
+        .clone()
+        .notify(h.id, "sloppod: approved.".into())
+        .await;
+    let steering = h.next().await;
+    assert_eq!(steering["method"], "_session/steering");
+
+    // The runtime restarts with both open on the agent.
+    let (hub, agent, mut to_agent) = restarted(&h).await;
+    hub.adopt_agent(
+        h.id,
+        &agent,
+        running(vec![turn_request.clone(), steering.clone()]),
+    )
+    .await;
+    assert_eq!(
+        kept_texts(&h).await,
+        ["sloppod: approved."],
+        "held until the steer's answer"
+    );
+
+    // The turn ends first, so the agent refuses the steer: the notice runs as a turn of its own.
+    let answer = |request: &Value, result: Value| json!({"jsonrpc": "2.0", "id": request["id"], "result": result});
+    from_agent(
+        &hub,
+        h.id,
+        &agent,
+        answer(&turn_request, json!({"stopReason": "end_turn"})),
+    )
+    .await;
+    from_agent(
+        &hub,
+        h.id,
+        &agent,
+        answer(&steering, json!({"outcome": "promptRequired"})),
+    )
+    .await;
+    assert_eq!(
+        prompt_text(&next_prompt(&mut to_agent).await),
+        ["sloppod: approved."]
+    );
+}
