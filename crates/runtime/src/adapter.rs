@@ -88,6 +88,11 @@ fn session_prompt(context: &AgentContext) -> String {
             context.repos_dir
         ));
     }
+    workspace.push_str(&format!(
+        "- Only {} survives a restart of the pod: keep your work there, and use `$TMPDIR` ({}/tmp) \
+         rather than /tmp for scratch files and worktrees.\n",
+        context.workdir, context.workdir
+    ));
     workspace.push_str(
         "- In each repository, you can push only your session branch and branches named after it \
          (`<session branch>-<name>`, e.g. for a second pull request; the name has only letters, digits, `.`, `_` \
