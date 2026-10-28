@@ -14,9 +14,6 @@ use uuid::Uuid;
 use crate::link::{AgentConn, RpcError};
 use crate::store::SessionStore;
 
-/// The longest a steer waits for a compaction to end.
-const COMPACTION_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
-
 #[derive(Clone, Debug)]
 pub enum UiEvent {
     /// A notification to forward as-is; `seq` is the event-log position for recorded updates.
@@ -68,7 +65,8 @@ struct LiveState {
     /// The agent is replaying history for `session/load`; that replay isn't new.
     loading: bool,
     turn_running: bool,
-    /// The agent is compacting its context; steers wait for it to end.
+    /// The agent is compacting its context; steers wait for it to end. A turn's end ends it too, in case the
+    /// compaction's own end never came.
     compacting: bool,
     /// How many turns the hub sent have ended, and why the last one failed, if it did. A watcher compares the count
     /// with the one it saw, so no turn's end is missed between its looks.
@@ -81,6 +79,13 @@ struct LiveState {
     restart_notice: Option<String>,
     /// The session was stopped: nothing queued for it runs any more.
     stopped: bool,
+}
+
+impl Live {
+    fn end_compaction(&self, state: &mut LiveState) {
+        state.compacting = false;
+        self.compaction_ended.notify_waiters();
+    }
 }
 
 pub struct Live {
@@ -266,8 +271,7 @@ impl Hub {
         }
         state.agent_session_id = None;
         state.turn_running = false;
-        state.compacting = false;
-        live.compaction_ended.notify_waiters();
+        live.end_compaction(&mut state);
     }
 
     pub async fn set_restart_notice(&self, id: Uuid, notice: String) {
@@ -530,6 +534,7 @@ impl Hub {
             state.agent = None;
             state.agent_session_id = None;
             state.turn_running = false;
+            live.end_compaction(&mut state);
             self.set_phase(id, Phase::Disconnected).await;
             state
                 .permissions
@@ -566,9 +571,10 @@ impl Hub {
                 state.agent_state["modes"]["currentModeId"] = mode.clone();
             }
             if update["sessionUpdate"] == "compaction_update" {
-                state.compacting = update["status"] == "in_progress";
-                if !state.compacting {
-                    live.compaction_ended.notify_waiters();
+                if update["status"] == "in_progress" {
+                    state.compacting = true;
+                } else {
+                    live.end_compaction(&mut state);
                 }
             }
         }
@@ -812,6 +818,7 @@ impl Hub {
             if !state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
                 return;
             }
+            live.end_compaction(&mut state);
             let agent_up = state.agent_session_id.is_some();
             state.turn_running = agent_up && !state.queue.is_empty();
             let next = state.turn_running.then(|| std::mem::take(&mut state.queue));
@@ -952,19 +959,16 @@ impl Hub {
     }
 
     /// A steer pre-empts whatever the agent is generating, and a compaction it pre-empts is cancelled rather than
-    /// resumed. So steers wait for one to end: a few minutes at most, so a missed end can't hold them forever.
+    /// resumed. So steers wait for one to end, however long it takes.
     async fn after_compaction(&self, id: Uuid) {
         let live = self.live(id);
-        let ended = async {
-            loop {
-                let notified = live.compaction_ended.notified();
-                if !live.state.lock().await.compacting {
-                    return;
-                }
-                notified.await;
+        loop {
+            let ended = live.compaction_ended.notified();
+            if !live.state.lock().await.compacting {
+                return;
             }
-        };
-        let _ = tokio::time::timeout(COMPACTION_WAIT, ended).await;
+            ended.await;
+        }
     }
 
     /// Delivers a message into the running turn; before the agent is up it joins the queue instead.
