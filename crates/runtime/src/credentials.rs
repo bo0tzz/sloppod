@@ -129,6 +129,16 @@ fn host_of(url: &str) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
+/// Serialises changes to which of an owner's credentials of a kind is the default, until the transaction ends.
+async fn lock_kind(tx: &mut sqlx::PgConnection, owner: &str, kind: &str) -> sqlx::Result<()> {
+    sqlx::query("select pg_advisory_xact_lock(hashtext($1 || '/' || $2))")
+        .bind(owner)
+        .bind(kind)
+        .execute(tx)
+        .await
+        .map(|_| ())
+}
+
 impl Credentials {
     pub async fn new(db: PgPool, vault: Vault) -> anyhow::Result<Self> {
         Ok(Self {
@@ -215,6 +225,8 @@ impl Credentials {
             _ => serde_json::json!({}),
         };
         let sealed = self.vault.encrypt(secret.as_bytes())?;
+        let mut tx = self.db.begin().await?;
+        lock_kind(&mut tx, owner, &new.kind).await?;
         let row: Option<CredentialRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "insert into credentials (id, owner, kind, name, config, secret, is_default) \
              values ($1, $2, $3, $4, $5, $6, not exists (select 1 from credentials where owner = $2 and kind = $3 and is_default)) \
@@ -226,8 +238,9 @@ impl Credentials {
         .bind(&name)
         .bind(&stored_config)
         .bind(&sealed)
-        .fetch_optional(&self.db)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
         let Some(row) = row else {
             return Ok(Err(Invalid(format!(
                 "there's already a {} credential named {name}",
@@ -247,10 +260,19 @@ impl Credentials {
         .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else { return Ok(None) };
-        sqlx::query("update credentials set is_default = (id = $1) where owner = $2 and kind = $3")
+        lock_kind(&mut tx, owner, &row.kind).await?;
+        // Two steps: the index allowing one default per kind is checked row by row, so one statement swapping it
+        // could briefly have two.
+        sqlx::query(
+            "update credentials set is_default = false where owner = $1 and kind = $2 and is_default and id <> $3",
+        )
+        .bind(owner)
+        .bind(&row.kind)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("update credentials set is_default = true where id = $1")
             .bind(id)
-            .bind(owner)
-            .bind(&row.kind)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -262,25 +284,37 @@ impl Credentials {
 
     /// Deletes a credential; another of its kind becomes the default if it was.
     pub async fn delete(&self, owner: &str, id: Uuid) -> anyhow::Result<bool> {
-        let deleted: Option<(String, bool)> = sqlx::query_as(
-            "delete from credentials where id = $1 and owner = $2 returning kind, is_default",
-        )
-        .bind(id)
-        .bind(owner)
-        .fetch_optional(&self.db)
-        .await?;
-        let Some((kind, was_default)) = deleted else {
+        let mut tx = self.db.begin().await?;
+        let kind: Option<(String,)> =
+            sqlx::query_as("select kind from credentials where id = $1 and owner = $2")
+                .bind(id)
+                .bind(owner)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((kind,)) = kind else {
             return Ok(false);
         };
-        if was_default {
-            sqlx::query(
-                "update credentials set is_default = true where id = \
-                 (select id from credentials where owner = $1 and kind = $2 order by created_at limit 1)",
-            )
+        lock_kind(&mut tx, owner, &kind).await?;
+        let deleted = sqlx::query("delete from credentials where id = $1 and owner = $2")
+            .bind(id)
             .bind(owner)
-            .bind(&kind)
-            .execute(&self.db)
-            .await?;
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+            > 0;
+        // The oldest left becomes the default, unless one already is (made so while this waited for the lock).
+        sqlx::query(
+            "update credentials set is_default = true where id = \
+             (select id from credentials where owner = $1 and kind = $2 order by created_at limit 1) \
+             and not exists (select 1 from credentials where owner = $1 and kind = $2 and is_default)",
+        )
+        .bind(owner)
+        .bind(&kind)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        if !deleted {
+            return Ok(false);
         }
         self.github.lock().await.remove(&id);
         Ok(true)
@@ -435,5 +469,80 @@ impl Credentials {
             .execute(&self.db)
             .await
             .map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use base64::Engine;
+
+    use super::*;
+
+    async fn credentials(db: PgPool) -> Credentials {
+        let key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        Credentials::new(db, Vault::from_base64(&key).unwrap())
+            .await
+            .unwrap()
+    }
+
+    fn claude(name: &str) -> NewCredential {
+        NewCredential {
+            kind: CLAUDE.into(),
+            name: name.into(),
+            config: Default::default(),
+            secret: "sk-test".into(),
+        }
+    }
+
+    async fn defaults(credentials: &Credentials) -> Vec<String> {
+        let rows = credentials.list("dev").await.unwrap();
+        rows.into_iter()
+            .filter(|r| r.is_default)
+            .map(|r| r.name)
+            .collect()
+    }
+
+    #[sqlx::test]
+    async fn two_first_credentials_at_once_leave_one_default(db: PgPool) {
+        let credentials = credentials(db).await;
+        let (a, b) = tokio::join!(
+            credentials.create("dev", claude("a")),
+            credentials.create("dev", claude("b"))
+        );
+        assert!(a.unwrap().is_ok() && b.unwrap().is_ok());
+        assert_eq!(defaults(&credentials).await.len(), 1);
+    }
+
+    #[sqlx::test]
+    async fn deleting_the_default_while_another_is_chosen_leaves_one_default(db: PgPool) {
+        let credentials = credentials(db).await;
+        let x = credentials
+            .create("dev", claude("x"))
+            .await
+            .unwrap()
+            .unwrap();
+        credentials
+            .create("dev", claude("z"))
+            .await
+            .unwrap()
+            .unwrap();
+        let y = credentials
+            .create("dev", claude("y"))
+            .await
+            .unwrap()
+            .unwrap();
+        let (deleted, chosen) = tokio::join!(
+            credentials.delete("dev", x.id),
+            credentials.set_default("dev", y.id)
+        );
+        assert!(deleted.unwrap());
+        assert!(chosen.unwrap().is_some());
+        assert_eq!(defaults(&credentials).await.len(), 1);
+
+        // Deleting the default promotes one of the rest.
+        let rows = credentials.list("dev").await.unwrap();
+        let default = rows.iter().find(|r| r.is_default).unwrap();
+        assert!(credentials.delete("dev", default.id).await.unwrap());
+        assert_eq!(defaults(&credentials).await.len(), 1);
     }
 }
