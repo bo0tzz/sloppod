@@ -23,6 +23,8 @@ export type Session = {
   agent_error?: string;
   /** The session that spawned it, for a sub-session. */
   parent_id?: string;
+  /** When the session, waiting for its usage limit to reset, carries on by itself. */
+  limited_until?: string;
 };
 
 export type NewSession = {
