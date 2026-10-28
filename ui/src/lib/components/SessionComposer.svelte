@@ -77,23 +77,29 @@
     return message.text ? `${message.text} (with ${pictures})` : `(${pictures})`;
   }
 
-  async function addImages(files: File[]) {
-    const room = MAX_IMAGES - images.length;
+  /** Additions run one after another, so each appends to the list as it is when its image is ready. */
+  let adding: Promise<void> = Promise.resolve();
+
+  function addImages(files: File[]) {
+    // Images still being prepared count against the limit too.
+    const room = MAX_IMAGES - images.length - attaching;
     if (files.length > room) {
       toastManager.warning({ title: `A message can carry up to ${MAX_IMAGES} images` });
     }
-    attaching++;
-    try {
-      for (const file of files.slice(0, Math.max(0, room))) {
+    const taken = files.slice(0, Math.max(0, room));
+    attaching += taken.length;
+    adding = adding.then(async () => {
+      for (const file of taken) {
         try {
-          images = [...images, await attach(file)];
+          const image = await attach(file);
+          images = [...images, image];
         } catch (error) {
           toastManager.danger({ title: "Couldn't add the image", description: errorMessage(error) });
+        } finally {
+          attaching--;
         }
       }
-    } finally {
-      attaching--;
-    }
+    });
     textarea?.focus();
   }
 

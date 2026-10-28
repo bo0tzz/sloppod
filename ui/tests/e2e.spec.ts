@@ -186,6 +186,36 @@ test('sends images picked, pasted or dropped into the message box', async ({ pag
   await expect(userMessages(page).filter({ hasText: 'What do these show?' }).locator('img')).toHaveCount(2);
 });
 
+test('an image removed while another is being prepared stays removed', async ({ page }) => {
+  // Holds preparing an image until the test lets it go.
+  await page.addInitScript(() => {
+    const real = window.createImageBitmap.bind(window);
+    const w = window as unknown as { holdImages: boolean; releaseImages: () => void };
+    let release: () => void = () => {};
+    let held = new Promise<void>((resolve) => (release = resolve));
+    w.holdImages = false;
+    w.releaseImages = () => release();
+    window.createImageBitmap = (async (...args: Parameters<typeof createImageBitmap>) => {
+      if (w.holdImages) await held;
+      return real(...args);
+    }) as typeof createImageBitmap;
+  });
+  await createSession(page, 'Look at my screenshots in sloppod');
+  await finishTurn(page);
+  const attachments = page.getByTestId('attachment');
+  await page.getByTestId('image-picker').setInputFiles({ name: 'a.png', mimeType: 'image/png', buffer: Buffer.from(PIXEL, 'base64') });
+  await expect(attachments).toHaveCount(1);
+
+  await page.evaluate(() => ((window as unknown as { holdImages: boolean }).holdImages = true));
+  await handImage(page, 'paste', 'b.png');
+  await expect(page.getByText('Adding…')).toBeVisible();
+  await page.getByRole('button', { name: 'Remove image 1' }).click();
+  await expect(attachments).toHaveCount(0);
+  await page.evaluate(() => (window as unknown as { releaseImages: () => void }).releaseImages());
+  await expect(page.getByText('Adding…')).toBeHidden();
+  await expect(attachments).toHaveCount(1);
+});
+
 test('a file that is not an image is not attached', async ({ page }) => {
   await createSession(page, 'Look at my files in sloppod');
   await finishTurn(page);
