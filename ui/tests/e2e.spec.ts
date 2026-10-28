@@ -895,6 +895,50 @@ test('adds a repository from the session menu', async ({ page }) => {
   await expect(page.getByRole('option', { name: 'bo0tzz/memini' })).toHaveCount(0);
 });
 
+test("adds a repository as one of the user's GitHub tokens", async ({ page }) => {
+  await page.request.post('/api/v1/credentials', {
+    data: { kind: 'github-user', name: 'mine', secret: 'github_pat_x', config: {} },
+  });
+  await createSession(page, 'Just chat for now');
+
+  const picker = page.getByTestId('add-repo');
+  const openPicker = async () => {
+    await page.getByRole('button', { name: 'Session actions' }).click();
+    await page.getByRole('menuitem', { name: 'Add repository…' }).click();
+  };
+  await openPicker();
+  await expect(picker.getByText('What the session pushes there is attributed to that person.')).toHaveCount(0);
+  await picker.getByRole('combobox', { name: 'Act as' }).click();
+  await page.getByRole('option', { name: 'bo0tzz (mine)' }).click();
+  await expect(picker.getByText('What the session pushes there is attributed to that person.')).toBeVisible();
+
+  // The token's repositories are offered, not the App's.
+  await picker.getByRole('combobox', { name: 'Repository' }).click();
+  await expect(page.getByRole('option', { name: 'bo0tzz/memini' })).toHaveCount(0);
+  await page.getByRole('option', { name: 'bo0tzz/dotfiles' }).click();
+  await page.getByRole('button', { name: 'Add', exact: true }).click();
+  await expect(page.getByTestId('session-subtitle')).toHaveText('bo0tzz/dotfiles');
+
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await page.getByRole('menuitem', { name: 'Grants' }).click();
+  await expect(page.getByRole('dialog').getByText('as bo0tzz')).toBeVisible();
+  await page.keyboard.press('Escape');
+
+  // It isn't offered again to the same token, but the App can still have it.
+  await openPicker();
+  await picker.getByRole('combobox', { name: 'Act as' }).click();
+  await page.getByRole('option', { name: 'bo0tzz (mine)' }).click();
+  await picker.getByRole('combobox', { name: 'Repository' }).click();
+  await expect(page.getByRole('option', { name: 'bo0tzz/sloppod' })).toBeVisible();
+  await expect(page.getByRole('option', { name: 'bo0tzz/dotfiles' })).toHaveCount(0);
+
+  // The mock is shared by the other tests, which expect no GitHub account.
+  const credentials: { id: string; kind: string }[] = await (await page.request.get('/api/v1/credentials')).json();
+  for (const credential of credentials.filter((entry) => entry.kind === 'github-user')) {
+    await page.request.delete(`/api/v1/credentials/${credential.id}`);
+  }
+});
+
 test('shows a proposal of an unknown kind generically', async ({ page }) => {
   const sessions: { id: string; title: string }[] = await (await page.request.get('/api/v1/sessions')).json();
   const session = sessions.find((candidate) => candidate.title === 'Park and wake')!;
