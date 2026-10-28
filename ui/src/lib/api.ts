@@ -62,7 +62,13 @@ export type IssueUpdate = {
   remove_labels?: string[];
 };
 export type IssueUpdatesPayload = { repo: string; updates: IssueUpdate[] };
-export type ProposalEdits = { title?: string; body?: string; auto_merge?: boolean; issues?: IssueDraft[] };
+export type ProposalEdits = {
+  title?: string;
+  body?: string;
+  auto_merge?: boolean;
+  issues?: IssueDraft[];
+  updates?: IssueUpdate[];
+};
 
 export type Proposal = {
   id: string;

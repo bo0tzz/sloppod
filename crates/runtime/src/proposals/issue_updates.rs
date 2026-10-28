@@ -67,10 +67,14 @@ fn update_list(updates: &Value) -> Result<Vec<Value>> {
                 .ok_or_else(|| Error::new(format!("update {} needs the issue's number", i + 1)))?;
             let mut checked = Map::new();
             checked.insert("number".into(), json!(number));
-            for field in ["title", "body", "comment"] {
+            for field in ["title", "comment"] {
                 if let Some(text) = update[field].as_str().filter(|t| !t.trim().is_empty()) {
                     checked.insert(field.into(), json!(text.trim()));
                 }
+            }
+            // A body replaces the old one, so an empty one is kept: it clears the body.
+            if let Some(body) = update["body"].as_str() {
+                checked.insert("body".into(), json!(body.trim()));
             }
             match update["close"].as_str() {
                 None => {}
@@ -131,8 +135,13 @@ fn describe(update: &Value) -> String {
     if update.get("reopen").is_some() {
         parts.push("reopened".to_owned());
     }
-    if update.get("title").is_some() || update.get("body").is_some() {
-        parts.push("edited".to_owned());
+    if update.get("title").is_some() {
+        parts.push("retitled".to_owned());
+    }
+    match update["body"].as_str() {
+        Some("") => parts.push("body cleared".to_owned()),
+        Some(_) => parts.push("body replaced".to_owned()),
+        None => {}
     }
     if update.get("add_labels").is_some() || update.get("remove_labels").is_some() {
         parts.push("relabelled".to_owned());
@@ -218,14 +227,6 @@ impl ProposalKind for IssueUpdates {
         let repo = payload["repo"].as_str().unwrap_or_default();
         let updates = update_list(&payload["updates"])?;
         let app = self.credentials.github(&session.owner).await.map_err(err)?;
-        let mut added: Vec<&str> = updates
-            .iter()
-            .flat_map(|u| u["add_labels"].as_array().into_iter().flatten())
-            .filter_map(Value::as_str)
-            .collect();
-        added.sort_unstable();
-        added.dedup();
-        app.ensure_labels(repo, &added).await.map_err(err)?;
 
         let (mut done, mut failed) = (Vec::new(), Vec::new());
         for update in &updates {
@@ -284,6 +285,8 @@ async fn apply(
         .filter_map(Value::as_str)
         .collect();
     if !added.is_empty() {
+        // Per update, after its comment: a label GitHub won't create fails only this update.
+        app.ensure_labels(repo, &added).await?;
         app.add_labels(repo, number, &added).await?;
     }
     for label in update["remove_labels"]
@@ -335,6 +338,12 @@ mod tests {
         assert!(update_list(&json!([])).is_err());
         assert!(update_list(&json!([{"comment": "no number"}])).is_err());
         assert!(update_list(&json!([{"number": 1}])).is_err());
+        // An empty body is a change: it clears the body.
+        assert_eq!(
+            update_list(&json!([{"number": 1, "body": ""}])).unwrap(),
+            vec![json!({"number": 1, "body": ""})]
+        );
+        assert_eq!(describe(&json!({"number": 1, "body": ""})), "body cleared");
         assert!(update_list(&json!([{"number": 1, "close": "wontfix"}])).is_err());
         assert!(
             update_list(&json!([{"number": 1, "close": "completed", "reopen": true}])).is_err()

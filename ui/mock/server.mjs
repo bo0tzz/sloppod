@@ -1320,6 +1320,7 @@ function approve(proposal, body, decidedBy) {
     notice = `Your stack was approved. ${proposal.result.message}`;
     ack = 'Great, the stack is open.';
   } else if (proposal.kind === 'github.issue.update') {
+    if (Array.isArray(body.updates)) proposal.payload.updates = body.updates;
     const updated = proposal.payload.updates.map((u) => ({ number: u.number }));
     proposal.status = 'executed';
     proposal.result = { updated, failed: [], message: `Updated ${updated.map((u) => `#${u.number}`).join(', ')}.` };
