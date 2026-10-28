@@ -1326,6 +1326,32 @@ async fn a_question_from_ask_user_waits_for_its_answer_without_the_agent() {
 }
 
 #[tokio::test]
+async fn a_question_from_ask_user_outlives_a_restart() {
+    let h = Harness::ready().await;
+    let questions = json!([{"question": "Which backoff?", "options": [{"label": "Exponential"}, {"label": "Fixed"}]}]);
+    h.hub.ask(h.id, questions).await.unwrap();
+
+    let (hub, agent, mut to_agent) = restarted(&h).await;
+    hub.restore_questions().await;
+    let replay = hub.replay(h.id).await.unwrap();
+    let (pid, method, params) = replay.permissions.first().cloned().expect("the question");
+    assert_eq!(method, "elicitation/create");
+    assert_eq!(params["message"], "Which backoff?");
+
+    // Answered after the restart, it reaches the agent and is kept no longer.
+    hub.agent_ready(h.id, &agent, "agent-session".into(), json!({}), None)
+        .await;
+    let answer = json!({"action": "accept", "content": {"question_0": "Fixed"}});
+    hub.answer_permission(h.id, pid, Ok(answer)).await;
+    assert_eq!(
+        prompt_text(&next_prompt(&mut to_agent).await),
+        ["sloppod: the user answered your question:\n- Which backoff?: Fixed"]
+    );
+    assert!(hub.replay(h.id).await.unwrap().permissions.is_empty());
+    assert!(h.store.questions().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn a_queued_message_is_kept_until_its_turn_takes_it() {
     let mut h = Harness::ready().await;
     let _busy = h.prompt("Busy");
