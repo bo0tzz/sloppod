@@ -109,6 +109,10 @@ pub struct Config {
     #[arg(long, env = "SLOPPOD_BUILD")]
     pub build: Option<String>,
 
+    /// The version this runtime was released as, e.g. `0.1.2`, or `0.1.2-main.153` for a build of main.
+    #[arg(long, env = "SLOPPOD_VERSION")]
+    pub version: Option<String>,
+
     /// Instructions rendered into every session as the agent's user-level instructions.
     #[arg(long, env = "SLOPPOD_INSTRUCTIONS_FILE")]
     pub instructions_file: Option<PathBuf>,

@@ -5,7 +5,7 @@
   import { AppShell, AppShellSidebar, IconButton, TooltipProvider } from '@immich/ui';
   import { mdiCogOutline, mdiMenuOpen, mdiPlus } from '@mdi/js';
   import { onMount, type Snippet } from 'svelte';
-  import { account } from '#lib/account.svelte.ts';
+  import { account, sourceLink } from '#lib/account.svelte.ts';
   import AppIcon from '#lib/components/AppIcon.svelte';
   import SessionList from '#lib/components/SessionList.svelte';
   import { sessions } from '#lib/sessions.svelte.ts';
@@ -65,8 +65,15 @@
               <span class="truncate" data-testid="current-user">
                 {account.user ? `Signed in as ${account.user}` : ''}
               </span>
-              {#if account.build}
-                <span class="truncate opacity-75" title="sloppod {account.build}" data-testid="runtime-build">sloppod {account.build}</span>
+              {#if account.version || account.build}
+                <a
+                  class="truncate opacity-75 hover:underline"
+                  href={sourceLink(account.build)}
+                  target="_blank"
+                  rel="noreferrer"
+                  title={account.build ? `Built from ${account.build}` : undefined}
+                  data-testid="runtime-build">sloppod {account.version ?? account.build}</a
+                >
               {/if}
             </div>
             <IconButton href="/settings" icon={mdiCogOutline} aria-label="Settings" variant="ghost" shape="round" size="small" color="secondary" />
