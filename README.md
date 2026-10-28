@@ -24,6 +24,7 @@ Concepts:
 - [6. The runtime is self-referential](docs/adr/0006-self-reference.md)
 - [7. Extension points have plugin-shaped boundaries](docs/adr/0007-extension-points.md)
 - [23. Users and ownership](docs/adr/0023-users-and-ownership.md)
+- [28. Sessions act as their owner only through grants the owner controls](docs/adr/0028-acting-as-the-owner.md)
 
 Approach:
 
