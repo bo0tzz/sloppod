@@ -1,4 +1,5 @@
-node_modules/
+# No trailing slash: a symlink to a shared node_modules is ignored too.
+node_modules
 build/
 .svelte-kit/
 test-results/
