@@ -429,6 +429,23 @@ test('saves the default model for new sessions', async ({ page }) => {
   await expect(defaults.getByRole('combobox', { name: 'Model' })).toContainText('Agent default');
 });
 
+test('saves a model id the agent does not list', async ({ page }) => {
+  const defaults = page.getByTestId('session-defaults');
+  await page.goto('/settings');
+  await defaults.getByRole('combobox', { name: 'Model' }).click();
+  await page.getByRole('option', { name: 'Other…', exact: true }).click();
+  await defaults.getByRole('textbox', { name: 'Model id' }).fill('claude-mythos-5-1');
+  await defaults.getByRole('button', { name: 'Save' }).click();
+  await expect(defaults.getByRole('button', { name: 'Save' })).toBeDisabled();
+
+  await page.reload();
+  await expect(defaults.getByRole('combobox', { name: 'Model' })).toContainText('Other…');
+  await expect(defaults.getByRole('textbox', { name: 'Model id' })).toHaveValue('claude-mythos-5-1');
+  const settings: { model: string } = await (await page.request.get('/api/v1/settings')).json();
+  expect(settings.model).toBe('claude-mythos-5-1');
+  await page.request.put('/api/v1/settings', { data: { model: null } });
+});
+
 test('requires review by default, or per session', async ({ page }) => {
   const defaults = page.getByTestId('session-defaults');
   const policy = defaults.getByRole('combobox', { name: 'Review by Codex' });
