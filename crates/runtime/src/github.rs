@@ -187,6 +187,22 @@ fn read_permissions(installation: &BTreeMap<String, String>) -> BTreeMap<String,
         .collect()
 }
 
+/// A push token's permissions: `contents: write`, and `workflows: write` too where the installation has it, so a push
+/// may change workflow files. Asking for a permission the installation lacks gets the whole token refused.
+fn push_permissions(installation: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut permissions = BTreeMap::from([
+        ("contents".to_owned(), "write".to_owned()),
+        ("metadata".to_owned(), "read".to_owned()),
+    ]);
+    if installation
+        .get("workflows")
+        .is_some_and(|level| level == "write")
+    {
+        permissions.insert("workflows".to_owned(), "write".to_owned());
+    }
+    permissions
+}
+
 pub struct GitHubApp {
     api: String,
     app_id: String,
@@ -505,16 +521,17 @@ impl GitHubApp {
         .with_context(|| format!("the GitHub App's installation on {repo} keeps disappearing"))
     }
 
-    /// A session's token for pushing to `repo`: that repository only, with `contents: write`.
+    /// A session's token for pushing to `repo`: that repository only, with [`push_permissions`].
     pub async fn push_token(&self, repo: &str) -> anyhow::Result<String> {
         self.mint_scoped(|| async move {
+            let installation = self.installation_for(repo).await?;
+            let Some(permissions) = self.installation_permissions(installation).await? else {
+                return Ok(None);
+            };
             Ok(Some(TokenScope {
-                installation: self.installation_for(repo).await?,
+                installation,
                 repositories: Some(repository_names([repo])),
-                permissions: Some(BTreeMap::from([
-                    ("contents".to_owned(), "write".to_owned()),
-                    ("metadata".to_owned(), "read".to_owned()),
-                ])),
+                permissions: Some(push_permissions(&permissions)),
             }))
         })
         .await?
@@ -1751,11 +1768,37 @@ mod tests {
                     1,
                     json!({
                         "repositories": ["r"],
-                        "permissions": {"contents": "write", "metadata": "read"},
+                        "permissions": {"contents": "write", "metadata": "read", "workflows": "write"},
                     })
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn pushes_may_change_workflows_only_where_the_installation_can() {
+        let installation = |workflows: Option<&str>| {
+            let mut permissions = BTreeMap::from([
+                ("contents".to_owned(), "write".to_owned()),
+                ("metadata".to_owned(), "read".to_owned()),
+            ]);
+            if let Some(level) = workflows {
+                permissions.insert("workflows".to_owned(), level.to_owned());
+            }
+            permissions
+        };
+        let contents = BTreeMap::from([
+            ("contents".to_owned(), "write".to_owned()),
+            ("metadata".to_owned(), "read".to_owned()),
+        ]);
+        let mut with_workflows = contents.clone();
+        with_workflows.insert("workflows".to_owned(), "write".to_owned());
+        assert_eq!(
+            push_permissions(&installation(Some("write"))),
+            with_workflows
+        );
+        assert_eq!(push_permissions(&installation(None)), contents);
+        assert_eq!(push_permissions(&installation(Some("read"))), contents);
     }
 
     #[tokio::test]
