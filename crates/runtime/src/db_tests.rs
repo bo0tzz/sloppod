@@ -999,3 +999,53 @@ async fn a_quota_keeps_the_windows_a_report_leaves_out(db: PgPool) {
             .is_empty()
     );
 }
+
+#[sqlx::test]
+async fn a_review_round_counts_its_wait_for_the_usage_limit_across_a_restart(db: PgPool) {
+    use crate::reviews::{paused, round_timed_out};
+
+    let author = session(&db, "dev").await;
+    let p = db::insert_proposal(
+        &db,
+        author,
+        "github.pr.create",
+        ProposalStatus::InReview,
+        &json!({"n": 1}),
+    )
+    .await
+    .unwrap()
+    .id;
+    let round = db::start_review_round(&db, p, "aaa", None).await.unwrap();
+    let started = db::reviews(&db, p).await.unwrap()[0].created_at;
+
+    // The reviewer worked 10 minutes, then hit its usage limit; the runtime was down for the hour that followed,
+    // and the limit reset meanwhile.
+    let limited_at = started + Duration::minutes(10);
+    db::pause_review(&db, p, round, limited_at).await.unwrap();
+    db::pause_review(&db, p, round, limited_at + Duration::minutes(1))
+        .await
+        .unwrap();
+    let back = limited_at + Duration::minutes(61);
+    let row = &db::reviews(&db, p).await.unwrap()[0];
+    assert_eq!(paused(row, back), Duration::minutes(61));
+
+    // The first check after the restart ends the wait then, downtime included.
+    db::unpause_review(&db, p, round, back).await.unwrap();
+    let row = &db::reviews(&db, p).await.unwrap()[0];
+    assert_eq!(row.paused_seconds, 61 * 60);
+    assert_eq!(row.paused_since, None);
+    // It keeps the 20 minutes of its 30 it hadn't used.
+    let at = |minutes| back + Duration::minutes(minutes);
+    assert!(!round_timed_out(
+        row.created_at,
+        paused(row, at(20)),
+        false,
+        at(20)
+    ));
+    assert!(round_timed_out(
+        row.created_at,
+        paused(row, at(21)),
+        false,
+        at(21)
+    ));
+}
