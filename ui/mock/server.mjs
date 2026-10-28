@@ -985,6 +985,15 @@ function broadcastProposal(proposal) {
 const availableRepos = () => (credentials.some((c) => c.kind === 'github-app') ? REPOS : []);
 
 /** An `owner/name` the user can access, or a bare name that matches exactly one of them. */
+/** What a new session can start with besides model access, memory and the repository: the runtime's `starting::defaults`. */
+const startingCapabilities = () => ['github', 'packages', 'docs', ...(credentials.some((c) => c.kind === 'chatgpt') ? ['codex'] : [])];
+
+/** How long a suggestion takes, so a test can see the pending hint and a later suggestion overtaking an edit. */
+const suggestDelay = 60;
+
+/** The message's first line, shortened, as the runtime's `default_title`. */
+const defaultTitle = (prompt) => prompt.trim().split('\n')[0].slice(0, 60).trim();
+
 function deriveRepo(prompt) {
   const repos = availableRepos();
   const full = repos.find((repo) => prompt.includes(repo));
@@ -995,11 +1004,14 @@ function deriveRepo(prompt) {
 
 /** Creates a session from its first message, which is recorded right away and queued for the agent; `parent` makes it a
  * sub-session. */
-function createSession({ prompt, repo, title, parent }) {
+function createSession({ prompt, repo, title, capabilities, parent }) {
   const id = randomUUID();
   const created = now();
-  const sessionRepo = repo ?? deriveRepo(prompt);
+  // Absent, the repository is derived from the prompt; null means none.
+  const sessionRepo = repo === undefined ? deriveRepo(prompt) : repo;
   const branch = sessionRepo ? `sloppod/${id.slice(0, 8)}` : null;
+  // Like the runtime: the chosen capabilities, and GitHub too when there's a repository, which needs it.
+  const chosen = (capability) => (capabilities ?? ['github', 'packages']).includes(capability) || (capability === 'github' && sessionRepo);
   const session = new MockSession({
     id,
     title: title ?? '',
@@ -1007,8 +1019,7 @@ function createSession({ prompt, repo, title, parent }) {
     branch,
     grants: [
       newGrant('model', {}, grantable.model),
-      newGrant('github', {}, grantable.github),
-      newGrant('packages', {}, grantable.packages),
+      ...['github', 'packages', 'docs', 'codex'].filter(chosen).map((capability) => newGrant(capability, {}, grantable[capability])),
       ...(sessionRepo
         ? [
             newGrant(
@@ -1384,16 +1395,29 @@ async function handleApi(req, res, url) {
 
   if (parts[0] === 'sessions') {
     if (parts.length === 1 && method === 'GET') return json(res, 200, sortedSessions());
+    if (parts.length === 2 && parts[1] === 'suggest' && method === 'POST') {
+      const body = await readBody(req);
+      const prompt = typeof body.prompt === 'string' ? body.prompt : '';
+      await sleep(suggestDelay);
+      // A prompt with "question:" gets what a judgement would give for one: no repository, and docs alone.
+      if (/question:/i.test(prompt)) {
+        return json(res, 200, { title: defaultTitle(prompt), repo: null, capabilities: ['docs'], source: 'judgement' });
+      }
+      return json(res, 200, { title: defaultTitle(prompt), repo: deriveRepo(prompt), capabilities: startingCapabilities(), source: 'match' });
+    }
     if (parts.length === 1 && method === 'POST') {
       const body = await readBody(req);
       if (typeof body.prompt !== 'string' || !body.prompt.trim()) return json(res, 400, { error: 'prompt is required' });
-      if (body.repo !== undefined && !availableRepos().includes(body.repo)) {
+      if (body.repo !== undefined && body.repo !== null && !availableRepos().includes(body.repo)) {
         return json(res, 400, { error: `unknown repository ${body.repo}` });
       }
       if (!credentials.some((c) => c.kind === 'claude')) {
         return json(res, 409, { error: 'no Claude account configured' });
       }
+      const unknown = (body.capabilities ?? []).find((c) => !startingCapabilities().includes(c));
+      if (unknown) return json(res, 400, { error: `a new session can start with ${startingCapabilities().join(', ')}, not ${unknown}` });
       const session = createSession(body);
+      if (typeof body.model === 'string' && body.model) session.data.model = body.model;
       startAgent(session, startupDelay(body.prompt));
       if (/failing start/i.test(body.prompt)) failStart(session);
       return json(res, 201, session.data);

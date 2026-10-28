@@ -939,6 +939,71 @@ async function deleteGitHubTokens(page: Page) {
   }
 }
 
+async function openNewSession(page: Page) {
+  await page.goto('/');
+  await page.getByRole('link', { name: 'New session' }).click();
+  await expect(page).toHaveURL(/\/new$/);
+}
+
+test('the new-session page suggests a starting set, and sends the one the user edited', async ({ page }) => {
+  await openNewSession(page);
+  const card = page.getByTestId('starting-card');
+  // The empty draft is suggested at once; it says what can be chosen.
+  await expect(card).toBeVisible();
+  for (const capability of ['github', 'packages', 'docs']) {
+    await expect(card.getByTestId(`capability-${capability}`).getByRole('checkbox')).toBeChecked();
+  }
+
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Fix the build in bo0tzz/sloppod');
+  const title = card.getByRole('textbox', { name: 'Title' });
+  await expect(title).toHaveValue('Fix the build in bo0tzz/sloppod');
+  await expect(card.getByRole('combobox')).toContainText('bo0tzz/sloppod');
+  await expect(card.getByTestId('starting-source')).toHaveText('Matched from your message');
+
+  // What the user changes stays, whatever a later suggestion says; the rest follows it.
+  await title.fill('Mend the build');
+  await card.getByTestId('capability-docs').getByRole('checkbox').click();
+  await expect(card.getByTestId('capability-docs').getByRole('checkbox')).not.toBeChecked();
+  await box.fill('Fix the build in bo0tzz/memini');
+  await expect(card.getByRole('combobox')).toContainText('bo0tzz/memini');
+  await expect(title).toHaveValue('Mend the build');
+  await expect(card.getByTestId('capability-docs').getByRole('checkbox')).not.toBeChecked();
+
+  await box.press('Enter');
+  await expect(page).toHaveURL(/\/sessions\/[0-9a-f-]+$/);
+  await expect(page.getByTestId('session-title')).toHaveText('Mend the build');
+  await expect(page.getByTestId('session-subtitle')).toHaveText('bo0tzz/memini');
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await page.getByRole('menuitem', { name: 'Grants' }).click();
+  const grants = page.getByTestId('grants');
+  await expect(grants.getByTestId('grant-packages')).toBeVisible();
+  await expect(grants.getByTestId('grant-docs')).toHaveCount(0);
+});
+
+test('choosing no repository sends none, though the message names one', async ({ page }) => {
+  await openNewSession(page);
+  const card = page.getByTestId('starting-card');
+  await page.getByRole('textbox', { name: 'Prompt' }).fill('Fix the build in bo0tzz/sloppod');
+  await expect(card.getByRole('combobox')).toContainText('bo0tzz/sloppod');
+  await card.getByRole('combobox').click();
+  await page.getByRole('option', { name: 'No repository' }).click();
+  await page.getByRole('textbox', { name: 'Prompt' }).press('Enter');
+  await expect(page).toHaveURL(/\/sessions\/[0-9a-f-]+$/);
+  await expect(page.getByTestId('session-subtitle')).toHaveText('No repository');
+});
+
+test('a judgement of the first message shows as its source, and gives the card its repository and grants', async ({ page }) => {
+  await openNewSession(page);
+  const card = page.getByTestId('starting-card');
+  await page.getByRole('textbox', { name: 'Prompt' }).fill('question: how does the library behave?');
+  await expect(card.getByTestId('starting-source')).toHaveText('Suggested by the model');
+  await expect(card.getByRole('combobox')).toContainText('No repository');
+  await expect(card.getByTestId('capability-docs').getByRole('checkbox')).toBeChecked();
+  await expect(card.getByTestId('capability-github').getByRole('checkbox')).not.toBeChecked();
+  await expect(card.getByTestId('capability-packages').getByRole('checkbox')).not.toBeChecked();
+});
+
 test('adds a repository from the session menu', async ({ page }) => {
   await createSession(page, 'Just chat for now');
   await expect(page.getByTestId('session-subtitle')).toHaveText('No repository');
@@ -1608,13 +1673,13 @@ test('grants, narrows, times and revokes the grants of a running session', async
 
   const add = grants.getByTestId('add-grant');
   await add.getByRole('combobox', { name: 'Grant' }).click();
-  await page.getByRole('option', { name: 'docs' }).click();
+  await page.getByRole('option', { name: 'codex' }).click();
   await add.getByRole('combobox', { name: 'Runs out' }).click();
   await page.getByRole('option', { name: 'In an hour' }).click();
   await add.getByRole('button', { name: 'Grant' }).click();
-  const docs = grants.getByTestId('grant-docs');
-  await expect(docs).toContainText('Library documentation');
-  await expect(docs).toContainText('Runs out');
+  const codex = grants.getByTestId('grant-codex');
+  await expect(codex).toContainText("Codex's API");
+  await expect(codex).toContainText('Runs out');
 
   const repo = grants.getByTestId('grant-repo');
   await repo.getByRole('button', { name: 'Make read only' }).click();
