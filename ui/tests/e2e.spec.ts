@@ -79,6 +79,14 @@ test("copies an agent message's Markdown", async ({ page, context }) => {
   await expect(message.getByRole('button', { name: 'Copy message' })).toBeVisible();
 
   await expect(userMessages(page).getByRole('button', { name: 'Copy message' })).toHaveCount(0);
+
+  // A denied clipboard says so on the button.
+  await page.evaluate(() => {
+    navigator.clipboard.writeText = () => Promise.reject(new DOMException('Denied', 'NotAllowedError'));
+  });
+  await message.getByRole('button', { name: 'Copy message' }).click();
+  await expect(message.getByRole('button', { name: "Couldn't copy" })).toBeVisible();
+  await expect(message.getByRole('status')).toHaveText("Couldn't copy the message");
 });
 
 test('touch screens always show the copy button', async ({ page, browser }) => {
