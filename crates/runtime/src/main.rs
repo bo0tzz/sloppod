@@ -240,8 +240,8 @@ async fn main() -> anyhow::Result<()> {
     }));
     let usage = state.clone();
     state.hub.set_usage_seen(Arc::new(move |id, update| {
-        let state = usage.clone();
-        Box::pin(async move { quota::seen(&state, id, update).await })
+        let (state, at) = (usage.clone(), chrono::Utc::now());
+        Box::pin(async move { quota::seen(&state, id, update, at).await })
     }));
     let checker = state.clone();
     state.hub.set_turn_ended(Arc::new(move |id| {

@@ -116,7 +116,7 @@ type Credential = {
 
 ### Quotas
 
-What's left of the usage limits of the user's inference credentials, as last reported (#140). Claude Code reports a Claude subscription's limits in its sessions' `usage_update`s (`_meta["_claude/rateLimit"]`), under the session owner's default Claude credential; they're known once a session has used it. A ChatGPT login's are read from ChatGPT every five minutes, as the Codex CLI reads them, since codex-acp doesn't report them. Each report updates the windows it covers and keeps the others as they were. A quota reads as it stands now: a window whose reset has passed shows as unused, and a refusal ends at its `resets_at`. Only credentials with a report are listed.
+What's left of the usage limits of the user's inference credentials, as last reported (#140). Claude Code reports a Claude subscription's limits in its sessions' `usage_update`s (`_meta["_claude/rateLimit"]`), under the session owner's default Claude credential; they're known once a session has used it. A ChatGPT login's are read from ChatGPT every five minutes, as the Codex CLI reads them, since codex-acp doesn't report them. Each report updates the windows it covers and keeps the others as they were; one that arrives after a newer one changes nothing the newer one said. A ChatGPT report that isn't as expected is logged and ignored. A quota reads as it stands now: a window whose reset has passed shows as unused, and a refusal ends at its `resets_at`. Only credentials with a report are listed.
 
 ```
 GET /api/v1/quotas -> Quota[]

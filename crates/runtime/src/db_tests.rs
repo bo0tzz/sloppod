@@ -924,7 +924,9 @@ async fn a_quota_keeps_the_windows_a_report_leaves_out(db: PgPool) {
         resets_at: Some(Utc::now() + Duration::hours(3)),
         status,
     };
+    let first = Utc::now() - Duration::minutes(10);
     let both = Observation {
+        observed_at: first,
         limited: false,
         resets_at: None,
         windows: [
@@ -933,16 +935,23 @@ async fn a_quota_keeps_the_windows_a_report_leaves_out(db: PgPool) {
         ]
         .into(),
     };
-    quota::store(&db, claude, &both, Utc::now()).await.unwrap();
+    quota::store(&db, claude, &both).await.unwrap();
     let reset_at = Utc::now() + Duration::hours(1);
     let refused = Observation {
+        observed_at: first + Duration::minutes(5),
         limited: true,
         resets_at: Some(reset_at),
         windows: [("five_hour".to_owned(), window(1.0, QuotaStatus::Rejected))].into(),
     };
-    quota::store(&db, claude, &refused, Utc::now())
-        .await
-        .unwrap();
+    quota::store(&db, claude, &refused).await.unwrap();
+    // A report from between the two that arrives late changes nothing they both had.
+    let late = Observation {
+        observed_at: first + Duration::minutes(1),
+        limited: false,
+        resets_at: None,
+        windows: [("five_hour".to_owned(), window(0.6, QuotaStatus::Allowed))].into(),
+    };
+    quota::store(&db, claude, &late).await.unwrap();
 
     let quotas = quota::list(&db, "dev", Utc::now()).await.unwrap();
     assert_eq!(quotas.len(), 1);
