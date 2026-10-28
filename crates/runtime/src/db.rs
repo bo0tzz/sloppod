@@ -48,6 +48,8 @@ pub struct SessionRow {
     pub agent_error: Option<String>,
     /// The session that spawned this one, for a sub-session (ADR 27).
     pub parent_id: Option<Uuid>,
+    /// When the session, which hit its usage limit, carries on by itself (#251).
+    pub limited_until: Option<DateTime<Utc>>,
 }
 
 impl SessionRow {
@@ -74,6 +76,7 @@ impl SessionRow {
             agent_status: None,
             agent_error: None,
             parent_id: None,
+            limited_until: None,
         }
     }
 
@@ -123,6 +126,7 @@ impl SessionRow {
             agent_status: self.agent_status.clone(),
             agent_error: self.agent_error.clone(),
             parent_id: self.parent_id,
+            limited_until: self.limited_until.map(|d| d.to_rfc3339()),
         }
     }
 
@@ -144,7 +148,7 @@ impl SessionRow {
     }
 }
 
-const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, repo, created_at, updated_at, active_at, deleted_at, agent_status, agent_error, parent_id, \
+const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, repo, created_at, updated_at, active_at, deleted_at, agent_status, agent_error, parent_id, limited_until, \
      coalesce((select jsonb_agg(jsonb_build_object('capability', g.capability, 'params', g.params) order by g.created_at) \
      from session_grants g where g.session_id = sessions.id), '[]'::jsonb) as grants";
 
@@ -511,6 +515,57 @@ pub async fn save_queue(db: &PgPool, id: Uuid, queue: &[Value]) -> sqlx::Result<
     .execute(db)
     .await
     .map(|_| ())
+}
+
+/// Sets when the session, waiting for its usage limit, carries on; none when it isn't waiting.
+pub async fn set_limited_until(
+    db: &PgPool,
+    id: Uuid,
+    until: Option<DateTime<Utc>>,
+) -> sqlx::Result<Option<SessionRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "update sessions set limited_until = $2 where id = $1 returning {SESSION_COLUMNS}"
+    )))
+    .bind(id)
+    .bind(until)
+    .fetch_optional(db)
+    .await
+}
+
+/// Ends a session's wait for its usage limit at `at`, and in the same transaction the wait of a review round it works
+/// on as a reviewer, so no restart can come between the two and count its downtime as waiting.
+pub async fn end_limit(
+    db: &PgPool,
+    id: Uuid,
+    at: DateTime<Utc>,
+) -> sqlx::Result<Option<SessionRow>> {
+    let mut tx = db.begin().await?;
+    let row = sqlx::query_as(AssertSqlSafe(format!(
+        "update sessions set limited_until = null where id = $1 returning {SESSION_COLUMNS}"
+    )))
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    sqlx::query(
+        "update reviews r set paused_seconds = r.paused_seconds + greatest(0, extract(epoch from $2 - r.paused_since))::bigint, \
+         paused_since = null from proposals p \
+         where p.review_session_id = $1 and r.proposal_id = p.id and r.paused_since is not null",
+    )
+    .bind(id)
+    .bind(at)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
+/// The sessions waiting for their usage limit, and when they carry on.
+pub async fn limited_sessions(db: &PgPool) -> sqlx::Result<Vec<(Uuid, DateTime<Utc>)>> {
+    sqlx::query_as(
+        "select id, limited_until from sessions where limited_until is not null and phase <> 'stopped' and deleted_at is null",
+    )
+    .fetch_all(db)
+    .await
 }
 
 /// Every kept queue, oldest change first.
@@ -1271,6 +1326,10 @@ pub struct ReviewRow {
     pub resolved: Value,
     pub created_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
+    /// How long the reviewer has waited for its usage limit in this round, in seconds, not counting a wait still on.
+    pub paused_seconds: i64,
+    /// When the reviewer's wait for its usage limit that's still on started.
+    pub paused_since: Option<DateTime<Utc>>,
 }
 
 impl ReviewRow {
@@ -1289,8 +1348,7 @@ impl ReviewRow {
     }
 }
 
-const REVIEW_COLUMNS: &str =
-    "round, head_sha, replies, verdict, summary, findings, resolved, created_at, finished_at";
+const REVIEW_COLUMNS: &str = "round, head_sha, replies, verdict, summary, findings, resolved, created_at, finished_at, paused_seconds, paused_since";
 
 /// A proposal's review rounds, first to last.
 pub async fn reviews(db: &PgPool, proposal: Uuid) -> sqlx::Result<Vec<ReviewRow>> {
@@ -1300,6 +1358,60 @@ pub async fn reviews(db: &PgPool, proposal: Uuid) -> sqlx::Result<Vec<ReviewRow>
     .bind(proposal)
     .fetch_all(db)
     .await
+}
+
+/// Marks a review round's reviewer as waiting for its usage limit from `at`, unless it already is; kept with the
+/// round, so time the runtime is down during the wait counts as waiting too.
+pub async fn pause_review(
+    db: &PgPool,
+    proposal: Uuid,
+    round: i32,
+    at: DateTime<Utc>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "update reviews set paused_since = $3 where proposal_id = $1 and round = $2 and paused_since is null",
+    )
+    .bind(proposal)
+    .bind(round)
+    .bind(at)
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
+/// Marks the running review round a reviewer session works on as waiting for its usage limit from `at`, unless it
+/// already is; done as the limit hits, so a restart before the round's watcher looks doesn't lose the wait.
+pub async fn pause_reviewer(db: &PgPool, reviewer: Uuid, at: DateTime<Utc>) -> sqlx::Result<()> {
+    sqlx::query(
+        "update reviews r set paused_since = $2 from proposals p \
+         where p.review_session_id = $1 and p.status = 'in_review' and r.proposal_id = p.id \
+         and r.verdict is null and r.paused_since is null \
+         and r.round = (select max(round) from reviews where proposal_id = p.id)",
+    )
+    .bind(reviewer)
+    .bind(at)
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
+/// Ends a review round's wait for the usage limit at `at`, adding it to the time the round has waited.
+pub async fn unpause_review(
+    db: &PgPool,
+    proposal: Uuid,
+    round: i32,
+    at: DateTime<Utc>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "update reviews set paused_seconds = paused_seconds + greatest(0, extract(epoch from $3 - paused_since))::bigint, \
+         paused_since = null where proposal_id = $1 and round = $2 and paused_since is not null",
+    )
+    .bind(proposal)
+    .bind(round)
+    .bind(at)
+    .execute(db)
+    .await
+    .map(|_| ())
 }
 
 /// Starts the next review round of a proposal; returns its number.

@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::db::SessionRow;
 use crate::link::{AgentConn, RpcError, from_agent};
-use crate::session::Hub;
+use crate::session::{Hub, TurnEnd};
 use crate::store::SessionStore;
 use crate::store::memory::MemoryStore;
 
@@ -366,7 +366,7 @@ async fn a_notice_waits_for_a_compaction_to_end() {
         .await;
     // Steering it in now would cut the compaction off.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(h.to_agent.try_recv().is_err());
+    h.agent_sent_nothing();
 
     from_agent(&h.hub, h.id, &h.agent, compaction("completed")).await;
     let steering = h.next().await;
@@ -540,7 +540,7 @@ async fn a_turn_that_ends_mid_compaction_lets_waiting_steers_go() {
         .notify(h.id, "sloppod: your proposal was approved.".into())
         .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(h.to_agent.try_recv().is_err());
+    h.agent_sent_nothing();
 
     // The compaction's own end never comes; the turn's does.
     h.respond(&turn_request, json!({"stopReason": "end_turn"}))
@@ -1738,7 +1738,7 @@ async fn every_turn_that_ends_is_counted_with_its_error() {
     let request = next_prompt(&mut h.to_agent).await;
     h.respond(&request, json!({"stopReason": "end_turn"})).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(h.hub.turns_ended(h.id).await, (1, None));
+    assert_eq!(h.hub.turns_ended(h.id).await, (1, Some(TurnEnd::Ended)));
 
     // A failed turn is counted too, with its error, however quickly it ends.
     let _failed = h.prompt("Fails");
@@ -1748,7 +1748,7 @@ async fn every_turn_that_ends_is_counted_with_its_error() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         h.hub.turns_ended(h.id).await,
-        (2, Some("upstream 503".into()))
+        (2, Some(TurnEnd::Failed("upstream 503".into())))
     );
 }
 
@@ -2193,6 +2193,292 @@ async fn usage_updates_are_handed_on_but_not_when_replayed() {
     assert_eq!(id, h.id);
     assert_eq!(update["used"], 2);
     assert!(seen.try_recv().is_err());
+}
+
+/// Fails the turn `request` carries as claude-agent-acp does when the account is at its usage limit.
+async fn hit_the_limit(h: &Harness, request: &Value) {
+    let error = json!({"jsonrpc": "2.0", "id": request["id"], "error": {
+        "code": -32603,
+        "message": "Internal error: You've hit your limit · resets 3pm (UTC)",
+        "data": {"errorKind": "rate_limit"},
+    }});
+    from_agent(&h.hub, h.id, &h.agent, error).await;
+}
+
+/// Waits until the session waits for its usage limit, and says until when.
+async fn limited(h: &Harness) -> chrono::DateTime<chrono::Utc> {
+    for _ in 0..100 {
+        if let Some(until) = h.hub.limited_until(h.id).await {
+            return until;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the session never waited for its limit");
+}
+
+#[tokio::test]
+async fn a_session_at_its_usage_limit_waits_then_carries_on_with_what_queued() {
+    let mut h = Harness::ready().await;
+    let reset = chrono::Utc::now() + chrono::Duration::hours(2);
+    h.hub
+        .set_limit_hit(Arc::new(move |_| Box::pin(async move { Some(reset) })));
+    let turn = h.prompt("Work");
+    let request = h.next().await;
+    hit_the_limit(&h, &request).await;
+    assert!(turn.await.unwrap().is_err());
+
+    // It waits until just after the reset, kept for a restart, and counts the turn as limited, not failed.
+    let until = limited(&h).await;
+    assert!(until > reset && until < reset + chrono::Duration::minutes(5));
+    let row = h.store.get_session(h.id).await.unwrap().unwrap();
+    assert_eq!(row.limited_until, Some(until));
+    assert_eq!(h.hub.turns_ended(h.id).await, (1, Some(TurnEnd::Limited)));
+    assert_eq!(h.phase().await, "idle");
+
+    // Meanwhile nothing starts a turn: a message queues as it would behind one, and so does a notice.
+    let message = h.prompt("Also this");
+    wait_for_queue(&h, 1).await;
+    h.hub.notify(h.id, "sloppod: a notice".into()).await;
+    assert!(
+        !h.hub
+            .notify_when_idle(h.id, None, "sloppod: only if idle".into())
+            .await
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    h.agent_sent_nothing();
+
+    // At the reset, it's told to carry on, in one turn with what queued.
+    h.hub.resume_after_limit(h.id, until).await;
+    let request = h.next().await;
+    assert_eq!(request["method"], "session/prompt");
+    let text = prompt_text(&request);
+    assert!(text[0].contains("usage limit"), "{text:?}");
+    assert_eq!(text[1..], ["Also this", "sloppod: a notice"]);
+    assert_eq!(h.hub.limited_until(h.id).await, None);
+    let row = h.store.get_session(h.id).await.unwrap().unwrap();
+    assert_eq!(row.limited_until, None);
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    message.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_limited_session_tries_again_later_when_the_reset_is_unknown() {
+    let mut h = Harness::ready().await;
+    let before = START.parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+    let _turn = h.prompt("Work");
+    let request = h.next().await;
+    hit_the_limit(&h, &request).await;
+    let first = limited(&h).await;
+    assert!(first > before + chrono::Duration::minutes(10));
+
+    // A wait that's been replaced doesn't end at its old time.
+    h.hub.resume_after_limit(h.id, before).await;
+    assert_eq!(h.hub.limited_until(h.id).await, Some(first));
+
+    // Trying again hits the limit again: it waits again, from then.
+    h.hub.resume_after_limit(h.id, first).await;
+    let request = h.next().await;
+    hit_the_limit(&h, &request).await;
+    let second = limited(&h).await;
+    assert!(second >= first);
+}
+
+#[tokio::test]
+async fn a_message_steered_in_while_limited_tries_now_and_ends_the_wait() {
+    let mut h = Harness::ready().await;
+    let _turn = h.prompt("Work");
+    let request = h.next().await;
+    hit_the_limit(&h, &request).await;
+    let until = limited(&h).await;
+
+    let message = h.prompt("Try now");
+    let queued = wait_for_queue(&h, 1).await;
+    let (hub, id) = (h.hub.clone(), h.id);
+    let qid = queued[0].clone();
+    tokio::spawn(async move { hub.steer_queued(id, json!({"id": qid})).await });
+    let steering = h.next().await;
+    assert_eq!(steering["method"], "_session/steering");
+    h.respond(&steering, json!({"outcome": "promptRequired"}))
+        .await;
+    let request = h.next().await;
+    assert_eq!(prompt_text(&request), ["Try now"]);
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    message.await.unwrap().unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.hub.limited_until(h.id).await, None);
+
+    // The wait that ended doesn't carry the session on again.
+    h.hub.resume_after_limit(h.id, until).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    h.agent_sent_nothing();
+}
+
+#[tokio::test]
+async fn a_wait_for_the_usage_limit_moves_with_the_quota() {
+    let mut h = Harness::ready().await;
+    let _turn = h.prompt("Work");
+    let request = h.next().await;
+    hit_the_limit(&h, &request).await;
+    let probe = limited(&h).await;
+
+    // The quota learns when the limit resets: the wait moves there.
+    let reset = chrono::Utc::now() + chrono::Duration::hours(3);
+    h.hub.move_limit(h.id, reset).await;
+    assert_eq!(h.hub.limited_until(h.id).await, Some(reset));
+    let row = h.store.get_session(h.id).await.unwrap().unwrap();
+    assert_eq!(row.limited_until, Some(reset));
+    h.hub.resume_after_limit(h.id, probe).await;
+    h.agent_sent_nothing();
+
+    // The credential isn't limited any more: the session carries on now.
+    h.hub.move_limit(h.id, START.parse().unwrap()).await;
+    let request = h.next().await;
+    assert!(prompt_text(&request)[0].contains("usage limit"));
+    assert_eq!(h.hub.limited_until(h.id).await, None);
+}
+
+impl Harness {
+    /// A runtime that restarted while the session waited for its usage limit until `until`, with `kept` in its
+    /// stored queue; its agent is attached but not up yet. Restored in startup's order.
+    async fn restarted_limited(until: chrono::DateTime<chrono::Utc>, kept: &[&str]) -> Self {
+        let store = Arc::new(MemoryStore::default());
+        let id = Uuid::new_v4();
+        let mut row = SessionRow::for_test(id, "dev");
+        row.limited_until = Some(until);
+        store.add_session(row);
+        let stored: Vec<Value> = kept
+            .iter()
+            .map(|text| json!({"id": Uuid::new_v4(), "blocks": [{"type": "text", "text": text}]}))
+            .collect();
+        store.save_queue(id, &stored).await.unwrap();
+        let hub = Arc::new(Hub::new(store.clone()));
+        let (tx, to_agent) = mpsc::unbounded_channel();
+        let agent = Arc::new(AgentConn::new(tx));
+        hub.attach_agent(id, agent.clone()).await;
+        let limited = hub.restore_limits().await;
+        assert_eq!(limited, [(id, until)]);
+        hub.restore_queues().await.unwrap();
+        hub.resume_limits(limited);
+        Self {
+            hub,
+            store,
+            id,
+            agent,
+            to_agent,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_wait_that_ended_during_a_restart_carries_on_with_the_kept_queue() {
+    let past = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let mut h = Harness::restarted_limited(past, &["Kept"]).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.hub.limited_until(h.id).await, None);
+    let kept = kept_texts(&h).await;
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    assert!(kept[0].contains("usage limit"));
+    assert_eq!(kept[1], "Kept");
+
+    h.agent_ready().await;
+    let request = h.next().await;
+    let text = prompt_text(&request);
+    assert!(text.iter().any(|t| t.contains("usage limit")), "{text:?}");
+    assert_eq!(text.last().map(String::as_str), Some("Kept"));
+}
+
+#[tokio::test]
+async fn an_agent_that_comes_back_during_the_wait_keeps_the_queue_until_it_ends() {
+    let until = chrono::Utc::now() + chrono::Duration::hours(1);
+    let mut h = Harness::restarted_limited(until, &["Kept"]).await;
+    assert_eq!(h.hub.limited_until(h.id).await, Some(until));
+
+    h.agent_ready().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    h.agent_sent_nothing();
+    assert_eq!(kept_texts(&h).await, ["Kept"]);
+    assert_eq!(h.phase().await, "idle");
+
+    h.hub.resume_after_limit(h.id, until).await;
+    let request = h.next().await;
+    let text = prompt_text(&request);
+    assert!(text.iter().any(|t| t.contains("usage limit")), "{text:?}");
+    assert_eq!(text.last().map(String::as_str), Some("Kept"));
+}
+
+#[tokio::test]
+async fn a_message_to_a_limited_session_without_its_agent_waits_and_steering_it_carries_on() {
+    let until = chrono::Utc::now() + chrono::Duration::hours(1);
+    let mut h = Harness::restarted_limited(until, &[]).await;
+    let woken = Arc::new(std::sync::Mutex::new(0));
+    {
+        let woken = woken.clone();
+        h.hub.set_waker(Arc::new(move |_| {
+            let woken = woken.clone();
+            Box::pin(async move {
+                *woken.lock().unwrap() += 1;
+                Ok(())
+            })
+        }));
+    }
+
+    // It waits, shown in the queue, and doesn't wake the session.
+    let message = h.prompt("Later");
+    let queued = wait_for_queue(&h, 1).await;
+    assert_eq!(*woken.lock().unwrap(), 0);
+
+    // Steering it in ends the wait: the session is woken to carry on with it.
+    let result = h
+        .hub
+        .steer_queued(h.id, json!({"id": queued[0]}))
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "queued");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.hub.limited_until(h.id).await, None);
+    assert_eq!(*woken.lock().unwrap(), 1);
+
+    h.agent_ready().await;
+    let request = h.next().await;
+    assert_eq!(
+        prompt_text(&request).last().map(String::as_str),
+        Some("Later")
+    );
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    message.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_carry_on_kept_before_a_restart_is_queued_once() {
+    // The runtime stopped after keeping the carry-on notice but before clearing the wait it ended.
+    let past = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let h = Harness::restarted_limited(past, &[crate::session::LIMIT_RESET_NOTICE, "Kept"]).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.hub.limited_until(h.id).await, None);
+    let kept = kept_texts(&h).await;
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    assert_eq!(kept[0], crate::session::LIMIT_RESET_NOTICE);
+    assert_eq!(kept[1], "Kept");
+}
+
+#[tokio::test]
+async fn the_end_of_a_wait_is_kept_as_it_happens() {
+    let mut h = Harness::ready().await;
+    let turn = h.prompt("Work");
+    let request = h.next().await;
+    hit_the_limit(&h, &request).await;
+    assert!(turn.await.unwrap().is_err());
+    let until = limited(&h).await;
+    assert!(
+        h.store.limits_ended.lock().unwrap().is_empty(),
+        "still waiting"
+    );
+
+    // Ending the wait is one write with ending a review round's wait (`end_limit`), at the time it ends.
+    h.hub.resume_after_limit(h.id, until).await;
+    let ended = h.store.limits_ended.lock().unwrap().clone();
+    assert_eq!(ended.len(), 1);
+    assert_eq!(ended[0].0, h.id);
 }
 
 #[tokio::test]

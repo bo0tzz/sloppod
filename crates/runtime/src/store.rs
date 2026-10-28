@@ -1,6 +1,7 @@
 //! What the session hub keeps in the database, behind a trait so the hub can run against memory in tests.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sloppod_protocol::api::Phase;
 use sqlx::PgPool;
@@ -45,6 +46,16 @@ pub trait SessionStore: Send + Sync {
     async fn pending_prompt(&self, id: Uuid) -> sqlx::Result<Option<String>>;
     /// Forgets the session's first message, once a turn has started with it.
     async fn clear_pending_prompt(&self, id: Uuid) -> sqlx::Result<()>;
+    /// Sets when the session, waiting for its usage limit, carries on; none when it isn't waiting.
+    async fn set_limited_until(
+        &self,
+        id: Uuid,
+        until: Option<DateTime<Utc>>,
+    ) -> sqlx::Result<Option<SessionRow>>;
+    /// Ends the session's wait for its usage limit at `at`, with a review round's wait it works on as a reviewer.
+    async fn end_limit(&self, id: Uuid, at: DateTime<Utc>) -> sqlx::Result<Option<SessionRow>>;
+    /// The sessions waiting for their usage limit, for after a restart.
+    async fn limited_sessions(&self) -> sqlx::Result<Vec<(Uuid, DateTime<Utc>)>>;
     /// The timezone of a session's owner, for the times its agent is told.
     async fn owner_zone(&self, owner: &str) -> sqlx::Result<chrono_tz::Tz>;
 }
@@ -129,6 +140,22 @@ impl SessionStore for PgStore {
     async fn clear_pending_prompt(&self, id: Uuid) -> sqlx::Result<()> {
         db::clear_pending_prompt(&self.0, id).await
     }
+
+    async fn set_limited_until(
+        &self,
+        id: Uuid,
+        until: Option<DateTime<Utc>>,
+    ) -> sqlx::Result<Option<SessionRow>> {
+        db::set_limited_until(&self.0, id, until).await
+    }
+
+    async fn end_limit(&self, id: Uuid, at: DateTime<Utc>) -> sqlx::Result<Option<SessionRow>> {
+        db::end_limit(&self.0, id, at).await
+    }
+
+    async fn limited_sessions(&self) -> sqlx::Result<Vec<(Uuid, DateTime<Utc>)>> {
+        db::limited_sessions(&self.0).await
+    }
 }
 
 #[cfg(test)]
@@ -141,6 +168,8 @@ pub mod memory {
     /// Sessions and their event logs in memory.
     #[derive(Default)]
     pub struct MemoryStore {
+        /// The waits for a usage limit ended, and when, for tests.
+        pub limits_ended: Mutex<Vec<(Uuid, DateTime<Utc>)>>,
         sessions: Mutex<HashMap<Uuid, SessionRow>>,
         events: Mutex<Vec<(Uuid, i64, Value)>>,
         /// Sessions' kept queues.
@@ -351,6 +380,31 @@ pub mod memory {
             self.pending_prompts.lock().unwrap().remove(&id);
             self.cleared_prompts.lock().unwrap().push(id);
             Ok(())
+        }
+
+        async fn set_limited_until(
+            &self,
+            id: Uuid,
+            until: Option<DateTime<Utc>>,
+        ) -> sqlx::Result<Option<SessionRow>> {
+            let mut sessions = self.sessions.lock().unwrap();
+            Ok(sessions.get_mut(&id).map(|row| {
+                row.limited_until = until;
+                row.clone()
+            }))
+        }
+
+        async fn end_limit(&self, id: Uuid, at: DateTime<Utc>) -> sqlx::Result<Option<SessionRow>> {
+            self.limits_ended.lock().unwrap().push((id, at));
+            self.set_limited_until(id, None).await
+        }
+
+        async fn limited_sessions(&self) -> sqlx::Result<Vec<(Uuid, DateTime<Utc>)>> {
+            let sessions = self.sessions.lock().unwrap();
+            Ok(sessions
+                .values()
+                .filter_map(|row| row.limited_until.map(|until| (row.id, until)))
+                .collect())
         }
     }
 }

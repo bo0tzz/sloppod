@@ -13,6 +13,7 @@ mod grants;
 mod identity;
 mod inference;
 mod lifecycle;
+mod limits;
 mod link;
 mod mcp;
 mod memini;
@@ -244,6 +245,12 @@ async fn main() -> anyhow::Result<()> {
         let (state, at) = (usage.clone(), chrono::Utc::now());
         Box::pin(async move { quota::seen(&state, id, update, at).await })
     }));
+    let limited = state.clone();
+    state.hub.set_limit_hit(Arc::new(move |id| {
+        let state = limited.clone();
+        Box::pin(async move { limits::hit(&state, id).await })
+    }));
+    limits::follow_quotas(&state);
     let checker = state.clone();
     state.hub.set_turn_ended(Arc::new(move |id| {
         let state = checker.clone();
@@ -385,6 +392,8 @@ async fn reconcile(state: &AppState) {
         }
         Err(e) => tracing::error!(error = %e, "listing parked sessions"),
     }
+    // Before the queues, so a session waiting for its usage limit keeps what was queued for it until then.
+    let limited = state.hub.restore_limits().await;
     // After the pods are placed, so a queue for a running session waits for its agent and a parked one wakes for it;
     // before anything that can queue a notice, which would otherwise replace the kept queue before it's read.
     // Nothing is listening yet, so nothing can queue a message or answer a question until this is done.
@@ -393,6 +402,7 @@ async fn reconcile(state: &AppState) {
         state.hub.restore_questions()
     })
     .await;
+    state.hub.resume_limits(limited);
     proposals::resume_approved(state).await;
     reviews::resume_round_watches(state).await;
     proposals::resume_stack_watches(state).await;
