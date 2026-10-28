@@ -11,7 +11,7 @@ use sloppod_contracts::{
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::{err, head_branch};
+use super::{branch_detail, err, head_branch};
 use crate::credentials::Credentials;
 use crate::db;
 
@@ -127,6 +127,7 @@ impl ProposalKind for Report {
             head_sha: field("head_sha")?,
             title: field("title")?,
             body: field("summary").unwrap_or_default(),
+            describes_change: true,
         })
     }
 
@@ -201,25 +202,8 @@ impl ProposalKind for Report {
     }
 
     async fn detail(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
-        let Some(head) = payload["head_sha"].as_str() else {
-            return Ok(json!({}));
-        };
-        let comparison = self
-            .credentials
-            .github(&session.owner)
-            .await
-            .map_err(err)?
-            .compare(
-                payload["repo"].as_str().unwrap_or_default(),
-                payload["base"].as_str().unwrap_or_default(),
-                head,
-            )
-            .await
-            .map_err(err)?;
-        Ok(json!({
-            "diff": comparison.diff,
-            "commits": comparison.commits.iter().map(|(sha, message)| json!({"sha": sha, "message": message})).collect::<Vec<_>>(),
-        }))
+        let app = self.credentials.github(&session.owner).await.map_err(err)?;
+        branch_detail(&app, payload).await
     }
 
     fn edit(&self, payload: &Value, edits: &Value) -> Result<Value> {
