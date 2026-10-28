@@ -906,6 +906,8 @@ function startAgent(session, ms) {
     session.startTimer = null;
     if (!sessions.has(session.data.id)) return;
     rememberModels();
+    delete session.data.agent_status;
+    delete session.data.agent_error;
     session.setPhase('idle');
     const items = session.queue.splice(0);
     if (items.length === 0) return;
@@ -923,7 +925,19 @@ function startAgent(session, ms) {
 /** The runtime remembers the models the agent offered, for the settings page. */
 const rememberModels = () => (settings.models = MODELS.map(({ value, name }) => ({ value, name })));
 
-const startupDelay = (prompt) => (/slow start/i.test(prompt) ? 3000 : DELAY * 8);
+/** Like a pod whose first start fails: a status, then the error, then a start that works. */
+function failStart(session) {
+  session.data.agent_status = 'cloning https://github.com/bo0tzz/sloppod.git';
+  setTimeout(() => {
+    const error = 'preparing the pod: git clone exited with status 128';
+    delete session.data.agent_status;
+    session.data.agent_error = error;
+    session.emit({ sessionUpdate: 'notice', severity: 'error', title: "The session's pod couldn't start the agent", description: error });
+    session.broadcast();
+  }, 1000);
+}
+
+const startupDelay = (prompt) => (/slow start|failing start/i.test(prompt) ? 3000 : DELAY * 8);
 
 function cancelTurn(session) {
   if (session.turn) session.turn.cancelled = true;
@@ -1158,6 +1172,7 @@ async function handleApi(req, res, url) {
       }
       const session = createSession(body);
       startAgent(session, startupDelay(body.prompt));
+      if (/failing start/i.test(body.prompt)) failStart(session);
       return json(res, 201, session.data);
     }
     if (parts.length === 2 && parts[1] === 'deleted' && method === 'GET') {

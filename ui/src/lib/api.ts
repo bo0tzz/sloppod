@@ -17,6 +17,10 @@ export type Session = {
   active_at: string;
   /** When it was deleted; it can be restored until it's purged a week later. */
   deleted_at?: string;
+  /** What the pod is doing while the agent starts, e.g. cloning the repository. */
+  agent_status?: string;
+  /** Why the agent last failed to start or exited; it's started again meanwhile. */
+  agent_error?: string;
 };
 
 export type NewSession = {

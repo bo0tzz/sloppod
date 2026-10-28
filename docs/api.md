@@ -61,6 +61,8 @@ type Session = {
   updated_at: string;
   active_at: string;   // when something last happened (an event was recorded); `GET /sessions` is ordered by it, newest first
   deleted_at?: string;   // when it was deleted; `GET /sessions` leaves deleted sessions out
+  agent_status?: string; // what the pod is doing while the agent starts, e.g. "cloning https://github.com/…"
+  agent_error?: string;  // why the agent last failed to start or exited; it's started again meanwhile. Both clear once it's ready
 };
 
 // What the session may do (ADR 2). Capabilities so far: "model", "github" (read: public data, plus the "repo"
@@ -217,7 +219,7 @@ Runtime → UI:
 
 | Method | Notes |
 |---|---|
-| `session/update` | Standard ACP updates: `user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `available_commands_update`, `config_option_update`, and compaction reports. Prompts sent by any UI are echoed as `user_message_chunk` with a `messageId` per prompt, so every viewer sees them; steers carry `_meta.sloppod.steering: true`, and notices to the agent (see Proposals) `_meta.sloppod.notice: true`. |
+| `session/update` | Standard ACP updates: `user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `available_commands_update`, `config_option_update`, compaction reports, and `notice` (`{severity, title, description}`, e.g. why the agent failed to start; recorded once per distinct failure). Prompts sent by any UI are echoed as `user_message_chunk` with a `messageId` per prompt, so every viewer sees them; steers carry `_meta.sloppod.steering: true`, and notices to the agent (see Proposals) `_meta.sloppod.notice: true`. |
 | `session/request_permission` (request) | Sent to every UI that has the session loaded, including requests still open when a UI loads the session (after the `session/load` response). The first answer wins. |
 | `elicitation/create` (request) | The agent asks the user something, e.g. with `ask_user` (below). Delivered like a permission request. Params: `{sessionId, mode: "form", message, requestedSchema, toolCallId?}`; the schema is an object of primitive fields (below). Answer `{action: "accept", content}`, `{action: "decline"}` (skip: the agent is told the user didn't answer) or `{action: "cancel"}`. |
 | `_sloppod/queue` `{sessionId, messages: {id, prompt}[]}` | The messages waiting behind the running turn, sent whenever that changes and when a UI loads the session. |

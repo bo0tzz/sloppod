@@ -497,6 +497,23 @@ test('queues messages while the agent starts', async ({ page }) => {
   await expect(page.getByTestId('composer-hint')).toBeHidden();
 });
 
+test('says what the pod is doing while the agent starts, and why a start failed', async ({ page }) => {
+  await createSession(page, 'failing start: fix the build in bo0tzz/sloppod');
+  const activity = page.getByTestId('activity');
+  await expect(activity).toHaveText('Cloning https://github.com/bo0tzz/sloppod.git…');
+
+  // The failure is in the transcript, and the session says it's trying again.
+  const failure = page.getByText("The session's pod couldn't start the agent");
+  await expect(failure).toBeVisible();
+  await expect(page.getByText('preparing the pod: git clone exited with status 128')).toBeVisible();
+  await expect(activity).toHaveText('Starting the agent again…');
+
+  // The next start works; the failure stays in the transcript.
+  await expect(permissionCard(page)).toBeVisible({ timeout: 20_000 });
+  await finishTurn(page);
+  await expect(failure).toBeVisible();
+});
+
 test('runs a session without a repository', async ({ page }) => {
   const prompt = 'Explain what the runtime does';
   await createSession(page, prompt);

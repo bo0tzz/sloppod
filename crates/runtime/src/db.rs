@@ -44,6 +44,8 @@ pub struct SessionRow {
     pub active_at: DateTime<Utc>,
     /// When it was deleted; it's restorable until it's purged.
     pub deleted_at: Option<DateTime<Utc>>,
+    pub agent_status: Option<String>,
+    pub agent_error: Option<String>,
 }
 
 impl SessionRow {
@@ -67,6 +69,8 @@ impl SessionRow {
             updated_at: Utc::now(),
             active_at: Utc::now(),
             deleted_at: None,
+            agent_status: None,
+            agent_error: None,
         }
     }
 
@@ -113,6 +117,8 @@ impl SessionRow {
             updated_at: self.updated_at.to_rfc3339(),
             active_at: self.active_at.to_rfc3339(),
             deleted_at: self.deleted_at.map(|d| d.to_rfc3339()),
+            agent_status: self.agent_status.clone(),
+            agent_error: self.agent_error.clone(),
         }
     }
 
@@ -121,7 +127,7 @@ impl SessionRow {
     }
 }
 
-const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, repo, created_at, updated_at, active_at, deleted_at, \
+const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, repo, created_at, updated_at, active_at, deleted_at, agent_status, agent_error, \
      coalesce((select jsonb_agg(jsonb_build_object('capability', g.capability, 'params', g.params) order by g.created_at) \
      from session_grants g where g.session_id = sessions.id), '[]'::jsonb) as grants";
 
@@ -276,6 +282,38 @@ pub async fn set_phase(db: &PgPool, id: Uuid, phase: Phase) -> sqlx::Result<Opti
     .bind(stopped)
     .fetch_optional(db)
     .await
+}
+
+/// Says what the pod is doing while the agent starts.
+pub async fn set_agent_status(db: &PgPool, id: Uuid, status: &str) -> sqlx::Result<()> {
+    sqlx::query("update sessions set agent_status = $2 where id = $1")
+        .bind(id)
+        .bind(status)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Records why the agent failed; returns whether that's news, rather than the failure it had last time.
+pub async fn set_agent_error(db: &PgPool, id: Uuid, error: &str) -> sqlx::Result<bool> {
+    let (news,): (bool,) = sqlx::query_as(
+        "update sessions s set agent_status = null, agent_error = $2 from sessions old \
+         where s.id = $1 and old.id = s.id returning old.agent_error is distinct from $2",
+    )
+    .bind(id)
+    .bind(error)
+    .fetch_one(db)
+    .await?;
+    Ok(news)
+}
+
+/// The agent is ready: what it was doing and why it failed before no longer apply.
+pub async fn clear_agent_status(db: &PgPool, id: Uuid) -> sqlx::Result<()> {
+    sqlx::query("update sessions set agent_status = null, agent_error = null where id = $1")
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(())
 }
 
 /// Sets the agent's automatic title, unless the person chose one; returns whether it changed.
