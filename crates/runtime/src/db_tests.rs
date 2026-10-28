@@ -807,3 +807,18 @@ async fn live_descendants_are_found_below_deleted_ones(db: PgPool) {
     assert_eq!(ids(db::live_descendants(&db, a).await.unwrap()), [c]);
     assert!(db::live_descendants(&db, c).await.unwrap().is_empty());
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_session_below_a_deleted_one_is_in_a_deleted_line(db: PgPool) {
+    // What stops a sub-session spawning a child while its tree is being deleted.
+    let a = session(&db, "alice").await;
+    let b = session(&db, "alice").await;
+    let c = session(&db, "alice").await;
+    db::set_parent(&db, b, a).await.unwrap();
+    db::set_parent(&db, c, b).await.unwrap();
+    assert!(!db::deleted_in_line(&db, c).await.unwrap());
+    db::mark_deleted(&db, a).await.unwrap();
+    for member in [a, b, c] {
+        assert!(db::deleted_in_line(&db, member).await.unwrap());
+    }
+}
