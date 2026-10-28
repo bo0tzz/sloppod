@@ -1241,7 +1241,6 @@ impl Hub {
         );
         self.sent(id, held, request).await;
         let result = answer.await;
-        self.heard_from_agent(id);
         {
             let live = self.live(id);
             let mut state = live.state.lock().await;
@@ -1645,6 +1644,7 @@ impl Hub {
 
     /// Counts a turn the hub sent as ended, failed with `error` or not.
     async fn turn_finished(&self, id: Uuid, error: Option<String>) {
+        self.heard_from_agent(id);
         let ok = error.is_none();
         {
             let live = self.live(id);
