@@ -445,6 +445,16 @@ async function agentScript(session, turn, prompt) {
     return;
   }
 
+  if (/long answer/i.test(prompt)) {
+    // Several screens of output in one go, as a long agent message arrives.
+    const messageId = randomUUID();
+    for (let i = 0; i < 2000; i++) {
+      session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'word ' }, messageId });
+    }
+    await say('The end.');
+    return;
+  }
+
   if (/long history/i.test(prompt)) {
     // More updates than one page of history, so a reload starts partway through.
     const messageId = randomUUID();
@@ -1610,6 +1620,14 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/_mock/drop-next-prompt' && req.method === 'POST') {
       dropNextPrompt = url.searchParams.get('when') === 'after' ? 'after' : 'before';
       return json(res, 200, { dropNextPrompt });
+    }
+    if (url.pathname === '/_mock/say' && req.method === 'POST') {
+      // More output in every session, as if its agent carried on.
+      const text = url.searchParams.get('text') ?? '';
+      for (const session of sessions.values()) {
+        session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text }, messageId: randomUUID() });
+      }
+      return json(res, 200, {});
     }
     if (url.pathname === '/_mock/drop' && req.method === 'POST') {
       for (const conn of connections) conn.ws.terminate();
