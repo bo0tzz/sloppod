@@ -43,5 +43,6 @@ Considered and not chosen:
 - **Using the PAT only where the App isn't installed:** simpler, but it conflates reach with identity; acting as the owner on a repository the App can reach would be impossible, and acting as the owner would happen silently wherever the App is missing.
 - **Ambient PAT for the whole session:** the default for most tools (`gh auth login` in a dev container), and the opposite of [ADR 2](0002-capabilities.md).
 - **Classic PATs:** they can't be narrowed to repositories, so every session holding one could reach everything the owner can.
+- **An OAuth App ("Connect GitHub"), for now:** it reaches everything the owner can, without a token to paste or renew, but its scopes can't be narrowed to repositories, so the stored token could do anything the owner can if it leaked, and organizations may block it. Grants still decide what sessions reach, so it fits the same model; it can be added later as a second kind of `github-user` credential, after fine-grained PATs.
 
 To decide during implementation: whether `propose` as the owner also covers merging, and whether a session may hold `as-owner` on a repository while its proposals there still open as the App.
