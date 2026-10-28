@@ -834,9 +834,22 @@ function createIssueUpdates(session) {
       updates: [
         { number: 100, comment: 'Fixed by #148.', close: 'completed', remove_labels: ['priority'] },
         { number: 65, comment: 'Superseded by #196.', close: 'duplicate' },
-        { number: 59, add_labels: ['priority'], title: 'Startup failures show in the UI' },
+        {
+          number: 59,
+          add_labels: ['priority'],
+          title: 'Startup failures show in the UI',
+          body: 'A pod that fails to start says why in the UI.\n\nToday it only shows in the logs.',
+        },
       ],
     },
+    // Like the runtime's detail: what the rewritten issue says now.
+    current: [
+      {
+        number: 59,
+        title: 'Startup failures are only in the logs',
+        body: 'A pod that fails to start says nothing.\n\nToday it only shows in the logs.',
+      },
+    ],
     created_at: now(),
   };
   proposals.set(proposal.id, proposal);
@@ -877,7 +890,7 @@ function createStack(session) {
 }
 
 function publicProposal(proposal) {
-  const { diff: _diff, commits: _commits, layers: _layers, ...rest } = proposal;
+  const { diff: _diff, commits: _commits, layers: _layers, current: _current, ...rest } = proposal;
   return rest;
 }
 
