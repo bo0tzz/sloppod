@@ -3,7 +3,7 @@
 
 use serde_json::{Value, json};
 use sloppod_contracts::{Grant, READ_WRITE, capability, same_repo};
-use sloppod_protocol::api::SessionKind;
+use sloppod_protocol::api::{Phase, SessionKind};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -156,6 +156,59 @@ pub async fn list(state: &AppState, parent: Uuid) -> Result<String, String> {
     Ok(Value::Array(children).to_string())
 }
 
+/// `message_session`: a message from `from` to its parent or one of its children, delivered as a notice. A parked
+/// sub-session is woken for it, if its tree is under the limit.
+pub async fn message(state: &AppState, from: Uuid, arguments: &Value) -> Result<String, String> {
+    let to: Uuid = arguments["id"]
+        .as_str()
+        .and_then(|id| id.parse().ok())
+        .ok_or("give the session's `id`")?;
+    let text = arguments["text"]
+        .as_str()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or("give the message's `text`")?;
+    let sender = db::get_session(&state.db, from)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("this session no longer exists")?;
+    let target = db::get_session(&state.db, to)
+        .await
+        .map_err(|e| e.to_string())?;
+    let who = match &target {
+        Some(target) if target.parent_id == Some(from) => "your parent session".to_owned(),
+        Some(target) if sender.parent_id == Some(target.id) => {
+            format!("your sub-session \"{}\" ({from})", sender.title)
+        }
+        _ => return Err("you can message your parent session and your own sub-sessions".into()),
+    };
+    let target = target.expect("matched above");
+    if target.deleted_at.is_some() || target.phase() == Phase::Stopped {
+        return Err("that session is stopped".into());
+    }
+    let _spawning = SPAWNING.lock().await;
+    if target.phase() == Phase::Parked && target.parent_id.is_some() {
+        let running = db::running_in_tree(&state.db, to)
+            .await
+            .map_err(|e| e.to_string())?;
+        if running >= MAX_RUNNING {
+            return Err(format!(
+                "that session is parked, and waking it would make more than {MAX_RUNNING} sub-sessions of this tree \
+                 run at once; wait for one to finish"
+            ));
+        }
+    }
+    state
+        .hub
+        .notify(to, format!("sloppod: a message from {who}: {text}"))
+        .await;
+    // A no-op unless it's parked, also if it parked since it was looked at.
+    lifecycle::wake(state, &target)
+        .await
+        .map_err(|e| format!("sent, but waking it failed: {e:#}"))?;
+    Ok("Sent.".into())
+}
+
 pub fn tools() -> Vec<Value> {
     vec![
         json!({
@@ -172,6 +225,18 @@ pub fn tools() -> Vec<Value> {
                     "model": {"type": "string", "description": "defaults to yours"},
                 },
                 "required": ["task"],
+            },
+        }),
+        json!({
+            "name": "message_session",
+            "description": "Send a message to your parent session or one of your sub-sessions, by id. It arrives as a notice between its tool calls, and wakes it if it's parked.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "text": {"type": "string"},
+                },
+                "required": ["id", "text"],
             },
         }),
         json!({

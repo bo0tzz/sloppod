@@ -631,6 +631,18 @@ impl GitHubApp {
     }
 
     pub async fn compare(&self, repo: &str, base: &str, head: &str) -> anyhow::Result<Comparison> {
+        self.compare_if_found(repo, base, head)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("branch {head} not found on {repo}; push it first"))
+    }
+
+    /// Compares `head` with `base`; `None` when either isn't on GitHub, e.g. a branch that was never pushed.
+    pub async fn compare_if_found(
+        &self,
+        repo: &str,
+        base: &str,
+        head: &str,
+    ) -> anyhow::Result<Option<Comparison>> {
         let range = format!(
             "/compare/{}...{}",
             branch_in_path(base),
@@ -640,7 +652,7 @@ impl GitHubApp {
             .repo_get(repo, &range, "application/vnd.github+json")
             .await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            bail!("branch {head} not found on {repo}; push it first");
+            return Ok(None);
         }
         let info: Value = response.error_for_status()?.json().await?;
         let head_sha = self.branch_sha(repo, head).await?;
@@ -664,12 +676,12 @@ impl GitHubApp {
             .error_for_status()?
             .text()
             .await?;
-        Ok(Comparison {
+        Ok(Some(Comparison {
             diff,
             commits,
             ahead_by: info["ahead_by"].as_u64().unwrap_or(0),
             head_sha,
-        })
+        }))
     }
 
     /// The commit a branch (or commit) points to.

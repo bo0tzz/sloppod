@@ -217,6 +217,7 @@ async fn call(state: &AppState, session: Uuid, params: &Value) -> Value {
         "withdraw_proposal" => withdraw_proposal(state, session, &arguments).await,
         "spawn_session" => subsessions::spawn(state, session, &arguments).await,
         "list_sessions" => subsessions::list(state, session).await,
+        "message_session" => subsessions::message(state, session, &arguments).await,
         _ => propose(state, session, name, arguments).await,
     };
     match result {
