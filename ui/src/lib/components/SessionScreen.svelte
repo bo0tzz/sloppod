@@ -367,7 +367,7 @@
           <div
             bind:this={scroller}
             onscroll={onScroll}
-            class="immich-scrollbar h-full overflow-y-auto"
+            class="immich-scrollbar relative h-full overflow-y-auto"
             data-testid="transcript-scroller"
           >
             <div bind:this={content} class="mx-auto flex w-full max-w-3xl flex-col gap-3 px-3 py-4 md:px-4">
