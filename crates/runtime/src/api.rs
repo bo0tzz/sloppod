@@ -28,6 +28,11 @@ pub fn routes() -> Router<AppState> {
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}", get(get_session).delete(delete_session))
         .route("/sessions/{id}/repos", post(add_repo))
+        .route("/sessions/{id}/grants", post(add_grant))
+        .route(
+            "/sessions/{id}/grants/{grant}",
+            axum::routing::patch(change_grant).delete(revoke_grant),
+        )
         .route("/sessions/deleted", get(list_deleted_sessions))
         .route("/sessions/{id}/restore", post(restore_session))
         .route("/sessions/{id}/park", post(park_session))
@@ -221,6 +226,23 @@ struct AddRepo {
 }
 
 #[derive(Deserialize)]
+struct NewGrant {
+    capability: String,
+    /// RFC 3339; none: it doesn't run out.
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Deserialize)]
+struct GrantChange {
+    /// A new expiry: a time, or `null` for none. Absent leaves it.
+    #[serde(default, deserialize_with = "present")]
+    expires_at: Option<Option<chrono::DateTime<chrono::Utc>>>,
+    /// Narrows the grant, e.g. a repository the session can push to becomes read only.
+    #[serde(default)]
+    narrow: bool,
+}
+
+#[derive(Deserialize)]
 struct SetReview {
     review: String,
 }
@@ -271,6 +293,123 @@ async fn add_repo(
             )
             .await;
     }
+    let session = db::get_session(&state.db, id)
+        .await?
+        .ok_or_else(not_found)?;
+    Ok(Json(session.to_api()))
+}
+
+/// Grants a session a capability it doesn't hold (ADR 2), from its owner. Repositories go through `add_repo`.
+async fn add_grant(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+    Json(body): Json<NewGrant>,
+) -> ApiResult<impl IntoResponse> {
+    let session = db::owned_session(&state.db, id, &user)
+        .await?
+        .ok_or_else(not_found)?;
+    let capability = body.capability.trim();
+    if !crate::grants::grantable(capability) {
+        return Err(bad_request(format!(
+            "{capability} can't be granted here; repositories are added with POST /sessions/{{id}}/repos"
+        )));
+    }
+    if session.context().has(capability) {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            format!("the session already has {capability}"),
+        ));
+    }
+    if body.expires_at.is_some_and(|at| at <= chrono::Utc::now()) {
+        return Err(bad_request("expires_at is in the past"));
+    }
+    let grant = Grant::new(capability, json!({}));
+    db::grant(&state.db, id, &grant, body.expires_at).await?;
+    let what = format!(
+        "the user granted this session {capability}: {}",
+        crate::grants::describe(&grant)
+    );
+    lifecycle::grants_changed(&state, id, &what).await;
+    let session = db::get_session(&state.db, id)
+        .await?
+        .ok_or_else(not_found)?;
+    Ok((StatusCode::CREATED, Json(session.to_api())))
+}
+
+/// Extends, shortens or clears a grant's expiry, or narrows it.
+async fn change_grant(
+    State(state): State<AppState>,
+    User(user): User,
+    Path((id, grant_id)): Path<(Uuid, Uuid)>,
+    Json(body): Json<GrantChange>,
+) -> ApiResult<impl IntoResponse> {
+    db::owned_session(&state.db, id, &user)
+        .await?
+        .ok_or_else(not_found)?;
+    let grant = db::session_grant(&state.db, id, grant_id)
+        .await?
+        .ok_or_else(not_found)?;
+    let mut changes = Vec::new();
+    if body.narrow {
+        let narrower = crate::grants::narrowed(&grant)
+            .ok_or_else(|| bad_request("this grant can't be narrowed"))?;
+        db::set_grant_params(&state.db, id, grant_id, &narrower).await?;
+        let narrowed = Grant {
+            params: narrower,
+            ..grant.clone()
+        };
+        changes.push(format!(
+            "narrowed to: {}",
+            crate::grants::describe(&narrowed)
+        ));
+    }
+    if let Some(expires_at) = body.expires_at {
+        if expires_at.is_some_and(|at| at <= chrono::Utc::now()) {
+            return Err(bad_request(
+                "expires_at is in the past; revoke the grant instead",
+            ));
+        }
+        db::set_grant_expiry(&state.db, id, grant_id, expires_at).await?;
+        changes.push(match expires_at {
+            Some(at) => format!("now runs out at {}", at.to_rfc3339()),
+            None => "no longer runs out".to_owned(),
+        });
+    }
+    if changes.is_empty() {
+        return Err(bad_request("give expires_at or narrow"));
+    }
+    let what = format!(
+        "the user changed this session's grant {} ({}): {}.",
+        grant.capability,
+        crate::grants::describe(&grant),
+        changes.join("; ")
+    );
+    lifecycle::grants_changed(&state, id, &what).await;
+    let session = db::get_session(&state.db, id)
+        .await?
+        .ok_or_else(not_found)?;
+    Ok(Json(session.to_api()))
+}
+
+/// Revokes a grant; it stops counting at once, at the authorizer.
+async fn revoke_grant(
+    State(state): State<AppState>,
+    User(user): User,
+    Path((id, grant_id)): Path<(Uuid, Uuid)>,
+) -> ApiResult<impl IntoResponse> {
+    db::owned_session(&state.db, id, &user)
+        .await?
+        .ok_or_else(not_found)?;
+    let grant = db::revoke_grant(&state.db, id, grant_id)
+        .await?
+        .ok_or_else(not_found)?;
+    let what = format!(
+        "the user revoked this session's grant {}: {}",
+        grant.capability,
+        crate::grants::describe(&grant)
+    );
+    lifecycle::grants_changed(&state, id, &what).await;
     let session = db::get_session(&state.db, id)
         .await?
         .ok_or_else(not_found)?;

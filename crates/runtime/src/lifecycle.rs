@@ -150,6 +150,60 @@ pub async fn start_session(
     Ok(row)
 }
 
+/// Applies the egress policy a session's grants call for: direct access to package hosts with `packages`. Run when
+/// its pod is placed, and again when its grants change.
+pub async fn apply_egress(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
+    let id = session.id.to_string();
+    state
+        .enforcer
+        .apply(&EgressSpec {
+            session_id: id.clone(),
+            pod_labels: pod_labels(&id),
+            intercepted_hosts: state.policies.hosts(),
+            direct_hosts: if session.context().has(capability::PACKAGES) {
+                state.config.direct_hosts.clone()
+            } else {
+                Vec::new()
+            },
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
+}
+
+/// After a session's grants changed (`what`, for the agent): its egress policy follows them, its agent and UIs are
+/// told. A session that isn't acting gets its egress at its next placement.
+pub async fn grants_changed(state: &AppState, id: Uuid, what: &str) {
+    if let Ok(Some(session)) = db::get_session(&state.db, id).await
+        && session.not_acting().is_none()
+        && let Err(e) = apply_egress(state, &session).await
+    {
+        tracing::warn!(session = %id, error = %e, "applying egress after a grant change");
+    }
+    state.hub.broadcast_session(id).await;
+    state
+        .hub
+        .notify(id, format!("sloppod: {what} See them with `list_grants`."))
+        .await;
+}
+
+/// Removes the grants that have run out and tells their sessions; they already stopped counting when they ran out.
+pub async fn sweep_expired_grants(state: &AppState) {
+    let expired = match db::sweep_expired_grants(&state.db).await {
+        Ok(expired) => expired,
+        Err(e) => {
+            tracing::warn!(error = %e, "removing grants that ran out");
+            return;
+        }
+    };
+    for (session, grant) in expired {
+        let what = format!(
+            "this session's grant ran out: {}",
+            crate::grants::describe(&grant)
+        );
+        grants_changed(state, session, &what).await;
+    }
+}
+
 /// Makes sure a session's pod and egress policy exist.
 pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
     if let Err(e) = ensure_memini_key(state, session).await {
@@ -160,7 +214,6 @@ pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result
         .await?
         .ok_or_else(|| anyhow::anyhow!("session {} is gone", session.id))?;
     let id = session.id.to_string();
-    let context = session.context();
     let labels = BTreeMap::from([
         (SESSION_LABEL.to_owned(), id.clone()),
         ("app.kubernetes.io/part-of".to_owned(), "sloppod".to_owned()),
@@ -169,19 +222,7 @@ pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result
             "session".to_owned(),
         ),
     ]);
-    state
-        .enforcer
-        .apply(&EgressSpec {
-            session_id: id.clone(),
-            pod_labels: pod_labels(&id),
-            intercepted_hosts: state.policies.hosts(),
-            direct_hosts: if context.has(capability::PACKAGES) {
-                state.config.direct_hosts.clone()
-            } else {
-                Vec::new()
-            },
-        })
-        .await?;
+    apply_egress(state, session).await?;
     state
         .placement
         .ensure(&PlacementSpec {

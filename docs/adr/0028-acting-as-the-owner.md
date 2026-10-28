@@ -46,3 +46,5 @@ Considered and not chosen:
 - **An OAuth App ("Connect GitHub"), for now:** it reaches everything the owner can, without a token to paste or renew, but its scopes can't be narrowed to repositories, so the stored token could do anything the owner can if it leaked, and organizations may block it. Grants still decide what sessions reach, so it fits the same model; it can be added later as a second kind of `github-user` credential, after fine-grained PATs.
 
 To decide during implementation: whether `propose` as the owner also covers merging, and whether a session may hold `as-owner` on a repository while its proposals there still open as the App.
+
+2026-10-28: the grant controls this relies on are built (ADR 2's dated note): grants have an expiry, and the owner grants, narrows, extends and revokes them while the session runs. The `as-owner` grant itself is still to come.

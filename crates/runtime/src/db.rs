@@ -106,13 +106,19 @@ impl SessionRow {
                 .map(|r| r.repo.to_owned())
                 .or(self.repo.clone()),
             branch: repo.as_ref().map(|r| r.branch.to_owned()),
-            grants: context
+            grants: self
                 .grants
-                .iter()
-                .map(|g| api::Grant {
+                .as_array()
+                .into_iter()
+                .flatten()
+                .zip(&context.grants)
+                .map(|(row, g)| api::Grant {
                     capability: g.capability.clone(),
                     params: g.params.clone(),
                     description: Some(crate::grants::describe(g)),
+                    id: row["id"].as_str().and_then(|id| id.parse().ok()),
+                    created_at: row["created_at"].as_str().map(str::to_owned),
+                    expires_at: row["expires_at"].as_str().map(str::to_owned),
                 })
                 .collect(),
             phase: Phase::parse(&self.phase),
@@ -149,8 +155,10 @@ impl SessionRow {
 }
 
 const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, repo, created_at, updated_at, active_at, deleted_at, agent_status, agent_error, parent_id, limited_until, \
-     coalesce((select jsonb_agg(jsonb_build_object('capability', g.capability, 'params', g.params) order by g.created_at) \
-     from session_grants g where g.session_id = sessions.id), '[]'::jsonb) as grants";
+     coalesce((select jsonb_agg(jsonb_build_object('id', g.id, 'capability', g.capability, 'params', g.params, \
+     'created_at', g.created_at, 'expires_at', g.expires_at) order by g.created_at) \
+     from session_grants g where g.session_id = sessions.id and (g.expires_at is null or g.expires_at > now())), \
+     '[]'::jsonb) as grants";
 
 pub struct NewSessionRow<'a> {
     pub id: Uuid,
@@ -1129,6 +1137,96 @@ pub async fn finish_proposal(
     .bind(error)
     .fetch_one(db)
     .await
+}
+
+/// Grants a session `grant` until `expires_at`, if it runs out; returns its id.
+pub async fn grant(
+    db: &PgPool,
+    session: Uuid,
+    grant: &Grant,
+    expires_at: Option<DateTime<Utc>>,
+) -> sqlx::Result<Uuid> {
+    sqlx::query_scalar(
+        "insert into session_grants (session_id, capability, params, expires_at) values ($1, $2, $3, $4) returning id",
+    )
+    .bind(session)
+    .bind(&grant.capability)
+    .bind(&grant.params)
+    .bind(expires_at)
+    .fetch_one(db)
+    .await
+}
+
+/// One of a session's grants that hasn't run out, as `(capability, params)`.
+pub async fn session_grant(db: &PgPool, session: Uuid, id: Uuid) -> sqlx::Result<Option<Grant>> {
+    let row: Option<(String, Value)> = sqlx::query_as(
+        "select capability, params from session_grants where id = $2 and session_id = $1 \
+         and (expires_at is null or expires_at > now())",
+    )
+    .bind(session)
+    .bind(id)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(|(capability, params)| Grant { capability, params }))
+}
+
+/// Changes when one of a session's grants runs out (none: never); says whether it had the grant.
+pub async fn set_grant_expiry(
+    db: &PgPool,
+    session: Uuid,
+    id: Uuid,
+    expires_at: Option<DateTime<Utc>>,
+) -> sqlx::Result<bool> {
+    let result =
+        sqlx::query("update session_grants set expires_at = $3 where id = $2 and session_id = $1")
+            .bind(session)
+            .bind(id)
+            .bind(expires_at)
+            .execute(db)
+            .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Replaces a grant's params, e.g. to narrow it; says whether the session had it.
+pub async fn set_grant_params(
+    db: &PgPool,
+    session: Uuid,
+    id: Uuid,
+    params: &Value,
+) -> sqlx::Result<bool> {
+    let result =
+        sqlx::query("update session_grants set params = $3 where id = $2 and session_id = $1")
+            .bind(session)
+            .bind(id)
+            .bind(params)
+            .execute(db)
+            .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Revokes one of a session's grants; returns what it was.
+pub async fn revoke_grant(db: &PgPool, session: Uuid, id: Uuid) -> sqlx::Result<Option<Grant>> {
+    let row: Option<(String, Value)> = sqlx::query_as(
+        "delete from session_grants where id = $2 and session_id = $1 returning capability, params",
+    )
+    .bind(session)
+    .bind(id)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(|(capability, params)| Grant { capability, params }))
+}
+
+/// Removes the grants that have run out, and returns them with their sessions, for telling those sessions.
+pub async fn sweep_expired_grants(db: &PgPool) -> sqlx::Result<Vec<(Uuid, Grant)>> {
+    let rows: Vec<(Uuid, String, Value)> = sqlx::query_as(
+        "delete from session_grants where expires_at <= now() returning session_id, capability, params",
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(session, capability, params)| (session, Grant { capability, params }))
+        .collect())
 }
 
 pub async fn add_grant(db: &PgPool, session: Uuid, grant: &Grant) -> sqlx::Result<()> {

@@ -1162,3 +1162,72 @@ async fn a_users_timezone_is_kept_and_utc_without_one(db: PgPool) {
         ReviewPolicy::Required
     );
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_grant_can_run_out_be_narrowed_and_be_revoked(db: PgPool) {
+    use sloppod_contracts::Grant;
+
+    let s = session(&db, "dev").await;
+    let capabilities = |row: &db::SessionRow| {
+        row.grants()
+            .iter()
+            .map(|g| g.capability.clone())
+            .collect::<Vec<_>>()
+    };
+    let soon = db::grant(
+        &db,
+        s,
+        &Grant::new("packages", json!({})),
+        Some(Utc::now() + Duration::hours(1)),
+    )
+    .await
+    .unwrap();
+    let repo = db::grant(
+        &db,
+        s,
+        &Grant::new(
+            "repo",
+            json!({"repo": "a/b", "access": "rw", "branch": "sloppod/1"}),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+    let row = db::get_session(&db, s).await.unwrap().unwrap();
+    assert_eq!(capabilities(&row), ["packages", "repo"]);
+    let api = row.to_api();
+    assert_eq!(api.grants[0].id, Some(soon));
+    assert!(api.grants[0].expires_at.is_some());
+    assert!(api.grants[1].expires_at.is_none());
+
+    // Narrowed: the repository becomes read only.
+    let narrower =
+        crate::grants::narrowed(&db::session_grant(&db, s, repo).await.unwrap().unwrap()).unwrap();
+    assert!(db::set_grant_params(&db, s, repo, &narrower).await.unwrap());
+    let row = db::get_session(&db, s).await.unwrap().unwrap();
+    assert_eq!(row.grants()[1].param("access"), Some("ro"));
+
+    // Run out: gone from the session at once, before the sweeper removes it.
+    assert!(
+        db::set_grant_expiry(&db, s, soon, Some(Utc::now() - Duration::seconds(1)))
+            .await
+            .unwrap()
+    );
+    let row = db::get_session(&db, s).await.unwrap().unwrap();
+    assert_eq!(capabilities(&row), ["repo"]);
+    assert!(db::session_grant(&db, s, soon).await.unwrap().is_none());
+    let swept = db::sweep_expired_grants(&db).await.unwrap();
+    assert_eq!(swept.len(), 1);
+    assert_eq!(swept[0].0, s);
+    assert_eq!(swept[0].1.capability, "packages");
+
+    // Revoked: returned once, then gone; another owner's session can't be named.
+    let revoked = db::revoke_grant(&db, s, repo).await.unwrap().unwrap();
+    assert_eq!(revoked.capability, "repo");
+    assert!(db::revoke_grant(&db, s, repo).await.unwrap().is_none());
+    let other = session(&db, "someone").await;
+    let theirs = db::grant(&db, other, &Grant::new("docs", json!({})), None)
+        .await
+        .unwrap();
+    assert!(db::revoke_grant(&db, s, theirs).await.unwrap().is_none());
+}

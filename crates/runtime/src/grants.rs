@@ -1,7 +1,33 @@
 //! What each grant lets a session do, in the words both its owner and its agent see.
 
+use serde_json::{Value, json};
 use sloppod_contracts::capability;
-use sloppod_contracts::{Grant, READ_WRITE};
+use sloppod_contracts::{Grant, READ_ONLY, READ_WRITE};
+
+/// The capabilities the owner can grant a session mid-session from its grants list. Repositories go through
+/// `POST /sessions/{id}/repos`; memory needs a key minted when the session's pod is placed, so it isn't here.
+pub fn grantable(capability: &str) -> bool {
+    matches!(
+        capability,
+        capability::MODEL
+            | capability::GITHUB
+            | capability::PACKAGES
+            | capability::DOCS
+            | capability::CODEX
+    )
+}
+
+/// A narrower version of a grant, if it has one: a repository the session can push to becomes read only.
+pub fn narrowed(grant: &Grant) -> Option<Value> {
+    if grant.capability != capability::REPO || grant.param("access") != Some(READ_WRITE) {
+        return None;
+    }
+    let mut params = grant.params.clone();
+    let fields = params.as_object_mut()?;
+    fields.insert("access".into(), json!(READ_ONLY));
+    fields.remove("branch");
+    Some(params)
+}
 
 pub fn describe(grant: &Grant) -> String {
     match grant.capability.as_str() {
@@ -35,9 +61,20 @@ pub fn describe(grant: &Grant) -> String {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use super::*;
+
+    #[test]
+    fn only_a_writable_repository_narrows() {
+        let rw = Grant::new(
+            "repo",
+            json!({"repo": "a/b", "access": "rw", "branch": "sloppod/1"}),
+        );
+        assert_eq!(narrowed(&rw), Some(json!({"repo": "a/b", "access": "ro"})));
+        let ro = Grant::new("repo", json!({"repo": "a/b", "access": "ro"}));
+        assert_eq!(narrowed(&ro), None);
+        assert_eq!(narrowed(&Grant::new("github", json!({}))), None);
+        assert!(grantable("packages") && !grantable("memory") && !grantable("repo"));
+    }
 
     #[test]
     fn repo_grants_name_their_branch() {
