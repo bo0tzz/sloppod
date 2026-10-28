@@ -863,3 +863,53 @@ async fn a_queue_kept_before_a_restart_runs_once_the_agent_is_up() {
     assert_eq!(prompt_text(&restored), ["Sent before the restart"]);
     assert!(h.store.queues().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn a_message_steered_before_the_agent_is_up_is_kept() {
+    let mut h = Harness::starting().await;
+    let steered = h
+        .hub
+        .clone()
+        .steer(
+            h.id,
+            json!({"sessionId": h.id, "prompt": [{"type": "text", "text": "Steered early"}]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(steered["outcome"], "queued");
+    let kept = h.store.queues().await.unwrap();
+    assert_eq!(kept[0].1[0]["blocks"][0]["text"], "Steered early");
+
+    h.agent_ready().await;
+    assert_eq!(
+        prompt_text(&next_prompt(&mut h.to_agent).await),
+        ["Steered early"]
+    );
+}
+
+#[tokio::test]
+async fn a_notice_after_a_restore_joins_the_kept_queue() {
+    let mut h = Harness::starting().await;
+    h.store
+        .save_queue(
+            h.id,
+            &[json!({"id": null, "blocks": [{"type": "text", "text": "Kept"}]})],
+        )
+        .await
+        .unwrap();
+    h.hub.restore_queues().await;
+    h.hub.clone().notify(h.id, "A notice".into()).await;
+    let kept = h.store.queues().await.unwrap();
+    let texts: Vec<&str> = kept[0]
+        .1
+        .iter()
+        .filter_map(|m| m["blocks"][0]["text"].as_str())
+        .collect();
+    assert_eq!(texts, ["Kept", "A notice"]);
+
+    h.agent_ready().await;
+    assert_eq!(
+        prompt_text(&next_prompt(&mut h.to_agent).await),
+        ["Kept", "A notice"]
+    );
+}

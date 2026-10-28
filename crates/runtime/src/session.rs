@@ -986,11 +986,16 @@ impl Hub {
         let blocks = params["prompt"].as_array().cloned().unwrap_or_default();
         let message_id = client_message_id(&params);
         if self.agent_for(id).await.is_err() {
-            self.live(id).state.lock().await.queue.push(Queued {
-                id: None,
-                blocks,
-                reply: None,
-            });
+            {
+                let live = self.live(id);
+                let mut state = live.state.lock().await;
+                state.queue.push(Queued {
+                    id: None,
+                    blocks,
+                    reply: None,
+                });
+                self.save_queue(id, &state.queue).await;
+            }
             self.record_user_message(id, &params["prompt"], false, message_id)
                 .await;
             self.wake_for_message(id).await?;
