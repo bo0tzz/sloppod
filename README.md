@@ -37,6 +37,7 @@ Approach:
 - [21. Credentials live in the runtime](docs/adr/0021-credentials-live-in-the-runtime.md)
 - [22. memini keys per session](docs/adr/0022-memini-keys-per-session.md)
 - [24. Proposals are reviewed by another model before a human sees them](docs/adr/0024-automated-review-before-human-review.md)
+- [26. The runtime makes small model calls of its own](docs/adr/0026-runtime-inference.md)
 
 Implementation:
 
