@@ -638,6 +638,9 @@ async fn prepare(
     let home =
         std::env::var("HOME").unwrap_or_else(|_| args.workdir.join("home").display().to_string());
     std::fs::create_dir_all(&home)?;
+    if let Ok(tmp) = std::env::var("TMPDIR") {
+        std::fs::create_dir_all(tmp)?;
+    }
     link_gh_extensions(Path::new(&home), GH_EXTENSIONS)?;
     let mut env: Vec<(String, String)> = Vec::new();
     let path = std::env::var("PATH").unwrap_or_default();

@@ -339,12 +339,29 @@ pub async fn append_event(db: &PgPool, id: Uuid, payload: &Value) -> sqlx::Resul
     Ok(seq)
 }
 
-pub async fn events(db: &PgPool, id: Uuid) -> sqlx::Result<Vec<(i64, Value)>> {
-    let rows =
-        sqlx::query("select seq, payload from session_events where session_id = $1 order by seq")
-            .bind(id)
-            .fetch_all(db)
-            .await?;
+/// The sequence number of the session's latest event; 0 when it has none.
+pub async fn last_event(db: &PgPool, id: Uuid) -> sqlx::Result<i64> {
+    sqlx::query_scalar("select coalesce(max(seq), 0) from session_events where session_id = $1")
+        .bind(id)
+        .fetch_one(db)
+        .await
+}
+
+/// Up to `limit` of the session's events after `after`, in order.
+pub async fn events(
+    db: &PgPool,
+    id: Uuid,
+    after: i64,
+    limit: i64,
+) -> sqlx::Result<Vec<(i64, Value)>> {
+    let rows = sqlx::query(
+        "select seq, payload from session_events where session_id = $1 and seq > $2 order by seq limit $3",
+    )
+    .bind(id)
+    .bind(after)
+    .bind(limit)
+    .fetch_all(db)
+    .await?;
     Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
 }
 

@@ -108,6 +108,8 @@ pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result
                 ("SLOPPOD_URL".into(), state.config.runtime_url()),
                 ("SLOPPOD_TOKEN_FILE".into(), format!("{TOKEN_DIR}/token")),
                 ("HOME".into(), format!("{WORKDIR}/home")),
+                // On the volume, so scratch work outlives a restart of the pod.
+                ("TMPDIR".into(), format!("{WORKDIR}/tmp")),
             ],
             cpu: state.config.session_cpu.clone(),
             memory: state.config.session_memory.clone(),
