@@ -7,7 +7,7 @@
   let timezone = $state<string | null>(null);
   let loadError = $state<string | null>(null);
 
-  const options = timezones().map((zone) => ({ value: zone, label: zone.replaceAll('_', ' ') }));
+  const options = $derived(timezones(timezone).map((zone) => ({ value: zone, label: zone.replaceAll('_', ' ') })));
 
   onMount(async () => {
     try {

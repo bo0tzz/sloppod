@@ -1264,7 +1264,7 @@ async function handleApi(req, res, url) {
         settings.review = body.review;
       }
       if ('timezone' in body) {
-        if (!Intl.supportedValuesOf('timeZone').includes(body.timezone)) {
+        if (body.timezone !== 'UTC' && !Intl.supportedValuesOf('timeZone').includes(body.timezone)) {
           return json(res, 400, { error: `${body.timezone} isn't a timezone, e.g. Europe/Amsterdam` });
         }
         settings.timezone = body.timezone;

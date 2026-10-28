@@ -1506,3 +1506,22 @@ test.describe('in Amsterdam', () => {
     await expect(setting).toContainText('Asia/Tokyo');
   });
 });
+
+test.describe('in UTC', () => {
+  test.use({ timezoneId: 'UTC' });
+
+  test('a browser in UTC gets UTC, which can be chosen again after another', async ({ page }) => {
+    await page.request.post('/_mock/forget-timezone');
+    await page.goto('/settings');
+    const setting = page.getByTestId('timezone-setting').getByRole('combobox', { name: 'Timezone' });
+    await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('UTC');
+    await expect(setting).toContainText('UTC');
+
+    await setting.click();
+    await page.getByRole('option', { name: 'Asia/Tokyo', exact: true }).click();
+    await expect(setting).toContainText('Asia/Tokyo');
+    await setting.click();
+    await page.getByRole('option', { name: 'UTC', exact: true }).click();
+    await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('UTC');
+  });
+});
