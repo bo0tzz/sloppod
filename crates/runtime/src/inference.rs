@@ -46,13 +46,7 @@ impl Inference {
         purpose: &str,
         prompt: &str,
     ) -> anyhow::Result<Value> {
-        let one_at_a_time = self
-            .owners
-            .lock()
-            .unwrap()
-            .entry(owner.to_owned())
-            .or_default()
-            .clone();
+        let one_at_a_time = self.lock(owner);
         let _turn = one_at_a_time.lock().await;
         let session = utility_session(state, owner).await?;
         self.used(session);
@@ -78,6 +72,27 @@ impl Inference {
             Err(e) => tracing::warn!(%owner, purpose, error = %e, "judgement failed"),
         }
         verdict
+    }
+
+    /// Has the owner's utility session's pod come up, so a judgement asked for soon doesn't wait for it: e.g. when
+    /// the user starts writing a first message (#232). Under the owner's judgement lock, so it never makes a second
+    /// utility session alongside a judgement or another warming.
+    pub async fn warm(&self, state: &AppState, owner: &str) {
+        let one_at_a_time = self.lock(owner);
+        let _turn = one_at_a_time.lock().await;
+        match utility_session(state, owner).await {
+            Ok(session) => self.used(session),
+            Err(e) => tracing::warn!(%owner, error = %e, "warming the utility session"),
+        }
+    }
+
+    fn lock(&self, owner: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.owners
+            .lock()
+            .unwrap()
+            .entry(owner.to_owned())
+            .or_default()
+            .clone()
     }
 
     fn used(&self, session: Uuid) {
@@ -114,15 +129,6 @@ fn reply(output: &str) -> anyhow::Result<Value> {
         .and_then(|t| t.strip_suffix("```"))
         .unwrap_or(text);
     Ok(serde_json::from_str(text.trim())?)
-}
-
-/// Has the owner's utility session's pod come up, so a judgement asked for soon doesn't wait for it: e.g. when the
-/// user starts writing a first message (#232).
-pub async fn warm(state: &AppState, owner: &str) {
-    match utility_session(state, owner).await {
-        Ok(session) => state.inference.used(session),
-        Err(e) => tracing::warn!(%owner, error = %e, "warming the utility session"),
-    }
 }
 
 /// The owner's utility session, made if they have none, and woken or placed so its pod is coming up.

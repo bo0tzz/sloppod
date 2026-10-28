@@ -162,15 +162,16 @@ const MIN_LENGTH: usize = 12;
 /// The starting set suggested for a first message. Advisory (ADR 26): the user edits it, and creating the session
 /// checks it again. While a newer draft waits, or if the judgement fails, it's what matching gives.
 pub async fn suggest(state: &AppState, owner: &str, prompt: &str) -> anyhow::Result<Value> {
+    // Every draft counts as the newest when it arrives, a short one too, before anything that could reorder them.
+    let (asked, lock) = state.suggestions.ask(owner);
     let repos = api::accessible_repos(state, owner).await;
     let defaults = defaults(state, owner).await?;
     let fallback = matched(prompt, &repos, &defaults);
     let prompt = prompt.trim();
     if prompt.chars().count() < MIN_LENGTH {
-        crate::inference::warm(state, owner).await;
+        state.inference.warm(state, owner).await;
         return Ok(fallback);
     }
-    let (asked, lock) = state.suggestions.ask(owner);
     let _one_at_a_time = lock.lock().await;
     if !state.suggestions.newest(owner, asked) {
         return Ok(fallback);
@@ -231,6 +232,20 @@ mod tests {
             DEFAULTS,
         );
         assert_eq!(made_up["repo"], "bo0tzz/dotfiles");
+    }
+
+    #[test]
+    fn only_the_newest_draft_is_judged() {
+        let suggestions = Suggestions::default();
+        let (long, _) = suggestions.ask("dev");
+        let (newer, _) = suggestions.ask("dev");
+        assert!(!suggestions.newest("dev", long));
+        assert!(suggestions.newest("dev", newer));
+        // A short draft that follows supersedes the long one waiting, though it isn't judged itself.
+        let (_short, _) = suggestions.ask("dev");
+        assert!(!suggestions.newest("dev", newer));
+        let (other, _) = suggestions.ask("someone");
+        assert!(suggestions.newest("someone", other), "per owner");
     }
 
     #[test]
