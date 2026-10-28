@@ -21,7 +21,7 @@ How should sloppod get this judgement?
 **The runtime calls models itself, for small, advisory judgements, on the owner's account.**
 
 - **A runtime service, `inference`.** It's one place that makes these calls: a purpose (what's being asked and why, for logs), a prompt, and a reply schema. Every feature that needs a judgement uses it, rather than each calling a model in its own way.
-- **Whose account:** the owner of what's being judged: their default inference account ([ADR 20](0020-switchable-inference-accounts.md), [ADR 21](0021-credentials-live-in-the-runtime.md)). Like a session's own calls, these go on their quota and bill. A user with no account gets no judgements, and the features that need them do without.
+- **Whose account:** the owner of what's being judged, through an **API key** credential (a new kind, e.g. an Anthropic API key, [ADR 21](0021-credentials-live-in-the-runtime.md)), billed per call. Not their subscription: a Claude or ChatGPT subscription is for its own clients (Claude Code, Codex), and the runtime calling the API with one would be using it outside those terms (see More Information). A user without an API key gets no judgements, and the features that need them do without.
 - **Which model:** a small, fast one by default (Haiku), configurable. Judgements are frequent and simple.
 - **Advisory only.** A judgement can make sloppod tell someone something: a notice to an agent, a hint in the UI, a suggested state change. It never authorizes anything. Capabilities, proposals and enforcement ([ADR 2](0002-capabilities.md), [3](0003-proposals-and-trusted-executor.md), [11](0011-enforcement-at-the-pod-boundary.md)) don't consult it. The content it reads often comes from an agent or the internet, so a judgement can be steered by what it reads, and the worst it can do is send a misleading notice.
 - **Structured replies.** Each purpose declares the JSON its reply must match; a reply that doesn't parse is treated as no judgement.
@@ -35,11 +35,15 @@ The first use is the turn-end check: when a turn ends, the runtime asks whether 
 - Good: one place for every such call, with its limits, logging and accounting.
 - Bad: the runtime spends the owner's quota on its own; small calls, but every turn end can cost one.
 - Bad: a dependency on the inference provider for features that didn't have one. Each degrades to doing nothing when calls fail.
-- Neutral: subscription accounts are meant for their own clients. Whether the runtime may call the API with one directly, and what that requires, needs a spike before anything else is built on it.
+- Bad: users who only have a subscription need an API key as well for these features; the cost is small (a few short calls to a small model per session per hour), but it's another credential to set up.
 
 ## More Information
 
+2026-10-28, spike: a plain `POST /v1/messages` with a Claude subscription's OAuth token, made through the authorizer exactly as a session's calls are but without Claude Code's own request shape, is refused (`rate_limit_error`), while the same token works for Claude Code. Shaping the request to pass as Claude Code would be getting around the provider's rule for the subscription, not a fix, so it isn't an option.
+
 Considered and not chosen:
+
+- **Judgements through the real client:** the runtime keeps a small utility session per owner (Claude Code in its own pod, like a review session, [ADR 24](0024-automated-review-before-human-review.md)) and asks it over ACP. That's a legitimate use of the subscription, but it holds a pod per owner, and each judgement waits on a whole agent turn. It stays an option for users without an API key if the features prove worth it.
 
 - **Agent-harness hooks** (a Claude Code `Stop` hook judged by a small model): available today, and close to what the turn-end check needs, since Claude Code passes the hook the last message and the background tasks it knows of. But it's per harness, so Codex sessions would go without, and each new adapter would need its own.
 - **Heuristics** (matching "I'll", "next", "starting"): cheap, but too blunt for prose, and every use would need its own rules.
