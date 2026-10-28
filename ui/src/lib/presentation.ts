@@ -81,6 +81,7 @@ export const proposalKinds: Record<string, { title: string; plural: string; exec
   'github.issue.create': { title: 'Issues proposal', plural: 'Issues', executed: 'Filed' },
   'github.issue.update': { title: 'Issue updates', plural: 'Issue updates', executed: 'Updated' },
   'sloppod.repo.grant': { title: 'Repository access', plural: 'Repository access', executed: 'Granted' },
+  'sloppod.repo.act_as_owner': { title: 'Acting as you', plural: 'Acting as you', executed: 'Granted' },
   'sloppod.session.report': { title: 'Report to the parent session', plural: 'Reports', executed: 'Delivered' },
   'sloppod.code_review': { title: 'Code review', plural: 'Code reviews', executed: 'Reviewed' },
 };
@@ -136,6 +137,14 @@ export function proposalSummary(proposal: Proposal): { label: string; title: str
         icon: mdiAlertCircleOutline,
       };
     }
+    case 'sloppod.repo.act_as_owner':
+      return {
+        label: 'Acting as you',
+        // The token picked when approving, once it's carried out.
+        title: `Act as ${payloadText(proposal.result?.login ?? payload.login) || 'you'} on ${payloadText(payload.repo)}`,
+        detail: payloadText(payload.reason) || undefined,
+        icon: mdiSourceRepository,
+      };
     case 'sloppod.repo.grant':
       return {
         label: 'Repository access',

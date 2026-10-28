@@ -9,7 +9,7 @@ use axum::routing::{delete, get, post, put};
 use serde::Deserialize;
 use serde_json::json;
 use sloppod_contracts::capability;
-use sloppod_contracts::{Grant, READ_WRITE, find_repo, is_repo_name};
+use sloppod_contracts::{Grant, READ_WRITE, find_repo};
 use sloppod_protocol::api::{
     Decision, NewCredential, NewSession, NewStandingApproval, ProposalStatus, ReviewPolicy,
 };
@@ -319,43 +319,20 @@ async fn add_repo_as(
         .github_user(user, credential)
         .await?
         .ok_or_else(|| bad_request("that isn't one of your GitHub tokens"))?;
-    let reach: Vec<String> = row.config["repositories"]
-        .as_array()
-        .map(|repos| {
-            repos
-                .iter()
-                .filter_map(|r| r.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
-    let more = row.config["more_repositories"].as_bool() == Some(true);
-    let repo = match find_repo(&reach, wanted) {
-        Some(repo) => repo.clone(),
-        // The token lists more repositories than were read when it was added; GitHub decides when it's used.
-        None if more && is_repo_name(wanted) => wanted.to_owned(),
-        None => {
-            return Err(bad_request(format!(
-                "the token {} doesn't reach {wanted}",
-                row.name
-            )));
-        }
-    };
-    let login = row.config("login").unwrap_or_default().to_owned();
+    let repo = crate::credentials::token_reaches(&row, wanted)
+        .ok_or_else(|| bad_request(format!("the token {} doesn't reach {wanted}", row.name)))?;
     let session = db::get_session(&state.db, id)
         .await?
         .ok_or_else(not_found)?;
-    proposals::grant_repo(&state.db, &session.context(), &repo).await?;
-    let credential = row.id.to_string();
-    db::set_repo_credential(&state.db, id, &repo, Some((&credential, &login))).await?;
+    proposals::grant_repo_as(&state.db, &session.context(), &repo, &row).await?;
     state.hub.broadcast_session(id).await;
     state
         .hub
         .notify(
             id,
             format!(
-                "sloppod: the user gave this session write access to {repo}, as {login}: on {repo}, git and GitHub's \
-                 API now act with their own GitHub token, so what you push there is attributed to them. {}",
-                proposals::repo_granted(&repo, id)
+                "sloppod: the user gave this session write access to {repo}. {}",
+                proposals::repo_granted_as(&repo, &row, id)
             ),
         )
         .await;
@@ -799,8 +776,14 @@ async fn create_standing_approval(
     User(user): User,
     Json(new): Json<NewStandingApproval>,
 ) -> ApiResult<impl IntoResponse> {
-    if state.proposals.get(&new.kind).is_none() {
+    let Some(kind) = state.proposals.get(&new.kind) else {
         return Err(bad_request(format!("unknown proposal kind {}", new.kind)));
+    };
+    if !kind.standing_approvable() {
+        return Err(bad_request(format!(
+            "{} proposals always wait for a person to decide them",
+            new.kind
+        )));
     }
     let target = new
         .target

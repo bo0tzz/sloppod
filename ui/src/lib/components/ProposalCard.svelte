@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { Badge, Button, Icon, LoadingSpinner } from '@immich/ui';
+  import { Badge, Button, Icon, LoadingSpinner, Select } from '@immich/ui';
+  import { onMount } from 'svelte';
   import { api, type Proposal } from '#lib/api.ts';
   import { actingAs, proposalStatus, proposalSummary } from '#lib/presentation.ts';
 
@@ -14,8 +15,27 @@
   const as = $derived(actingAs(proposal));
   const pending = $derived(proposal.status === 'pending');
   // Everything there is to review fits on the card; only pull requests need the full review.
-  const inline = $derived(pending && proposal.kind === 'sloppod.repo.grant');
-  const payload = $derived(proposal.payload as { repo?: string; branch?: string; reason?: string });
+  const actAsOwner = $derived(proposal.kind === 'sloppod.repo.act_as_owner');
+  const inline = $derived(pending && (proposal.kind === 'sloppod.repo.grant' || actAsOwner));
+  const payload = $derived(
+    proposal.payload as { repo?: string; branch?: string; reason?: string; credential?: string; login?: string },
+  );
+  /** For acting as the user: the GitHub tokens to pick from, and the one picked (the agent's suggestion at first). */
+  let tokens = $state<{ id: string; name: string; login: string }[]>([]);
+  // svelte-ignore state_referenced_locally
+  let credential = $state(payload.credential);
+  const picked = $derived(tokens.find((token) => token.id === credential));
+  const title = $derived(actAsOwner && picked ? `Act as ${picked.login} on ${payload.repo}` : summary.title);
+
+  onMount(async () => {
+    if (!actAsOwner || !pending) return;
+    try {
+      const detail = (await api.getProposal(proposal.id)) as { tokens?: { id: string; name: string; login: string }[] };
+      tokens = detail.tokens ?? [];
+    } catch {
+      // Without the list, the suggested token is what's approved.
+    }
+  });
 
   let busy = $state<'approve' | 'reject' | null>(null);
   let error = $state<string | null>(null);
@@ -24,7 +44,8 @@
     busy = verdict;
     error = null;
     try {
-      onChange(verdict === 'approve' ? await api.approveProposal(proposal.id) : await api.rejectProposal(proposal.id));
+      const edits = actAsOwner && credential !== payload.credential ? { credential } : {};
+      onChange(verdict === 'approve' ? await api.approveProposal(proposal.id, edits) : await api.rejectProposal(proposal.id));
     } catch (cause) {
       error = cause instanceof Error ? cause.message : String(cause);
     } finally {
@@ -52,7 +73,7 @@
           <Badge size="tiny" shape="round" color="warning" class="shrink-0 whitespace-nowrap" data-testid="proposal-acts-as">as {as}</Badge>
         {/if}
       </div>
-      <span class="truncate text-sm font-medium" title={summary.title}>{summary.title}</span>
+      <span class="truncate text-sm font-medium" {title} data-testid="proposal-card-title">{title}</span>
       {#if summary.detail && !inline}
         <span class="text-muted truncate text-xs {proposal.kind === 'github.pr.create' ? 'font-mono' : ''}" title={summary.detail}>
           {summary.detail}
@@ -77,10 +98,28 @@
     {#if payload.reason}
       <p class="text-sm whitespace-pre-wrap" data-testid="proposal-reason">{payload.reason}</p>
     {/if}
-    <p class="text-muted text-xs">
-      Approving lets the session push <span class="font-mono">{payload.branch}</span> to {payload.repo} and propose pull
-      requests from it. Merging stays with you.
-    </p>
+    {#if actAsOwner}
+      {#if tokens.length > 1}
+        <div class="w-64" data-testid="proposal-token">
+          <Select
+            size="small"
+            title="Which of your GitHub tokens"
+            options={tokens.map((token) => ({ value: token.id, label: `${token.login} (${token.name})` }))}
+            bind:value={credential}
+          />
+        </div>
+      {/if}
+      <p class="text-muted text-xs">
+        Approving lets the session act on {payload.repo} as {picked?.login ?? payload.login ?? 'you'}, with your own GitHub
+        token: git, GitHub's API and its proposals there go out in your name. It also gets write access to its branch
+        <span class="font-mono">{payload.branch}</span> there.
+      </p>
+    {:else}
+      <p class="text-muted text-xs">
+        Approving lets the session push <span class="font-mono">{payload.branch}</span> to {payload.repo} and propose pull
+        requests from it. Merging stays with you.
+      </p>
+    {/if}
     {#if error}
       <p class="text-danger text-xs">{error}</p>
     {/if}

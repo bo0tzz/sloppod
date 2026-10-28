@@ -30,6 +30,40 @@ pub async fn grant_repo(db: &PgPool, session: &SessionContext, repo: &str) -> an
     Ok(true)
 }
 
+/// Lets a session push its branch to `repo` and act there with one of the owner's GitHub tokens (ADR 29).
+pub async fn grant_repo_as(
+    db: &PgPool,
+    session: &SessionContext,
+    repo: &str,
+    token: &crate::credentials::CredentialRow,
+) -> anyhow::Result<()> {
+    grant_repo(db, session, repo).await?;
+    let credential = token.id.to_string();
+    let login = token.config("login").unwrap_or_default();
+    db::set_repo_credential(
+        db,
+        session.session_id.parse()?,
+        repo,
+        Some((&credential, login)),
+    )
+    .await?;
+    Ok(())
+}
+
+/// What the agent needs to know to use a repository it now acts on as the user.
+pub fn repo_granted_as(
+    repo: &str,
+    token: &crate::credentials::CredentialRow,
+    session: Uuid,
+) -> String {
+    let login = token.config("login").unwrap_or_default();
+    format!(
+        "On {repo} you act as {login}, with their own GitHub token: git and GitHub's API go out in their name, and so \
+         do your proposals there, so what you push and propose is attributed to them. {}",
+        repo_granted(repo, session)
+    )
+}
+
 /// What the agent needs to know to use a repository it was just given.
 pub fn repo_granted(repo: &str, session: Uuid) -> String {
     let branch = session_branch(session);

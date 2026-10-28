@@ -590,6 +590,29 @@ async function agentScript(session, turn, prompt) {
     return;
   }
 
+  if (/act as me on (\S+)/i.test(prompt)) {
+    const repo = prompt.match(/act as me on (\S+)/i)[1];
+    const reason = "sloppod's GitHub App isn't installed there.";
+    await step(2);
+    const token = credentials.find((c) => c.kind === 'github-user' && c.config.repositories.includes(repo));
+    if (!token) {
+      await say(`None of your GitHub tokens reach **${repo}**, so I can't ask to act as you there.`);
+      return;
+    }
+    const proposal = {
+      id: randomUUID(),
+      session_id: session.data.id,
+      kind: 'sloppod.repo.act_as_owner',
+      status: 'pending',
+      payload: { repo, reason, branch: sessionBranch(session), credential: token.id, login: token.config.login },
+      created_at: now(),
+    };
+    proposals.set(proposal.id, proposal);
+    broadcastProposal(proposal);
+    await say(`I've asked to act as you on **${repo}**. I'll carry on once you approve it.`);
+    return;
+  }
+
   if (!session.data.repo && /request a repository/i.test(prompt)) {
     const repo = availableRepos().at(-1) ?? REPOS.at(-1);
     const reason = 'The change you asked for lives in that repository, and this session has none yet.';
@@ -1500,7 +1523,14 @@ async function handleApi(req, res, url) {
     }
     const proposal = proposals.get(parts[1]);
     if (!proposal) return json(res, 404, { error: 'proposal not found' });
-    if (parts.length === 2 && method === 'GET') return json(res, 200, proposal);
+    if (parts.length === 2 && method === 'GET') {
+      if (proposal.kind !== 'sloppod.repo.act_as_owner') return json(res, 200, proposal);
+      // As the runtime's detail: the tokens the user can pick from.
+      const tokens = credentials
+        .filter((c) => c.kind === 'github-user')
+        .map((c) => ({ id: c.id, name: c.name, login: c.config.login }));
+      return json(res, 200, { ...proposal, tokens });
+    }
     if (parts.length === 3 && parts[2] === 'reviews' && method === 'GET') return json(res, 200, reviews.get(proposal.id) ?? []);
     if (parts.length === 3 && method === 'POST' && (parts[2] === 'approve' || parts[2] === 'reject')) {
       if (proposal.status !== 'pending') return json(res, 409, { error: `proposal is already ${proposal.status}` });
@@ -1570,6 +1600,29 @@ function approve(proposal, body, decidedBy) {
     proposal.result = { issues: filed, failed: [], message: `Filed ${filed.map((i) => `#${i.number}`).join(', ')}.` };
     notice = `Your issues were approved and filed: ${filed.map((i) => i.url).join(', ')}`;
     ack = 'Thanks, the issues are filed.';
+  } else if (proposal.kind === 'sloppod.repo.act_as_owner') {
+    if (typeof body.credential === 'string') proposal.payload.credential = body.credential;
+    const token = credentials.find((c) => c.id === proposal.payload.credential && c.kind === 'github-user');
+    const repo = proposal.payload.repo;
+    if (!token || !token.config.repositories.includes(repo)) {
+      proposal.status = 'failed';
+      proposal.error = `the token doesn't reach ${repo}`;
+      notice = `Your proposal was approved, but carrying it out failed: ${proposal.error}`;
+      ack = 'I see.';
+    } else {
+      proposal.status = 'executed';
+      proposal.result = { login: token.config.login };
+      if (session) {
+        grantRepo(session, repo);
+        const grant = session.data.grants.find((g) => g.capability === 'repo' && g.params.repo === repo);
+        const login = token.config.login;
+        grant.params = { ...grant.params, credential: token.id, as: login };
+        grant.description = `${repo}: read, and push the session branch \`${grant.params.branch}\` and branches named after it, as ${login} (the user's own GitHub token).`;
+        session.broadcast();
+      }
+      notice = `On ${repo} you now act as ${token.config.login}.`;
+      ack = `Thanks, on ${repo} I now act as ${token.config.login}.`;
+    }
   } else if (proposal.kind === 'sloppod.repo.grant') {
     proposal.status = 'executed';
     if (session) grantRepo(session, proposal.payload.repo);
@@ -1633,7 +1686,7 @@ function inspectUserToken(secret) {
   const days = secret.includes('soon') ? 3 : 60;
   return {
     config: {
-      login: 'bo0tzz',
+      login: secret.includes('work') ? 'bo0tzz-work' : 'bo0tzz',
       expires_at: new Date(Date.now() + days * 24 * 3600_000).toISOString(),
       repositories: ['bo0tzz/sloppod', 'bo0tzz/dotfiles'],
       more_repositories: secret.includes('many'),
