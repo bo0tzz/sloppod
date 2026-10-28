@@ -1300,8 +1300,14 @@ pub fn without_agent_credits(text: &str) -> String {
         let line = line.trim().to_ascii_lowercase();
         (line.starts_with("co-authored-by:")
             && (line.contains("anthropic.com") || line.contains("claude")))
-            || line.contains("generated with [claude code]")
-            || line.contains("generated with claude code")
+            || {
+                // The footer alone on its line, with or without its emoji and link; not prose about it.
+                let footer = line.trim_start_matches('🤖').trim_start();
+                footer == "generated with claude code"
+                    || footer == "generated with [claude code]"
+                    || (footer.starts_with("generated with [claude code](")
+                        && footer.ends_with(')'))
+            }
     };
     if !text.lines().any(credit) {
         return text.to_owned();
@@ -2046,7 +2052,10 @@ mod tests {
     fn agents_credits_are_left_out() {
         let text = "Fixes the build.\n\nCo-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n";
         assert_eq!(without_agent_credits(text), "Fixes the build.");
-        let kept = "Co-authored-by: Ada <ada@example.com>\nThanks to Claude Shannon.\n";
+        let plain = "Done.\nGenerated with Claude Code";
+        assert_eq!(without_agent_credits(plain), "Done.");
+        let kept = "Co-authored-by: Ada <ada@example.com>\nThanks to Claude Shannon.\nThe parser rejects files generated with \
+                    Claude Code; steps follow.\n- It drops \"Generated with Claude Code\" lines.\n";
         assert_eq!(without_agent_credits(kept), kept);
         assert_eq!(
             without_agent_credits_in(
