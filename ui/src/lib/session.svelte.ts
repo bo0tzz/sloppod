@@ -18,6 +18,7 @@ import type {
   SessionUpdate,
   StopReason,
 } from './acp/types.ts';
+import { account } from './account.svelte.ts';
 import { api, ApiError, newerProposal, newerSession, type Proposal, type Session } from './api.ts';
 import { loadUnconfirmed, saveUnconfirmed } from './drafts.ts';
 import { sessions } from './sessions.svelte.ts';
@@ -165,6 +166,8 @@ export class SessionView {
     });
     this.steeringSupported = init?._meta?.steering?.supported === true;
 
+    // A reconnect: the runtime may have been redeployed meanwhile.
+    if (this.loaded) account.refresh();
     const rest = this.loaded ? this.refresh() : Promise.resolve();
     this.#replay = new Transcript();
     this.#replayUpdates = [];
