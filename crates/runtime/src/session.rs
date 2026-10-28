@@ -158,8 +158,9 @@ enum Asker {
         request_id: Value,
         agent: Arc<AgentConn>,
     },
-    /// The agent's `ask_user` tool, which returned at once: the answer goes to the agent as a notice.
-    Tool { questions: Value },
+    /// The agent's `ask_user` tool, which returned at once: the answer goes to the agent as a notice. Kept in the
+    /// store under `key` until then.
+    Tool { key: Uuid, questions: Value },
 }
 
 #[derive(Default)]
@@ -799,8 +800,8 @@ impl Hub {
     }
 
     /// Keeps the session's queue in the store as it is now, so a restart doesn't lose it (#39). Called under the
-    /// session's state lock, right after the queue changes.
-    async fn save_queue(&self, id: Uuid, state: &LiveState) {
+    /// session's state lock, right after the queue changes. Says whether it was kept.
+    async fn save_queue(&self, id: Uuid, state: &LiveState) -> bool {
         let stored: Vec<Value> = state
             .in_flight
             .iter()
@@ -813,15 +814,29 @@ impl Hub {
             })
             .chain(state.queue.iter().map(stored))
             .collect();
-        if let Err(e) = self.store.save_queue(id, &stored).await {
-            tracing::warn!(session = %id, error = %e, "keeping the session's queue");
+        match self.store.save_queue(id, &stored).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(session = %id, error = %e, "keeping the session's queue");
+                false
+            }
         }
     }
 
     /// Keeps `batch` in the stored queue while it's on its way to the agent; under the state lock.
     async fn hold(&self, id: Uuid, state: &mut LiveState, batch: &[Queued]) -> Option<Uuid> {
+        self.hold_kept(id, state, batch).await.0
+    }
+
+    /// Like `hold`, and says whether the stored queue was kept.
+    async fn hold_kept(
+        &self,
+        id: Uuid,
+        state: &mut LiveState,
+        batch: &[Queued],
+    ) -> (Option<Uuid>, bool) {
         if batch.is_empty() {
-            return None;
+            return (None, true);
         }
         let key = Uuid::new_v4();
         state.in_flight.push(Held {
@@ -830,8 +845,8 @@ impl Hub {
             restored: false,
             stored: batch.iter().map(stored).collect(),
         });
-        self.save_queue(id, state).await;
-        Some(key)
+        let kept = self.save_queue(id, state).await;
+        (Some(key), kept)
     }
 
     /// A held batch was sent as `request`.
@@ -1221,10 +1236,18 @@ impl Hub {
         );
         match permission.asker {
             Asker::Agent { request_id, agent } => agent.respond(request_id, result),
-            Asker::Tool { questions } => {
+            Asker::Tool { key, questions } => {
                 let answer = result.unwrap_or_else(|_| json!({"action": "cancel"}));
-                self.notify(id, crate::questions::answer_text(&questions, &answer))
+                // The notice is kept until it reaches the agent, so the question can go once that's stored. If it
+                // couldn't be, the question stays stored and comes back after a restart rather than both being lost.
+                let kept = self
+                    .notify(id, crate::questions::answer_text(&questions, &answer))
                     .await;
+                if !kept {
+                    tracing::warn!(session = %id, "keeping an answered question, as its answer couldn't be stored");
+                } else if let Err(e) = self.store.forget_question(key).await {
+                    tracing::warn!(session = %id, error = %e, "forgetting an answered question");
+                }
             }
         }
         self.broadcast(
@@ -1556,9 +1579,10 @@ impl Hub {
     }
 
     /// Tells the agent something: a new turn when it's idle, steered into the running one, or queued until it's
-    /// up. Kept in the stored queue until it reaches the agent, so a restart doesn't lose it (#237).
-    pub async fn notify(self: &Arc<Self>, id: Uuid, text: String) {
-        self.notify_summarised(id, text, None).await;
+    /// up. Kept in the stored queue until it reaches the agent, so a restart doesn't lose it (#237); says whether
+    /// it was kept.
+    pub async fn notify(self: &Arc<Self>, id: Uuid, text: String) -> bool {
+        self.notify_summarised(id, text, None).await
     }
 
     /// A notice the UI shows folded as `summary`, e.g. a message from another session; the agent gets all of it.
@@ -1567,28 +1591,28 @@ impl Hub {
         id: Uuid,
         text: String,
         summary: Option<String>,
-    ) {
+    ) -> bool {
         let notice = notice_queued(&text);
         let blocks = notice.blocks.clone();
-        let delivery = {
+        let (delivery, kept) = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
             let up = state.agent.is_some() && state.agent_session_id.is_some();
             if !up || (state.limited_until.is_some() && !state.turn_running) {
                 state.queue.push(notice);
-                self.save_queue(id, &state).await;
-                Delivery::Queued
+                let kept = self.save_queue(id, &state).await;
+                (Delivery::Queued, kept)
             } else if state.turn_running {
-                let held = self
-                    .hold(id, &mut state, std::slice::from_ref(&notice))
+                let (held, kept) = self
+                    .hold_kept(id, &mut state, std::slice::from_ref(&notice))
                     .await;
-                Delivery::Steer(held)
+                (Delivery::Steer(held), kept)
             } else {
                 state.turn_running = true;
-                let held = self
-                    .hold(id, &mut state, std::slice::from_ref(&notice))
+                let (held, kept) = self
+                    .hold_kept(id, &mut state, std::slice::from_ref(&notice))
                     .await;
-                Delivery::Turn(state.agent.clone(), notice, held)
+                (Delivery::Turn(state.agent.clone(), notice, held), kept)
             }
         };
         self.record_notice(id, &blocks[0], summary.as_deref()).await;
@@ -1611,6 +1635,7 @@ impl Hub {
                 });
             }
         }
+        kept
     }
 
     /// Shows a notice in the session's log as a message to the agent.
@@ -1832,6 +1857,28 @@ impl Hub {
     /// as a notice.
     pub async fn ask(&self, id: Uuid, questions: Value) -> Result<(), String> {
         let params = crate::questions::elicitation(&questions, &id.to_string())?;
+        let key = Uuid::new_v4();
+        self.store
+            .save_question(id, key, &questions)
+            .await
+            .map_err(|e| format!("couldn't keep the question: {e}"))?;
+        self.show_question(id, key, questions, params).await;
+        Ok(())
+    }
+
+    /// Shows the questions a restart left unanswered again (#39). On an error reading them it shows none, for the
+    /// caller to try again.
+    pub async fn restore_questions(&self) -> sqlx::Result<()> {
+        for (id, key, questions) in self.store.questions().await? {
+            match crate::questions::elicitation(&questions, &id.to_string()) {
+                Ok(params) => self.show_question(id, key, questions, params).await,
+                Err(e) => tracing::warn!(session = %id, error = %e, "restoring a question"),
+            }
+        }
+        Ok(())
+    }
+
+    async fn show_question(&self, id: Uuid, key: Uuid, questions: Value, params: Value) {
         let pid = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
@@ -1842,7 +1889,7 @@ impl Hub {
                 Permission {
                     method: "elicitation/create".into(),
                     params: params.clone(),
-                    asker: Asker::Tool { questions },
+                    asker: Asker::Tool { key, questions },
                 },
             );
             pid
@@ -1855,7 +1902,6 @@ impl Hub {
                 params,
             },
         );
-        Ok(())
     }
 
     pub async fn turn_running(&self, id: Uuid) -> bool {

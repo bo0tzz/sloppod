@@ -398,6 +398,10 @@ async fn reconcile(state: &AppState) {
     // before anything that can queue a notice, which would otherwise replace the kept queue before it's read.
     // Nothing is listening yet, so nothing can queue a message or answer a question until this is done.
     until_done("restoring queued messages", || state.hub.restore_queues()).await;
+    until_done("restoring unanswered questions", || {
+        state.hub.restore_questions()
+    })
+    .await;
     state.hub.resume_limits(limited);
     proposals::resume_approved(state).await;
     reviews::resume_round_watches(state).await;

@@ -494,6 +494,17 @@ async fn a_purge_claim_wins_over_restoring_and_is_retried_until_done(db: PgPool)
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_question_is_kept_until_forgotten(db: PgPool) {
+    let s = session(&db, "dev").await;
+    let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+    let questions = json!([{"question": "Which?"}]);
+    db::save_question(&db, s, first, &questions).await.unwrap();
+    db::save_question(&db, s, second, &questions).await.unwrap();
+    db::forget_question(&db, first).await.unwrap();
+    assert_eq!(db::questions(&db).await.unwrap(), [(s, second, questions)]);
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
 async fn a_queue_is_kept_until_emptied(db: PgPool) {
     let s = session(&db, "dev").await;
     let queue = [json!({"id": null, "blocks": [{"type": "text", "text": "hi"}]})];
