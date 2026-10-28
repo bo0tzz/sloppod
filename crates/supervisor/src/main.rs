@@ -19,6 +19,7 @@ use futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use sloppod_protocol::link::{
     AgentReady, FromSupervisor, Launch, PATH, RUNTIME_INFO, RunningAgent, ToSupervisor,
+    TranscriptRef,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::TcpStream;
@@ -241,6 +242,7 @@ async fn run(
             version: env!("CARGO_PKG_VERSION").to_owned(),
             agent: agent.as_ref().and_then(Agent::running),
             local_proxy: LOCAL_PROXY_UP.load(std::sync::atomic::Ordering::SeqCst),
+            fetch_transcript: true,
         },
     )
     .await?;
@@ -449,7 +451,12 @@ async fn launch_agent(
         open: HashMap::new(),
         waiting: HashMap::new(),
         unsent: None,
-        synced: HashMap::new(),
+        // The runtime has these already: what's synced from them is what's appended.
+        synced: launch
+            .transcript_files
+            .iter()
+            .map(|f| (f.name.clone(), f.len))
+            .collect(),
     })
 }
 
@@ -470,6 +477,43 @@ async fn stop(child: &mut Child) {
     let _ = child.kill().await;
 }
 
+/// Fetches a transcript file from the runtime into `path`, through a partial file so a fetch cut off midway isn't
+/// taken for the whole file next time.
+/// Where the runtime serves a transcript file; the name is one path segment, whatever it contains.
+fn transcript_url(base: &str, name: &str) -> anyhow::Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(base)?;
+    url.path_segments_mut()
+        .map_err(|()| anyhow::anyhow!("the runtime URL {base} can't have a path"))?
+        .pop_if_empty()
+        .extend(
+            sloppod_protocol::link::TRANSCRIPT_PATH
+                .split('/')
+                .filter(|s| !s.is_empty()),
+        )
+        .push(name);
+    Ok(url)
+}
+
+async fn fetch_transcript(args: &Args, name: &str, path: &Path) -> anyhow::Result<()> {
+    let token = std::fs::read_to_string(&args.token_file).context("reading the pod's token")?;
+    let mut response = reqwest::Client::new()
+        .get(transcript_url(&args.url, name)?)
+        .bearer_auth(token.trim())
+        .send()
+        .await?
+        .error_for_status()
+        .with_context(|| format!("fetching the transcript file {name}"))?;
+    let partial = path.with_extension("jsonl.partial");
+    let mut file = tokio::fs::File::create(&partial).await?;
+    while let Some(chunk) = response.chunk().await? {
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    drop(file);
+    tokio::fs::rename(&partial, path).await?;
+    Ok(())
+}
+
 /// Where to sync a transcript file of `len` bytes from, given how much the runtime has; `None` when it's up to date.
 /// A file that shrank (or one the runtime has none of) is sent whole.
 fn sync_from(len: u64, synced: Option<u64>) -> Option<u64> {
@@ -482,6 +526,18 @@ fn sync_from(len: u64, synced: Option<u64>) -> Option<u64> {
 
 /// Sends the runtime what was appended to each transcript file since the last sync (ADR 1). It stops at the first
 /// send that fails, since the link is gone then.
+/// The most of a transcript file one sync message carries.
+const SYNC_CHUNK: usize = 4 << 20;
+
+/// What's to sync, in pieces, so a file sent whole isn't one message the size of the file. Nothing to send is still
+/// one piece: a file that became empty replaces the runtime's copy with nothing.
+fn sync_pieces(content: &[u8]) -> Vec<&[u8]> {
+    if content.is_empty() {
+        return vec![content];
+    }
+    content.chunks(SYNC_CHUNK).collect()
+}
+
 async fn sync_transcript(dir: &str, synced: &mut HashMap<String, u64>, sink: &mut Sink) {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return;
@@ -498,16 +554,27 @@ async fn sync_transcript(dir: &str, synced: &mut HashMap<String, u64>, sink: &mu
         let Some((offset, content)) = appended else {
             continue;
         };
-        let message = FromSupervisor::TranscriptAppend {
-            name: name.clone(),
-            offset,
-            content_b64: base64::engine::general_purpose::STANDARD.encode(&content),
-        };
-        if let Err(e) = send(sink, &message).await {
-            tracing::warn!(error = %e, file = %name, "syncing the transcript failed");
-            return;
+        let pieces = sync_pieces(&content);
+        // A replacement counts as synced only once all of it is sent; one cut off is sent whole again.
+        let replacing = offset == 0 && pieces.len() > 1;
+        let mut sent = offset;
+        for piece in pieces {
+            let message = FromSupervisor::TranscriptAppend {
+                name: name.clone(),
+                offset: sent,
+                content_b64: base64::engine::general_purpose::STANDARD.encode(piece),
+                replaces: (replacing && sent == 0).then_some(content.len() as u64),
+            };
+            if let Err(e) = send(sink, &message).await {
+                tracing::warn!(error = %e, file = %name, "syncing the transcript failed");
+                return;
+            }
+            sent += piece.len() as u64;
+            if !replacing {
+                synced.insert(name.clone(), sent);
+            }
         }
-        synced.insert(name, offset + content.len() as u64);
+        synced.insert(name, sent);
     }
 }
 
@@ -639,6 +706,18 @@ async fn prepare(
             let content = base64::engine::general_purpose::STANDARD.decode(&file.content_b64)?;
             write_file(&path, &content)?;
             tracing::info!(file = %file.name, "restored transcript");
+        }
+    }
+
+    for TranscriptRef { name, .. } in &launch.transcript_files {
+        if !sloppod_protocol::link::is_transcript_file_name(name) {
+            tracing::warn!(file = %name, "not restoring a transcript file with that name");
+            continue;
+        }
+        let path = Path::new(&launch.transcript_dir).join(name);
+        if !path.exists() {
+            fetch_transcript(args, name, &path).await?;
+            tracing::info!(file = %name, "restored transcript");
         }
     }
 
@@ -781,6 +860,28 @@ async fn run_cmd(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_sync_goes_in_bounded_pieces_and_an_empty_file_still_syncs() {
+        let big = vec![b'x'; SYNC_CHUNK * 2 + 1];
+        let lens: Vec<usize> = sync_pieces(&big).iter().map(|p| p.len()).collect();
+        assert_eq!(lens, [SYNC_CHUNK, SYNC_CHUNK, 1]);
+        assert_eq!(sync_pieces(b""), [b"" as &[u8]]);
+    }
+
+    #[test]
+    fn a_transcript_name_is_one_path_segment() {
+        for (name, path) in [
+            ("a.jsonl", "/link/v1/transcript/a.jsonl"),
+            ("a#b.jsonl", "/link/v1/transcript/a%23b.jsonl"),
+            ("a?b.jsonl", "/link/v1/transcript/a%3Fb.jsonl"),
+            ("a%b.jsonl", "/link/v1/transcript/a%25b.jsonl"),
+        ] {
+            let url = transcript_url("http://sloppod:8080/", name).unwrap();
+            assert_eq!(url.path(), path, "{name}");
+            assert_eq!((url.query(), url.fragment()), (None, None));
+        }
+    }
+
     use super::*;
     use serde_json::json;
 
