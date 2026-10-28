@@ -503,8 +503,9 @@ test('says what the pod is doing while the agent starts, and why a start failed'
   await expect(activity).toHaveText('Cloning https://github.com/bo0tzz/sloppod.git…');
 
   // The failure is in the transcript, and the session says it's trying again.
-  const failure = page.getByRole('alert').filter({ hasText: "The session's pod couldn't start the agent" });
-  await expect(failure).toContainText('git clone exited with status 128');
+  const failure = page.getByText("The session's pod couldn't start the agent");
+  await expect(failure).toBeVisible();
+  await expect(page.getByText('preparing the pod: git clone exited with status 128')).toBeVisible();
   await expect(activity).toHaveText('Starting the agent again…');
 
   // The next start works; the failure stays in the transcript.
