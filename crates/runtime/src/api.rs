@@ -8,14 +8,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use serde::Deserialize;
 use serde_json::json;
-use sloppod_contracts::capability;
-use sloppod_contracts::{Grant, READ_WRITE, find_repo};
+use sloppod_contracts::{Grant, find_repo};
 use sloppod_protocol::api::{
     Decision, NewCredential, NewSession, NewStandingApproval, ProposalStatus, ReviewPolicy,
 };
 use uuid::Uuid;
 
-use crate::credentials::CHATGPT;
 use crate::proposals::{self, DecideError, Verdict};
 use crate::session::ParkError;
 use crate::users::User;
@@ -26,6 +24,7 @@ pub fn routes() -> Router<AppState> {
         .route("/me", get(me))
         .route("/settings", get(get_settings).put(put_settings))
         .route("/sessions", get(list_sessions).post(create_session))
+        .route("/sessions/suggest", post(suggest_session))
         .route("/sessions/{id}", get(get_session).delete(delete_session))
         .route("/sessions/{id}/repos", post(add_repo))
         .route("/sessions/{id}/grants", post(add_grant))
@@ -468,7 +467,7 @@ async fn revoke_grant(
     Ok(Json(session.to_api()))
 }
 
-async fn accessible_repos(state: &AppState, user: &str) -> Vec<String> {
+pub(crate) async fn accessible_repos(state: &AppState, user: &str) -> Vec<String> {
     let Ok(app) = state.credentials.github(user).await else {
         return Vec::new();
     };
@@ -496,7 +495,7 @@ pub(crate) fn default_title(prompt: &str) -> String {
 
 /// The repository a first message is about: one named as `owner/name`, or a bare name that matches exactly
 /// one accessible repository. Sessions don't need one (ADR 1).
-fn derive_repo(prompt: &str, repos: &[String]) -> Option<String> {
+pub(crate) fn derive_repo(prompt: &str, repos: &[String]) -> Option<String> {
     let text = prompt.to_lowercase();
     let words: Vec<&str> = text
         .split(|c: char| !(c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/')))
@@ -550,32 +549,30 @@ async fn create_session(
         ));
     }
     let repos = accessible_repos(&state, &user).await;
-    let repo =
-        match &new.repo {
-            Some(wanted) => Some(find_repo(&repos, wanted.trim()).cloned().ok_or_else(|| {
+    let repo = match &new.repo {
+        Some(None) => None,
+        Some(Some(wanted)) => {
+            Some(find_repo(&repos, wanted.trim()).cloned().ok_or_else(|| {
                 bad_request(format!("{wanted} isn't accessible to your GitHub App"))
-            })?),
-            None => derive_repo(prompt, &repos),
-        };
+            })?)
+        }
+        None => derive_repo(prompt, &repos),
+    };
 
     let id = Uuid::new_v4();
-    let mut grants = vec![
-        Grant::new(capability::MODEL, json!({})),
-        Grant::new(capability::GITHUB, json!({})),
-        Grant::new(capability::PACKAGES, json!({})),
-        Grant::new(capability::DOCS, json!({})),
-    ];
-    if state.credentials.has_default(&user, CHATGPT).await? {
-        grants.push(Grant::new(capability::CODEX, json!({})));
-    }
-    if let Some(repo) = &repo {
-        let branch = proposals::session_branch(id);
-        grants.push(Grant::new(
-            capability::REPO,
-            json!({"repo": repo, "access": READ_WRITE, "branch": branch}),
-        ));
-    }
-    let model = db::user_model(&state.db, &user).await?;
+    let defaults = crate::starting::defaults(&state, &user).await?;
+    let grants =
+        crate::starting::grants(&defaults, new.capabilities.as_deref(), repo.as_deref(), id)
+            .map_err(bad_request)?;
+    let model = match new
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        Some(model) => Some(model.to_owned()),
+        None => db::user_model(&state.db, &user).await?,
+    };
     let review = db::user_review(&state.db, &user).await?;
     let custom = new
         .title
@@ -604,6 +601,22 @@ async fn create_session(
     .await
     .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok((StatusCode::CREATED, Json(row.to_api())))
+}
+
+#[derive(Deserialize)]
+struct Draft {
+    prompt: String,
+}
+
+/// The starting set suggested for a first message as it's written (#232): `{title, repo, capabilities, source}`.
+async fn suggest_session(
+    State(state): State<AppState>,
+    User(user): User,
+    Json(draft): Json<Draft>,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(
+        crate::starting::suggest(&state, &user, &draft.prompt).await?,
+    ))
 }
 
 async fn delete_session(

@@ -13,6 +13,7 @@ All bodies are JSON. Errors are `{"error": "<message>"}` with a 4xx/5xx status.
 ```
 GET    /api/v1/sessions             -> Session[]   (most recently active first)
 POST   /api/v1/sessions             -> Session     body: NewSession
+POST   /api/v1/sessions/suggest     -> StartingSet body: {prompt}; the starting set suggested for a first message as it's written (#232)
 GET    /api/v1/sessions/{id}        -> Session
 DELETE /api/v1/sessions/{id}        -> 204         parks the session (cancelling its turn) and marks it deleted, and its sub-sessions at any depth with it, including any restored below one already deleted; restorable for 7 days, then purged with its pod, volume and keys
 GET    /api/v1/sessions/deleted     -> Session[]   deleted sessions not purged yet, most recently deleted first
@@ -49,9 +50,20 @@ A session starts from its first message: the UI opens an empty chat, and sending
 ```ts
 type NewSession = {
   prompt: string;        // the first message; recorded right away and sent once the agent is up
-  repo?: string;         // "owner/name"; derived from the prompt when absent
+  repo?: string | null;  // "owner/name"; derived from the prompt when absent; null for none (e.g. a suggested one the user cleared)
   title?: string;        // kept as given; without one, the agent's automatic title is used
   agent?: string;        // the agent to run: "claude-code" (the default) or "codex"
+  capabilities?: string[]; // what it starts with, from "github", "packages", "docs" and, with a ChatGPT login, "codex"; all of them when absent. Model access always comes, memory with the user's memini, and "github" with a repository. 400 for anything else
+  model?: string;        // instead of the user's default model
+};
+
+// A suggested starting set (ADR 2, #232). Advisory: the UI shows it as a card the user edits, and sends what the
+// card says with POST /api/v1/sessions, which checks it again.
+type StartingSet = {
+  title: string;
+  repo: string | null;   // one the user's GitHub App reaches, as GitHub spells it, or none
+  capabilities: string[];
+  source: "judgement" | "match"; // a judgement (ADR 26) made it, or matching the message's words did (the fallback)
 };
 
 type Session = {

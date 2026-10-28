@@ -138,10 +138,12 @@ async fn main() -> anyhow::Result<()> {
             agent,
         } => {
             let body = NewSession {
-                repo,
+                repo: repo.map(Some),
                 title,
                 prompt,
                 agent,
+                capabilities: None,
+                model: None,
             };
             let session: Session = serde_json::from_value(
                 check(

@@ -10,14 +10,33 @@ pub mod api {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct NewSession {
         pub prompt: String,
-        /// Derived from the prompt when absent; a session may have no repository at all.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub repo: Option<String>,
+        /// Derived from the prompt when absent; `null` for none, e.g. when the user cleared a suggested one (#232).
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "present"
+        )]
+        pub repo: Option<Option<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub title: Option<String>,
         /// The agent to run, e.g. `claude-code` (the default) or `codex`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub agent: Option<String>,
+        /// The capabilities it starts with, from the defaults (#232); all of them when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub capabilities: Option<Vec<String>>,
+        /// The model to run, instead of the user's default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub model: Option<String>,
+    }
+
+    /// Tells a field that's `null` (`Some(None)`) from one that's absent (`None`, with `#[serde(default)]`).
+    fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+        T: Deserialize<'de>,
+    {
+        T::deserialize(deserializer).map(Some)
     }
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -561,5 +580,29 @@ mod transcript_name_tests {
         ] {
             assert!(!is_transcript_file_name(refused), "{refused}");
         }
+    }
+}
+
+#[cfg(test)]
+mod new_session_tests {
+    use super::api::NewSession;
+
+    #[test]
+    fn no_repository_is_told_from_one_left_to_be_found() {
+        let parse = |json: &str| serde_json::from_str::<NewSession>(json).unwrap().repo;
+        assert_eq!(
+            parse(r#"{"prompt": "Fix sloppod"}"#),
+            None,
+            "absent: found from the message"
+        );
+        assert_eq!(
+            parse(r#"{"prompt": "Fix sloppod", "repo": null}"#),
+            Some(None),
+            "null: none"
+        );
+        assert_eq!(
+            parse(r#"{"prompt": "Fix it", "repo": "o/r"}"#),
+            Some(Some("o/r".to_owned()))
+        );
     }
 }
