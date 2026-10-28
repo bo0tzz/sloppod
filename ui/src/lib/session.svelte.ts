@@ -379,6 +379,16 @@ export class SessionView {
     return this.#conn.request('_sloppod/steer_queued', { sessionId: this.id, id });
   }
 
+  /** Takes a queued message out of the queue without running it; resolves with what it held. */
+  async removeQueued(id: string): Promise<ContentBlock[]> {
+    const { prompt } = await this.#conn.request<{ prompt: ContentBlock[] }>('_sloppod/remove_queued', {
+      sessionId: this.id,
+      id,
+    });
+    this.#doneSending(id);
+    return prompt;
+  }
+
   /**
    * Stops the turn. The runtime answers the turn's open requests as cancelled and tells every UI they're resolved;
    * questions asked with `ask_user` aren't the turn's, so they stay open.

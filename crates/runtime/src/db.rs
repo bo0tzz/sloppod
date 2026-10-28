@@ -579,6 +579,30 @@ pub async fn has_message(db: &PgPool, id: Uuid, message_id: Uuid) -> sqlx::Resul
     .await
 }
 
+/// Notes that the user took the message with this id back out of the session's queue.
+pub async fn remove_message(db: &PgPool, id: Uuid, message_id: Uuid) -> sqlx::Result<()> {
+    sqlx::query(
+        "insert into session_removed_messages (session_id, message_id) values ($1, $2) \
+         on conflict do nothing",
+    )
+    .bind(id)
+    .bind(message_id)
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
+/// Whether the user took the message with this id back out of the session's queue.
+pub async fn message_removed(db: &PgPool, id: Uuid, message_id: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "select exists(select 1 from session_removed_messages where session_id = $1 and message_id = $2)",
+    )
+    .bind(id)
+    .bind(message_id)
+    .fetch_one(db)
+    .await
+}
+
 /// The text of the session's first message, e.g. a sub-session's task.
 pub async fn first_message(db: &PgPool, id: Uuid) -> sqlx::Result<Option<String>> {
     sqlx::query_scalar(

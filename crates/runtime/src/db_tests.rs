@@ -504,6 +504,17 @@ async fn a_queue_is_kept_until_emptied(db: PgPool) {
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
+async fn remembers_messages_taken_back_per_session(db: PgPool) {
+    let (s, other) = (session(&db, "dev").await, session(&db, "dev").await);
+    let message = Uuid::new_v4();
+    assert!(!db::message_removed(&db, s, message).await.unwrap());
+    db::remove_message(&db, s, message).await.unwrap();
+    db::remove_message(&db, s, message).await.unwrap();
+    assert!(db::message_removed(&db, s, message).await.unwrap());
+    assert!(!db::message_removed(&db, other, message).await.unwrap());
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
 async fn finds_stacks_set_to_merge(db: PgPool) {
     let s = session(&db, "dev").await;
     let mut ids = Vec::new();

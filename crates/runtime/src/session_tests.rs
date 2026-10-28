@@ -2,6 +2,7 @@
 //! agent and record in the session's log.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -266,6 +267,64 @@ async fn a_queued_message_can_be_steered_into_the_turn() {
         .await;
     first.await.unwrap().unwrap();
     assert_eq!(h.phase().await, "idle");
+}
+
+#[tokio::test]
+async fn a_queued_message_can_be_taken_back() {
+    let mut h = Harness::ready().await;
+    let first = h.prompt("First");
+    let first_request = h.next().await;
+    let kept = h.prompt("Kept");
+    wait_for_queue(&h, 1).await;
+    let taken = h.prompt("Taken back");
+    let queued = wait_for_queue(&h, 2).await;
+
+    let removed = h
+        .hub
+        .remove_queued(h.id, json!({"id": queued[1]}))
+        .await
+        .unwrap();
+    assert_eq!(removed["prompt"][0]["text"], "Taken back");
+    assert_eq!(taken.await.unwrap().unwrap()["stopReason"], "cancelled");
+    assert_eq!(h.queued().await, [queued[0].clone()]);
+    let stored = h.store.queues().await.unwrap();
+    let texts: Vec<&str> = stored[0]
+        .1
+        .iter()
+        .filter_map(|m| m["blocks"][0]["text"].as_str())
+        .collect();
+    assert_eq!(texts, ["Kept"]);
+    assert!(
+        h.hub
+            .remove_queued(h.id, json!({"id": queued[1]}))
+            .await
+            .is_err()
+    );
+    // A UI that didn't hear it was taken back sends it again; it doesn't run.
+    let resent = h
+        .hub
+        .prompt(
+            h.id,
+            json!({"sessionId": h.id, "prompt": [{"type": "text", "text": "Taken back"}],
+                "_meta": {"sloppod": {"messageId": queued[1]}}}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resent["stopReason"], "cancelled");
+    assert_eq!(h.queued().await, [queued[0].clone()]);
+
+    // It never runs; the rest of the queue still does.
+    h.respond(&first_request, json!({"stopReason": "end_turn"}))
+        .await;
+    first.await.unwrap().unwrap();
+    let next = h.next().await;
+    assert_eq!(prompt_text(&next), ["Kept"]);
+    h.respond(&next, json!({"stopReason": "end_turn"})).await;
+    kept.await.unwrap().unwrap();
+    assert_eq!(
+        h.user_messages(),
+        [("First".to_owned(), false), ("Kept".to_owned(), false)]
+    );
 }
 
 #[tokio::test]
@@ -1446,13 +1505,111 @@ async fn a_queue_kept_before_a_restart_runs_once_the_agent_is_up() {
         )
         .await
         .unwrap();
-    h.hub.restore_queues().await;
+    h.hub.restore_queues().await.unwrap();
     h.agent_ready().await;
     let restored = next_prompt(&mut h.to_agent).await;
     assert_eq!(prompt_text(&restored), ["Sent before the restart"]);
     h.respond(&restored, json!({"stopReason": "end_turn"}))
         .await;
     wait_until_nothing_kept(&h).await;
+}
+
+#[tokio::test]
+async fn a_message_taken_back_before_a_restart_does_not_run_from_the_kept_queue() {
+    // Taken back, but the restart came before the queue was saved without it.
+    let mut h = Harness::starting().await;
+    let (taken, kept) = (Uuid::new_v4(), Uuid::new_v4());
+    h.store
+        .save_queue(
+            h.id,
+            &[
+                json!({"id": taken, "blocks": [{"type": "text", "text": "Taken back"}]}),
+                json!({"id": kept, "blocks": [{"type": "text", "text": "Kept"}]}),
+            ],
+        )
+        .await
+        .unwrap();
+    h.store.remove_message(h.id, taken).await.unwrap();
+    h.hub.restore_queues().await.unwrap();
+    assert_eq!(h.queued().await, [kept.to_string()]);
+    h.agent_ready().await;
+    let restored = next_prompt(&mut h.to_agent).await;
+    assert_eq!(prompt_text(&restored), ["Kept"]);
+}
+
+#[tokio::test]
+async fn a_message_sent_again_while_it_is_taken_back_does_not_run() {
+    let mut h = Harness::ready().await;
+    let _first = h.prompt("First");
+    h.next().await;
+    let _taken = h.prompt("Taken back");
+    let qid = wait_for_queue(&h, 1).await.remove(0);
+
+    // The removal holds the session while it notes the message was taken back; the resend comes in meanwhile.
+    h.store.gate_removals.store(true, Ordering::SeqCst);
+    let (hub, id, removed_id) = (h.hub.clone(), h.id, qid.clone());
+    let removal =
+        tokio::spawn(async move { hub.remove_queued(id, json!({"id": removed_id})).await });
+    h.store.removal_started.notified().await;
+    let (hub, id) = (h.hub.clone(), h.id);
+    let resend = tokio::spawn(async move {
+        hub.prompt(
+            id,
+            json!({"sessionId": id, "prompt": [{"type": "text", "text": "Taken back"}],
+                "_meta": {"sloppod": {"messageId": qid}}}),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    h.store.removals_released.notify_one();
+    removal.await.unwrap().unwrap();
+    let resent = tokio::time::timeout(Duration::from_secs(2), resend)
+        .await
+        .expect("the resend is answered")
+        .unwrap()
+        .unwrap();
+    assert_eq!(resent["stopReason"], "cancelled");
+    assert!(h.queued().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_restore_that_cannot_read_removals_changes_nothing_until_it_can() {
+    let mut h = Harness::starting().await;
+    let (taken, kept) = (Uuid::new_v4(), Uuid::new_v4());
+    let queue = [
+        json!({"id": taken, "blocks": [{"type": "text", "text": "Taken back"}]}),
+        json!({"id": kept, "blocks": [{"type": "text", "text": "Kept"}]}),
+    ];
+    h.store.save_queue(h.id, &queue).await.unwrap();
+    h.store.remove_message(h.id, taken).await.unwrap();
+    h.store.fail_removal_lookups.store(true, Ordering::SeqCst);
+    assert!(h.hub.restore_queues().await.is_err());
+    assert!(h.queued().await.is_empty());
+    assert_eq!(h.store.queues().await.unwrap(), [(h.id, queue.to_vec())]);
+
+    // Tried again once it can be read: the one taken back is dropped and the other runs.
+    h.store.fail_removal_lookups.store(false, Ordering::SeqCst);
+    h.hub.restore_queues().await.unwrap();
+    assert_eq!(h.queued().await, [kept.to_string()]);
+    h.agent_ready().await;
+    assert_eq!(prompt_text(&next_prompt(&mut h.to_agent).await), ["Kept"]);
+}
+
+#[tokio::test]
+async fn a_message_taken_back_before_a_restart_leaves_nothing_kept() {
+    let h = Harness::starting().await;
+    let taken = Uuid::new_v4();
+    h.store
+        .save_queue(
+            h.id,
+            &[json!({"id": taken, "blocks": [{"type": "text", "text": "Taken back"}]})],
+        )
+        .await
+        .unwrap();
+    h.store.remove_message(h.id, taken).await.unwrap();
+    h.hub.restore_queues().await.unwrap();
+    assert!(h.queued().await.is_empty());
+    assert!(h.store.queues().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1488,7 +1645,7 @@ async fn a_notice_after_a_restore_joins_the_kept_queue() {
         )
         .await
         .unwrap();
-    h.hub.restore_queues().await;
+    h.hub.restore_queues().await.unwrap();
     h.hub.clone().notify(h.id, "A notice".into()).await;
     let kept = h.store.queues().await.unwrap();
     let texts: Vec<&str> = kept[0]
@@ -1564,7 +1721,7 @@ async fn restarted(
     let (tx, to_agent) = mpsc::unbounded_channel();
     let agent = Arc::new(AgentConn::new(tx));
     hub.attach_agent(h.id, agent.clone()).await;
-    hub.restore_queues().await;
+    hub.restore_queues().await.unwrap();
     (hub, agent, to_agent)
 }
 
@@ -1578,6 +1735,32 @@ fn running(open: Vec<Value>) -> RunningAgent {
         open,
         waiting: Vec::new(),
     }
+}
+
+#[tokio::test]
+async fn a_message_taken_back_does_not_run_when_sent_again_after_a_restart() {
+    let mut h = Harness::ready().await;
+    let _first = h.prompt("First");
+    h.next().await;
+    let _taken = h.prompt("Taken back");
+    let queued = wait_for_queue(&h, 1).await;
+    h.hub
+        .remove_queued(h.id, json!({"id": queued[0]}))
+        .await
+        .unwrap();
+
+    // The UI never heard, and sends it again to the restarted runtime.
+    let (hub, _agent, _to_agent) = restarted(&h).await;
+    let resent = hub
+        .prompt(
+            h.id,
+            json!({"sessionId": h.id, "prompt": [{"type": "text", "text": "Taken back"}],
+                "_meta": {"sloppod": {"messageId": queued[0]}}}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resent["stopReason"], "cancelled");
+    assert!(h.store.queues().await.unwrap().is_empty());
 }
 
 #[tokio::test]
