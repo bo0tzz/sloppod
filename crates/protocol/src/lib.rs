@@ -112,6 +112,8 @@ pub mod api {
             Work = "work",
             /// It reviews another session's proposal (ADR 24).
             Review = "review",
+            /// An owner's own, for the runtime's judgements (ADR 26); its agent isn't prompted.
+            Utility = "utility",
         }
     }
 

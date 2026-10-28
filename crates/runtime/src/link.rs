@@ -487,6 +487,7 @@ pub async fn agent_context(
         instructions: match session.kind {
             SessionKind::Review => Some(crate::reviews::INSTRUCTIONS.to_owned()),
             SessionKind::Work => state.instructions.clone(),
+            SessionKind::Utility => None,
         },
         model: session.model.clone(),
         memory,

@@ -578,6 +578,34 @@ async fn a_command_run_in_the_pod_gets_its_own_result() {
 }
 
 #[tokio::test]
+async fn a_turn_that_ends_well_is_handed_on_for_checking() {
+    let mut h = Harness::ready().await;
+    let (tx, mut ended) = mpsc::unbounded_channel();
+    h.hub.set_turn_ended(Arc::new(move |id| {
+        let tx = tx.clone();
+        Box::pin(async move {
+            let _ = tx.send(id);
+        })
+    }));
+    let turn = h.prompt("Fine");
+    let request = h.next().await;
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+    let id = tokio::time::timeout(Duration::from_secs(5), ended.recv())
+        .await
+        .unwrap();
+    assert_eq!(id, Some(h.id));
+
+    // One that fails isn't.
+    let _failed = h.prompt("Fails");
+    let request = h.next().await;
+    let error = json!({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32603, "message": "upstream 503"}});
+    from_agent(&h.hub, h.id, &h.agent, error).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(ended.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn a_notice_waits_for_the_agent_to_be_up() {
     let mut h = Harness::starting().await;
     h.hub

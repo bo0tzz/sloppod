@@ -128,9 +128,13 @@ pub enum ParkError {
 pub type Waker =
     Arc<dyn Fn(Uuid) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync>;
 
+/// Called when a turn the hub sent ends well, e.g. to check what it ended on (ADR 26).
+pub type TurnEnded = Arc<dyn Fn(Uuid) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 pub struct Hub {
     store: Arc<dyn SessionStore>,
     waker: StdMutex<Option<Waker>>,
+    turn_ended: StdMutex<Option<TurnEnded>>,
     sessions: StdMutex<HashMap<Uuid, Arc<Live>>>,
     agent_capabilities: StdMutex<Option<Value>>,
 }
@@ -159,6 +163,7 @@ impl Hub {
         Self {
             store,
             waker: StdMutex::default(),
+            turn_ended: StdMutex::default(),
             sessions: StdMutex::default(),
             agent_capabilities: StdMutex::default(),
         }
@@ -166,6 +171,15 @@ impl Hub {
 
     pub fn set_waker(&self, waker: Waker) {
         *self.waker.lock().unwrap() = Some(waker);
+    }
+
+    pub fn set_turn_ended(&self, turn_ended: TurnEnded) {
+        *self.turn_ended.lock().unwrap() = Some(turn_ended);
+    }
+
+    /// The session's agent, if it's up.
+    pub async fn agent(&self, id: Uuid) -> Option<Arc<AgentConn>> {
+        self.agent_for(id).await.ok().map(|(agent, _)| agent)
     }
 
     /// Wakes the session if it's parked, after any park in progress, so a message queued for an absent agent
@@ -1239,10 +1253,17 @@ impl Hub {
 
     /// Counts a turn the hub sent as ended, failed with `error` or not.
     async fn turn_finished(&self, id: Uuid, error: Option<String>) {
-        let live = self.live(id);
-        let mut state = live.state.lock().await;
-        state.turns_ended += 1;
-        state.last_turn_error = error;
+        let ok = error.is_none();
+        {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            state.turns_ended += 1;
+            state.last_turn_error = error;
+        }
+        let turn_ended = self.turn_ended.lock().unwrap().clone();
+        if let (true, Some(turn_ended)) = (ok, turn_ended) {
+            tokio::spawn(turn_ended(id));
+        }
     }
 
     /// How many of the session's turns have ended, and why the last one failed, if it did.
