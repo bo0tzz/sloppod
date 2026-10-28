@@ -3,10 +3,11 @@
 //! has landed, the change the pull request makes is compared with the one that was reviewed: if it's the same, as
 //! after a rebase or a merge of the base, auto-merge goes back on, pinned to the new head.
 //!
-//! Each branch counts the pushes admitted to it. A recheck only restores auto-merge for the latest of them, and
-//! turns it off again if another push was admitted while it did, so a push still landing never merges unreviewed.
+//! Pushes to a branch are admitted one at a time, each numbered as it is, and auto-merge only goes back on for the
+//! latest, with the branch held so no push is admitted meanwhile. A push still landing never merges unreviewed.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -53,26 +54,56 @@ pub struct Recheck {
     pub pulls: Vec<(u64, String)>,
     /// The commit the push sets the branch to.
     pub sha: String,
-    /// Which of the pushes admitted to the branch this is.
-    pub generation: u64,
+    /// The push's admission; only the latest to its branch restores auto-merge.
+    pub admission: u64,
 }
 
-/// A branch's pull requests waiting to have auto-merge restored, and how many pushes to it were admitted.
+/// A branch's latest admitted push, and its pull requests waiting to have auto-merge restored.
 #[derive(Default)]
-struct Waiting {
-    generation: u64,
+struct Branch {
+    latest: u64,
     pulls: BTreeMap<u64, String>,
 }
 
+/// A branch, shared by the guard admitting pushes to it and the rechecks restoring auto-merge on it.
+type Shared = Arc<tokio::sync::Mutex<Branch>>;
+
 /// Pushes the authorizer admitted to heads of pull requests set to merge themselves, and the rechecks they wait on.
+/// Everything about one branch happens under its lock: admitting a push, and turning auto-merge back on.
 pub struct Rechecks {
     db: PgPool,
     tx: mpsc::UnboundedSender<Recheck>,
-    branches: Mutex<HashMap<(String, String), Waiting>>,
+    branches: Mutex<HashMap<(String, String), Shared>>,
+    /// Admissions are numbered across branches, so a number is never reused.
+    admissions: AtomicU64,
 }
 
-fn key(repo: &str, branch: &str) -> (String, String) {
-    (repo.to_lowercase(), branch.to_owned())
+/// A push being admitted to a branch, holding the branch until it's decided.
+pub struct Admission {
+    branch: tokio::sync::OwnedMutexGuard<Branch>,
+    pub number: u64,
+}
+
+impl Admission {
+    /// The pull requests still waiting on the branch from earlier pushes.
+    pub fn waiting(&self) -> Vec<u64> {
+        self.branch.pulls.keys().copied().collect()
+    }
+
+    /// Has the push recheck `pulls` and those already waiting once it lands; returns them all.
+    pub fn recheck(mut self, pulls: Vec<(u64, String)>) -> Vec<(u64, String)> {
+        self.branch.pulls.extend(pulls);
+        self.branch
+            .pulls
+            .iter()
+            .map(|(n, f)| (*n, f.clone()))
+            .collect()
+    }
+
+    /// Leaves the branch's pull requests to be merged by hand: the push couldn't be rechecked.
+    pub fn forget(mut self) {
+        self.branch.pulls.clear();
+    }
 }
 
 impl Rechecks {
@@ -82,21 +113,27 @@ impl Rechecks {
             db,
             tx,
             branches: Mutex::default(),
+            admissions: AtomicU64::new(0),
         };
         (Arc::new(rechecks), rx)
     }
 
-    /// Counts a push to `branch` as admitted, before anything about it is decided, so that a recheck of an earlier
-    /// push no longer restores auto-merge. Returns the pull requests still waiting on the branch.
-    pub fn admitting(&self, repo: &str, branch: &str) -> Vec<(u64, String)> {
-        let mut branches = self.branches.lock().unwrap();
-        match branches.get_mut(&key(repo, branch)) {
-            Some(waiting) => {
-                waiting.generation += 1;
-                waiting.pulls.iter().map(|(n, f)| (*n, f.clone())).collect()
-            }
-            None => Vec::new(),
-        }
+    fn branch(&self, repo: &str, branch: &str) -> Shared {
+        self.branches
+            .lock()
+            .unwrap()
+            .entry((repo.to_lowercase(), branch.to_owned()))
+            .or_default()
+            .clone()
+    }
+
+    /// Admits a push to `branch`: from now on no recheck of an earlier push restores auto-merge. The branch is held
+    /// until the admission is decided, so pushes to it are admitted one at a time, in order.
+    pub async fn admit(&self, repo: &str, branch: &str) -> Admission {
+        let mut branch = self.branch(repo, branch).lock_owned().await;
+        let number = self.admissions.fetch_add(1, Ordering::SeqCst) + 1;
+        branch.latest = number;
+        Admission { branch, number }
     }
 
     /// The fingerprints of the change each of `pulls` was reviewed with; `None` if any has none, so it can't be
@@ -116,46 +153,16 @@ impl Rechecks {
         Ok(Some(reviewed))
     }
 
-    /// Has the push recheck `pulls` once it lands, as the latest push to its branch.
-    pub fn recheck(&self, mut recheck: Recheck) {
-        {
-            let mut branches = self.branches.lock().unwrap();
-            let waiting = branches
-                .entry(key(&recheck.repo, &recheck.branch))
-                .or_default();
-            waiting.generation += 1;
-            waiting.pulls.extend(recheck.pulls.iter().cloned());
-            recheck.pulls = waiting.pulls.iter().map(|(n, f)| (*n, f.clone())).collect();
-            recheck.generation = waiting.generation;
-        }
+    pub fn send(&self, recheck: Recheck) {
         let _ = self.tx.send(recheck);
     }
 
-    /// Forgets what was waiting on the branch: a push that couldn't be rechecked left it to be merged by hand.
-    pub fn forget(&self, repo: &str, branch: &str) {
-        self.branches.lock().unwrap().remove(&key(repo, branch));
-    }
-
-    fn is_latest(&self, recheck: &Recheck) -> bool {
-        self.branches
+    async fn is_latest(&self, recheck: &Recheck) -> bool {
+        self.branch(&recheck.repo, &recheck.branch)
             .lock()
-            .unwrap()
-            .get(&key(&recheck.repo, &recheck.branch))
-            .is_some_and(|w| w.generation == recheck.generation)
-    }
-
-    /// Ends the wait if `recheck` is still the latest push to its branch; whether it was.
-    fn conclude(&self, recheck: &Recheck) -> bool {
-        let mut branches = self.branches.lock().unwrap();
-        let key = key(&recheck.repo, &recheck.branch);
-        if branches
-            .get(&key)
-            .is_some_and(|w| w.generation == recheck.generation)
-        {
-            branches.remove(&key);
-            return true;
-        }
-        false
+            .await
+            .latest
+            == recheck.admission
     }
 }
 
@@ -167,7 +174,6 @@ trait Pulls: Send + Sync {
     /// The diff from `base` to the commit `sha`, as of their merge base.
     async fn diff(&self, repo: &str, base: &str, sha: &str) -> anyhow::Result<String>;
     async fn enable(&self, repo: &str, node_id: &str, sha: &str) -> anyhow::Result<()>;
-    async fn disable(&self, repo: &str, node_id: &str) -> anyhow::Result<()>;
 }
 
 #[async_trait]
@@ -182,10 +188,6 @@ impl Pulls for GitHubApp {
 
     async fn enable(&self, repo: &str, node_id: &str, sha: &str) -> anyhow::Result<()> {
         self.enable_auto_merge(repo, node_id, sha).await
-    }
-
-    async fn disable(&self, repo: &str, node_id: &str) -> anyhow::Result<()> {
-        self.disable_pull_auto_merge_in(repo, node_id).await
     }
 }
 
@@ -235,8 +237,16 @@ fn notice(branch: &str, pull: u64, outcome: &Outcome) -> Option<String> {
     }
 }
 
-/// Rechecks each pull request a push landed on. Auto-merge goes back on only if the push is still the latest to
-/// its branch once it's on again; otherwise it's turned off again and the later push's recheck takes over.
+/// What checking one pull request found, before anything is turned back on.
+enum Checked {
+    /// Its change is the one reviewed; auto-merge can go back on for this node id.
+    Matches(String),
+    Off(String),
+    Superseded,
+}
+
+/// Rechecks each pull request a push landed on, then, holding the branch, turns auto-merge back on where the change
+/// is the one reviewed, if no later push has been admitted. No push can be admitted while it does.
 async fn recheck_push(
     rechecks: &Rechecks,
     github: &dyn Pulls,
@@ -244,37 +254,52 @@ async fn recheck_push(
     landing: Duration,
     poll: Duration,
 ) -> Vec<(u64, Outcome)> {
-    let mut outcomes = Vec::new();
-    let mut enabled = Vec::new();
+    let mut checked = Vec::new();
     for (pull, reviewed) in &recheck.pulls {
-        let outcome =
-            match recheck_pull(rechecks, github, recheck, *pull, reviewed, landing, poll).await {
-                Ok((outcome, node_id)) => {
-                    if outcome == Outcome::Kept {
-                        enabled.push(node_id);
-                    }
-                    outcome
+        let found = check_pull(rechecks, github, recheck, *pull, reviewed, landing, poll)
+            .await
+            .unwrap_or_else(|e| Checked::Off(format!("it couldn't be checked ({e:#})")));
+        checked.push((*pull, found));
+    }
+    let superseded = || {
+        recheck
+            .pulls
+            .iter()
+            .map(|(pull, _)| (*pull, Outcome::Superseded))
+            .collect()
+    };
+    if checked
+        .iter()
+        .any(|(_, c)| matches!(c, Checked::Superseded))
+    {
+        return superseded();
+    }
+    let mut branch = rechecks
+        .branch(&recheck.repo, &recheck.branch)
+        .lock_owned()
+        .await;
+    if branch.latest != recheck.admission {
+        return superseded();
+    }
+    let mut outcomes = Vec::new();
+    for (pull, found) in checked {
+        let outcome = match found {
+            Checked::Matches(node_id) => {
+                match github.enable(&recheck.repo, &node_id, &recheck.sha).await {
+                    Ok(()) => Outcome::Kept,
+                    Err(e) => Outcome::Off(format!("it couldn't be set to merge again ({e:#})")),
                 }
-                Err(e) => Outcome::Off(format!("it couldn't be checked ({e:#})")),
-            };
-        outcomes.push((*pull, outcome));
+            }
+            Checked::Off(why) => Outcome::Off(why),
+            Checked::Superseded => Outcome::Superseded,
+        };
+        outcomes.push((pull, outcome));
     }
-    if rechecks.conclude(recheck) {
-        return outcomes;
-    }
-    // A later push was admitted while this one was being rechecked: what it turned back on goes off again.
-    for node_id in enabled {
-        if let Err(e) = github.disable(&recheck.repo, &node_id).await {
-            tracing::error!(repo = %recheck.repo, error = %e, "turning auto-merge off again after a later push");
-        }
-    }
+    branch.pulls.clear();
     outcomes
-        .into_iter()
-        .map(|(pull, _)| (pull, Outcome::Superseded))
-        .collect()
 }
 
-async fn recheck_pull(
+async fn check_pull(
     rechecks: &Rechecks,
     github: &dyn Pulls,
     recheck: &Recheck,
@@ -282,41 +307,34 @@ async fn recheck_pull(
     reviewed: &str,
     landing: Duration,
     poll: Duration,
-) -> anyhow::Result<(Outcome, String)> {
+) -> anyhow::Result<Checked> {
     let deadline = tokio::time::Instant::now() + landing;
     let pull = loop {
-        if !rechecks.is_latest(recheck) {
-            return Ok((Outcome::Superseded, String::new()));
+        if !rechecks.is_latest(recheck).await {
+            return Ok(Checked::Superseded);
         }
         let pull = github.pull(&recheck.repo, number).await?;
         if pull["head"]["sha"] == recheck.sha.as_str() {
             break pull;
         }
         if tokio::time::Instant::now() >= deadline {
-            return Ok((
-                Outcome::Off("the push didn't show up on it".into()),
-                String::new(),
-            ));
+            return Ok(Checked::Off("the push didn't show up on it".into()));
         }
         tokio::time::sleep(poll).await;
     };
-    let node_id = pull["node_id"].as_str().unwrap_or_default().to_owned();
     if pull["state"] != "open" {
-        return Ok((Outcome::Off("it's no longer open".into()), node_id));
+        return Ok(Checked::Off("it's no longer open".into()));
     }
     let base = pull["base"]["ref"].as_str().unwrap_or_default();
     let diff = github.diff(&recheck.repo, base, &recheck.sha).await?;
     if fingerprint(&diff).as_deref() != Some(reviewed) {
-        return Ok((
-            Outcome::Off("the change it makes isn't the one that was reviewed".into()),
-            node_id,
+        return Ok(Checked::Off(
+            "the change it makes isn't the one that was reviewed".into(),
         ));
     }
-    if !rechecks.is_latest(recheck) {
-        return Ok((Outcome::Superseded, node_id));
-    }
-    github.enable(&recheck.repo, &node_id, &recheck.sha).await?;
-    Ok((Outcome::Kept, node_id))
+    Ok(Checked::Matches(
+        pull["node_id"].as_str().unwrap_or_default().to_owned(),
+    ))
 }
 
 #[cfg(test)]
@@ -398,8 +416,8 @@ index 3333333..4444444 100644
         heads: Mutex<Vec<String>>,
         diff: String,
         calls: Mutex<Vec<String>>,
-        /// Run while auto-merge is being turned on, e.g. to admit another push meanwhile.
-        on_enable: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        /// Held while auto-merge is being turned on, to see what can happen meanwhile.
+        enabling: tokio::sync::Mutex<()>,
     }
 
     impl Fake {
@@ -408,7 +426,7 @@ index 3333333..4444444 100644
                 heads: Mutex::new(heads.iter().rev().map(|h| (*h).to_owned()).collect()),
                 diff: diff.to_owned(),
                 calls: Mutex::default(),
-                on_enable: Mutex::default(),
+                enabling: tokio::sync::Mutex::default(),
             }
         }
 
@@ -420,11 +438,13 @@ index 3333333..4444444 100644
     #[async_trait]
     impl Pulls for Fake {
         async fn pull(&self, _: &str, number: u64) -> anyhow::Result<Value> {
-            let mut heads = self.heads.lock().unwrap();
-            let head = if heads.len() > 1 {
-                heads.pop().unwrap()
-            } else {
-                heads[0].clone()
+            let head = {
+                let mut heads = self.heads.lock().unwrap();
+                if heads.len() > 1 {
+                    heads.pop().unwrap()
+                } else {
+                    heads[0].clone()
+                }
             };
             Ok(serde_json::json!({
                 "number": number, "state": "open", "node_id": format!("PR{number}"),
@@ -438,21 +458,11 @@ index 3333333..4444444 100644
         }
 
         async fn enable(&self, _: &str, node_id: &str, sha: &str) -> anyhow::Result<()> {
+            let _held = self.enabling.lock().await;
             self.calls
                 .lock()
                 .unwrap()
                 .push(format!("enable {node_id} {sha}"));
-            if let Some(hook) = self.on_enable.lock().unwrap().take() {
-                hook();
-            }
-            Ok(())
-        }
-
-        async fn disable(&self, _: &str, node_id: &str) -> anyhow::Result<()> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("disable {node_id}"));
             Ok(())
         }
     }
@@ -462,26 +472,19 @@ index 3333333..4444444 100644
         Rechecks::new(db).0
     }
 
-    /// Admits a push of `sha` to `s-1`, the head of #7, and returns its recheck.
-    fn push(rechecks: &Rechecks, sha: &str) -> Recheck {
-        let waiting = rechecks.admitting("o/r", "s-1");
-        let mut pulls = waiting;
-        if pulls.is_empty() {
-            pulls.push((7, fingerprint(REVIEWED).unwrap()));
-        }
-        let recheck = Recheck {
+    /// Admits a push of `sha` to `s-1`, the head of #7, as the guard does, and returns its recheck.
+    async fn push(rechecks: &Rechecks, sha: &str) -> Recheck {
+        let admission = rechecks.admit("o/r", "s-1").await;
+        let number = admission.number;
+        let pulls = admission.recheck(vec![(7, fingerprint(REVIEWED).unwrap())]);
+        Recheck {
             owner: "dev".into(),
             session: Uuid::nil(),
             repo: "o/r".into(),
             branch: "s-1".into(),
             pulls,
             sha: sha.into(),
-            generation: 0,
-        };
-        rechecks.recheck(recheck.clone());
-        Recheck {
-            generation: rechecks.branches.lock().unwrap()[&key("o/r", "s-1")].generation,
-            ..recheck
+            admission: number,
         }
     }
 
@@ -490,18 +493,18 @@ index 3333333..4444444 100644
     #[tokio::test]
     async fn a_rebase_turns_auto_merge_back_on_at_the_new_head() {
         let rechecks = rechecks();
-        let recheck = push(&rechecks, "b");
+        let recheck = push(&rechecks, "b").await;
         let github = Fake::new(&["a", "b"], REBASED);
         let outcomes = recheck_push(&rechecks, &github, &recheck, QUICK * 100, QUICK).await;
         assert_eq!(outcomes, [(7, Outcome::Kept)]);
         assert_eq!(github.calls(), ["diff b", "enable PR7 b"]);
-        assert!(rechecks.admitting("o/r", "s-1").is_empty());
+        assert!(rechecks.admit("o/r", "s-1").await.waiting().is_empty());
     }
 
     #[tokio::test]
     async fn any_other_change_leaves_it_off() {
         let rechecks = rechecks();
-        let recheck = push(&rechecks, "b");
+        let recheck = push(&rechecks, "b").await;
         let github = Fake::new(&["b"], &REVIEWED.replace("let c = 4", "let c = 5"));
         let outcomes = recheck_push(&rechecks, &github, &recheck, QUICK * 100, QUICK).await;
         assert!(matches!(outcomes[..], [(7, Outcome::Off(_))]));
@@ -511,10 +514,16 @@ index 3333333..4444444 100644
     #[tokio::test]
     async fn a_later_push_takes_over_from_an_earlier_one() {
         let rechecks = rechecks();
-        let first = push(&rechecks, "b");
+        let first = push(&rechecks, "b").await;
         // A second push is admitted before the first has landed; auto-merge is already off by then.
-        let second = push(&rechecks, "c");
-        assert_eq!(second.pulls.len(), 1, "the later push rechecks #7 too");
+        let second = rechecks.admit("o/r", "s-1").await;
+        assert_eq!(second.waiting(), [7], "the later push rechecks #7 too");
+        let second = Recheck {
+            admission: second.number,
+            pulls: second.recheck(Vec::new()),
+            sha: "c".into(),
+            ..first.clone()
+        };
         let github = Fake::new(&["a", "b", "c"], REBASED);
         assert_eq!(
             recheck_push(&rechecks, &github, &first, QUICK * 100, QUICK).await,
@@ -528,25 +537,62 @@ index 3333333..4444444 100644
     }
 
     #[tokio::test]
-    async fn a_push_admitted_while_auto_merge_goes_back_on_turns_it_off_again() {
+    async fn pushes_are_admitted_one_at_a_time_in_order() {
         let rechecks = rechecks();
-        let first = push(&rechecks, "b");
-        let github = Fake::new(&["b"], REBASED);
-        let during = rechecks.clone();
-        *github.on_enable.lock().unwrap() = Some(Box::new(move || {
-            during.admitting("o/r", "s-1");
-        }));
-        assert_eq!(
-            recheck_push(&rechecks, &github, &first, QUICK * 100, QUICK).await,
-            [(7, Outcome::Superseded)]
+        // A push is being admitted: auto-merge is turned off and fingerprints are looked up while it holds the branch.
+        let first = rechecks.admit("o/r", "s-1").await;
+        let later = {
+            let rechecks = rechecks.clone();
+            tokio::spawn(async move {
+                let admission = rechecks.admit("o/r", "s-1").await;
+                (admission.number, admission.waiting())
+            })
+        };
+        tokio::time::sleep(QUICK * 20).await;
+        assert!(
+            !later.is_finished(),
+            "a second push waits for the first to be decided"
         );
-        assert_eq!(github.calls(), ["diff b", "enable PR7 b", "disable PR7"]);
+        let first_number = first.number;
+        first.recheck(vec![(7, fingerprint(REVIEWED).unwrap())]);
+        let (number, waiting) = later.await.unwrap();
+        assert!(number > first_number);
+        assert_eq!(waiting, [7], "and then sees what the first left waiting");
+    }
+
+    #[tokio::test]
+    async fn no_push_is_admitted_while_auto_merge_goes_back_on() {
+        let rechecks = rechecks();
+        let first = push(&rechecks, "b").await;
+        let github = Arc::new(Fake::new(&["b"], REBASED));
+        // The enable mutation is slow to answer; a push comes in meanwhile.
+        let enabling = github.enabling.lock().await;
+        let recheck = {
+            let (rechecks, github) = (rechecks.clone(), github.clone());
+            tokio::spawn(async move {
+                recheck_push(&rechecks, github.as_ref(), &first, QUICK * 100, QUICK).await
+            })
+        };
+        tokio::time::sleep(QUICK * 20).await;
+        let later = {
+            let rechecks = rechecks.clone();
+            tokio::spawn(async move { rechecks.admit("o/r", "s-1").await.number })
+        };
+        tokio::time::sleep(QUICK * 20).await;
+        assert!(
+            !later.is_finished(),
+            "the push waits until auto-merge is back on"
+        );
+        drop(enabling);
+        assert_eq!(recheck.await.unwrap(), [(7, Outcome::Kept)]);
+        // Admitted only now, the push turns auto-merge off again in the guard, after the enable, never before it.
+        later.await.unwrap();
     }
 
     #[tokio::test]
     async fn a_push_that_never_lands_leaves_it_off() {
         let rechecks = rechecks();
-        let recheck = push(&rechecks, "b");
+        let recheck = push(&rechecks, "b").await;
         let github = Fake::new(&["a"], REBASED);
         let outcomes = recheck_push(&rechecks, &github, &recheck, QUICK * 5, QUICK).await;
         assert!(matches!(outcomes[..], [(7, Outcome::Off(_))]));

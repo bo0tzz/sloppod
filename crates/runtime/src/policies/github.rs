@@ -111,8 +111,10 @@ impl GitHubPolicy {
                                     continue;
                                 };
                                 self.pushes.admit(repo, pushed);
-                                // Counted before auto-merge is touched, so no earlier recheck turns it back on for this.
-                                let waiting = self.rechecks.admitting(repo, pushed);
+                                // Holds the branch until this push is decided, and from now on no recheck of an earlier
+                                // push turns auto-merge back on.
+                                let admission = self.rechecks.admit(repo, pushed).await;
+                                let waiting = admission.waiting();
                                 let disabled =
                                     app.disable_auto_merge(repo, pushed).await.map_err(err)?;
                                 if disabled.is_empty() && waiting.is_empty() {
@@ -129,19 +131,20 @@ impl GitHubPolicy {
                                     _ => None,
                                 };
                                 if let Some((session_id, pulls)) = reviewed {
-                                    self.rechecks.recheck(Recheck {
+                                    let number = admission.number;
+                                    self.rechecks.send(Recheck {
                                         owner: session.owner.clone(),
                                         session: session_id,
                                         repo: repo.to_owned(),
                                         branch: pushed.to_owned(),
-                                        pulls,
+                                        pulls: admission.recheck(pulls),
                                         sha: new.clone(),
-                                        generation: 0,
+                                        admission: number,
                                     });
                                 } else {
-                                    self.rechecks.forget(repo, pushed);
+                                    admission.forget();
                                     let mut affected = disabled.clone();
-                                    affected.extend(waiting.iter().map(|(n, _)| *n));
+                                    affected.extend(waiting.iter().copied());
                                     affected.sort_unstable();
                                     affected.dedup();
                                     let pulls: Vec<String> =
