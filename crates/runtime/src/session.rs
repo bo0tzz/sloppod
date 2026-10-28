@@ -54,6 +54,17 @@ fn notice_queued(text: &str) -> Queued {
     }
 }
 
+/// A batch of prompts on its way to the agent.
+struct Held {
+    key: Uuid,
+    /// The request carrying it, once sent. After a restart, a held batch whose request the supervisor still has open
+    /// reached the agent; any other is sent again.
+    request: Option<i64>,
+    /// Left by the runtime before a restart, waiting to learn whether it reached the agent.
+    restored: bool,
+    stored: Vec<Value>,
+}
+
 /// How a notice gets to the agent.
 enum Delivery {
     Queued,
@@ -99,9 +110,9 @@ struct LiveState {
     permissions: HashMap<u64, Permission>,
     next_permission: u64,
     queue: Vec<Queued>,
-    /// Prompts taken from the queue, or notices, on their way to the agent: kept in the stored queue until they reach
-    /// it, so a restart in between delivers them again rather than losing them (#237). Keyed by batch.
-    in_flight: Vec<(Uuid, Vec<Value>)>,
+    /// Prompts taken from the queue, and notices, on their way to the agent: kept in the stored queue until the
+    /// request carrying them is answered, so a restart before then doesn't lose them (#237).
+    in_flight: Vec<Held>,
     /// For an agent a runtime restart cut off, if it has to be launched again rather than attached to.
     restart_notice: Option<String>,
     /// The session was stopped: nothing queued for it runs any more.
@@ -362,6 +373,17 @@ impl Hub {
         if self.agent_capabilities().is_none() {
             self.set_agent_capabilities(running.ready.capabilities);
         }
+        // What a restart left on its way to the agent: delivered if it's among the agent's open requests, sent again if not.
+        let open: Vec<i64> = running
+            .open
+            .iter()
+            .filter_map(|r| r["id"].as_i64())
+            .collect();
+        {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            self.settle_restored(id, &mut state, &open).await;
+        }
         let mut turn = None;
         for request in &running.open {
             if let Some(request_id) = request["id"].as_i64() {
@@ -448,6 +470,7 @@ impl Hub {
             state.agent_session_id = Some(agent_session_id);
             state.agent_state = agent_state;
             state.loading = false;
+            self.settle_restored(id, &mut state, &[]).await;
             let queued = std::mem::take(&mut state.queue);
             let held = self.hold(id, &mut state, &queued).await;
             if pending.is_some() || !queued.is_empty() {
@@ -506,8 +529,6 @@ impl Hub {
                         };
                         match cleared {
                             Ok(()) => {
-                                // Likewise what's held for it: from here this turn has it.
-                                self.release(id, &mut state, held).await;
                                 self.set_phase(id, Phase::Working).await;
                                 Start::Run(agent_session_id, queued)
                             }
@@ -574,7 +595,9 @@ impl Hub {
                 }
             };
             let agent = taken_for;
-            let result = self.turn_on(id, &agent, &agent_session_id, blocks).await;
+            let result = self
+                .turn_on(id, &agent, &agent_session_id, blocks, held)
+                .await;
             if let Err(e) = &result {
                 tracing::warn!(session = %id, error = %e, "queued prompt failed");
             }
@@ -590,7 +613,13 @@ impl Hub {
         let stored: Vec<Value> = state
             .in_flight
             .iter()
-            .flat_map(|(_, batch)| batch.iter().cloned())
+            .flat_map(|held| {
+                held.stored.iter().map(|q| {
+                    let mut q = q.clone();
+                    q["held"] = json!({"batch": held.key, "request": held.request});
+                    q
+                })
+            })
             .chain(state.queue.iter().map(stored))
             .collect();
         if let Err(e) = self.store.save_queue(id, &stored).await {
@@ -604,11 +633,51 @@ impl Hub {
             return None;
         }
         let key = Uuid::new_v4();
-        state
-            .in_flight
-            .push((key, batch.iter().map(stored).collect()));
+        state.in_flight.push(Held {
+            key,
+            request: None,
+            restored: false,
+            stored: batch.iter().map(stored).collect(),
+        });
         self.save_queue(id, state).await;
         Some(key)
+    }
+
+    /// A held batch was sent as `request`.
+    async fn sent(&self, id: Uuid, key: Option<Uuid>, request: i64) {
+        let Some(key) = key else {
+            return;
+        };
+        let live = self.live(id);
+        let mut state = live.state.lock().await;
+        if let Some(held) = state.in_flight.iter_mut().find(|h| h.key == key) {
+            held.request = Some(request);
+            self.save_queue(id, &state).await;
+        }
+    }
+
+    /// Held batches a restart left: those whose request the agent still has open reached it, and the rest go back to
+    /// the front of the queue. Under the state lock, when the agent's open requests are known.
+    async fn settle_restored(&self, id: Uuid, state: &mut LiveState, open: &[i64]) {
+        if !state.in_flight.iter().any(|h| h.restored) {
+            return;
+        }
+        let (restored, current): (Vec<Held>, Vec<Held>) = std::mem::take(&mut state.in_flight)
+            .into_iter()
+            .partition(|h| h.restored);
+        state.in_flight = current;
+        let resent = restored
+            .into_iter()
+            .filter(|h| h.request.is_none_or(|r| !open.contains(&r)))
+            .flat_map(|h| h.stored)
+            .map(|q| Queued {
+                id: q["id"].as_str().and_then(|s| s.parse().ok()),
+                blocks: q["blocks"].as_array().cloned().unwrap_or_default(),
+                reply: None,
+            });
+        let since = std::mem::take(&mut state.queue);
+        state.queue = resent.chain(since).collect();
+        self.save_queue(id, state).await;
     }
 
     /// A held batch reached the agent, or went back to the queue; under the state lock.
@@ -617,23 +686,40 @@ impl Hub {
             return;
         };
         let before = state.in_flight.len();
-        state.in_flight.retain(|(k, _)| *k != key);
+        state.in_flight.retain(|h| h.key != key);
         if state.in_flight.len() != before {
             self.save_queue(id, state).await;
         }
     }
 
-    /// A held notice that couldn't be delivered goes back to the queue, for the next turn or agent.
-    async fn requeue_held(&self, id: Uuid, key: Uuid, blocks: Vec<Value>) {
-        let live = self.live(id);
-        let mut state = live.state.lock().await;
-        if state.in_flight.iter().any(|(k, _)| *k == key) {
+    /// A held notice that couldn't be delivered goes back to the queue, and runs now if the agent is idle, e.g.
+    /// because the turn it was steered into ended meanwhile.
+    async fn requeue_held(self: &Arc<Self>, id: Uuid, key: Uuid, blocks: Vec<Value>) {
+        let next = {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            if !state.in_flight.iter().any(|h| h.key == key) {
+                return;
+            }
             state.queue.push(Queued {
                 id: None,
                 blocks,
                 reply: None,
             });
             self.release(id, &mut state, Some(key)).await;
+            let idle = state.agent_session_id.is_some() && !state.turn_running && !state.stopped;
+            match (state.agent.clone(), idle) {
+                (Some(agent), true) => {
+                    state.turn_running = true;
+                    let queued = std::mem::take(&mut state.queue);
+                    let held = self.hold(id, &mut state, &queued).await;
+                    Some((agent, queued, held))
+                }
+                _ => None,
+            }
+        };
+        if let Some((agent, queued, held)) = next {
+            tokio::spawn(self.clone().run_queued(id, agent, None, queued, held));
         }
     }
 
@@ -649,15 +735,37 @@ impl Hub {
             }
         };
         for (id, stored) in queues {
-            let restored: Vec<Queued> = stored
-                .into_iter()
-                .map(|q| Queued {
-                    id: q["id"].as_str().and_then(|s| s.parse().ok()),
-                    blocks: q["blocks"].as_array().cloned().unwrap_or_default(),
-                    reply: None,
-                })
-                .collect();
-            if restored.is_empty() {
+            // What was on its way to the agent waits, held, until its agent says what it has.
+            let mut held: Vec<Held> = Vec::new();
+            let mut restored: Vec<Queued> = Vec::new();
+            for q in stored {
+                if q["held"].is_object() {
+                    let key = q["held"]["batch"]
+                        .as_str()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or_default();
+                    let mut entry = q.clone();
+                    if let Some(entry) = entry.as_object_mut() {
+                        entry.remove("held");
+                    }
+                    match held.iter_mut().find(|h| h.key == key) {
+                        Some(batch) => batch.stored.push(entry),
+                        None => held.push(Held {
+                            key,
+                            request: q["held"]["request"].as_i64(),
+                            restored: true,
+                            stored: vec![entry],
+                        }),
+                    }
+                } else {
+                    restored.push(Queued {
+                        id: q["id"].as_str().and_then(|s| s.parse().ok()),
+                        blocks: q["blocks"].as_array().cloned().unwrap_or_default(),
+                        reply: None,
+                    });
+                }
+            }
+            if restored.is_empty() && held.is_empty() {
                 continue;
             }
             {
@@ -665,6 +773,7 @@ impl Hub {
                 let mut state = live.state.lock().await;
                 let since = std::mem::take(&mut state.queue);
                 state.queue = restored.into_iter().chain(since).collect();
+                state.in_flight.extend(held);
                 self.save_queue(id, &state).await;
             }
             self.broadcast_queue(id).await;
@@ -963,7 +1072,8 @@ impl Hub {
                 "the session's agent isn't running yet; try again shortly",
             ));
         };
-        self.turn_on(id, &agent, &agent_session_id, blocks).await
+        self.turn_on(id, &agent, &agent_session_id, blocks, None)
+            .await
     }
 
     /// Marks a turn working on the session's current agent, which it returns; `None` if there isn't one up.
@@ -982,19 +1092,26 @@ impl Hub {
         Some(started)
     }
 
+    /// Runs a turn on `agent`; `held`, what it carries, stays kept until the agent answers.
     async fn turn_on(
         self: &Arc<Self>,
         id: Uuid,
         agent: &Arc<AgentConn>,
         agent_session_id: &str,
         blocks: Vec<Value>,
+        held: Option<Uuid>,
     ) -> Result<Value, RpcError> {
-        let result = agent
-            .request(
-                "session/prompt",
-                json!({"sessionId": agent_session_id, "prompt": blocks}),
-            )
-            .await;
+        let (request, answer) = agent.send_request(
+            "session/prompt",
+            json!({"sessionId": agent_session_id, "prompt": blocks}),
+        );
+        self.sent(id, held, request).await;
+        let result = answer.await;
+        {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            self.release(id, &mut state, held).await;
+        }
         self.turn_finished(id, result.as_ref().err().map(|e| e.message.clone()))
             .await;
         self.end_turn(id, agent).await;
@@ -1187,16 +1304,16 @@ impl Hub {
         for _ in 0..10 {
             self.after_compaction(id).await;
             let (agent, agent_session_id) = self.agent_for(id).await?;
-            let result = agent
-                .request(
-                    "_session/steering",
-                    json!({
-                        "sessionId": agent_session_id,
-                        "prompt": blocks,
-                        "_meta": {"steering": {"idleBehavior": "promptRequired"}},
-                    }),
-                )
-                .await?;
+            let (request, answer) = agent.send_request(
+                "_session/steering",
+                json!({
+                    "sessionId": agent_session_id,
+                    "prompt": blocks,
+                    "_meta": {"steering": {"idleBehavior": "promptRequired"}},
+                }),
+            );
+            self.sent(id, held, request).await;
+            let result = answer.await?;
             if result["outcome"] != "promptRequired" {
                 let live = self.live(id);
                 let mut state = live.state.lock().await;
