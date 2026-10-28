@@ -129,6 +129,13 @@ pub mod memory {
         pub cleared_prompts: Mutex<Vec<Uuid>>,
         /// Makes clearing a first message fail, as a lost database would.
         pub fail_clearing: std::sync::atomic::AtomicBool,
+        /// Makes reading whether a message was taken back fail, as a lost database would.
+        pub fail_removal_lookups: std::sync::atomic::AtomicBool,
+        /// Holds taking a message back, while its state lock is held, until `removals_released`; says when one
+        /// reaches it with `removal_started`.
+        pub gate_removals: std::sync::atomic::AtomicBool,
+        pub removal_started: tokio::sync::Notify,
+        pub removals_released: tokio::sync::Notify,
     }
 
     impl MemoryStore {
@@ -194,11 +201,21 @@ pub mod memory {
         }
 
         async fn remove_message(&self, id: Uuid, message_id: Uuid) -> sqlx::Result<()> {
+            if self.gate_removals.load(std::sync::atomic::Ordering::SeqCst) {
+                self.removal_started.notify_one();
+                self.removals_released.notified().await;
+            }
             self.removed.lock().unwrap().insert((id, message_id));
             Ok(())
         }
 
         async fn message_removed(&self, id: Uuid, message_id: Uuid) -> sqlx::Result<bool> {
+            if self
+                .fail_removal_lookups
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(sqlx::Error::PoolTimedOut);
+            }
             Ok(self.removed.lock().unwrap().contains(&(id, message_id)))
         }
 

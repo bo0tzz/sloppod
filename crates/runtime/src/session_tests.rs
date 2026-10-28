@@ -2,6 +2,7 @@
 //! agent and record in the session's log.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -1385,6 +1386,79 @@ async fn a_message_taken_back_before_a_restart_does_not_run_from_the_kept_queue(
     h.agent_ready().await;
     let restored = next_prompt(&mut h.to_agent).await;
     assert_eq!(prompt_text(&restored), ["Kept"]);
+}
+
+#[tokio::test]
+async fn a_message_sent_again_while_it_is_taken_back_does_not_run() {
+    let mut h = Harness::ready().await;
+    let _first = h.prompt("First");
+    h.next().await;
+    let _taken = h.prompt("Taken back");
+    let qid = wait_for_queue(&h, 1).await.remove(0);
+
+    // The removal holds the session while it notes the message was taken back; the resend comes in meanwhile.
+    h.store.gate_removals.store(true, Ordering::SeqCst);
+    let (hub, id, removed_id) = (h.hub.clone(), h.id, qid.clone());
+    let removal =
+        tokio::spawn(async move { hub.remove_queued(id, json!({"id": removed_id})).await });
+    h.store.removal_started.notified().await;
+    let (hub, id) = (h.hub.clone(), h.id);
+    let resend = tokio::spawn(async move {
+        hub.prompt(
+            id,
+            json!({"sessionId": id, "prompt": [{"type": "text", "text": "Taken back"}],
+                "_meta": {"sloppod": {"messageId": qid}}}),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    h.store.removals_released.notify_one();
+    removal.await.unwrap().unwrap();
+    let resent = tokio::time::timeout(Duration::from_secs(2), resend)
+        .await
+        .expect("the resend is answered")
+        .unwrap()
+        .unwrap();
+    assert_eq!(resent["stopReason"], "cancelled");
+    assert!(h.queued().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_restart_keeps_messages_whose_removal_it_cannot_read_until_it_can() {
+    let mut h = Harness::starting().await;
+    let (taken, kept) = (Uuid::new_v4(), Uuid::new_v4());
+    h.store
+        .save_queue(
+            h.id,
+            &[
+                json!({"id": taken, "blocks": [{"type": "text", "text": "Taken back"}]}),
+                json!({"id": kept, "blocks": [{"type": "text", "text": "Kept"}]}),
+            ],
+        )
+        .await
+        .unwrap();
+    h.store.remove_message(h.id, taken).await.unwrap();
+    h.store.fail_removal_lookups.store(true, Ordering::SeqCst);
+    h.hub.restore_queues().await;
+    // Neither is queued yet, and both stay stored, even as the queue changes.
+    assert!(h.queued().await.is_empty());
+    let _later = h.prompt("Later");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let stored: Vec<String> = h.store.queues().await.unwrap()[0]
+        .1
+        .iter()
+        .filter_map(|m| m["blocks"][0]["text"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(stored, ["Taken back", "Kept", "Later"]);
+
+    // Once it can be read, the one taken back is dropped and the other runs, ahead of what came since.
+    h.store.fail_removal_lookups.store(false, Ordering::SeqCst);
+    wait_for_queue(&h, 1).await;
+    h.agent_ready().await;
+    assert_eq!(
+        prompt_text(&next_prompt(&mut h.to_agent).await),
+        ["Kept", "Later"]
+    );
 }
 
 #[tokio::test]
