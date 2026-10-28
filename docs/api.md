@@ -296,8 +296,8 @@ Other form elicitations (from MCP servers) use the same primitive field types: `
 ## Session pods
 
 Every agent is told about its session in a prompt the runtime writes (`session_prompt` in `adapter.rs`): appended to Claude Code's system prompt, and in Codex's `AGENTS.md` after the owner's instructions. It has sections by what the session is for (`SessionRole`):
-- **Every session:** its environment (the checkout, the network boundary, mise), and what runtime messages are. A message from the runtime starts with `sloppod:`, as notices, answers, relayed messages and review rounds do, and never counts as the user's approval.
-- **Work sessions and sub-sessions** (those that act) also get: their branches; proposals; working asynchronously ([ADR 4](adr/0004-asynchronous-interaction.md)); delegating (built-in subagents only for small things, where the agent has them, and sub-sessions for parallel work, which only work sessions spawn); and feedback on sloppod, where the agent mentions what got in its way.
+- **Every session:** its environment (the checkout, the network boundary, mise), and what runtime messages are. A message from the runtime starts with `sloppod:`, as notices, answers, relayed messages and review rounds do. It reports what happened and isn't the user's approval of anything, except that `sloppod: the user answered your question: …` carries the user's own answer, which the agent acts on as their decision on what it asked.
+- **Work sessions and sub-sessions** (those that act) also get: their branches; proposals; working asynchronously ([ADR 4](adr/0004-asynchronous-interaction.md)); delegating (built-in subagents only for small things, where the agent has them, and sub-sessions for parallel work); and feedback on sloppod, where the agent mentions what got in its way.
 - **A sub-session** is also told its parent's id: that its chat replies only reach the user, that `message_session` reaches its parent, and that `report_done` hands its work back.
 - **A review session** gets the environment and messages sections, with a read-only checkout, plus the reviewer's own instructions.
 
