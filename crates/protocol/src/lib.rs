@@ -168,13 +168,24 @@ pub mod api {
         pub description: Option<String>,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Clone, Serialize, Deserialize)]
     pub struct NewCredential {
         pub kind: String,
         pub name: String,
         #[serde(default)]
         pub config: serde_json::Map<String, Value>,
         pub secret: String,
+    }
+
+    /// Leaves the secret out, so logging one can't leak it.
+    impl std::fmt::Debug for NewCredential {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("NewCredential")
+                .field("kind", &self.kind)
+                .field("name", &self.name)
+                .field("config", &self.config)
+                .finish_non_exhaustive()
+        }
     }
 
     /// A credential as the API shows it; the secret is write-only.
