@@ -8,6 +8,7 @@ const executablePath = process.env.CHROMIUM_PATH ?? (existsSync('/usr/bin/chromi
 export default defineConfig({
   testDir: 'tests',
   workers: 1,
+  fullyParallel: true,
   timeout: 45_000,
   expect: { timeout: 15_000 },
   reporter: [['list']],
