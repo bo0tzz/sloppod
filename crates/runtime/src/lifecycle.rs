@@ -211,9 +211,23 @@ pub async fn roll_images(state: &AppState) {
         ) {
             continue;
         }
-        tracing::info!(session = %session.id, from = ?running, to = %current, "replacing an idle session's pod for the new image");
-        if let Err(e) = state.placement.replace_pod(&session.id.to_string()).await {
-            tracing::warn!(session = %session.id, error = %e, "replacing a session's pod");
+        let id = session.id.to_string();
+        let replaced = state
+            .hub
+            .replace_pod(session.id, || async {
+                state.placement.replace_pod(&id).await?;
+                Ok(())
+            })
+            .await;
+        match replaced {
+            Ok(true) => {
+                tracing::info!(session = %session.id, from = ?running, to = %current, "replaced an idle session's pod for the new image");
+            }
+            // Something started meanwhile; the next sweep looks again.
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(session = %session.id, error = %e, "replacing a session's pod")
+            }
         }
     }
 }
