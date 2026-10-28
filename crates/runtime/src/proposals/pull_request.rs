@@ -214,7 +214,7 @@ impl Stack {
     }
 }
 
-fn stack_layers(payload: &Value) -> &[Value] {
+pub(super) fn stack_layers(payload: &Value) -> &[Value] {
     payload["pull_requests"]
         .as_array()
         .map(Vec::as_slice)

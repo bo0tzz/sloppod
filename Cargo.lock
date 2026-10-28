@@ -3287,9 +3287,11 @@ name = "sloppod-supervisor"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "axum",
  "base64 0.23.1",
  "clap",
  "futures",
+ "reqwest",
  "rustls",
  "serde_json",
  "sloppod-protocol",

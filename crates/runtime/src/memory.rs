@@ -80,7 +80,8 @@ pub async fn proxy(
 }
 
 async fn forward(state: &AppState, peer: SocketAddr, request: Request) -> anyhow::Result<Response> {
-    let Some(session) = state.pods.session_for_ip(&peer.ip().to_string()) else {
+    let Some(session) = crate::identity::calling_session(state, request.headers(), peer.ip()).await
+    else {
         return Ok((
             StatusCode::FORBIDDEN,
             "sloppod: memory is only for session pods\n",

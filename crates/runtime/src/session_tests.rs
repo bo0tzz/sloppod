@@ -268,6 +268,38 @@ async fn a_notice_starts_a_turn_when_the_agent_is_idle() {
 }
 
 #[tokio::test]
+async fn a_notice_waits_for_a_compaction_to_end() {
+    let mut h = Harness::ready().await;
+    let turn = h.prompt("First");
+    let turn_request = h.next().await;
+    let compaction = |status: &str| {
+        json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "agent-session", "update": {
+            "sessionUpdate": "compaction_update", "compactionId": "c1", "status": status,
+        }}})
+    };
+    from_agent(&h.hub, h.id, &h.agent, compaction("in_progress")).await;
+
+    h.hub
+        .notify(h.id, "sloppod: your proposal was approved.".into())
+        .await;
+    // Steering it in now would cut the compaction off.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(h.to_agent.try_recv().is_err());
+
+    from_agent(&h.hub, h.id, &h.agent, compaction("completed")).await;
+    let steering = h.next().await;
+    assert_eq!(steering["method"], "_session/steering");
+    assert_eq!(
+        prompt_text(&steering),
+        ["sloppod: your proposal was approved."]
+    );
+    h.respond(&steering, json!({"outcome": "injected"})).await;
+    h.respond(&turn_request, json!({"stopReason": "end_turn"}))
+        .await;
+    turn.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn a_notice_waits_for_the_agent_to_be_up() {
     let mut h = Harness::starting().await;
     h.hub
@@ -911,5 +943,28 @@ async fn a_notice_after_a_restore_joins_the_kept_queue() {
     assert_eq!(
         prompt_text(&next_prompt(&mut h.to_agent).await),
         ["Kept", "A notice"]
+    );
+}
+
+#[tokio::test]
+async fn every_turn_that_ends_is_counted_with_its_error() {
+    let mut h = Harness::ready().await;
+    assert_eq!(h.hub.turns_ended(h.id).await, (0, None));
+
+    let _ok = h.prompt("Fine");
+    let request = next_prompt(&mut h.to_agent).await;
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.hub.turns_ended(h.id).await, (1, None));
+
+    // A failed turn is counted too, with its error, however quickly it ends.
+    let _failed = h.prompt("Fails");
+    let request = next_prompt(&mut h.to_agent).await;
+    let error = json!({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32603, "message": "upstream 503"}});
+    from_agent(&h.hub, h.id, &h.agent, error).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        h.hub.turns_ended(h.id).await,
+        (2, Some("upstream 503".into()))
     );
 }
