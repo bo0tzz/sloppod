@@ -1,6 +1,6 @@
 # 29. Every grant names the credential it acts with
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-10-28
 
 ## Context and Problem Statement
