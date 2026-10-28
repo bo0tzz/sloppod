@@ -95,6 +95,8 @@ export class SessionView {
       onStateChange: (state, error) => {
         this.connection = state;
         this.connectionError = error ?? null;
+        // Once the connection is fully up: messages cut off by the last drop, or written while it was down.
+        if (state === 'open' && this.loaded) this.#settleUnconfirmed();
         if (state !== 'open') {
           // Requests from a dropped socket can no longer be answered; a reload re-sends live ones.
           this.permissions = [];
@@ -181,7 +183,6 @@ export class SessionView {
       this.#replayUpdates = null;
     }
     this.loaded = true;
-    this.#settleUnconfirmed();
     await rest;
   }
 
