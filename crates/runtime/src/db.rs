@@ -525,6 +525,40 @@ pub async fn queues(db: &PgPool) -> sqlx::Result<Vec<(Uuid, Vec<Value>)>> {
         .collect())
 }
 
+/// Keeps questions the session's agent asked with `ask_user`, until they're answered (#39).
+pub async fn save_question(
+    db: &PgPool,
+    id: Uuid,
+    question: Uuid,
+    questions: &Value,
+) -> sqlx::Result<()> {
+    sqlx::query("insert into session_questions (id, session_id, questions) values ($1, $2, $3)")
+        .bind(question)
+        .bind(id)
+        .bind(questions)
+        .execute(db)
+        .await
+        .map(|_| ())
+}
+
+/// Forgets an answered question.
+pub async fn forget_question(db: &PgPool, question: Uuid) -> sqlx::Result<()> {
+    sqlx::query("delete from session_questions where id = $1")
+        .bind(question)
+        .execute(db)
+        .await
+        .map(|_| ())
+}
+
+/// Every kept question, `(session, question, questions)`, oldest first.
+pub async fn questions(db: &PgPool) -> sqlx::Result<Vec<(Uuid, Uuid, Value)>> {
+    sqlx::query_as(
+        "select session_id, id, questions from session_questions order by created_at, id",
+    )
+    .fetch_all(db)
+    .await
+}
+
 /// The session's first message, until a turn has started with it.
 pub async fn pending_prompt(db: &PgPool, id: Uuid) -> sqlx::Result<Option<String>> {
     let row: Option<(Option<String>,)> =
