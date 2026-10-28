@@ -149,6 +149,8 @@ pub mod memory {
         pub cleared_prompts: Mutex<Vec<Uuid>>,
         /// Makes clearing a first message fail, as a lost database would.
         pub fail_clearing: std::sync::atomic::AtomicBool,
+        /// Makes keeping a session's queue fail, as a lost database would.
+        pub fail_saving_queues: std::sync::atomic::AtomicBool,
         /// Makes reading whether a message was taken back fail, as a lost database would.
         pub fail_removal_lookups: std::sync::atomic::AtomicBool,
         /// Holds taking a message back, while its state lock is held, until `removals_released`; says when one
@@ -268,6 +270,12 @@ pub mod memory {
         }
 
         async fn save_queue(&self, id: Uuid, queue: &[Value]) -> sqlx::Result<()> {
+            if self
+                .fail_saving_queues
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(sqlx::Error::PoolTimedOut);
+            }
             let mut queues = self.queues.lock().unwrap();
             if queue.is_empty() {
                 queues.remove(&id);

@@ -1326,6 +1326,26 @@ async fn a_question_from_ask_user_waits_for_its_answer_without_the_agent() {
 }
 
 #[tokio::test]
+async fn a_question_whose_answer_could_not_be_stored_comes_back_after_a_restart() {
+    // The agent isn't up, so the answer would wait in the stored queue, which can't be written.
+    let h = Harness::starting().await;
+    let questions = json!([{"question": "Which backoff?", "options": [{"label": "Exponential"}, {"label": "Fixed"}]}]);
+    h.hub.ask(h.id, questions).await.unwrap();
+    let (pid, _, _) = h.hub.replay(h.id).await.unwrap().permissions[0].clone();
+    h.store.fail_saving_queues.store(true, Ordering::SeqCst);
+    let answer = json!({"action": "accept", "content": {"question_0": "Fixed"}});
+    h.hub.answer_permission(h.id, pid, Ok(answer)).await;
+    assert_eq!(h.store.questions().await.unwrap().len(), 1);
+
+    h.store.fail_saving_queues.store(false, Ordering::SeqCst);
+    let (hub, _agent, _to_agent) = restarted(&h).await;
+    hub.restore_questions().await;
+    let replay = hub.replay(h.id).await.unwrap();
+    assert_eq!(replay.permissions.len(), 1);
+    assert_eq!(replay.permissions[0].2["message"], "Which backoff?");
+}
+
+#[tokio::test]
 async fn a_question_from_ask_user_outlives_a_restart() {
     let h = Harness::ready().await;
     let questions = json!([{"question": "Which backoff?", "options": [{"label": "Exponential"}, {"label": "Fixed"}]}]);
