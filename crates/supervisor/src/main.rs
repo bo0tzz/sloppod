@@ -101,6 +101,9 @@ struct Agent {
     unsent: Option<Value>,
     /// How much of each transcript file the runtime has, so syncs send only what was appended.
     synced: HashMap<String, u64>,
+    /// The agent's environment and working directory, for commands the runtime runs beside it.
+    env: Vec<(String, String)>,
+    cwd: String,
 }
 
 impl Agent {
@@ -308,6 +311,9 @@ async fn run(
         Terminate,
     }
     let mut ping = tokio::time::interval(Duration::from_secs(20));
+    // Results of commands the runtime asked to run, sent back on this link.
+    let (results_tx, mut results) =
+        tokio::sync::mpsc::unbounded_channel::<(u64, Result<String, String>)>();
     let deadline = tokio::time::sleep(LINK_TIMEOUT);
     tokio::pin!(deadline);
     let event = loop {
@@ -347,6 +353,20 @@ async fn run(
                             a.synced.remove(&name);
                             sync_transcript(&a.transcript_dir, &mut a.synced, &mut sink).await;
                         }
+                        Ok(ToSupervisor::Run { id, command, env, input, timeout_secs }) => {
+                            let (base, cwd, results) = (a.env.clone(), a.cwd.clone(), results_tx.clone());
+                            tokio::spawn(async move {
+                                let result = run_command(
+                                    &command,
+                                    base.into_iter().chain(env),
+                                    &cwd,
+                                    &input,
+                                    Duration::from_secs(timeout_secs),
+                                )
+                                .await;
+                                let _ = results.send((id, result));
+                            });
+                        }
                         Ok(ToSupervisor::Launch(_) | ToSupervisor::Attach { .. }) => {}
                         Err(e) => tracing::warn!(error = %e, "bad message from runtime"),
                     },
@@ -354,6 +374,15 @@ async fn run(
                     Some(Ok(_)) => {}
                 }
             },
+            Some((id, result)) = results.recv() => {
+                let (output, error) = match result {
+                    Ok(output) => (Some(output), None),
+                    Err(error) => (None, Some(error)),
+                };
+                if send(&mut sink, &FromSupervisor::RunResult { id, output, error }).await.is_err() {
+                    break Event::LinkEnded;
+                }
+            }
             _ = ping.tick() => {
                 if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
                     break Event::LinkEnded;
@@ -416,7 +445,9 @@ async fn launch_agent(
         prepared = prepare(args, launch, sink) => prepared,
         _ = closed(stream) => bail!("link closed while preparing the pod"),
     };
+    let mut agent_env = Vec::new();
     let spawned = prepared.and_then(|env| {
+        agent_env = env.clone();
         let [program, args @ ..] = &launch.command[..] else {
             bail!("the runtime sent no command to run");
         };
@@ -463,7 +494,51 @@ async fn launch_agent(
             .iter()
             .map(|f| (f.name.clone(), f.len))
             .collect(),
+        env: agent_env,
+        cwd: launch.cwd.clone(),
     })
+}
+
+/// Runs a command the runtime asked for, apart from the agent; what it printed, or why it failed.
+async fn run_command(
+    command: &[String],
+    env: impl IntoIterator<Item = (String, String)>,
+    cwd: &str,
+    input: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let [program, args @ ..] = command else {
+        return Err("no command to run".into());
+    };
+    let mut child = Command::new(program)
+        .args(args)
+        .envs(env)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("starting {program}: {e}"))?;
+    let mut stdin = child.stdin.take().ok_or("no stdin")?;
+    stdin
+        .write_all(input.as_bytes())
+        .await
+        .map_err(|e| format!("writing its input: {e}"))?;
+    drop(stdin);
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .map_err(|_| format!("it took longer than {}s", timeout.as_secs()))?
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "it exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 async fn stop(child: &mut Child) {
@@ -979,5 +1054,55 @@ mod sync_tests {
             Some((0, b"one\ntwo\n".to_vec()))
         );
         std::fs::remove_file(&path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+
+    fn sh(script: &str) -> Vec<String> {
+        vec!["sh".into(), "-c".into(), script.into()]
+    }
+
+    #[tokio::test]
+    async fn a_command_gets_its_input_and_the_agents_environment() {
+        let env = [
+            ("JUDGE".to_owned(), "base".to_owned()),
+            ("JUDGE".to_owned(), "changed".to_owned()),
+        ];
+        let out = run_command(
+            &sh("cat; echo \" $JUDGE\""),
+            env,
+            "/",
+            "hello",
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "hello changed\n");
+    }
+
+    #[tokio::test]
+    async fn a_failure_or_a_timeout_says_why() {
+        let failed = run_command(
+            &sh("echo oops >&2; exit 3"),
+            [],
+            "/",
+            "",
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(failed.contains("oops"), "{failed}");
+        let slow = run_command(&sh("sleep 5"), [], "/", "", Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(slow.contains("longer than"), "{slow}");
+        assert!(
+            run_command(&[], [], "/", "", Duration::from_secs(1))
+                .await
+                .is_err()
+        );
     }
 }

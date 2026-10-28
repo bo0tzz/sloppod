@@ -446,6 +446,43 @@ async fn a_turn_that_ends_after_its_agent_retired_hands_nothing_on_to_it() {
 }
 
 #[tokio::test]
+async fn a_command_run_in_the_pod_gets_its_own_result() {
+    let mut h = Harness::ready().await;
+    let run = |input: &str| {
+        let (agent, input) = (h.agent.clone(), input.to_owned());
+        tokio::spawn(async move {
+            agent
+                .run(
+                    vec!["judge".into()],
+                    Vec::new(),
+                    input,
+                    Duration::from_secs(5),
+                )
+                .await
+        })
+    };
+    let (first, second) = (run("one"), run("two"));
+    let mut ids = Vec::new();
+    while ids.len() < 2 {
+        if let ToSupervisor::Run { id, input, .. } = h.to_agent.recv().await.unwrap() {
+            ids.push((id, input));
+        }
+    }
+    ids.sort_by_key(|(_, input)| input.clone());
+    // Answered out of order, each gets its own.
+    h.agent.run_result(ids[1].0, None, Some("failed".into()));
+    h.agent.run_result(ids[0].0, Some("ok".into()), None);
+    assert_eq!(first.await.unwrap(), Ok("ok".into()));
+    assert_eq!(second.await.unwrap(), Err("failed".into()));
+
+    // A link that goes fails what's still waiting.
+    let pending = run("three");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    h.agent.close();
+    assert!(pending.await.unwrap().is_err());
+}
+
+#[tokio::test]
 async fn a_notice_waits_for_the_agent_to_be_up() {
     let mut h = Harness::starting().await;
     h.hub
