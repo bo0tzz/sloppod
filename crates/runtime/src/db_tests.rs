@@ -370,6 +370,14 @@ async fn parked_sessions_are_left_alone_on_startup(db: PgPool) {
         db::get_session(&db, parked).await.unwrap().unwrap().phase(),
         Phase::Parked
     );
+    // Their egress policies are swept instead.
+    let swept: Vec<Uuid> = db::parked_sessions(&db)
+        .await
+        .unwrap()
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(swept, [parked]);
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]

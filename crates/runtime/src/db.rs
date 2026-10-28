@@ -243,6 +243,14 @@ pub async fn active_sessions(db: &PgPool) -> sqlx::Result<Vec<SessionRow>> {
     .await
 }
 
+pub async fn parked_sessions(db: &PgPool) -> sqlx::Result<Vec<SessionRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "select {SESSION_COLUMNS} from sessions where phase = 'parked'"
+    )))
+    .fetch_all(db)
+    .await
+}
+
 pub async fn get_session(db: &PgPool, id: Uuid) -> sqlx::Result<Option<SessionRow>> {
     sqlx::query_as(AssertSqlSafe(format!(
         "select {SESSION_COLUMNS} from sessions where id = $1"

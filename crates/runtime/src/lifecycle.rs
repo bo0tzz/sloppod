@@ -145,11 +145,12 @@ pub async fn park(state: &AppState, session: &db::SessionRow) -> Result<(), Park
     state
         .hub
         .park(session.id, || async {
-            state
-                .placement
-                .suspend(&id)
-                .await
-                .map_err(anyhow::Error::from)
+            state.placement.suspend(&id).await?;
+            // A parked session holds no listener; waking applies its policy again. Startup sweeps what's left here.
+            if let Err(e) = state.enforcer.remove(&id).await {
+                tracing::warn!(session = %id, error = %e, "removing a parked session's egress policy");
+            }
+            Ok(())
         })
         .await
 }
