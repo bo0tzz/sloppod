@@ -17,6 +17,7 @@ use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, PostParams};
 use serde_json::{Value, json};
+use sloppod_contracts::capability;
 use sloppod_contracts::{AgentContext, MemoryContext};
 use sloppod_protocol::api::SessionKind;
 use sloppod_protocol::link::{
@@ -308,7 +309,9 @@ async fn launch_for(
                     .session
                     .grants
                     .iter()
-                    .find(|g| g.capability == "repo" && g.param("repo") == Some(grant.repo))
+                    .find(|g| {
+                        g.capability == capability::REPO && g.param("repo") == Some(grant.repo)
+                    })
                     .and_then(|g| g.param("commit"))
                     .map(str::to_owned),
             }),
@@ -324,7 +327,7 @@ async fn launch_for(
 pub async fn agent_context(state: &AppState, session: &db::SessionRow) -> AgentContext {
     let context = session.context();
     let namespace = context
-        .grant("memory")
+        .grant(capability::MEMORY)
         .and_then(|g| g.param("namespace"))
         .map(str::to_owned);
     let memory = match namespace {

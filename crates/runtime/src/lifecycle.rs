@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use serde_json::json;
+use sloppod_contracts::capability;
 use sloppod_contracts::{EgressSpec, Grant, PlacementSpec};
 
 use crate::memini::MeminiAdmin;
@@ -28,7 +29,7 @@ async fn ensure_memini_key(state: &AppState, session: &db::SessionRow) -> anyhow
     }
     let context = session.context();
     let granted = context
-        .grant("memory")
+        .grant(capability::MEMORY)
         .and_then(|g| g.param("namespace"))
         .map(str::to_owned);
     let home = memini
@@ -52,7 +53,7 @@ async fn ensure_memini_key(state: &AppState, session: &db::SessionRow) -> anyhow
         .await?;
     if granted.is_none() {
         let grant = Grant::new(
-            "memory",
+            capability::MEMORY,
             json!({"namespace": namespace, "access": "rw", "key": key.name}),
         );
         db::add_grant(&state.db, session.id, &grant).await?;
@@ -85,7 +86,7 @@ pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result
             session_id: id.clone(),
             pod_labels: BTreeMap::from([(SESSION_LABEL.to_owned(), id.clone())]),
             intercepted_hosts: state.policies.hosts(),
-            direct_hosts: if context.has("packages") {
+            direct_hosts: if context.has(capability::PACKAGES) {
                 state.config.direct_hosts.clone()
             } else {
                 Vec::new()
@@ -177,7 +178,7 @@ pub async fn remove_session(state: &AppState, session: &db::SessionRow) -> anyho
     state.hub.stop(id).await;
     state.placement.delete(&id.to_string()).await?;
     state.enforcer.remove(&id.to_string()).await?;
-    if session.context().has("memory")
+    if session.context().has(capability::MEMORY)
         && let Some((admin, _)) = state.credentials.memini(&session.owner).await?
         && let Err(e) = admin
             .delete_key(&MeminiAdmin::key_name(&id.to_string()))

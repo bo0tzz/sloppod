@@ -87,7 +87,7 @@ impl SessionContext {
     pub fn repos(&self) -> impl Iterator<Item = &str> {
         self.grants
             .iter()
-            .filter(|g| g.capability == "repo")
+            .filter(|g| g.capability == capability::REPO)
             .filter_map(|g| g.param("repo"))
     }
 
@@ -95,7 +95,7 @@ impl SessionContext {
     fn repo_grants(&self, access: &str) -> impl Iterator<Item = RepoGrant<'_>> {
         self.grants
             .iter()
-            .filter(move |g| g.capability == "repo" && g.param("access") == Some(access))
+            .filter(move |g| g.capability == capability::REPO && g.param("access") == Some(access))
             .filter_map(|g| {
                 Some(RepoGrant {
                     repo: g.param("repo")?,
@@ -124,6 +124,22 @@ impl SessionContext {
         self.repo_grants(READ_ONLY)
             .find(|g| g.repo.eq_ignore_ascii_case(repo))
     }
+}
+
+/// The built-in capability names a grant can have (ADR 2).
+pub mod capability {
+    /// Claude's API, with the owner's Claude account.
+    pub const MODEL: &str = "model";
+    /// Codex's API, with the owner's ChatGPT login.
+    pub const CODEX: &str = "codex";
+    /// GitHub's API and git.
+    pub const GITHUB: &str = "github";
+    /// Package registries and tool downloads, reached directly.
+    pub const PACKAGES: &str = "packages";
+    /// Long-term memory (memini).
+    pub const MEMORY: &str = "memory";
+    /// A repository: `{repo, access, branch?, commit?}`.
+    pub const REPO: &str = "repo";
 }
 
 /// A repository grant's `access`: read only, or read and push the session's branches (ADR 2).

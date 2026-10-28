@@ -8,6 +8,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use serde::Deserialize;
 use serde_json::json;
+use sloppod_contracts::capability;
 use sloppod_contracts::{Grant, READ_WRITE};
 use sloppod_protocol::api::{
     Decision, NewCredential, NewSession, NewStandingApproval, Phase, ProposalStatus, ReviewPolicy,
@@ -358,17 +359,17 @@ async fn create_session(
 
     let id = Uuid::new_v4();
     let mut grants = vec![
-        Grant::new("model", json!({})),
-        Grant::new("github", json!({})),
-        Grant::new("packages", json!({})),
+        Grant::new(capability::MODEL, json!({})),
+        Grant::new(capability::GITHUB, json!({})),
+        Grant::new(capability::PACKAGES, json!({})),
     ];
     if state.credentials.secret(&user, CHATGPT).await?.is_some() {
-        grants.push(Grant::new("codex", json!({})));
+        grants.push(Grant::new(capability::CODEX, json!({})));
     }
     if let Some(repo) = &repo {
         let branch = proposals::session_branch(id);
         grants.push(Grant::new(
-            "repo",
+            capability::REPO,
             json!({"repo": repo, "access": READ_WRITE, "branch": branch}),
         ));
     }
