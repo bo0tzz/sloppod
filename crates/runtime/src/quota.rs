@@ -57,7 +57,6 @@ impl Quotas {
     }
 
     /// Every credential's quota as it changes.
-    #[allow(dead_code)] // For #251, which waits out a limit.
     pub fn subscribe(&self) -> broadcast::Receiver<Change> {
         self.changed.subscribe()
     }

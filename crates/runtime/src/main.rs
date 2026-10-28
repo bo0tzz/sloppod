@@ -13,6 +13,7 @@ mod grants;
 mod identity;
 mod inference;
 mod lifecycle;
+mod limits;
 mod link;
 mod mcp;
 mod memini;
@@ -243,6 +244,12 @@ async fn main() -> anyhow::Result<()> {
         let state = usage.clone();
         Box::pin(async move { quota::seen(&state, id, update).await })
     }));
+    let resets = state.clone();
+    state.hub.set_limit_reset(Arc::new(move |id| {
+        let state = resets.clone();
+        Box::pin(async move { limits::reset(&state, id).await })
+    }));
+    limits::follow_quotas(&state);
     let checker = state.clone();
     state.hub.set_turn_ended(Arc::new(move |id| {
         let state = checker.clone();
@@ -384,6 +391,8 @@ async fn reconcile(state: &AppState) {
         }
         Err(e) => tracing::error!(error = %e, "listing parked sessions"),
     }
+    // Before the queues, so a session waiting for its usage limit keeps what was queued for it until then.
+    state.hub.restore_limits().await;
     // After the pods are placed, so a queue for a running session waits for its agent and a parked one wakes for it;
     // before anything that can queue a notice, which would otherwise replace the kept queue before it's read.
     state.hub.restore_queues().await;
