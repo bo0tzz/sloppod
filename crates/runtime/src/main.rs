@@ -236,6 +236,16 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                every.tick().await;
+                lifecycle::roll_images(&state).await;
+            }
+        });
+    }
 
     tokio::spawn(rebases::run(state.clone(), pushes_to_recheck));
     let authz = tokio::spawn(authz::serve(config.authz_listen, state.clone()));

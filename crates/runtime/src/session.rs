@@ -1179,6 +1179,14 @@ impl Hub {
         self.live(id).state.lock().await.turn_running
     }
 
+    /// Whether anything is going on in the session: a turn, messages waiting, or a question or permission request
+    /// the user hasn't answered.
+    pub async fn busy(&self, id: Uuid) -> bool {
+        let live = self.live(id);
+        let state = live.state.lock().await;
+        state.turn_running || !state.queue.is_empty() || !state.permissions.is_empty()
+    }
+
     /// Counts a turn the hub sent as ended, failed with `error` or not.
     async fn turn_finished(&self, id: Uuid, error: Option<String>) {
         let live = self.live(id);

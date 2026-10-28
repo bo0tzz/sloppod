@@ -3,7 +3,7 @@
 sloppod ships as an OCI Helm chart, `oci://ghcr.io/bo0tzz/charts/sloppod`, published from `main` together with two images:
 
 - `ghcr.io/bo0tzz/sloppod`: the runtime and UI
-- `ghcr.io/bo0tzz/sloppod-session`: the session image with the supervisor, the Claude Code adapter, mise and the memini plugin
+- `ghcr.io/bo0tzz/sloppod-session`: the session image with the supervisor, the Claude Code adapter, mise and the memini plugin. A new session image reaches running sessions as they go idle: a session idle for 15 minutes whose pod runs another image is parked and woken, which gives it a new pod, and its agent resumes the conversation. Busy sessions keep their pod until they're idle
 
 Releases are `v<version>` tags: chart `<version>` on images tagged `v<version>` (and `latest`). Every push to `main` also publishes chart `<last release, next patch>-main.<run>` (e.g. `0.1.1-main.12` after `v0.1.0`) on images tagged with the commit (and `main`); semver ranges without a prerelease part skip those. A release commit sets the version in `Chart.yaml` and `Cargo.toml`; the tag has to match both. Installing the chart from a checkout instead needs `image.tag` and `session.image.tag` set, because the in-repo `appVersion` isn't an image tag.
 

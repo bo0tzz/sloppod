@@ -162,6 +162,52 @@ pub async fn park(state: &AppState, session: &db::SessionRow) -> Result<(), Park
         .await
 }
 
+/// How long a session has to have been quiet before its pod is replaced for a newer session image.
+const ROLL_AFTER_IDLE: chrono::Duration = chrono::Duration::minutes(15);
+
+/// Whether a session's pod is due to be replaced for the current session image: it runs another, and the session
+/// has been idle a while, so the replacement interrupts nothing.
+fn due_for_image(
+    session: &db::SessionRow,
+    running: Option<&str>,
+    current: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    session.phase() == sloppod_protocol::api::Phase::Idle
+        && now - session.active_at >= ROLL_AFTER_IDLE
+        && running.is_some_and(|image| image != current)
+}
+
+/// Gives idle sessions whose pods run an older session image a new pod (#28): parking and waking one replaces its
+/// pod from the current spec, the transcript synced in between, and its agent resumes the conversation. Never during
+/// a turn or with anything waiting: parking refuses a session in a turn, and busy ones are left for later.
+pub async fn roll_images(state: &AppState) {
+    let sessions = match db::active_sessions(&state.db).await {
+        Ok(sessions) => sessions,
+        Err(e) => {
+            tracing::error!(error = %e, "listing sessions to roll onto the new image");
+            return;
+        }
+    };
+    let current = &state.config.session_image;
+    for session in sessions {
+        let running = state.pods.session_image(session.id);
+        if !due_for_image(&session, running.as_deref(), current, chrono::Utc::now())
+            || state.hub.busy(session.id).await
+        {
+            continue;
+        }
+        tracing::info!(session = %session.id, from = ?running, to = %current, "replacing an idle session's pod for the new image");
+        if let Err(e) = park(state, &session).await {
+            tracing::info!(session = %session.id, error = %e, "not replacing the pod now");
+            continue;
+        }
+        if let Err(e) = wake(state, &session).await {
+            tracing::warn!(session = %session.id, error = %e, "waking a session after replacing its pod");
+        }
+    }
+}
+
 /// Brings a parked session back: its pod starts again and the agent resumes its conversation. Other sessions are
 /// left as they are, and a deleted one stays parked until it's restored.
 pub async fn wake(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
@@ -199,4 +245,59 @@ pub async fn remove_session(state: &AppState, session: &db::SessionRow) -> anyho
         .delete_session_secret(id, SESSION_KEY)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Duration, Utc};
+    use sloppod_protocol::api::Phase;
+    use uuid::Uuid;
+
+    use super::*;
+
+    #[test]
+    fn only_an_idle_session_on_an_older_image_gets_a_new_pod() {
+        let now = Utc::now();
+        let session = |phase: Phase, quiet: i64| {
+            let mut row = db::SessionRow::for_test(Uuid::now_v7(), "dev");
+            row.phase = phase.as_str().to_owned();
+            row.active_at = now - Duration::minutes(quiet);
+            row
+        };
+        let idle = session(Phase::Idle, 30);
+        assert!(due_for_image(
+            &idle,
+            Some("session:old"),
+            "session:new",
+            now
+        ));
+        assert!(!due_for_image(
+            &idle,
+            Some("session:new"),
+            "session:new",
+            now
+        ));
+        // No live pod to replace.
+        assert!(!due_for_image(&idle, None, "session:new", now));
+        // Active a moment ago, or not idle.
+        assert!(!due_for_image(
+            &session(Phase::Idle, 5),
+            Some("session:old"),
+            "session:new",
+            now
+        ));
+        for phase in [
+            Phase::Working,
+            Phase::Waiting,
+            Phase::Starting,
+            Phase::Disconnected,
+        ] {
+            assert!(!due_for_image(
+                &session(phase, 30),
+                Some("session:old"),
+                "session:new",
+                now
+            ));
+        }
+    }
 }
