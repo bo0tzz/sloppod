@@ -9,6 +9,7 @@ use sloppod_contracts::{Grant, READ_ONLY, ReviewSubject};
 use sloppod_protocol::api::{ProposalStatus, ReviewPolicy, SessionKind};
 use uuid::Uuid;
 
+use crate::session::TurnEnd;
 use crate::{AppState, db, lifecycle, proposals};
 
 /// After this many rounds with changes requested, the proposal goes to the human with the open findings.
@@ -114,7 +115,8 @@ fn round_timed_out(started: DateTime<Utc>, now: DateTime<Utc>) -> bool {
 /// What's left to do about a review round that hasn't reached a verdict.
 #[derive(Debug, PartialEq, Eq)]
 enum Stall {
-    /// Still going, or not started yet.
+    /// Still going, not started yet, or waiting for the usage limit to reset, after which the reviewer carries on
+    /// by itself.
     Wait,
     /// A turn ended without a verdict: remind the reviewer once.
     Nudge,
@@ -128,17 +130,17 @@ enum Stall {
 /// How many failed reviewer turns a round carries on after.
 const FAILED_TURN_RETRIES: u32 = 3;
 
-/// Decides about a round after a check: `turn_ended` says a reviewer turn ended since the last check, and `failed`
-/// that it ended in an error rather than by the reviewer stopping; `retries` counts failed turns carried on after.
-fn stall(turn_ended: bool, failed: bool, retries: u32, nudged: bool, timed_out: bool) -> Stall {
+/// Decides about a round after a check: `ended` is how the last reviewer turn ended, if one ended since the last
+/// check; `retries` counts failed turns carried on after.
+fn stall(ended: Option<&TurnEnd>, retries: u32, nudged: bool, timed_out: bool) -> Stall {
     if timed_out {
         return Stall::GiveUp;
     }
-    match (turn_ended, failed && retries < FAILED_TURN_RETRIES, nudged) {
-        (false, _, _) => Stall::Wait,
-        (true, true, _) => Stall::Retry,
-        (true, false, false) => Stall::Nudge,
-        (true, false, true) => Stall::GiveUp,
+    match ended {
+        None | Some(TurnEnd::Limited) => Stall::Wait,
+        Some(TurnEnd::Failed(_)) if retries < FAILED_TURN_RETRIES => Stall::Retry,
+        Some(_) if nudged => Stall::GiveUp,
+        Some(_) => Stall::Nudge,
     }
 }
 
@@ -150,8 +152,15 @@ fn watch_round(state: &AppState, proposal: Uuid, session: Uuid, round: i32) {
     tokio::spawn(async move {
         let (mut nudged, mut retries) = (false, 0);
         let (mut seen, _) = state.hub.turns_ended(session).await;
+        // Time the reviewer spends waiting for its usage limit doesn't count towards the round's.
+        let (mut limited, mut looked) = (chrono::Duration::zero(), Utc::now());
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
+            let now = Utc::now();
+            if state.hub.limited_until(session).await.is_some() {
+                limited += now - looked;
+            }
+            looked = now;
             // Errors are retried at the next check; only a confirmed outcome ends the watch.
             let (rounds, current) = match tokio::try_join!(
                 db::reviews(&state.db, proposal),
@@ -171,17 +180,20 @@ fn watch_round(state: &AppState, proposal: Uuid, session: Uuid, round: i32) {
             {
                 return;
             }
-            let timed_out = round_timed_out(this.created_at, Utc::now());
+            let timed_out = round_timed_out(this.created_at + limited, now);
             // Counted, not sampled: a turn that starts and ends between two looks still counts.
-            let (ended, error) = state.hub.turns_ended(session).await;
-            let turn_ended = ended > seen;
-            seen = ended;
-            let failed = error.filter(|_| turn_ended);
-            match stall(turn_ended, failed.is_some(), retries, nudged, timed_out) {
+            let (count, last) = state.hub.turns_ended(session).await;
+            let ended = last.filter(|_| count > seen);
+            seen = count;
+            match stall(ended.as_ref(), retries, nudged, timed_out) {
                 Stall::Wait => {}
                 Stall::Retry => {
                     retries += 1;
-                    tracing::info!(%proposal, round, error = ?failed, "a review turn failed; carrying on");
+                    let error = match ended {
+                        Some(TurnEnd::Failed(error)) => error,
+                        _ => String::new(),
+                    };
+                    tracing::info!(%proposal, round, %error, "a review turn failed; carrying on");
                     state
                         .hub
                         .notify(
@@ -189,7 +201,7 @@ fn watch_round(state: &AppState, proposal: Uuid, session: Uuid, round: i32) {
                             format!(
                                 "sloppod: your last turn failed ({}). Carry on with this review round where you \
                                  left off, and finish it by calling the `submit_review` tool.",
-                                failed.unwrap_or_default()
+                                error
                             ),
                         )
                         .await;
@@ -862,36 +874,50 @@ mod tests {
         let expired = now - chrono::Duration::minutes(31);
         assert!(round_timed_out(expired, now));
         assert_eq!(
-            stall(false, false, 0, false, round_timed_out(expired, now)),
+            stall(None, 0, false, round_timed_out(expired, now)),
             Stall::GiveUp
         );
     }
 
     #[test]
     fn a_stalled_round_is_nudged_once_then_given_up() {
-        assert_eq!(stall(false, false, 0, false, false), Stall::Wait);
-        assert_eq!(stall(true, false, 0, false, false), Stall::Nudge);
-        assert_eq!(stall(false, false, 0, true, false), Stall::Wait);
-        assert_eq!(stall(true, false, 0, true, false), Stall::GiveUp);
-        assert_eq!(stall(false, false, 0, false, true), Stall::GiveUp);
+        let ended = Some(&TurnEnd::Ended);
+        assert_eq!(stall(None, 0, false, false), Stall::Wait);
+        assert_eq!(stall(ended, 0, false, false), Stall::Nudge);
+        assert_eq!(stall(None, 0, true, false), Stall::Wait);
+        assert_eq!(stall(ended, 0, true, false), Stall::GiveUp);
+        assert_eq!(stall(None, 0, false, true), Stall::GiveUp);
     }
 
     #[test]
     fn a_failed_turn_is_carried_on_from_a_few_times() {
+        let failed = TurnEnd::Failed("upstream 503".into());
+        let failed = Some(&failed);
         // A failed turn doesn't use up the nudge, nor count as giving up after one.
-        assert_eq!(stall(true, true, 0, false, false), Stall::Retry);
-        assert_eq!(stall(true, true, 2, true, false), Stall::Retry);
+        assert_eq!(stall(failed, 0, false, false), Stall::Retry);
+        assert_eq!(stall(failed, 2, true, false), Stall::Retry);
         // After that, it counts like any other turn that ended without a verdict.
         assert_eq!(
-            stall(true, true, FAILED_TURN_RETRIES, false, false),
+            stall(failed, FAILED_TURN_RETRIES, false, false),
             Stall::Nudge
         );
         assert_eq!(
-            stall(true, true, FAILED_TURN_RETRIES, true, false),
+            stall(failed, FAILED_TURN_RETRIES, true, false),
             Stall::GiveUp
         );
         // The round's time limit still holds.
-        assert_eq!(stall(true, true, 0, false, true), Stall::GiveUp);
+        assert_eq!(stall(failed, 0, false, true), Stall::GiveUp);
+    }
+
+    #[test]
+    fn a_turn_stopped_by_the_usage_limit_waits_for_the_reset() {
+        // The reviewer carries on by itself once the limit resets: no retry, nudge or giving up meanwhile.
+        let limited = Some(&TurnEnd::Limited);
+        assert_eq!(
+            stall(limited, FAILED_TURN_RETRIES, true, false),
+            Stall::Wait
+        );
+        assert_eq!(stall(limited, 0, false, false), Stall::Wait);
     }
 
     #[test]

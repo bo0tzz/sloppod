@@ -1,8 +1,8 @@
 <script lang="ts">
   import { Icon, Text } from '@immich/ui';
-  import { mdiSourceBranch } from '@mdi/js';
+  import { mdiSourceBranch, mdiTimerSandComplete } from '@mdi/js';
   import type { Session } from '#lib/api.ts';
-  import { absoluteTime, timeAgo } from '#lib/format.ts';
+  import { absoluteTime, clockTime, timeAgo } from '#lib/format.ts';
   import PhaseBadge from './PhaseBadge.svelte';
 
   let {
@@ -52,6 +52,11 @@
         <span class="min-w-0 grow truncate font-medium {compact ? 'text-sm' : ''}">
           {session.title || 'New session'}
         </span>
+        {#if session.limited_until}
+          <span class="text-warning shrink-0" title="Waiting for the usage limit; carries on at {clockTime(session.limited_until, now)}" data-testid="session-limited">
+            <Icon icon={mdiTimerSandComplete} size="1.1em" aria-label="Waiting for the usage limit" />
+          </span>
+        {/if}
         <PhaseBadge phase={session.phase} />
       </div>
       <div class="text-muted flex min-w-0 items-center gap-1.5 text-xs">
