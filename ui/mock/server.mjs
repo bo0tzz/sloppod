@@ -1,4 +1,3 @@
-  for (const image of images) session.emit({ sessionUpdate: 'user_message_chunk', content: image, messageId });
 #!/usr/bin/env node
 // A mock sloppod runtime implementing docs/api.md (REST and ACP over /acp) with a scripted fake agent.
 //
@@ -254,6 +253,7 @@ function echoUser(
     messageId,
     ...(steering || notice ? { _meta: { sloppod } } : {}),
   });
+  for (const image of images) session.emit({ sessionUpdate: 'user_message_chunk', content: image, messageId });
 }
 
 /**
