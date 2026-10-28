@@ -124,7 +124,7 @@ impl TurnEnd {
 }
 
 /// What a session that waited for its usage limit is told when it carries on.
-const LIMIT_RESET_NOTICE: &str = "sloppod: your last turn stopped at the account's usage limit, which should have \
+pub(crate) const LIMIT_RESET_NOTICE: &str = "sloppod: your last turn stopped at the account's usage limit, which should have \
      reset by now. Carry on where you left off.";
 
 /// A batch of prompts on its way to the agent.
@@ -258,6 +258,11 @@ pub type UsageSeen =
 pub type LimitHit =
     Arc<dyn Fn(Uuid) -> Pin<Box<dyn Future<Output = Option<DateTime<Utc>>> + Send>> + Send + Sync>;
 
+/// Called when a session's wait for its usage limit ends, with when, to keep what depends on it (a review round's
+/// pause).
+pub type LimitEnded =
+    Arc<dyn Fn(Uuid, DateTime<Utc>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 pub struct Hub {
     store: Arc<dyn SessionStore>,
     waker: StdMutex<Option<Waker>>,
@@ -268,6 +273,7 @@ pub struct Hub {
     /// The time the tests say it is, instead of the clock's.
     now: StdMutex<Option<DateTime<Utc>>>,
     limit_hit: StdMutex<Option<LimitHit>>,
+    limit_ended: StdMutex<Option<LimitEnded>>,
 }
 
 fn notification(method: &str, params: Value) -> Value {
@@ -299,6 +305,7 @@ impl Hub {
             sessions: StdMutex::default(),
             agent_capabilities: StdMutex::default(),
             limit_hit: StdMutex::default(),
+            limit_ended: StdMutex::default(),
             now: StdMutex::default(),
         }
     }
@@ -341,6 +348,18 @@ impl Hub {
 
     pub fn set_limit_hit(&self, limit_hit: LimitHit) {
         *self.limit_hit.lock().unwrap() = Some(limit_hit);
+    }
+
+    pub fn set_limit_ended(&self, limit_ended: LimitEnded) {
+        *self.limit_ended.lock().unwrap() = Some(limit_ended);
+    }
+
+    /// A session's wait for its usage limit ended at `at`.
+    async fn limit_ended(&self, id: Uuid, at: DateTime<Utc>) {
+        let limit_ended = self.limit_ended.lock().unwrap().clone();
+        if let Some(limit_ended) = limit_ended {
+            limit_ended(id, at).await;
+        }
     }
 
     /// The session's agent, if it's up.
@@ -1839,8 +1858,12 @@ impl Hub {
                 state.limited_until = until;
                 self.save_limit(id, until).await;
             }
-            until.filter(|_| changed)
+            (until.filter(|_| changed), changed && until.is_none())
         };
+        let (limited, ended) = limited;
+        if ended {
+            self.limit_ended(id, now).await;
+        }
         if let Some(until) = limited {
             tracing::info!(session = %id, %until, "the session hit its usage limit; it carries on then");
             self.resume_at(id, until);
@@ -1909,27 +1932,34 @@ impl Hub {
             if state.limited_until != Some(until) || state.stopped {
                 return;
             }
-            state.limited_until = None;
-            self.save_limit(id, None).await;
             // A turn the user started meanwhile carries on by itself, and the queue runs after it.
             if state.turn_running {
-                return;
-            }
-            let up = state.agent.is_some() && state.agent_session_id.is_some();
-            state.queue.insert(0, notice);
-            if up {
-                state.turn_running = true;
-                let queued = std::mem::take(&mut state.queue);
-                let held = self.hold(id, &mut state, &queued).await;
-                (
-                    state.agent.clone().map(|agent| (agent, queued, held)),
-                    false,
-                )
+                state.limited_until = None;
+                self.save_limit(id, None).await;
+                (None, false)
             } else {
-                self.save_queue(id, &state).await;
-                (None, true)
+                let up = state.agent.is_some() && state.agent_session_id.is_some();
+                // Kept before the wait is cleared, so a restart in between still carries on; one kept by a restart
+                // that came after it isn't queued again.
+                let kept = state.queue.iter().any(|q| q.blocks.first() == Some(&block));
+                if !kept {
+                    state.queue.insert(0, notice);
+                }
+                let start = if up {
+                    state.turn_running = true;
+                    let queued = std::mem::take(&mut state.queue);
+                    let held = self.hold(id, &mut state, &queued).await;
+                    state.agent.clone().map(|agent| (agent, queued, held))
+                } else {
+                    self.save_queue(id, &state).await;
+                    None
+                };
+                state.limited_until = None;
+                self.save_limit(id, None).await;
+                (start, !up)
             }
         };
+        self.limit_ended(id, self.now()).await;
         self.record_notice(id, &block, None).await;
         if let Some((agent, queued, held)) = start {
             self.broadcast_queue(id).await;

@@ -250,6 +250,11 @@ async fn main() -> anyhow::Result<()> {
         let state = limited.clone();
         Box::pin(async move { limits::hit(&state, id).await })
     }));
+    let ended = state.clone();
+    state.hub.set_limit_ended(Arc::new(move |id, at| {
+        let state = ended.clone();
+        Box::pin(async move { limits::ended(&state, id, at).await })
+    }));
     limits::follow_quotas(&state);
     let checker = state.clone();
     state.hub.set_turn_ended(Arc::new(move |id| {

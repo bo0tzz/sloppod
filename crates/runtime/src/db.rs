@@ -1280,6 +1280,21 @@ pub async fn pause_reviewer(db: &PgPool, reviewer: Uuid, at: DateTime<Utc>) -> s
     .map(|_| ())
 }
 
+/// Ends the wait of the review round a reviewer session works on at `at`, adding it to the time the round has waited;
+/// done as the session's wait ends, so a restart before the round's watcher looks doesn't count downtime as waiting.
+pub async fn unpause_reviewer(db: &PgPool, reviewer: Uuid, at: DateTime<Utc>) -> sqlx::Result<()> {
+    sqlx::query(
+        "update reviews r set paused_seconds = r.paused_seconds + greatest(0, extract(epoch from $2 - r.paused_since))::bigint, \
+         paused_since = null from proposals p \
+         where p.review_session_id = $1 and r.proposal_id = p.id and r.paused_since is not null",
+    )
+    .bind(reviewer)
+    .bind(at)
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
 /// Ends a review round's wait for the usage limit at `at`, adding it to the time the round has waited.
 pub async fn unpause_review(
     db: &PgPool,

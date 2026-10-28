@@ -58,6 +58,14 @@ pub async fn hit(state: &AppState, session: Uuid) -> Option<DateTime<Utc>> {
     reset(state, session).await
 }
 
+/// A session's wait for its usage limit ended at `at`: a review round it works on runs out of time again from then,
+/// kept at once so a restart doesn't count the downtime as waiting.
+pub async fn ended(state: &AppState, session: Uuid, at: DateTime<Utc>) {
+    if let Err(e) = db::unpause_reviewer(&state.db, session, at).await {
+        tracing::warn!(%session, error = %e, "unpausing the review a session works on");
+    }
+}
+
 /// When the limit the session's credential is at resets, if its quota says it's at one.
 pub async fn reset(state: &AppState, session: Uuid) -> Option<DateTime<Utc>> {
     let row = db::get_session(&state.db, session).await.ok()??;

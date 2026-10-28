@@ -2197,3 +2197,37 @@ async fn a_message_to_a_limited_session_without_its_agent_waits_and_steering_it_
     h.respond(&request, json!({"stopReason": "end_turn"})).await;
     message.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn a_carry_on_kept_before_a_restart_is_queued_once() {
+    // The runtime stopped after keeping the carry-on notice but before clearing the wait it ended.
+    let past = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let h = Harness::restarted_limited(past, &[crate::session::LIMIT_RESET_NOTICE, "Kept"]).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.hub.limited_until(h.id).await, None);
+    let kept = kept_texts(&h).await;
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    assert_eq!(kept[0], crate::session::LIMIT_RESET_NOTICE);
+    assert_eq!(kept[1], "Kept");
+}
+
+#[tokio::test]
+async fn the_end_of_a_wait_is_handed_on_as_it_happens() {
+    let mut h = Harness::ready().await;
+    let (tx, mut ended) = mpsc::unbounded_channel();
+    h.hub.set_limit_ended(Arc::new(move |id, _| {
+        let tx = tx.clone();
+        Box::pin(async move {
+            let _ = tx.send(id);
+        })
+    }));
+    let turn = h.prompt("Work");
+    let request = h.next().await;
+    hit_the_limit(&h, &request).await;
+    assert!(turn.await.unwrap().is_err());
+    let until = limited(&h).await;
+    assert!(ended.try_recv().is_err(), "still waiting");
+
+    h.hub.resume_after_limit(h.id, until).await;
+    assert_eq!(ended.try_recv().unwrap(), h.id);
+}

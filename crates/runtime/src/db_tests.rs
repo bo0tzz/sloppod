@@ -1095,6 +1095,14 @@ async fn a_review_round_keeps_a_wait_the_runtime_went_down_in_before_its_watcher
         at(21)
     ));
 
+    // Ended as the session's wait ends, not at the watcher's next look: a restart later counts no downtime.
+    db::pause_reviewer(&db, reviewer, at(30)).await.unwrap();
+    db::unpause_reviewer(&db, reviewer, at(40)).await.unwrap();
+    db::unpause_review(&db, p, round, at(100)).await.unwrap();
+    let row = &db::reviews(&db, p).await.unwrap()[0];
+    assert_eq!(row.paused_seconds, 70 * 60);
+    assert_eq!(row.paused_since, None);
+
     // A round that has its verdict isn't paused.
     db::finish_review_round(&db, p, "approve", "Fine.", &json!([]), &json!([]))
         .await
