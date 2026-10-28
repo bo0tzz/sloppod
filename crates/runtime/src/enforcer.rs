@@ -88,6 +88,58 @@ fn envoy_config(
     authz: SocketAddr,
     trusted_ca: &str,
 ) -> Value {
+    let manager = json!({
+        "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
+        "stat_prefix": LISTENER,
+        // One canonical path for the authorizer and the upstream alike: dot segments resolved and
+        // repeated slashes merged before any policy looks, so no policy has to get that right
+        // itself. Escaped slashes are left as sent.
+        "normalize_path": true,
+        "merge_slashes": true,
+        "stream_idle_timeout": "900s",
+        "request_timeout": "0s",
+        "route_config": {
+            "name": LISTENER,
+            "virtual_hosts": [{
+                "name": "all",
+                "domains": ["*"],
+                "routes": [{
+                    "match": {"prefix": "/"},
+                    "route": {"cluster": "sloppod-upstream", "timeout": "0s"},
+                }],
+            }],
+        },
+        "http_filters": [
+            {
+                "name": "envoy.filters.http.ext_authz",
+                "typed_config": {
+                    "@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz",
+                    "transport_api_version": "V3",
+                    "failure_mode_allow": false,
+                    "status_on_error": {"code": 503},
+                    "with_request_body": {
+                        "max_request_bytes": 65536,
+                        "allow_partial_message": true,
+                        "pack_as_bytes": true,
+                    },
+                    "grpc_service": {
+                        // Cilium prefixes resource names with `<namespace>/<config>/`, but only
+                        // rewrites the references it knows about. The authority must not
+                        // contain those slashes: HTTP/2 servers reject it.
+                        "envoy_grpc": {
+                            "cluster_name": format!("{namespace}/{LISTENER}/sloppod-authz"),
+                            "authority": "sloppod-authz",
+                        },
+                        "timeout": "10s",
+                    },
+                },
+            },
+            {
+                "name": "envoy.filters.http.router",
+                "typed_config": {"@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"},
+            },
+        ],
+    });
     json!({
         "apiVersion": "cilium.io/v2",
         "kind": "CiliumEnvoyConfig",
@@ -116,53 +168,7 @@ fn envoy_config(
                     },
                     "filters": [{
                         "name": "envoy.filters.network.http_connection_manager",
-                        "typed_config": {
-                            "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
-                            "stat_prefix": LISTENER,
-                            "stream_idle_timeout": "900s",
-                            "request_timeout": "0s",
-                            "route_config": {
-                                "name": LISTENER,
-                                "virtual_hosts": [{
-                                    "name": "all",
-                                    "domains": ["*"],
-                                    "routes": [{
-                                        "match": {"prefix": "/"},
-                                        "route": {"cluster": "sloppod-upstream", "timeout": "0s"},
-                                    }],
-                                }],
-                            },
-                            "http_filters": [
-                                {
-                                    "name": "envoy.filters.http.ext_authz",
-                                    "typed_config": {
-                                        "@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz",
-                                        "transport_api_version": "V3",
-                                        "failure_mode_allow": false,
-                                        "status_on_error": {"code": 503},
-                                        "with_request_body": {
-                                            "max_request_bytes": 65536,
-                                            "allow_partial_message": true,
-                                            "pack_as_bytes": true,
-                                        },
-                                        "grpc_service": {
-                                            // Cilium prefixes resource names with `<namespace>/<config>/`, but only
-                                            // rewrites the references it knows about. The authority must not
-                                            // contain those slashes: HTTP/2 servers reject it.
-                                            "envoy_grpc": {
-                                                "cluster_name": format!("{namespace}/{LISTENER}/sloppod-authz"),
-                                                "authority": "sloppod-authz",
-                                            },
-                                            "timeout": "10s",
-                                        },
-                                    },
-                                },
-                                {
-                                    "name": "envoy.filters.http.router",
-                                    "typed_config": {"@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"},
-                                },
-                            ],
-                        },
+                        "typed_config": manager,
                     }],
                 }],
             },
@@ -350,6 +356,21 @@ mod tests {
                 json!({"matchPattern": "**.cluster.local"}),
             ]
         );
+    }
+
+    #[test]
+    fn the_listener_hands_policies_a_normalised_path() {
+        let config = envoy_config(
+            "slop",
+            "cert",
+            "key",
+            "127.0.0.1:9001".parse().unwrap(),
+            "/ca.crt",
+        );
+        let manager =
+            &config["spec"]["resources"][0]["filter_chains"][0]["filters"][0]["typed_config"];
+        assert_eq!(manager["normalize_path"], true);
+        assert_eq!(manager["merge_slashes"], true);
     }
 
     #[test]
