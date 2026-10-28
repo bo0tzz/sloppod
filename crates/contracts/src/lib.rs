@@ -128,6 +128,16 @@ impl SessionContext {
             .and_then(|g| g.param("credential"))
     }
 
+    /// Whose GitHub token the session acts with on `repo`, by login; none for the GitHub App.
+    pub fn repo_acting_as(&self, repo: &str) -> Option<&str> {
+        self.repo_credential(repo)?;
+        self.grants
+            .iter()
+            .filter(|g| g.capability == capability::REPO)
+            .find(|g| g.param("repo").is_some_and(|r| same_repo(r, repo)))
+            .and_then(|g| g.param("as"))
+    }
+
     pub fn writable_repo_for(&self, repo: &str) -> Option<RepoGrant<'_>> {
         self.writable_repos().find(|g| same_repo(g.repo, repo))
     }

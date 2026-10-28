@@ -13,6 +13,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use sloppod_contracts::{Error, ProposalKind, RepoGrant, Result, SessionContext, ToolSpec};
 use sloppod_protocol::api::{Proposal, ProposalStatus, ReviewPolicy};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::github::{GitHubApp, StackWatch};
@@ -114,6 +115,35 @@ async fn branch_detail(app: &GitHubApp, payload: &Value) -> Result<Value> {
 }
 
 /// The repository a pull request or issue is for: the one named, or the only one the session can push to.
+/// The client a proposal reads and acts with on `repo` (ADR 29): the identity the session's grant of `repo` names, or
+/// the GitHub App. Every proposal kind gets its client here.
+pub(crate) async fn github_for(
+    credentials: &crate::credentials::Credentials,
+    session: &SessionContext,
+    repo: &str,
+) -> Result<Arc<GitHubApp>> {
+    credentials
+        .github_as(&session.owner, session.repo_credential(repo))
+        .await
+        .map_err(|e| Error::new(e.to_string()))
+}
+
+/// A proposal is carried out as whoever it said it would act as when it was approved (`as` in its payload, or the
+/// App): if the session's grant of its repository changed identity since, nothing is done.
+fn same_identity(session: &SessionContext, target: Option<&str>, payload: &Value) -> Result<()> {
+    let now = target.and_then(|repo| session.repo_acting_as(repo));
+    let proposed = payload["as"].as_str();
+    if now == proposed {
+        return Ok(());
+    }
+    let who = |login: Option<&str>| login.map_or("the GitHub App".to_owned(), str::to_owned);
+    Err(Error::new(format!(
+        "it was proposed to act as {}, but the session now acts as {} there, so nothing was done; propose it again",
+        who(proposed),
+        who(now)
+    )))
+}
+
 fn target_repo<'a>(session: &'a SessionContext, named: Option<&str>) -> Result<RepoGrant<'a>> {
     if let Some(repo) = named {
         return session.writable_repo_for(repo).ok_or_else(|| {
@@ -160,7 +190,14 @@ pub async fn propose(
     let asked = arguments["review"].as_bool() == Some(true) || kind.is_review();
     let required = session.review == ReviewPolicy::Required;
     let context = session.context();
-    let payload = kind.prepare(&context, arguments).await.map_err(|e| e.0)?;
+    let mut payload = kind.prepare(&context, arguments).await.map_err(|e| e.0)?;
+    // Who it acts as, shown wherever it's reviewed and held to when it's carried out.
+    if let Some(login) = kind
+        .target(&payload)
+        .and_then(|repo| context.repo_acting_as(&repo).map(str::to_owned))
+    {
+        payload["as"] = json!(login);
+    }
     let mut subject = kind.review_subject(&payload).filter(|_| asked || required);
     if asked && subject.is_none() {
         return Err("proposals of this kind aren't reviewed; propose it without review".into());
@@ -453,7 +490,19 @@ async fn carry_out(
     let session = db::get_session(&state.db, session_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("session gone"))?;
-    let finished = match kind.execute(&session.context(), payload).await {
+    let context = session.context();
+    let target = kind.target(payload);
+    let span = crate::github::acting_span(
+        &session_id.to_string(),
+        target
+            .as_deref()
+            .and_then(|repo| context.repo_credential(repo)),
+    );
+    let executed = match same_identity(&context, target.as_deref(), payload) {
+        Ok(()) => kind.execute(&context, payload).instrument(span).await,
+        Err(e) => Err(e),
+    };
+    let finished = match executed {
         Ok(result) => {
             db::finish_proposal(&state.db, id, ProposalStatus::Executed, Some(&result), None)
                 .await?
@@ -551,7 +600,13 @@ pub fn watch_stack(state: &AppState, proposal: &db::ProposalRow) {
         loop {
             tokio::time::sleep(STACK_WATCH_EVERY).await;
             let app = match db::get_session(&state.db, session_id).await {
-                Ok(Some(session)) => state.credentials.github(&session.owner).await,
+                Ok(Some(session)) => {
+                    let context = session.context();
+                    state
+                        .credentials
+                        .github_as(&context.owner, context.repo_credential(&repo))
+                        .await
+                }
                 Ok(None) => return,
                 Err(e) => Err(e.into()),
             };
@@ -638,6 +693,34 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn a_proposal_is_carried_out_as_whoever_it_said_it_would_act_as() {
+        let app = session(&["a/one"]);
+        let mut mine = session(&["a/one"]);
+        mine.grants[0].params["credential"] = json!("c1");
+        mine.grants[0].params["as"] = json!("dev");
+        assert_eq!(mine.repo_acting_as("A/One"), Some("dev"));
+        assert_eq!(app.repo_acting_as("a/one"), None);
+
+        let as_app = json!({"repo": "a/one"});
+        let as_dev = json!({"repo": "a/one", "as": "dev"});
+        assert!(same_identity(&app, Some("a/one"), &as_app).is_ok());
+        assert!(same_identity(&mine, Some("a/one"), &as_dev).is_ok());
+        let switched = same_identity(&mine, Some("a/one"), &as_app).unwrap_err();
+        assert!(
+            switched
+                .0
+                .contains("proposed to act as the GitHub App, but the session now acts as dev"),
+            "{}",
+            switched.0
+        );
+        assert!(same_identity(&app, Some("a/one"), &as_dev).is_err());
+        assert!(
+            same_identity(&mine, None, &json!({})).is_ok(),
+            "nothing on a repository"
+        );
     }
 
     #[test]

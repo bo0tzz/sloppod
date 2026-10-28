@@ -32,7 +32,7 @@
   import { diffStats, diffTexts, parseUnifiedDiff } from '#lib/diff.ts';
   import { readStored, writeStored } from '#lib/storage.ts';
   import { absoluteTime } from '#lib/format.ts';
-  import { proposalKinds, proposalStatus, proposalSummary } from '#lib/presentation.ts';
+  import { actingAs, proposalKinds, proposalStatus, proposalSummary } from '#lib/presentation.ts';
   import DiffView from './DiffView.svelte';
   import Markdown from './Markdown.svelte';
   import PullRequestChanges from './PullRequestChanges.svelte';
@@ -43,6 +43,7 @@
     onChange,
     onClose,
   }: { proposal: Proposal; onChange: (proposal: Proposal) => void; onClose: () => void } = $props();
+  const as = $derived(actingAs(proposal));
 
   // svelte-ignore state_referenced_locally
   const kind = proposal.kind;
@@ -193,6 +194,11 @@
           {/if}
           {#if pr?.auto_merge}
             <Badge color="info" shape="round" size="small" data-testid="proposal-auto-merge">Merges when checks pass</Badge>
+          {/if}
+          {#if as}
+            <Badge color="warning" shape="round" size="small" data-testid="proposal-acts-as" title="Carried out with {as}'s own GitHub token, in their name">
+              Acts as {as}
+            </Badge>
           {/if}
           {#if pr}
             <span class="text-muted min-w-0 font-mono text-xs break-all">{pr.repo}: {pr.head} → {pr.base}</span>

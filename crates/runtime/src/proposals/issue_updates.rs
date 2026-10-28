@@ -283,7 +283,7 @@ impl ProposalKind for IssueUpdates {
         if numbers.is_empty() {
             return Ok(json!({}));
         }
-        let app = self.credentials.github(&session.owner).await.map_err(err)?;
+        let app = super::github_for(&self.credentials, session, repo).await?;
         let mut current = Vec::new();
         for number in numbers {
             let mut issue = app.issue(repo, number).await.map_err(err)?;
@@ -300,7 +300,7 @@ impl ProposalKind for IssueUpdates {
     async fn execute(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
         let repo = payload["repo"].as_str().unwrap_or_default();
         let updates = update_list(&payload["updates"])?;
-        let app = self.credentials.github(&session.owner).await.map_err(err)?;
+        let app = super::github_for(&self.credentials, session, repo).await?;
 
         let (mut done, mut failed) = (Vec::new(), Vec::new());
         for update in &updates {

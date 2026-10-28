@@ -146,7 +146,7 @@ impl ProposalKind for Issues {
     async fn execute(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
         let repo = payload["repo"].as_str().unwrap_or_default();
         let issues = issue_list(&payload["issues"])?;
-        let app = self.credentials.github(&session.owner).await.map_err(err)?;
+        let app = super::github_for(&self.credentials, session, repo).await?;
         let mut labels: Vec<&str> = issues
             .iter()
             .flat_map(|i| i["labels"].as_array().into_iter().flatten())

@@ -159,7 +159,19 @@ async fn poll(state: &AppState) {
 }
 
 async fn check(state: &AppState, pull: &db::WatchedPull) -> anyhow::Result<()> {
-    let app = state.credentials.github(&pull.owner).await?;
+    // Watched as whoever the session acts as on the repository (ADR 29), which can read it.
+    let credential = db::get_session(&state.db, pull.session_id)
+        .await?
+        .and_then(|session| {
+            session
+                .context()
+                .repo_credential(&pull.repo)
+                .map(str::to_owned)
+        });
+    let app = state
+        .credentials
+        .github_as(&pull.owner, credential.as_deref())
+        .await?;
     let (owner, name) = pull
         .repo
         .split_once('/')
