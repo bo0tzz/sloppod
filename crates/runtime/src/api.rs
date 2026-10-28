@@ -549,13 +549,15 @@ async fn create_session(
         ));
     }
     let repos = accessible_repos(&state, &user).await;
-    let repo =
-        match &new.repo {
-            Some(wanted) => Some(find_repo(&repos, wanted.trim()).cloned().ok_or_else(|| {
+    let repo = match &new.repo {
+        Some(None) => None,
+        Some(Some(wanted)) => {
+            Some(find_repo(&repos, wanted.trim()).cloned().ok_or_else(|| {
                 bad_request(format!("{wanted} isn't accessible to your GitHub App"))
-            })?),
-            None => derive_repo(prompt, &repos),
-        };
+            })?)
+        }
+        None => derive_repo(prompt, &repos),
+    };
 
     let id = Uuid::new_v4();
     let defaults = crate::starting::defaults(&state, &user).await?;

@@ -138,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
             agent,
         } => {
             let body = NewSession {
-                repo,
+                repo: repo.map(Some),
                 title,
                 prompt,
                 agent,

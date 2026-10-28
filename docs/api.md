@@ -50,7 +50,7 @@ A session starts from its first message: the UI opens an empty chat, and sending
 ```ts
 type NewSession = {
   prompt: string;        // the first message; recorded right away and sent once the agent is up
-  repo?: string;         // "owner/name"; derived from the prompt when absent
+  repo?: string | null;  // "owner/name"; derived from the prompt when absent; null for none (e.g. a suggested one the user cleared)
   title?: string;        // kept as given; without one, the agent's automatic title is used
   agent?: string;        // the agent to run: "claude-code" (the default) or "codex"
   capabilities?: string[]; // what it starts with, from "github", "packages", "docs" and, with a ChatGPT login, "codex"; all of them when absent. Model access always comes, memory with the user's memini, and "github" with a repository. 400 for anything else
