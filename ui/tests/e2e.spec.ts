@@ -382,6 +382,22 @@ test('reconnects after the socket drops without duplicating history', async ({ p
   await expect(permissionCard(page)).toBeVisible();
 });
 
+test('the sidebar shows a redeployed runtime once the connection is back', async ({ page }) => {
+  await createSession(page, 'Reconnect me in sloppod');
+  await finishTurn(page);
+  const build = page.getByTestId('runtime-build');
+  await expect(build).toHaveText('sloppod 0.0.1-main.1');
+
+  try {
+    await page.request.post('/_mock/build?version=0.0.1-main.2&build=v0.0.2');
+    await page.request.post('/_mock/drop');
+    await expect(build).toHaveText('sloppod 0.0.1-main.2');
+    await expect(build).toHaveAttribute('href', 'https://github.com/bo0tzz/sloppod/releases/tag/v0.0.2');
+  } finally {
+    await page.request.post('/_mock/build');
+  }
+});
+
 test('a message written while reconnecting is sent once the connection is back', async ({ page }) => {
   await createSession(page, 'Reconnect me in sloppod');
   await finishTurn(page);
