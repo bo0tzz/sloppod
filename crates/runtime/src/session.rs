@@ -812,10 +812,24 @@ impl Hub {
                         }),
                     }
                 } else {
-                    restored.push(unstored(&q));
+                    let queued = unstored(&q);
+                    // Taken back before a restart that came before its queue was saved without it.
+                    if let Some(qid) = queued.id {
+                        match self.store.message_removed(id, qid).await {
+                            Ok(true) => continue,
+                            Ok(false) => {}
+                            Err(e) => {
+                                tracing::warn!(session = %id, error = %e, "checking whether a queued message was taken back");
+                            }
+                        }
+                    }
+                    restored.push(queued);
                 }
             }
             if restored.is_empty() && held.is_empty() {
+                let live = self.live(id);
+                let state = live.state.lock().await;
+                self.save_queue(id, &state).await;
                 continue;
             }
             {

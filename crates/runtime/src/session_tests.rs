@@ -1341,6 +1341,46 @@ async fn a_queue_kept_before_a_restart_runs_once_the_agent_is_up() {
 }
 
 #[tokio::test]
+async fn a_message_taken_back_before_a_restart_does_not_run_from_the_kept_queue() {
+    // Taken back, but the restart came before the queue was saved without it.
+    let mut h = Harness::starting().await;
+    let (taken, kept) = (Uuid::new_v4(), Uuid::new_v4());
+    h.store
+        .save_queue(
+            h.id,
+            &[
+                json!({"id": taken, "blocks": [{"type": "text", "text": "Taken back"}]}),
+                json!({"id": kept, "blocks": [{"type": "text", "text": "Kept"}]}),
+            ],
+        )
+        .await
+        .unwrap();
+    h.store.remove_message(h.id, taken).await.unwrap();
+    h.hub.restore_queues().await;
+    assert_eq!(h.queued().await, [kept.to_string()]);
+    h.agent_ready().await;
+    let restored = next_prompt(&mut h.to_agent).await;
+    assert_eq!(prompt_text(&restored), ["Kept"]);
+}
+
+#[tokio::test]
+async fn a_message_taken_back_before_a_restart_leaves_nothing_kept() {
+    let h = Harness::starting().await;
+    let taken = Uuid::new_v4();
+    h.store
+        .save_queue(
+            h.id,
+            &[json!({"id": taken, "blocks": [{"type": "text", "text": "Taken back"}]})],
+        )
+        .await
+        .unwrap();
+    h.store.remove_message(h.id, taken).await.unwrap();
+    h.hub.restore_queues().await;
+    assert!(h.queued().await.is_empty());
+    assert!(h.store.queues().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn a_message_steered_before_the_agent_is_up_is_kept() {
     let mut h = Harness::starting().await;
     let steered = h
