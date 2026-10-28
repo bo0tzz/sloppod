@@ -454,7 +454,7 @@ fn next_round_prompt(
         None => String::new(),
     };
     format!(
-        "Round {round} of {MAX_ROUNDS}: the author worked on your findings, and `{head}` is now at {head_sha}. \
+        "sloppod: round {round} of {MAX_ROUNDS}: the author worked on your findings, and `{head}` is now at {head_sha}. \
          Your checkout has been moved there, and `git diff {previous_sha}..{head_sha}` shows what changed since your \
          last review (if `git rev-parse HEAD` says otherwise, `git fetch origin {head} && git checkout --detach {head_sha}`).\n\n\
          Check each finding below against the code at {head_sha}. Report again each that still holds, whatever its \

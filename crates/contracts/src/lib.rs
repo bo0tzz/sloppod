@@ -395,6 +395,9 @@ pub struct AgentFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentContext {
     pub session: SessionContext,
+    /// What the session is for, which decides what its agent is told.
+    #[serde(default)]
+    pub role: SessionRole,
     pub workdir: String,
     /// The repository the session is about, checked out at `repo_dir`.
     pub repo: Option<String>,
@@ -407,6 +410,20 @@ pub struct AgentContext {
     pub instructions: Option<String>,
     pub model: Option<String>,
     pub memory: Option<MemoryContext>,
+}
+
+/// What a session is for, as its agent needs to know it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionRole {
+    /// The owner's own session, working on what they asked.
+    #[default]
+    Work,
+    /// A session another one spawned for part of its work (ADR 27), with its parent's id.
+    SubSession { parent: String },
+    /// A reviewer of a proposal (ADR 24), with a read-only checkout.
+    Review,
+    /// The runtime's own small model calls (ADR 26), with no tools.
+    Utility,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
