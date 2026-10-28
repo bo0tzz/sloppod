@@ -21,7 +21,7 @@ use crate::github::{GitHubApp, StackWatch};
 use crate::{AppState, db, lifecycle, reviews};
 
 pub use act_as::ActAsOwner;
-pub use code_review::CodeReview;
+pub use code_review::{CODE_REVIEW, CodeReview};
 pub use issue_updates::IssueUpdates;
 pub use issues::Issues;
 use pull_request::stack_layers;
@@ -167,19 +167,26 @@ fn same_identity(session: &SessionContext, target: Option<&str>, payload: &Value
     )))
 }
 
+/// How a refusal for a repository the session can't push to ends: what to do about it, if anything.
+fn next_step(session: &SessionContext) -> String {
+    session.role.repo_next_step()
+}
+
 fn target_repo<'a>(session: &'a SessionContext, named: Option<&str>) -> Result<RepoGrant<'a>> {
     if let Some(repo) = named {
         return session.writable_repo_for(repo).ok_or_else(|| {
             Error::new(format!(
-                "this session can't push to {repo}; ask for write access with request_repository first"
+                "this session can't push to {repo}{}",
+                next_step(session)
             ))
         });
     }
     let writable: Vec<RepoGrant> = session.writable_repos().collect();
     match writable.as_slice() {
-        [] => Err(Error::new(
-            "this session can't push to any repository; ask for write access with request_repository first",
-        )),
+        [] => Err(Error::new(format!(
+            "this session can't push to any repository{}",
+            next_step(session)
+        ))),
         [only] => Ok(only.clone()),
         several => Err(Error::new(format!(
             "this session can push to {}; say which one with `repo`",
@@ -212,6 +219,8 @@ pub async fn propose(
     // error, as is asking when the owner has no login for the reviewer. Under the policy those just skip review.
     let asked = arguments["review"].as_bool() == Some(true) || kind.is_review();
     let required = session.review == ReviewPolicy::Required;
+    // A sub-session's passed report whose review this one carries over (#247).
+    let from_sub_session = arguments["from_sub_session"].as_str().map(str::to_owned);
     let context = session.context();
     let payload = prepared(kind.as_ref(), &context, arguments)
         .await
@@ -240,6 +249,17 @@ pub async fn propose(
         }
         subject = None;
     }
+    let carried = match (&from_sub_session, &subject) {
+        (Some(child), Some(subject)) => {
+            reviews::carried_over(state, &session, child, subject).await?
+        }
+        (Some(_), None) => {
+            return Err(
+                "`from_sub_session` carries a review over, so this proposal needs one: add `review: true`".into(),
+            );
+        }
+        (None, _) => None,
+    };
     let status = if subject.is_some() {
         ProposalStatus::InReview
     } else {
@@ -255,7 +275,7 @@ pub async fn propose(
             .await
             .map_err(|e| e.to_string());
     };
-    if let Err(e) = reviews::start(state, &row, &subject, None).await {
+    if let Err(e) = reviews::start(state, &row, &subject, None, carried.as_ref()).await {
         tracing::warn!(proposal = %row.id, error = %e, "starting a review");
         let row = db::move_proposal(
             &state.db,
@@ -652,8 +672,11 @@ pub fn watch_stack(state: &AppState, proposal: &db::ProposalRow) {
                         .notify(
                             session_id,
                             format!(
-                                "sloppod: #{number} in your stack on {repo} has new commits since it was approved, so \
-                                 the stack's auto-merge is now off and it needs merging by hand."
+                                "sloppod: {} in your stack has new commits since it was approved, so the stack's \
+                                 auto-merge is now off and it needs merging by hand. {} It's at {}.",
+                                crate::pulls::pull_ref(&repo, number),
+                                crate::pulls::TELL_THE_USER,
+                                crate::pulls::pull_url(&repo, number)
                             ),
                         )
                         .await;
@@ -717,6 +740,7 @@ mod tests {
         SessionContext {
             session_id: Uuid::nil().to_string(),
             owner: "dev".into(),
+            role: Default::default(),
             grants: repos
                 .iter()
                 .map(|r| {

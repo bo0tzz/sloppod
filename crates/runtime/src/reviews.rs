@@ -30,12 +30,105 @@ pub async fn available(state: &AppState, owner: &str) -> anyhow::Result<bool> {
 
 /// Starts the next review round of a proposal in review: in a new review session for the first round, or in the
 /// one that reviewed the earlier rounds.
+/// A review a proposal carries over from a sub-session's passed report of the same work (#247): the report's
+/// reviewer, parked since, reviews the proposal from what it passed.
+#[derive(Debug, Clone)]
+pub struct CarriedOver {
+    pub reviewer: Uuid,
+    /// The commit the reviewer passed, and the branch it was on.
+    pub sha: String,
+    pub head: String,
+}
+
+/// The review a proposal of `parent`'s can carry over from its sub-session `child`: that sub-session's latest report
+/// whose review passed, if its reviewer is still there and it's of the same repository. An error when `child` isn't
+/// one of `parent`'s sub-sessions; none, so the review starts afresh, when there's nothing to carry over.
+pub async fn carried_over(
+    state: &AppState,
+    parent: &db::SessionRow,
+    child: &str,
+    subject: &ReviewSubject,
+) -> Result<Option<CarriedOver>, String> {
+    let reviewed_again = |kind: &str| {
+        state
+            .proposals
+            .get(kind)
+            .is_some_and(|kind| kind.reviewed_again())
+    };
+    carried_over_in(&state.db, parent, child, subject, reviewed_again).await
+}
+
+/// [`carried_over`], with which proposal kinds carry their review over given.
+pub(crate) async fn carried_over_in(
+    db: &sqlx::PgPool,
+    parent: &db::SessionRow,
+    child: &str,
+    subject: &ReviewSubject,
+    reviewed_again: impl Fn(&str) -> bool,
+) -> Result<Option<CarriedOver>, String> {
+    let child = child
+        .parse::<Uuid>()
+        .ok()
+        .ok_or("`from_sub_session` is the id of one of your sub-sessions")?;
+    let ours = db::get_session(db, child)
+        .await
+        .map_err(|e| e.to_string())?
+        .is_some_and(|row| row.parent_id == Some(parent.id));
+    if !ours {
+        return Err("`from_sub_session` isn't one of your sub-sessions".into());
+    }
+    let reports = db::list_proposals(
+        db,
+        &parent.owner,
+        Some(child),
+        Some(ProposalStatus::Executed),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let passed = reports.iter().rev().find(|report| {
+        reviewed_again(&report.kind) && report.payload["review"]["verdict"] == "pass"
+    });
+    let Some(report) = passed else {
+        return Ok(None);
+    };
+    let (Some(reviewer), Some(sha), Some(head)) = (
+        report.review_session_id,
+        report.payload["head_sha"].as_str(),
+        report.payload["head"].as_str(),
+    ) else {
+        return Ok(None);
+    };
+    let same_repo = report.payload["repo"]
+        .as_str()
+        .is_some_and(|repo| sloppod_contracts::same_repo(repo, &subject.repo));
+    let kept = db::get_session(db, reviewer)
+        .await
+        .map_err(|e| e.to_string())?
+        .is_some_and(|row| row.deleted_at.is_none())
+        && !db::has_active_review(db, reviewer)
+            .await
+            .map_err(|e| e.to_string())?;
+    Ok((same_repo && kept).then(|| CarriedOver {
+        reviewer,
+        sha: sha.to_owned(),
+        head: head.to_owned(),
+    }))
+}
+
 pub async fn start(
     state: &AppState,
     proposal: &db::ProposalRow,
     subject: &ReviewSubject,
     replies: Option<&str>,
+    carried: Option<&CarriedOver>,
 ) -> anyhow::Result<()> {
+    // A kept reviewer is only taken if nothing else has it; otherwise the review starts afresh.
+    let carried = match carried {
+        Some(carried) if db::claim_reviewer(&state.db, proposal.id, carried.reviewer).await? => {
+            Some(carried)
+        }
+        _ => None,
+    };
     let previous = db::reviews(&state.db, proposal.id).await?.pop();
     let round = db::start_review_round(&state.db, proposal.id, &subject.head_sha, replies).await?;
     let prompt = match &previous {
@@ -50,9 +143,12 @@ pub async fn start(
                 .unwrap_or_default(),
             replies,
         ),
-        None => first_round_prompt(subject),
+        None => match carried {
+            Some(carried) => carried_over_prompt(subject, carried),
+            None => first_round_prompt(subject),
+        },
     };
-    if let Some(session) = proposal.review_session_id {
+    if let Some(session) = carried.map(|c| c.reviewer).or(proposal.review_session_id) {
         db::set_repo_commit(&state.db, session, &subject.repo, &subject.head_sha).await?;
         // Queued first, so the round reaches the reviewer however long waking it takes.
         state.hub.notify(session, prompt).await;
@@ -409,6 +505,26 @@ fn described(subject: &ReviewSubject) -> String {
     }
 }
 
+/// The first round of a proposal whose review carries over from a report this reviewer passed (#247).
+fn carried_over_prompt(subject: &ReviewSubject, carried: &CarriedOver) -> String {
+    let ReviewSubject {
+        repo,
+        base,
+        head,
+        head_sha,
+        ..
+    } = subject;
+    let CarriedOver {
+        sha, head: passed, ..
+    } = carried;
+    format!(
+        "sloppod: the work you passed, `{passed}` at {sha}, is now proposed on {repo}: `{head}` at {head_sha}, to          merge into `{base}`. Your checkout has been moved there (if `git rev-parse HEAD` says otherwise, `git fetch          origin {head} && git checkout --detach {head_sha}`).\n\n\
+         What you passed stands; review what's new. `git diff {sha}..{head_sha}` shows what changed since you passed          it (empty if it's the same commit), and `git fetch origin {base} && git diff origin/{base}...{head_sha}` the          whole change, for what the new commits break elsewhere. Raise only p0 or p1 findings in what changed since, or          in how it fits the rest; zero findings is the expected outcome when it's what you passed. A title or          description that doesn't describe the change is a finding too: a human decides from them.\n\n{}\n\n\
+         Then call `submit_review`.",
+        described(subject)
+    )
+}
+
 fn first_round_prompt(subject: &ReviewSubject) -> String {
     let ReviewSubject {
         repo,
@@ -718,7 +834,11 @@ pub async fn submit(state: &AppState, session: Uuid, arguments: &Value) -> Resul
         )
     };
     state.hub.notify(proposal.session_id, notice).await;
-    end(state, session);
+    if kind.reviewed_again() {
+        keep(state, session);
+    } else {
+        end(state, session);
+    }
     let author = db::get_session(&state.db, proposal.session_id)
         .await
         .map_err(|e| e.to_string())?
@@ -790,7 +910,7 @@ pub async fn request(state: &AppState, session: Uuid, arguments: &Value) -> Resu
     .map_err(|e| e.to_string())?
     .ok_or("the proposal changed meanwhile")?;
     state.hub.broadcast_proposal(&row.to_api());
-    start(state, &row, &subject, replies)
+    start(state, &row, &subject, replies, None)
         .await
         .map_err(|e| e.to_string())?;
     Ok("The next review round has started; you'll be told how it goes.".into())
@@ -858,6 +978,52 @@ pub async fn abandon(state: &AppState, session: Uuid) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Parks a review session whose proposal's review may carry over to a later one (#247), after its current turn ends.
+/// It's deleted later: by the proposal that carries it over, or by [`sweep_kept_reviewers`].
+fn keep(state: &AppState, session: Uuid) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        turn_ended(&state, session).await;
+        let result = park_kept(&state, session).await;
+        if let Err(e) = result {
+            tracing::warn!(%session, error = %e, "parking a review session to keep");
+        }
+    });
+}
+
+/// Parks a kept reviewer unless a proposal has carried its review over meanwhile, and wakes it again if one did while
+/// it was being parked: that proposal's round is queued, and its wake found the reviewer still running.
+async fn park_kept(state: &AppState, session: Uuid) -> anyhow::Result<()> {
+    if db::has_active_review(&state.db, session).await? {
+        return Ok(());
+    }
+    let Some(row) = db::get_session(&state.db, session).await? else {
+        return Ok(());
+    };
+    lifecycle::park(state, &row).await?;
+    if db::has_active_review(&state.db, session).await?
+        && let Some(row) = db::get_session(&state.db, session).await?
+    {
+        lifecycle::wake(state, &row).await?;
+    }
+    Ok(())
+}
+
+/// How long a kept reviewer waits for a proposal to carry its review over.
+pub const KEPT_REVIEWER: chrono::Duration = chrono::Duration::hours(24);
+
+/// Deletes kept reviewers (`keep`) that no proposal has used for [`KEPT_REVIEWER`].
+pub async fn sweep_kept_reviewers(state: &AppState) {
+    match db::idle_review_sessions(&state.db, Utc::now() - KEPT_REVIEWER).await {
+        Ok(sessions) => {
+            for session in sessions {
+                end(state, session);
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "listing kept reviewers"),
+    }
+}
+
 /// Deletes a review session once it's done, after its current turn ends.
 pub fn end(state: &AppState, session: Uuid) {
     let state = state.clone();
@@ -884,6 +1050,30 @@ mod tests {
             f[k] = v.clone();
         }
         f
+    }
+
+    #[test]
+    fn a_carried_over_review_looks_at_what_changed_since_it_passed() {
+        let subject = ReviewSubject {
+            repo: "o/r".into(),
+            base: "main".into(),
+            head: "sloppod/p".into(),
+            head_sha: "beef".into(),
+            title: "Fix the build".into(),
+            body: "It was broken.".into(),
+            describes_change: true,
+        };
+        let carried = CarriedOver {
+            reviewer: Uuid::nil(),
+            sha: "c0ffee".into(),
+            head: "sloppod/p-child".into(),
+        };
+        let prompt = carried_over_prompt(&subject, &carried);
+        assert!(prompt.starts_with("sloppod: the work you passed, `sloppod/p-child` at c0ffee"));
+        assert!(prompt.contains("git diff c0ffee..beef"));
+        assert!(prompt.contains("git diff origin/main...beef"));
+        assert!(prompt.contains("It was broken."));
+        assert!(prompt.contains("submit_review"));
     }
 
     #[test]

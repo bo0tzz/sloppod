@@ -64,6 +64,7 @@ mod tests {
             session_id: "s".into(),
             owner: "dev".into(),
             grants,
+            role: Default::default(),
         }
     }
 

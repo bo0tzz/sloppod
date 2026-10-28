@@ -83,9 +83,9 @@ pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<
                 .find(|repo| same_repo(repo, wanted))
                 .map(str::to_owned)
                 .ok_or_else(|| {
+                    let next = parent.role().repo_next_step();
                     format!(
-                        "a sub-session works in a repository you can push to, and you can't push to {wanted}; \
-                         request it with request_repository first"
+                        "a sub-session works in a repository you can push to, and you can't push to {wanted}{next}"
                     )
                 })?,
         ),
@@ -147,8 +147,14 @@ pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<
     )
     .await
     .map_err(|e| format!("{e:#}"))?;
-    let branch = child.to_api().branch;
-    Ok(json!({"id": child.id, "title": child.title, "branch": branch}).to_string())
+    let branch = match child.to_api().branch {
+        Some(branch) => format!(" on branch `{branch}`"),
+        None => String::new(),
+    };
+    Ok(format!(
+        "Started sub-session {} \"{}\"{branch}. You're told when it reports; list_sessions shows how it's doing.",
+        child.id, child.title
+    ))
 }
 
 /// `list_sessions`: the session's children, and how each is doing.
@@ -231,7 +237,7 @@ pub fn tools() -> Vec<Value> {
     vec![
         json!({
             "name": "spawn_session",
-            "description": "Start a sub-session for a piece of your work that can run on its own: a session with its own pod and agent, linked to yours. It starts with your grants, or fewer, and works on a branch named after yours, starting from your branch as pushed (push first), so you can merge, rebase or propose what it does. At most 5 run at once. Returns its id and branch.",
+            "description": format!("Start a sub-session for a piece of your work that can run on its own: a session with its own pod and agent, linked to yours. It starts with your grants, or fewer, and works on a branch named after yours, starting from your branch as pushed (push first), so you can merge, rebase or propose what it does. At most {MAX_RUNNING} run at once. Returns its id and branch."),
             "inputSchema": {
                 "type": "object",
                 "properties": {

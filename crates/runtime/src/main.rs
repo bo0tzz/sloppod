@@ -276,6 +276,7 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 every.tick().await;
                 lifecycle::sweep_expired_grants(&state).await;
+                reviews::sweep_kept_reviewers(&state).await;
             }
         });
     }

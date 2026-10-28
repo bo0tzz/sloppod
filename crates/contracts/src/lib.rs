@@ -62,6 +62,48 @@ impl Grant {
     }
 }
 
+/// What a session is for: what its agent is told, and which tools and next steps it has.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionRole {
+    /// The owner's own session, working on what they asked.
+    #[default]
+    Work,
+    /// A session another one spawned for part of its work (ADR 27), with its parent's id.
+    SubSession { parent: String },
+    /// A reviewer of a proposal (ADR 24), with a read-only checkout.
+    Review,
+    /// The runtime's own small model calls (ADR 26), with no tools.
+    Utility,
+}
+
+impl SessionRole {
+    /// Whether it acts outside its pod (proposals, questions to the user, sub-sessions): work sessions and
+    /// sub-sessions do, reviewers and utility sessions don't.
+    pub fn acts(&self) -> bool {
+        matches!(self, Self::Work | Self::SubSession { .. })
+    }
+
+    /// What to do about a repository the session can't push to, to follow a semicolon; none if there's nothing. Only
+    /// a work session of its own can call `request_repository`; a sub-session works where its parent can push, so it
+    /// asks through its report (ADR 27).
+    pub fn repo_advice(&self) -> Option<&'static str> {
+        match self {
+            Self::Work => Some("ask for write access with the request_repository tool"),
+            Self::SubSession { .. } => {
+                Some("say in your report that you need it, and your parent session can request it")
+            }
+            Self::Review | Self::Utility => None,
+        }
+    }
+
+    /// The end of a refusal for a repository the session can't push to: `; ` and [`Self::repo_advice`], or nothing.
+    pub fn repo_next_step(&self) -> String {
+        self.repo_advice()
+            .map(|advice| format!("; {advice}"))
+            .unwrap_or_default()
+    }
+}
+
 /// What extension points know about the session they act for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionContext {
@@ -69,6 +111,8 @@ pub struct SessionContext {
     /// The user the session belongs to; credentials are theirs (ADR 23).
     pub owner: String,
     pub grants: Vec<Grant>,
+    #[serde(default)]
+    pub role: SessionRole,
 }
 
 /// A writable repository grant: the repository and the session branch, the only ref it may push.
@@ -395,9 +439,6 @@ pub struct AgentFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentContext {
     pub session: SessionContext,
-    /// What the session is for, which decides what its agent is told.
-    #[serde(default)]
-    pub role: SessionRole,
     pub workdir: String,
     /// The repository the session is about, checked out at `repo_dir`.
     pub repo: Option<String>,
@@ -410,20 +451,6 @@ pub struct AgentContext {
     pub instructions: Option<String>,
     pub model: Option<String>,
     pub memory: Option<MemoryContext>,
-}
-
-/// What a session is for, as its agent needs to know it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SessionRole {
-    /// The owner's own session, working on what they asked.
-    #[default]
-    Work,
-    /// A session another one spawned for part of its work (ADR 27), with its parent's id.
-    SubSession { parent: String },
-    /// A reviewer of a proposal (ADR 24), with a read-only checkout.
-    Review,
-    /// The runtime's own small model calls (ADR 26), with no tools.
-    Utility,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -522,6 +549,11 @@ pub trait ProposalKind: Send + Sync {
     fn standing_approvable(&self) -> bool {
         true
     }
+    /// Whether a later proposal of the same change can carry its review over (#247), like a sub-session's report,
+    /// whose branch its parent then proposes: its reviewer is kept, parked, once it passes, instead of deleted.
+    fn reviewed_again(&self) -> bool {
+        false
+    }
     /// Whether it asks for a review and nothing else, like a session's request for a second opinion on a branch: it's
     /// always reviewed, and once the review is over there's nothing to carry out. Only for kinds that aren't outward.
     fn is_review(&self) -> bool {
@@ -560,6 +592,7 @@ mod repo_tests {
         let session = SessionContext {
             session_id: "s".into(),
             owner: "o".into(),
+            role: SessionRole::default(),
             grants: vec![
                 Grant::new(
                     capability::REPO,
@@ -586,6 +619,29 @@ mod repo_tests {
         assert_eq!(repo_from_git_path("sloppod.git"), "sloppod");
         assert_eq!(repo_from_git_path("sloppod.git.git"), "sloppod.git");
         assert_eq!(repo_from_git_path("sloppod"), "sloppod");
+    }
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::*;
+
+    #[test]
+    fn a_refusal_only_names_tools_the_session_has() {
+        assert!(
+            SessionRole::Work
+                .repo_next_step()
+                .contains("request_repository")
+        );
+        let sub = SessionRole::SubSession { parent: "p".into() }.repo_next_step();
+        assert!(
+            sub.starts_with("; ")
+                && sub.contains("your report")
+                && !sub.contains("request_repository")
+        );
+        assert_eq!(SessionRole::Review.repo_next_step(), "");
+        assert!(!SessionRole::Review.acts() && !SessionRole::Utility.acts());
+        assert!(SessionRole::Work.acts() && SessionRole::SubSession { parent: "p".into() }.acts());
     }
 }
 
