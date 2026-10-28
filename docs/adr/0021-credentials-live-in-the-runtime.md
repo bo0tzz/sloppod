@@ -27,3 +27,7 @@ Chosen option: **rows in the database, encrypted with a master key**.
 - Good: database backups only ever hold ciphertext.
 - Bad: losing the master key makes every stored credential unreadable; rotating it needs a re-encryption pass, which doesn't exist yet.
 - Bad: the runtime can read every credential, which it needs to anyway to attach them.
+
+## More Information
+
+2026-10-28: a fourth kind, `chatgpt`, holds a Codex login (the `auth.json` of a `codex login`) for review sessions ([ADR 24](0024-automated-review-before-human-review.md)). The runtime refreshes its tokens itself and stores them sealed again. A memini credential's URL may not carry a username or password: the config is returned by the API, and only the secret is write-only.

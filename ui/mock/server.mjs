@@ -493,6 +493,20 @@ async function agentScript(session, turn, prompt) {
     return;
   }
 
+  if (session.data.repo && /tidy the issues/i.test(prompt)) {
+    await step(2);
+    const proposeId = randomUUID();
+    tool({ toolCallId: proposeId, title: 'mcp__sloppod__propose_issue_updates', kind: 'other', status: 'pending' });
+    await step(2);
+    const proposal = createIssueUpdates(session);
+    update(proposeId, {
+      status: 'completed',
+      content: [{ type: 'content', content: { type: 'text', text: `Proposal ${proposal.id} created and waiting for human review.` } }],
+    });
+    await say("I've proposed closing two finished issues and relabelling another.");
+    return;
+  }
+
   if (session.data.repo && /file issues/i.test(prompt)) {
     await step(2);
     const proposeId = randomUUID();
@@ -793,6 +807,28 @@ function createIssues(session) {
   return proposal;
 }
 
+function createIssueUpdates(session) {
+  const proposal = {
+    id: randomUUID(),
+    session_id: session.data.id,
+    kind: 'github.issue.update',
+    status: 'pending',
+    payload: {
+      repo: session.data.repo,
+      updates: [
+        { number: 100, comment: 'Fixed by #148.', close: 'completed', remove_labels: ['priority'] },
+        { number: 65, comment: 'Superseded by #196.', close: 'duplicate' },
+        { number: 59, add_labels: ['priority'], title: 'Startup failures show in the UI' },
+      ],
+    },
+    created_at: now(),
+  };
+  proposals.set(proposal.id, proposal);
+  broadcastProposal(proposal);
+  applyStandingApproval(proposal);
+  return proposal;
+}
+
 function createStack(session) {
   const branch = session.data.branch;
   const layer = (file, before, after, message) => ({
@@ -916,6 +952,8 @@ function startAgent(session, ms) {
     session.startTimer = null;
     if (!sessions.has(session.data.id)) return;
     rememberModels();
+    delete session.data.agent_status;
+    delete session.data.agent_error;
     session.setPhase('idle');
     const items = session.queue.splice(0);
     if (items.length === 0) return;
@@ -933,7 +971,19 @@ function startAgent(session, ms) {
 /** The runtime remembers the models the agent offered, for the settings page. */
 const rememberModels = () => (settings.models = MODELS.map(({ value, name }) => ({ value, name })));
 
-const startupDelay = (prompt) => (/slow start/i.test(prompt) ? 3000 : DELAY * 8);
+/** Like a pod whose first start fails: a status, then the error, then a start that works. */
+function failStart(session) {
+  session.data.agent_status = 'cloning https://github.com/bo0tzz/sloppod.git';
+  setTimeout(() => {
+    const error = 'preparing the pod: git clone exited with status 128';
+    delete session.data.agent_status;
+    session.data.agent_error = error;
+    session.emit({ sessionUpdate: 'notice', severity: 'error', title: "The session's pod couldn't start the agent", description: error });
+    session.broadcast();
+  }, 1000);
+}
+
+const startupDelay = (prompt) => (/slow start|failing start/i.test(prompt) ? 3000 : DELAY * 8);
 
 function cancelTurn(session) {
   if (session.turn) session.turn.cancelled = true;
@@ -1168,6 +1218,7 @@ async function handleApi(req, res, url) {
       }
       const session = createSession(body);
       startAgent(session, startupDelay(body.prompt));
+      if (/failing start/i.test(body.prompt)) failStart(session);
       return json(res, 201, session.data);
     }
     if (parts.length === 2 && parts[1] === 'deleted' && method === 'GET') {
@@ -1293,6 +1344,13 @@ function approve(proposal, body, decidedBy) {
     proposal.result = { pull_requests: opened, stack: 7, auto_merge: Boolean(proposal.payload.auto_merge), message: `Opened ${opened.map((p) => p.url).join(', ')} as stack #7.${merging}` };
     notice = `Your stack was approved. ${proposal.result.message}`;
     ack = 'Great, the stack is open.';
+  } else if (proposal.kind === 'github.issue.update') {
+    if (Array.isArray(body.updates)) proposal.payload.updates = body.updates;
+    const updated = proposal.payload.updates.map((u) => ({ number: u.number }));
+    proposal.status = 'executed';
+    proposal.result = { updated, failed: [], message: `Updated ${updated.map((u) => `#${u.number}`).join(', ')}.` };
+    notice = `Your issue updates were approved and made: ${proposal.result.message}`;
+    ack = 'Thanks, the tracker is tidy.';
   } else if (proposal.kind === 'github.issue.create') {
     if (Array.isArray(body.issues)) proposal.payload.issues = body.issues;
     const filed = proposal.payload.issues.map((issue, index) => {

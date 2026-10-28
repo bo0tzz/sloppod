@@ -77,7 +77,7 @@ impl RequestPolicy for CodexPolicy {
                 ),
                 ("chatgpt-account-id".into(), tokens.account_id),
             ],
-            vec!["cookie".into()],
+            Vec::new(),
         ))
     }
 }

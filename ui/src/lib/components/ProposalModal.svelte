@@ -20,6 +20,8 @@
     api,
     type IssueDraft,
     type IssuesPayload,
+    type IssueUpdate,
+    type IssueUpdatesPayload,
     type Proposal,
     type ProposalDetail,
     type ProposalEdits,
@@ -63,7 +65,13 @@
   const pr = $derived(detail?.kind === 'github.pr.create' ? (detail.payload as PullRequestPayload) : null);
   const grant = $derived(detail?.kind === 'sloppod.repo.grant' ? (detail.payload as RepoGrantPayload) : null);
   const issues = $derived(detail?.kind === 'github.issue.create' ? (detail.payload as IssuesPayload) : null);
+  const issueUpdates = $derived(
+    detail?.kind === 'github.issue.update' ? (detail.payload as IssueUpdatesPayload) : null,
+  );
+  const closeReasons = { completed: 'completed', not_planned: 'not planned', duplicate: 'a duplicate' };
   const filing = $derived(drafts.filter((draft) => draft.file).length);
+  let updateDrafts = $state<(IssueUpdate & { make: boolean })[]>([]);
+  const making = $derived(updateDrafts.filter((draft) => draft.make).length);
   const summary = $derived(proposalSummary(detail ?? proposal));
   const stack = $derived(detail?.kind === 'github.stack.create' ? (detail.payload as StackPayload) : null);
   const pending = $derived(detail?.status === 'pending');
@@ -101,6 +109,9 @@
   const diffCounts = (diff: string) => diffStats(parseUnifiedDiff(diff) ?? []);
 
   function resetDrafts() {
+    if (detail?.kind === 'github.issue.update') {
+      updateDrafts = (detail.payload as IssueUpdatesPayload).updates.map((update) => ({ ...update, make: true }));
+    }
     if (detail?.kind !== 'github.issue.create') return;
     drafts = (detail.payload as IssuesPayload).issues.map((issue) => ({ ...issue, labels: [...issue.labels], file: true }));
   }
@@ -120,6 +131,7 @@
     if (editing && pr && title !== pr.title) edits.title = title;
     if (editing && pr && body !== pr.body) edits.body = body;
     if (issues) edits.issues = drafts.filter((draft) => draft.file).map(({ file: _file, ...issue }) => issue);
+    if (issueUpdates) edits.updates = updateDrafts.filter((draft) => draft.make).map(({ make: _make, ...update }) => update);
     if (pr && autoMerge !== (pr.auto_merge === true)) edits.auto_merge = autoMerge;
     if (stack && autoMerge !== (stack.auto_merge === true)) edits.auto_merge = autoMerge;
     try {
@@ -243,6 +255,50 @@
           {@render stackedPullRequests(detail, stack)}
         {:else if issues}
           {@render issueList()}
+        {:else if issueUpdates}
+          <ul class="flex flex-col gap-3" data-testid="issue-updates">
+            <!-- By position: one proposal may update the same issue twice. -->
+            {#each updateDrafts as update, index (index)}
+              <li
+                class={['border-light-200 flex flex-col gap-1 rounded-xl border p-3', !update.make && 'opacity-60']}
+                data-testid="issue-update"
+              >
+                <div class="flex items-center justify-between gap-2">
+                  <Text fontWeight="semi-bold">
+                    #{update.number}
+                    {#if update.close}<span class="text-muted font-normal">· close as {closeReasons[update.close]}</span>{/if}
+                    {#if update.reopen}<span class="text-muted font-normal">· reopen</span>{/if}
+                  </Text>
+                  {#if pending}
+                    <label class="text-muted flex shrink-0 items-center gap-2 text-xs">
+                      <Checkbox bind:checked={update.make} aria-label="Make this update" size="tiny" />
+                      Make this update
+                    </label>
+                  {/if}
+                </div>
+                {#if update.title}<Text size="small">New title: {update.title}</Text>{/if}
+                {#if update.add_labels?.length}<Text size="small">Add labels: {update.add_labels.join(', ')}</Text>{/if}
+                {#if update.remove_labels?.length}
+                  <Text size="small">Remove labels: {update.remove_labels.join(', ')}</Text>
+                {/if}
+                {#if editing && update.make}
+                  <Field label="Comment">
+                    <Textarea bind:value={update.comment} />
+                  </Field>
+                {:else if update.comment}
+                  <div class="bg-light-100 rounded-lg p-2 text-sm"><Markdown text={update.comment} /></div>
+                {/if}
+                {#if update.body === ''}
+                  <Text size="small">Clears the body</Text>
+                {:else if update.body}
+                  <details>
+                    <summary class="text-muted cursor-pointer text-sm">New body</summary>
+                    <div class="bg-light-100 mt-1 rounded-lg p-2 text-sm"><Markdown text={update.body} /></div>
+                  </details>
+                {/if}
+              </li>
+            {/each}
+          </ul>
         {:else if grant}
           <div class="flex flex-col gap-3">
             <Heading tag="h2" size="tiny" data-testid="proposal-title">{summary.title}</Heading>
@@ -304,18 +360,20 @@
           </Button>
           {#if editing}
             <Button color="secondary" variant="ghost" shape="round" onclick={discardEdits}>Discard edits</Button>
-          {:else if pr || issues}
+          {:else if pr || issues || issueUpdates}
             <Button color="secondary" variant="outline" shape="round" onclick={startEditing}>Edit</Button>
           {/if}
           <Button
             color="success"
             shape="round"
             loading={busy === 'approve'}
-            disabled={busy === 'reject' || (issues !== null && filing === 0)}
+            disabled={busy === 'reject' || (issues !== null && filing === 0) || (issueUpdates !== null && making === 0)}
             onclick={approve}
           >
             {#if issues}
               File {filing} {filing === 1 ? 'issue' : 'issues'}
+            {:else if issueUpdates}
+              Make {making} {making === 1 ? 'update' : 'updates'}
             {:else}
               {editing ? 'Approve with edits' : 'Approve'}
             {/if}

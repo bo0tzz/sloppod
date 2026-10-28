@@ -156,6 +156,12 @@ pub mod api {
         /// When it was deleted; it can be restored until it's purged a week later.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub deleted_at: Option<String>,
+        /// What the pod is doing while the agent starts, e.g. cloning the repository.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent_status: Option<String>,
+        /// Why the agent last failed to start or exited; it's started again meanwhile.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent_error: Option<String>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

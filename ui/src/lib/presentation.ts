@@ -78,6 +78,7 @@ export const proposalKinds: Record<string, { title: string; plural: string; exec
   'github.pr.create': { title: 'Pull request proposal', plural: 'Pull requests', executed: 'Opened' },
   'github.stack.create': { title: 'Stacked pull requests', plural: 'Stacked pull requests', executed: 'Opened' },
   'github.issue.create': { title: 'Issues proposal', plural: 'Issues', executed: 'Filed' },
+  'github.issue.update': { title: 'Issue updates', plural: 'Issue updates', executed: 'Updated' },
   'sloppod.repo.grant': { title: 'Repository access', plural: 'Repository access', executed: 'Granted' },
 };
 
@@ -114,6 +115,15 @@ export function proposalSummary(proposal: Proposal): { label: string; title: str
       return {
         label: 'Issues',
         title: issues.length === 1 ? payloadText(issues[0].title) : `${issues.length} issues`,
+        detail: payloadText(payload.repo),
+        icon: mdiAlertCircleOutline,
+      };
+    }
+    case 'github.issue.update': {
+      const updates = Array.isArray(payload.updates) ? (payload.updates as { number?: unknown }[]) : [];
+      return {
+        label: 'Issue updates',
+        title: updates.length === 1 ? `#${String(updates[0].number)}` : `${updates.length} issues`,
         detail: payloadText(payload.repo),
         icon: mdiAlertCircleOutline,
       };

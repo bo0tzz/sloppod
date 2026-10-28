@@ -54,11 +54,12 @@
   );
   const showReconnecting = $derived(view.loaded && view.connection !== 'open');
   const activity = $derived.by(() => {
+    const status = session?.agent_status ? `${session.agent_status[0].toUpperCase()}${session.agent_status.slice(1)}…` : null;
     switch (session?.phase) {
       case 'starting':
-        return 'Starting the agent…';
+        return status ?? (session.agent_error ? 'Starting the agent again…' : 'Starting the agent…');
       case 'disconnected':
-        return 'Bringing the agent back…';
+        return status ?? 'Bringing the agent back…';
       case 'waiting':
         return view.questions.length > 0 && view.permissions.length === 0 ? 'Waiting for your answer' : 'Waiting for your decision';
       default:
