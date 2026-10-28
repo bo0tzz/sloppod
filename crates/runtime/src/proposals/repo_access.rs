@@ -8,7 +8,7 @@ use sloppod_contracts::capability;
 use sloppod_contracts::{
     Error, Grant, Manifest, ProposalKind, READ_WRITE, Result, SessionContext, ToolSpec,
 };
-use sloppod_contracts::{RepoRequests, find_repo};
+use sloppod_contracts::{SessionRole, find_repo};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -136,15 +136,10 @@ impl ProposalKind for RepoAccess {
             )));
         }
         // A sub-session works where its parent can push, so the parent can integrate it (ADR 27).
-        let id: Uuid = session.session_id.parse().map_err(err)?;
-        if db::get_session(&self.db, id)
-            .await
-            .map_err(err)?
-            .is_some_and(|row| row.parent_id.is_some())
-        {
+        if let SessionRole::SubSession { .. } = session.role {
             return Err(Error::new(format!(
                 "a sub-session can't get write access to another repository: {}",
-                RepoRequests::ViaParent.advice().unwrap_or_default()
+                session.role.repo_advice().unwrap_or_default()
             )));
         }
         let repos = self

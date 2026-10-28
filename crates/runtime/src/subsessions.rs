@@ -83,11 +83,7 @@ pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<
                 .find(|repo| same_repo(repo, wanted))
                 .map(str::to_owned)
                 .ok_or_else(|| {
-                    let next = parent
-                        .repo_requests()
-                        .advice()
-                        .map(|advice| format!("; {advice}"))
-                        .unwrap_or_default();
+                    let next = parent.role().repo_next_step();
                     format!(
                         "a sub-session works in a repository you can push to, and you can't push to {wanted}{next}"
                     )

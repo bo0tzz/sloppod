@@ -50,8 +50,8 @@ impl Agents {
 /// What every agent is told about the session it runs in, in sections that depend on what the session is for
 /// (`SessionRole`). `subagents` says whether the agent has built-in subagents of its own, as Claude Code does.
 fn session_prompt(context: &AgentContext, subagents: bool) -> String {
-    let role = &context.role;
-    let acts = matches!(role, SessionRole::Work | SessionRole::SubSession { .. });
+    let role = &context.session.role;
+    let acts = role.acts();
     let mut prompt = String::from(
         "You are running in a sloppod session: a sandboxed Kubernetes pod.\n\n# Your environment\n",
     );
@@ -407,12 +407,11 @@ mod tests {
 
     fn context() -> AgentContext {
         AgentContext {
-            role: SessionRole::Work,
             session: SessionContext {
                 session_id: "s".into(),
                 owner: "dev".into(),
                 grants: vec![],
-                repo_requests: Default::default(),
+                role: SessionRole::Work,
             },
             workdir: "/workspace".into(),
             repo: None,
@@ -455,7 +454,7 @@ mod tests {
         assert!(!session_prompt(&with_repo(context(), "rw"), false).contains("built-in subagents"));
 
         let mut sub = with_repo(context(), "rw");
-        sub.role = SessionRole::SubSession {
+        sub.session.role = SessionRole::SubSession {
             parent: "p-1".into(),
         };
         let sub = session_prompt(&sub, true);
@@ -467,7 +466,7 @@ mod tests {
         );
 
         let mut review = with_repo(context(), "ro");
-        review.role = SessionRole::Review;
+        review.session.role = SessionRole::Review;
         let review = session_prompt(&review, true);
         assert!(review.contains("A read-only copy of o/r"));
         assert!(review.contains("# Messages from sloppod"));

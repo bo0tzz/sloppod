@@ -7,7 +7,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
-use sloppod_contracts::RepoRequests;
+use sloppod_contracts::SessionRole;
 use sloppod_protocol::api::{ProposalStatus, SessionKind};
 use uuid::Uuid;
 
@@ -240,7 +240,7 @@ async fn ask_user(state: &AppState, session: Uuid, arguments: &Value) -> Result<
 
 async fn list_grants_text(state: &AppState, session: Uuid) -> Result<String, String> {
     match db::get_session(&state.db, session).await {
-        Ok(Some(row)) => Ok(grant_list(&row.to_api().grants, row.repo_requests())),
+        Ok(Some(row)) => Ok(grant_list(&row.to_api().grants, &row.role())),
         _ => Err("couldn't load the session".into()),
     }
 }
@@ -328,7 +328,7 @@ async fn propose(
     })
 }
 
-fn grant_list(grants: &[sloppod_protocol::api::Grant], requests: RepoRequests) -> String {
+fn grant_list(grants: &[sloppod_protocol::api::Grant], role: &SessionRole) -> String {
     let mut lines: Vec<String> = grants
         .iter()
         .map(|g| {
@@ -344,8 +344,8 @@ fn grant_list(grants: &[sloppod_protocol::api::Grant], requests: RepoRequests) -
             )
         })
         .collect();
-    let next = requests
-        .advice()
+    let next = role
+        .repo_advice()
         .map(|advice| format!("; for another repository, {advice}"))
         .unwrap_or_default();
     lines.push(format!("Anything else is refused{next}."));
@@ -358,12 +358,12 @@ mod tests {
 
     #[test]
     fn the_grant_list_points_to_request_repository_only_where_it_exists() {
-        assert!(grant_list(&[], RepoRequests::Itself).contains("request_repository"));
-        let sub = grant_list(&[], RepoRequests::ViaParent);
+        assert!(grant_list(&[], &SessionRole::Work).contains("request_repository"));
+        let sub = grant_list(&[], &SessionRole::SubSession { parent: "p".into() });
         assert!(!sub.contains("request_repository"), "{sub}");
         assert!(sub.contains("your report"), "{sub}");
         assert_eq!(
-            grant_list(&[], RepoRequests::Never),
+            grant_list(&[], &SessionRole::Review),
             "Anything else is refused."
         );
     }

@@ -109,11 +109,7 @@ impl GitHubPolicy {
                     } else {
                         format!(" (it can push to {})", writable.join(", "))
                     };
-                    let next = session
-                        .repo_requests
-                        .advice()
-                        .map(|advice| format!("; {advice}"))
-                        .unwrap_or_default();
+                    let next = session.role.repo_next_step();
                     return Ok(Decision::deny(format!(
                         "sloppod: this session can't push to {}{can}{next}.\n",
                         git.repo
@@ -349,7 +345,7 @@ impl RequestPolicy for GitHubPolicy {
 
 fn proposal_hint(what: &str, session: &SessionContext) -> String {
     // A review session has none of the proposal tools, so there's nothing to point it to.
-    if session.repo_requests == sloppod_contracts::RepoRequests::Never {
+    if !session.role.acts() {
         return format!(
             "sloppod: {what}. This session can't make GitHub writes or propose them.\n"
         );
@@ -361,7 +357,7 @@ fn proposal_hint(what: &str, session: &SessionContext) -> String {
         ),
         None => format!(
             "to change a repository, {}, then push to your session branch and call propose_pull_request",
-            session.repo_requests.advice().unwrap_or_default()
+            session.role.repo_advice().unwrap_or_default()
         ),
     };
     format!(
@@ -628,12 +624,12 @@ fn graphql_is_read_only(body: &[u8]) -> std::result::Result<bool, String> {
 mod tests {
     use super::*;
 
-    fn context(repo_requests: sloppod_contracts::RepoRequests) -> SessionContext {
+    fn context(role: sloppod_contracts::SessionRole) -> SessionContext {
         SessionContext {
             session_id: "s".into(),
             owner: "dev".into(),
             grants: vec![],
-            repo_requests,
+            role,
         }
     }
 
@@ -653,14 +649,14 @@ mod tests {
 
         let hint = proposal_hint(
             "that's refused",
-            &context(sloppod_contracts::RepoRequests::ViaParent),
+            &context(sloppod_contracts::SessionRole::SubSession { parent: "p".into() }),
         );
         assert!(!hint.contains("request_repository"), "{hint}");
         assert!(hint.contains("your report"), "{hint}");
 
         let hint = proposal_hint(
             "that's refused",
-            &context(sloppod_contracts::RepoRequests::Never),
+            &context(sloppod_contracts::SessionRole::Review),
         );
         for tool in ["propose_", "request_"] {
             assert!(!hint.contains(tool), "{hint}");
