@@ -30,6 +30,7 @@ base64 = "0.23.1"
 chacha20poly1305 = "0.11.0"
 bytes = "1.12.1"
 chrono = { version = "0.4.45", features = ["serde"] }
+chrono-tz = "0.10.4"
 envoy-types = "0.7.7"
 futures = "0.3.34"
 graphql-parser = "0.4.1"

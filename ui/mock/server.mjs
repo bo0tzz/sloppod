@@ -36,7 +36,7 @@ const MODELS = [
   { value: 'haiku', name: 'Haiku' },
 ];
 /** The user's defaults for new sessions. `models` fills in once a session has offered them. */
-const settings = { model: null, models: [], review: 'off' };
+const settings = { model: null, models: [], review: 'off', timezone: null };
 const CANCELLED = Symbol('cancelled');
 
 /** @type {Map<string, MockSession>} */
@@ -1244,6 +1244,12 @@ async function handleApi(req, res, url) {
         if (!['off', 'required'].includes(body.review)) return json(res, 400, { error: 'review must be one of off, required' });
         settings.review = body.review;
       }
+      if ('timezone' in body) {
+        if (!Intl.supportedValuesOf('timeZone').includes(body.timezone)) {
+          return json(res, 400, { error: `${body.timezone} isn't a timezone, e.g. Europe/Amsterdam` });
+        }
+        settings.timezone = body.timezone;
+      }
       return json(res, 200, settings);
     }
   }
@@ -1635,6 +1641,10 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   try {
     if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
+    if (url.pathname === '/_mock/forget-timezone' && req.method === 'POST') {
+      settings.timezone = null;
+      return json(res, 200, {});
+    }
     if (url.pathname === '/_mock/fail-next-prompt' && req.method === 'POST') {
       failNextPrompt = true;
       return json(res, 200, { failNextPrompt });

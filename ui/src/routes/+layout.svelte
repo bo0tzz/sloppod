@@ -10,6 +10,7 @@
   import SessionList from '#lib/components/SessionList.svelte';
   import { sessions } from '#lib/sessions.svelte.ts';
   import { sidebar } from '#lib/sidebar.svelte.ts';
+  import { adoptBrowserTimezone } from '#lib/timezone.ts';
 
   let { children }: { children: Snippet } = $props();
 
@@ -22,6 +23,7 @@
 
   onMount(() => {
     account.load();
+    void adoptBrowserTimezone();
     return sessions.subscribe();
   });
 </script>
