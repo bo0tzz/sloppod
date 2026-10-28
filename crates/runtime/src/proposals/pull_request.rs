@@ -8,7 +8,7 @@ use sloppod_contracts::{
     Error, Manifest, ProposalKind, RepoGrant, Result, ReviewSubject, SessionContext, ToolSpec,
 };
 
-use super::{err, head_branch, target_repo};
+use super::{branch_detail, err, head_branch, target_repo};
 use crate::credentials::Credentials;
 use crate::github::{GitHubApp, PushLog, StackMerge};
 
@@ -75,6 +75,7 @@ impl ProposalKind for PullRequest {
             head_sha: field("head_sha")?,
             title: field("title")?,
             body: field("body").unwrap_or_default(),
+            describes_change: true,
         })
     }
 
@@ -117,22 +118,7 @@ impl ProposalKind for PullRequest {
     }
 
     async fn detail(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
-        let base = payload["base"].as_str().unwrap_or("main");
-        // What the reviewer sees is the commit that was proposed, not wherever the branch is now.
-        let head = payload["head_sha"]
-            .as_str()
-            .or(payload["head"].as_str())
-            .unwrap_or_default();
-        let comparison = self
-            .app(session)
-            .await?
-            .compare(payload["repo"].as_str().unwrap_or_default(), base, head)
-            .await
-            .map_err(err)?;
-        Ok(json!({
-            "diff": comparison.diff,
-            "commits": comparison.commits.iter().map(|(sha, message)| json!({"sha": sha, "message": message})).collect::<Vec<_>>(),
-        }))
+        branch_detail(&*self.app(session).await?, payload).await
     }
 
     fn edit(&self, payload: &Value, edits: &Value) -> Result<Value> {
@@ -257,6 +243,7 @@ fn stack_review_subject(payload: &Value) -> Option<ReviewSubject> {
         head_sha: top["head_sha"].as_str()?.to_owned(),
         title: format!("a stack of {} pull requests", layers.len()),
         body,
+        describes_change: true,
     })
 }
 

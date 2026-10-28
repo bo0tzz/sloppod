@@ -81,6 +81,7 @@ export const proposalKinds: Record<string, { title: string; plural: string; exec
   'github.issue.update': { title: 'Issue updates', plural: 'Issue updates', executed: 'Updated' },
   'sloppod.repo.grant': { title: 'Repository access', plural: 'Repository access', executed: 'Granted' },
   'sloppod.session.report': { title: 'Report to the parent session', plural: 'Reports', executed: 'Delivered' },
+  'sloppod.code_review': { title: 'Code review', plural: 'Code reviews', executed: 'Reviewed' },
 };
 
 export function proposalStatus(proposal: Proposal): { label: string; color: Color } {
