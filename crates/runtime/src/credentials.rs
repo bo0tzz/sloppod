@@ -145,6 +145,24 @@ fn host_of(url: &str) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
+/// The repository a `github-user` token reaches that's `wanted`, as GitHub names it: one it listed when it was added,
+/// or, when it listed more than were read, any well-formed name, which GitHub then decides on when it's used.
+pub fn token_reaches(row: &CredentialRow, wanted: &str) -> Option<String> {
+    let listed: Vec<&str> = row.config["repositories"]
+        .as_array()
+        .map(|repos| repos.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    match sloppod_contracts::find_repo(listed, wanted) {
+        Some(repo) => Some(repo.to_owned()),
+        None if row.config["more_repositories"].as_bool() == Some(true)
+            && sloppod_contracts::is_repo_name(wanted) =>
+        {
+            Some(wanted.to_owned())
+        }
+        None => None,
+    }
+}
+
 /// Whether a token is one a `github-user` credential can hold: a fine-grained one, which can be narrowed to
 /// repositories, and not a classic one, which reaches everything its user can.
 fn user_token_shape(token: &str) -> Result<(), &'static str> {
@@ -548,6 +566,16 @@ impl Credentials {
         )?);
         cache.insert(row.id, client.clone());
         Ok(client)
+    }
+
+    /// The owner's GitHub tokens (`github-user`), oldest first.
+    pub async fn github_users(&self, owner: &str) -> sqlx::Result<Vec<CredentialRow>> {
+        Ok(self
+            .list(owner)
+            .await?
+            .into_iter()
+            .filter(|row| row.kind == GITHUB_USER)
+            .collect())
     }
 
     /// One of the owner's GitHub tokens (`github-user`), by id.

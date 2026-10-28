@@ -1,5 +1,6 @@
 //! Proposals (ADR 3): the kinds an agent can propose, and proposing, deciding and carrying them out.
 
+mod act_as;
 mod code_review;
 mod issue_updates;
 mod issues;
@@ -19,12 +20,13 @@ use uuid::Uuid;
 use crate::github::{GitHubApp, StackWatch};
 use crate::{AppState, db, lifecycle, reviews};
 
+pub use act_as::ActAsOwner;
 pub use code_review::{CODE_REVIEW, CodeReview};
 pub use issue_updates::IssueUpdates;
 pub use issues::Issues;
 use pull_request::stack_layers;
 pub use pull_request::{PullRequest, Stack};
-pub use repo_access::{RepoAccess, grant_repo, repo_granted};
+pub use repo_access::{RepoAccess, grant_repo, grant_repo_as, repo_granted, repo_granted_as};
 pub use report::{REPORT, Report};
 
 #[derive(Default, Clone)]
@@ -343,6 +345,9 @@ async fn apply_standing_approval(
     kind: &dyn ProposalKind,
     proposal: Proposal,
 ) -> anyhow::Result<Proposal> {
+    if !kind.standing_approvable() {
+        return Ok(proposal);
+    }
     let standing = db::matching_standing_approval(
         &state.db,
         &session.owner,

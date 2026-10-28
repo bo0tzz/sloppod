@@ -424,6 +424,9 @@ pub struct AgentFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentContext {
     pub session: SessionContext,
+    /// What the session is for, which decides what its agent is told.
+    #[serde(default)]
+    pub role: SessionRole,
     pub workdir: String,
     /// The repository the session is about, checked out at `repo_dir`.
     pub repo: Option<String>,
@@ -436,6 +439,20 @@ pub struct AgentContext {
     pub instructions: Option<String>,
     pub model: Option<String>,
     pub memory: Option<MemoryContext>,
+}
+
+/// What a session is for, as its agent needs to know it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionRole {
+    /// The owner's own session, working on what they asked.
+    #[default]
+    Work,
+    /// A session another one spawned for part of its work (ADR 27), with its parent's id.
+    SubSession { parent: String },
+    /// A reviewer of a proposal (ADR 24), with a read-only checkout.
+    Review,
+    /// The runtime's own small model calls (ADR 26), with no tools.
+    Utility,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -527,6 +544,11 @@ pub trait ProposalKind: Send + Sync {
     /// Whether carrying it out acts outside sloppod. One that doesn't, like a sub-session's report to its parent, is
     /// carried out by the runtime once its review is over, without waiting for a person (ADR 27).
     fn outward(&self) -> bool {
+        true
+    }
+    /// Whether a standing approval may approve it. A kind whose approval picks something only a person should, like
+    /// which of their credentials a session acts as, says no: its proposals always wait for one.
+    fn standing_approvable(&self) -> bool {
         true
     }
     /// Whether it asks for a review and nothing else, like a session's request for a second opinion on a branch: it's

@@ -31,7 +31,7 @@ pub async fn handler(
             "protocolVersion": message["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "sloppod", "version": state.config.build.as_deref().unwrap_or(env!("CARGO_PKG_VERSION"))},
-            "instructions": "Tools for outward actions. Each creates a proposal that a human reviews before sloppod carries it out.",
+            "instructions": "sloppod's tools for this session: proposals of outward actions (a person reviews them before sloppod carries them out), questions to the user, what the session is granted, and, for work sessions, sub-sessions. Each tool says what it does.",
         })),
         "ping" => Ok(json!({})),
         "tools/list" => match session_kind(&state, session).await {
