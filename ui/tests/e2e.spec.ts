@@ -1368,3 +1368,38 @@ test('only the transcript scrolls, not the page around it', async ({ page }) => 
   expect(overflowing).toEqual({ transcript: true, found: [] });
   await expect(page.getByRole('textbox', { name: 'Prompt' })).toBeInViewport({ ratio: 1 });
 });
+
+test('a GitHub account is checked when added, and shows whose it is, what it reaches and when it expires', async ({ page }) => {
+  await page.goto('/settings');
+  const section = page.getByTestId('credentials-github-user');
+  const row = (name: string) => section.getByTestId('credential').filter({ hasText: name });
+  const add = async (name: string, token: string) => {
+    await section.getByRole('button', { name: 'Add GitHub account' }).click();
+    await section.getByLabel('Name', { exact: true }).fill(name);
+    await section.getByLabel('Fine-grained personal access token', { exact: true }).fill(token);
+    await section.getByRole('button', { name: 'Save' }).click();
+  };
+  await expect(section).toContainText('No GitHub account yet');
+
+  await add('Classic', 'ghp_classic');
+  await expect(section.getByText("that's a classic token")).toBeVisible();
+  await section.getByRole('button', { name: 'Cancel' }).click();
+
+  await add('Mine', 'github_pat_mine');
+  await expect(row('Mine')).toContainText('Account: bo0tzz');
+  await expect(row('Mine').getByTestId('token-repositories')).toHaveText('Reaches 2 repositories');
+  await expect(row('Mine').getByTestId('token-repositories')).toHaveAttribute('title', 'bo0tzz/sloppod\nbo0tzz/dotfiles');
+  await expect(row('Mine').getByTestId('token-expiry')).toHaveAttribute('data-level', 'ok');
+  await expect(page.getByText('github_pat_mine')).toHaveCount(0);
+
+  await add('Expiring', 'github_pat_soon');
+  const expiry = row('Expiring').getByTestId('token-expiry');
+  await expect(expiry).toHaveAttribute('data-level', 'soon');
+  await expect(expiry).toContainText('Expires in 3 days; make a new token and replace this one');
+
+  for (const name of ['Mine', 'Expiring']) {
+    await row(name).getByRole('button', { name: `Delete ${name}` }).click();
+    await page.getByRole('button', { name: 'Delete', exact: true }).click();
+    await expect(row(name)).toHaveCount(0);
+  }
+});
