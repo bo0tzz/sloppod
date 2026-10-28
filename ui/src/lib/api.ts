@@ -178,6 +178,28 @@ export type NewCredential = {
   secret: string;
 };
 
+/** What's left of an inference credential's usage limits, as last reported. `utilization` is a fraction, usually 0 to 1. */
+export type Quota = {
+  credential_id: string;
+  kind: CredentialKind;
+  name: string;
+  /** The provider refuses its requests now, until `resets_at`. */
+  limited: boolean;
+  resets_at: string | null;
+  windows: QuotaWindow[];
+  observed_at: string;
+};
+
+export type QuotaStatus = 'allowed' | 'warning' | 'rejected';
+
+export type QuotaWindow = {
+  /** `five_hour` and `seven_day` for the session and weekly limits. */
+  window: string;
+  utilization: number | null;
+  resets_at: string | null;
+  status: QuotaStatus;
+};
+
 /** Defaults for new sessions. `models` is what the agent offered most recently; empty before the first session. */
 export type Settings = {
   model: string | null;
@@ -240,6 +262,7 @@ export const api = {
   setSessionReview: (id: string, review: ReviewPolicy) =>
     call<Session>('PUT', `/sessions/${encodeURIComponent(id)}/review`, { review }),
   listCredentials: () => call<Credential[]>('GET', '/credentials'),
+  listQuotas: () => call<Quota[]>('GET', '/quotas'),
   listStandingApprovals: () => call<StandingApproval[]>('GET', '/standing-approvals'),
   createStandingApproval: (approval: NewStandingApproval) =>
     call<StandingApproval>('POST', '/standing-approvals', approval),

@@ -175,10 +175,15 @@ pub type Waker =
 /// Called when a turn the hub sent ends well, e.g. to check what it ended on (ADR 26).
 pub type TurnEnded = Arc<dyn Fn(Uuid) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+/// Called with each `usage_update` an agent sends, e.g. to keep the rate limits it reports (#140).
+pub type UsageSeen =
+    Arc<dyn Fn(Uuid, Value) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 pub struct Hub {
     store: Arc<dyn SessionStore>,
     waker: StdMutex<Option<Waker>>,
     turn_ended: StdMutex<Option<TurnEnded>>,
+    usage_seen: StdMutex<Option<UsageSeen>>,
     sessions: StdMutex<HashMap<Uuid, Arc<Live>>>,
     agent_capabilities: StdMutex<Option<Value>>,
 }
@@ -208,6 +213,7 @@ impl Hub {
             store,
             waker: StdMutex::default(),
             turn_ended: StdMutex::default(),
+            usage_seen: StdMutex::default(),
             sessions: StdMutex::default(),
             agent_capabilities: StdMutex::default(),
         }
@@ -219,6 +225,10 @@ impl Hub {
 
     pub fn set_turn_ended(&self, turn_ended: TurnEnded) {
         *self.turn_ended.lock().unwrap() = Some(turn_ended);
+    }
+
+    pub fn set_usage_seen(&self, usage_seen: UsageSeen) {
+        *self.usage_seen.lock().unwrap() = Some(usage_seen);
     }
 
     /// The session's agent, if it's up.
@@ -899,6 +909,11 @@ impl Hub {
             let mut state = live.state.lock().await;
             if state.loading {
                 return;
+            }
+            if update["sessionUpdate"] == "usage_update"
+                && let Some(usage_seen) = self.usage_seen.lock().unwrap().clone()
+            {
+                tokio::spawn(usage_seen(id, update.clone()));
             }
             if update["sessionUpdate"] == "current_mode_update"
                 && let Some(mode) = update.get("currentModeId")
