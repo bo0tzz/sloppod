@@ -434,6 +434,10 @@ pub mod link {
             name: String,
             offset: u64,
             content_b64: String,
+            /// On the first piece of a replacement (offset 0) that takes more than one: the whole replacement's
+            /// length. The runtime keeps its copy until all of it is in.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            replaces: Option<u64>,
         },
         AgentExited {
             code: Option<i32>,

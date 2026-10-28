@@ -369,6 +369,31 @@ pub async fn append_transcript(
     Ok(result.rows_affected() == 1)
 }
 
+/// Where a replacement of a transcript file is put together until all of it is in. It isn't a transcript file name,
+/// so it's never restored to a pod.
+pub fn staged_transcript(name: &str) -> String {
+    format!("{name}.staged")
+}
+
+/// Makes a staged replacement the transcript file, in one step.
+pub async fn promote_transcript(db: &PgPool, id: Uuid, name: &str) -> sqlx::Result<()> {
+    let mut tx = db.begin().await?;
+    sqlx::query("delete from transcripts where session_id = $1 and name = $2")
+        .bind(id)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "update transcripts set name = $2, updated_at = now() where session_id = $1 and name = $3",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(staged_transcript(name))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
+}
+
 pub async fn upsert_transcript(
     db: &PgPool,
     id: Uuid,
@@ -390,7 +415,8 @@ pub async fn upsert_transcript(
 /// The session's transcript files and how long each is.
 pub async fn transcript_lens(db: &PgPool, id: Uuid) -> sqlx::Result<Vec<(String, i64)>> {
     sqlx::query_as(
-        "select name, octet_length(content)::bigint from transcripts where session_id = $1 order by name",
+        "select name, octet_length(content)::bigint from transcripts where session_id = $1 and name like '%.jsonl' \
+         order by name",
     )
     .bind(id)
     .fetch_all(db)
@@ -429,10 +455,12 @@ pub async fn transcript_chunk(
 }
 
 pub async fn transcripts(db: &PgPool, id: Uuid) -> sqlx::Result<Vec<(String, Vec<u8>)>> {
-    let rows = sqlx::query("select name, content from transcripts where session_id = $1")
-        .bind(id)
-        .fetch_all(db)
-        .await?;
+    let rows = sqlx::query(
+        "select name, content from transcripts where session_id = $1 and name like '%.jsonl'",
+    )
+    .bind(id)
+    .fetch_all(db)
+    .await?;
     Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
 }
 

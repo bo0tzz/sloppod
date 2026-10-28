@@ -554,20 +554,27 @@ async fn sync_transcript(dir: &str, synced: &mut HashMap<String, u64>, sink: &mu
         let Some((offset, content)) = appended else {
             continue;
         };
+        let pieces = sync_pieces(&content);
+        // A replacement counts as synced only once all of it is sent; one cut off is sent whole again.
+        let replacing = offset == 0 && pieces.len() > 1;
         let mut sent = offset;
-        for piece in sync_pieces(&content) {
+        for piece in pieces {
             let message = FromSupervisor::TranscriptAppend {
                 name: name.clone(),
                 offset: sent,
                 content_b64: base64::engine::general_purpose::STANDARD.encode(piece),
+                replaces: (replacing && sent == 0).then_some(content.len() as u64),
             };
             if let Err(e) = send(sink, &message).await {
                 tracing::warn!(error = %e, file = %name, "syncing the transcript failed");
                 return;
             }
             sent += piece.len() as u64;
-            synced.insert(name.clone(), sent);
+            if !replacing {
+                synced.insert(name.clone(), sent);
+            }
         }
+        synced.insert(name, sent);
     }
 }
 

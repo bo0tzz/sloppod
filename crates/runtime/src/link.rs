@@ -508,6 +508,8 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
         }
     };
 
+    // Transcript replacements being put together on this link: file name -> its whole length.
+    let mut staging = HashMap::new();
     loop {
         let message = match tokio::time::timeout(LINK_TIMEOUT, stream.next()).await {
             Ok(Some(Ok(message))) => message,
@@ -575,19 +577,23 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
                 name,
                 offset,
                 content_b64,
+                replaces,
             } if transcript_name_ok(session_id, &name) => {
                 let Ok(content) = base64::engine::general_purpose::STANDARD.decode(&content_b64)
                 else {
                     tracing::warn!(session = %session_id, file = %name, "undecodable transcript sync");
                     continue;
                 };
-                let stored = if offset == 0 {
-                    db::upsert_transcript(&state.db, session_id, &name, &content)
-                        .await
-                        .map(|()| true)
-                } else {
-                    db::append_transcript(&state.db, session_id, &name, offset, &content).await
-                };
+                let stored = store_transcript_piece(
+                    &state.db,
+                    session_id,
+                    &mut staging,
+                    &name,
+                    offset,
+                    &content,
+                    replaces,
+                )
+                .await;
                 match stored {
                     Ok(true) => {}
                     Ok(false) => {
@@ -613,6 +619,45 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
     agent.close();
     state.hub.detach_agent(session_id, &agent).await;
     writer.abort();
+}
+
+/// Stores a piece of a transcript sync; returns whether it was in step with the stored copy. A replacement that comes
+/// in several pieces is staged, so the stored copy stays whole until the last piece is in.
+pub(crate) async fn store_transcript_piece(
+    db: &sqlx::PgPool,
+    session: Uuid,
+    staging: &mut HashMap<String, u64>,
+    name: &str,
+    offset: u64,
+    content: &[u8],
+    replaces: Option<u64>,
+) -> sqlx::Result<bool> {
+    let len = content.len() as u64;
+    if offset == 0 {
+        match replaces {
+            Some(total) if total > len => {
+                db::upsert_transcript(db, session, &db::staged_transcript(name), content).await?;
+                staging.insert(name.to_owned(), total);
+            }
+            _ => {
+                staging.remove(name);
+                db::upsert_transcript(db, session, name, content).await?;
+            }
+        }
+        return Ok(true);
+    }
+    let Some(&total) = staging.get(name) else {
+        return db::append_transcript(db, session, name, offset, content).await;
+    };
+    if !db::append_transcript(db, session, &db::staged_transcript(name), offset, content).await? {
+        staging.remove(name);
+        return Ok(false);
+    }
+    if offset + len >= total {
+        staging.remove(name);
+        db::promote_transcript(db, session, name).await?;
+    }
+    Ok(true)
 }
 
 /// A transcript file name the session's pod can be given back; one that isn't is dropped and logged.
