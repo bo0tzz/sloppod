@@ -386,31 +386,63 @@ async fn a_message_sent_again_does_not_run_twice() {
     assert_eq!(h.user_messages(), [("Once".to_owned(), false)]);
 }
 
-#[tokio::test]
-async fn a_notice_for_the_next_agent_skips_the_one_still_attached() {
-    let mut h = Harness::ready().await;
-    // The pod is going away with its agent still attached and idle.
-    h.hub
-        .notify_next(h.id, "sloppod: your pod was stopped.".into())
-        .await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    while let Ok(message) = h.to_agent.try_recv() {
-        assert!(
-            !matches!(message, ToSupervisor::Acp { .. }),
-            "the dying agent was sent {message:?}"
-        );
+impl Harness {
+    /// Nothing but non-ACP messages (transcript syncs) went to the agent.
+    fn agent_sent_nothing(&mut self) {
+        while let Ok(message) = self.to_agent.try_recv() {
+            assert!(
+                !matches!(message, ToSupervisor::Acp { .. }),
+                "the agent was sent {message:?}"
+            );
+        }
     }
-    // It's kept through the restart, and the next agent gets it.
-    assert_eq!(h.store.queues().await.unwrap().len(), 1);
-    h.hub.detach_agent(h.id, &h.agent).await;
-    let (tx, to_agent) = mpsc::unbounded_channel();
-    h.agent = Arc::new(AgentConn::new(tx));
-    h.to_agent = to_agent;
-    h.hub.attach_agent(h.id, h.agent.clone()).await;
-    h.agent_ready().await;
+
+    /// The agent's pod went away and a new one came up.
+    async fn replace_agent(&mut self) {
+        self.hub.detach_agent(self.id, &self.agent).await;
+        let (tx, to_agent) = mpsc::unbounded_channel();
+        self.agent = Arc::new(AgentConn::new(tx));
+        self.to_agent = to_agent;
+        self.hub.attach_agent(self.id, self.agent.clone()).await;
+        self.agent_ready().await;
+    }
+}
+
+const STOPPED: &str = "sloppod: your pod was stopped.";
+
+#[tokio::test]
+async fn a_retired_agent_gets_no_more_work_and_its_replacement_gets_the_notice() {
+    let mut h = Harness::ready().await;
+    // Its pod is going away with the agent idle.
+    h.hub.retire_agent(h.id, &h.agent).await;
+    h.hub.notify(h.id, STOPPED.into()).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    h.agent_sent_nothing();
+    assert_eq!(
+        h.store.queues().await.unwrap().len(),
+        1,
+        "kept through the restart"
+    );
+
+    h.replace_agent().await;
+    assert_eq!(prompt_text(&h.next().await), [STOPPED]);
+}
+
+#[tokio::test]
+async fn a_turn_that_ends_after_its_agent_retired_hands_nothing_on_to_it() {
+    let mut h = Harness::ready().await;
+    let turn = h.prompt("Busy");
     let request = h.next().await;
-    assert_eq!(request["method"], "session/prompt");
-    assert_eq!(prompt_text(&request), ["sloppod: your pod was stopped."]);
+    // The report arrives during the turn, and the turn then ends before the link goes.
+    h.hub.retire_agent(h.id, &h.agent).await;
+    h.hub.notify(h.id, STOPPED.into()).await;
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    h.agent_sent_nothing();
+
+    h.replace_agent().await;
+    assert_eq!(prompt_text(&h.next().await), [STOPPED]);
 }
 
 #[tokio::test]

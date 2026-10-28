@@ -939,34 +939,14 @@ impl Hub {
 
     /// Tells the agent something happened outside its turns, e.g. a proposal was decided: a new turn when it's
     /// idle, steered into the running one, or queued until it's up.
-    /// Leaves a notice for the session's next agent: it waits in the queue even while an agent is attached, e.g. one
-    /// whose pod is going away, and runs once the next one is up.
-    pub async fn notify_next(&self, id: Uuid, text: String) {
-        let blocks = vec![json!({"type": "text", "text": text})];
-        {
-            let live = self.live(id);
-            let mut state = live.state.lock().await;
-            state.queue.push(Queued {
-                id: None,
-                blocks: blocks.clone(),
-                reply: None,
-            });
-            self.save_queue(id, &state.queue).await;
+    /// The agent's pod is going away: from now on the agent counts as not up, so new prompts and notices, and
+    /// whatever its running turn would hand on when it ends, wait for the agent that replaces it.
+    pub async fn retire_agent(&self, id: Uuid, agent: &Arc<AgentConn>) {
+        let live = self.live(id);
+        let mut state = live.state.lock().await;
+        if state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
+            state.agent_session_id = None;
         }
-        self.record_notice(id, &blocks[0]).await;
-    }
-
-    async fn record_notice(&self, id: Uuid, block: &Value) {
-        self.record(
-            id,
-            json!({
-                "sessionUpdate": "user_message_chunk",
-                "messageId": Uuid::new_v4(),
-                "content": block,
-                "_meta": {"sloppod": {"notice": true}},
-            }),
-        )
-        .await;
     }
 
     pub async fn notify(self: &Arc<Self>, id: Uuid, text: String) {
@@ -989,7 +969,16 @@ impl Hub {
                 Some(true)
             }
         };
-        self.record_notice(id, &blocks[0]).await;
+        self.record(
+            id,
+            json!({
+                "sessionUpdate": "user_message_chunk",
+                "messageId": Uuid::new_v4(),
+                "content": blocks[0],
+                "_meta": {"sloppod": {"notice": true}},
+            }),
+        )
+        .await;
         match delivery {
             None => {}
             Some(true) => {
