@@ -286,14 +286,34 @@ const sessionBranch = (session) => `sloppod/${session.data.id.slice(0, 8)}`;
 const hasRepoGrant = (session, repo) =>
   session.data.grants.some((grant) => grant.capability === 'repo' && grant.params.repo === repo);
 
+/** What the runtime says of each capability that can be granted while a session runs (`grants::describe`). */
+const grantable = {
+  model: "Claude's API, with the owner's Claude account.",
+  github: "GitHub's API and git.",
+  packages: 'Package registries and tool downloads.',
+  docs: 'Library documentation, through Context7.',
+  codex: "Codex's API on chatgpt.com, with the owner's ChatGPT login.",
+};
+
+const newGrant = (capability, params, description, expires_at) => ({
+  id: randomUUID(),
+  capability,
+  params,
+  description,
+  created_at: now(),
+  ...(expires_at ? { expires_at } : {}),
+});
+
 /** Gives the session write access to another repository; the first one also becomes its `repo`. */
 function grantRepo(session, repo) {
   if (!hasRepoGrant(session, repo)) {
-    session.data.grants.push({
-      capability: 'repo',
-      params: { repo, access: 'rw', branch: sessionBranch(session) },
-      description: `${repo}: read, and push the session branch \`${sessionBranch(session)}\` and branches named after it.`,
-    });
+    session.data.grants.push(
+      newGrant(
+        'repo',
+        { repo, access: 'rw', branch: sessionBranch(session) },
+        `${repo}: read, and push the session branch \`${sessionBranch(session)}\` and branches named after it.`,
+      ),
+    );
   }
   if (!session.data.repo) {
     session.data.repo = repo;
@@ -933,23 +953,23 @@ function createSession({ prompt, repo, title, parent }) {
     repo: sessionRepo,
     branch,
     grants: [
-      { capability: 'model', params: {}, description: "Claude's API, with the owner's Claude account." },
-      { capability: 'github', params: {}, description: "GitHub's API and git." },
-      { capability: 'packages', params: {}, description: 'Package registries and tool downloads.' },
+      newGrant('model', {}, grantable.model),
+      newGrant('github', {}, grantable.github),
+      newGrant('packages', {}, grantable.packages),
       ...(sessionRepo
         ? [
-            {
-              capability: 'repo',
-              params: { repo: sessionRepo, access: 'rw', branch },
-              description: `${sessionRepo}: read, and push the session branch \`${branch}\` and branches named after it.`,
-            },
+            newGrant(
+              'repo',
+              { repo: sessionRepo, access: 'rw', branch },
+              `${sessionRepo}: read, and push the session branch \`${branch}\` and branches named after it.`,
+            ),
           ]
         : []),
-      {
-        capability: 'memory',
-        params: { namespace: sessionRepo ?? 'bo0tzz', access: 'rw' },
-        description: `Long-term memory (memini), in the namespace ${sessionRepo ?? 'bo0tzz'}.`,
-      },
+      newGrant(
+        'memory',
+        { namespace: sessionRepo ?? 'bo0tzz', access: 'rw' },
+        `Long-term memory (memini), in the namespace ${sessionRepo ?? 'bo0tzz'}.`,
+      ),
     ],
     phase: 'starting',
     agent: 'claude-code',
@@ -1370,6 +1390,48 @@ async function handleApi(req, res, url) {
           `Thanks, I can push to ${body.repo} now.`,
         );
       }
+      return json(res, 200, session.data);
+    }
+    if (parts.length === 3 && parts[2] === 'grants' && method === 'POST') {
+      const body = await readBody(req);
+      if (!grantable[body.capability]) {
+        return json(res, 400, { error: `${body.capability} can't be granted here; repositories are added with POST /sessions/{id}/repos` });
+      }
+      if (session.data.grants.some((grant) => grant.capability === body.capability)) {
+        return json(res, 409, { error: `the session already has ${body.capability}` });
+      }
+      if (body.expires_at && Date.parse(body.expires_at) <= Date.now()) return json(res, 400, { error: 'expires_at is in the past' });
+      session.data.grants.push(newGrant(body.capability, {}, grantable[body.capability], body.expires_at));
+      session.broadcast();
+      void notifyAgent(session, `sloppod: the user granted this session ${body.capability}.`, `Thanks, I have ${body.capability} now.`);
+      return json(res, 201, session.data);
+    }
+    if (parts.length === 4 && parts[2] === 'grants' && (method === 'PATCH' || method === 'DELETE')) {
+      const index = session.data.grants.findIndex((grant) => grant.id === parts[3]);
+      if (index < 0) return json(res, 404, { error: 'not found' });
+      const grant = session.data.grants[index];
+      if (method === 'DELETE') {
+        session.data.grants.splice(index, 1);
+        session.broadcast();
+        void notifyAgent(session, `sloppod: the user revoked this session's grant ${grant.capability}.`, 'Understood.');
+        return json(res, 200, session.data);
+      }
+      const body = await readBody(req);
+      if (!body.narrow && body.expires_at === undefined) return json(res, 400, { error: 'give expires_at or narrow' });
+      if (body.expires_at && Date.parse(body.expires_at) <= Date.now()) {
+        return json(res, 400, { error: 'expires_at is in the past; revoke the grant instead' });
+      }
+      if (body.narrow && !(grant.capability === 'repo' && grant.params.access === 'rw')) {
+        return json(res, 400, { error: "this grant can't be narrowed" });
+      }
+      if (body.narrow) {
+        grant.params = { repo: grant.params.repo, access: 'ro' };
+        grant.description = `${grant.params.repo}: read only.`;
+      }
+      if (body.expires_at === null) delete grant.expires_at;
+      else if (body.expires_at) grant.expires_at = body.expires_at;
+      session.broadcast();
+      void notifyAgent(session, `sloppod: the user changed this session's grant ${grant.capability}.`, 'Noted.');
       return json(res, 200, session.data);
     }
     if (parts.length === 2 && method === 'DELETE') {

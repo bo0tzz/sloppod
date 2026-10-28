@@ -490,7 +490,7 @@
 {/if}
 
 {#if showGrants && session}
-  <GrantsModal grants={session.grants} onClose={() => (showGrants = false)} />
+  <GrantsModal {session} onChange={(updated) => view.setSession(updated)} onClose={() => (showGrants = false)} />
 {/if}
 
 {#if showAddRepo && session}
