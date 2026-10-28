@@ -351,6 +351,25 @@ async fn findings_from_before_severities_still_read(db: PgPool) {
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
+async fn an_agent_failure_is_news_once_until_the_agent_is_ready(db: PgPool) {
+    let s = session(&db, "dev").await;
+    db::set_agent_status(&db, s, "cloning").await.unwrap();
+    let row = db::get_session(&db, s).await.unwrap().unwrap().to_api();
+    assert_eq!(row.agent_status.as_deref(), Some("cloning"));
+    assert!(db::set_agent_error(&db, s, "clone failed").await.unwrap());
+    assert!(!db::set_agent_error(&db, s, "clone failed").await.unwrap());
+    let row = db::get_session(&db, s).await.unwrap().unwrap().to_api();
+    assert_eq!(row.agent_status, None);
+    assert_eq!(row.agent_error.as_deref(), Some("clone failed"));
+
+    db::clear_agent_status(&db, s).await.unwrap();
+    let row = db::get_session(&db, s).await.unwrap().unwrap().to_api();
+    assert_eq!((row.agent_status, row.agent_error), (None, None));
+    // After a start that worked, the same failure is news again.
+    assert!(db::set_agent_error(&db, s, "clone failed").await.unwrap());
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
 async fn parked_sessions_are_left_alone_on_startup(db: PgPool) {
     use sloppod_protocol::api::Phase;
 
