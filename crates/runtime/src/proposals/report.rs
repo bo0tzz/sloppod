@@ -156,8 +156,15 @@ impl ProposalKind for Report {
         });
         if let Some((repo, head, base)) = branch {
             let app = self.credentials.github(&session.owner).await.map_err(err)?;
-            // A branch that was never pushed has nothing to hand over; a failed comparison is retried.
-            if let Some(comparison) = app.compare_if_found(repo, base, head).await.map_err(err)?
+            // A child spawned before its parent pushed started from the default branch, so that's its base then. A
+            // branch that was never pushed has nothing to hand over; a failed comparison is retried.
+            let mut base = base.to_owned();
+            let mut comparison = app.compare_if_found(repo, &base, head).await.map_err(err)?;
+            if comparison.is_none() {
+                base = app.default_branch(repo).await.map_err(err)?;
+                comparison = app.compare_if_found(repo, &base, head).await.map_err(err)?;
+            }
+            if let Some(comparison) = comparison
                 && comparison.ahead_by > 0
             {
                 payload["repo"] = json!(repo);
