@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::OnceCell;
 
-const API: &str = "https://api.github.com";
+pub const API: &str = "https://api.github.com";
 
 /// Lookups the authorizer makes while deciding a request, which Envoy gives 10 s in all.
 const AUTHZ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1074,6 +1074,15 @@ impl GitHubApp {
             .collect())
     }
 
+    /// An issue's title and body as they are now, `{title, body}`; a missing body is empty.
+    pub async fn issue(&self, repo: &str, number: u64) -> anyhow::Result<Value> {
+        let issue: Value = self.repo_json(repo, &format!("/issues/{number}")).await?;
+        Ok(json!({
+            "title": issue["title"].as_str().unwrap_or_default(),
+            "body": issue["body"].as_str().unwrap_or_default(),
+        }))
+    }
+
     pub async fn create_issue(&self, repo: &str, payload: &Value) -> anyhow::Result<Value> {
         let body = self.repo_post(repo, "/issues", payload).await?;
         Ok(json!({"url": body["html_url"], "number": body["number"]}))
@@ -1166,6 +1175,96 @@ impl GitHubApp {
     }
 }
 
+/// What GitHub says of a user's personal access token (ADR 28): whose it is, when it expires, and which
+/// repositories it reaches.
+#[derive(Debug, PartialEq)]
+pub struct UserToken {
+    pub login: String,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub repositories: Vec<String>,
+    /// More than [`MAX_LISTED_PAGES`] pages of them, so the list stops short.
+    pub more_repositories: bool,
+}
+
+/// How many pages of a token's repositories are listed.
+const MAX_LISTED_PAGES: usize = 10;
+
+/// The `github-authentication-token-expiration` header, e.g. `2026-11-27 12:00:00 UTC` or `… +0100`.
+fn token_expiry(header: &str) -> Option<DateTime<Utc>> {
+    let header = header.trim();
+    DateTime::parse_from_str(header, "%Y-%m-%d %H:%M:%S %z")
+        .map(|at| at.with_timezone(&Utc))
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(header.strip_suffix(" UTC")?, "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .map(|at| at.and_utc())
+        })
+}
+
+/// Asks GitHub about a user's token. `Ok(Err(_))` is GitHub refusing it, with a reason for the user.
+pub async fn inspect_user_token(
+    http: &reqwest::Client,
+    api: &str,
+    token: &str,
+) -> anyhow::Result<Result<UserToken, String>> {
+    let get = |path: String| {
+        http.get(format!("{api}{path}"))
+            .bearer_auth(token)
+            .header(reqwest::header::USER_AGENT, "sloppod")
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header("x-github-api-version", "2022-11-28")
+            .send()
+    };
+    let user = get("/user".into()).await?;
+    if matches!(
+        user.status(),
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        return Ok(Err(
+            "GitHub refused the token: it's wrong, expired or revoked".into(),
+        ));
+    }
+    let user = user.error_for_status()?;
+    let expires_at = user
+        .headers()
+        .get("github-authentication-token-expiration")
+        .and_then(|h| h.to_str().ok())
+        .and_then(token_expiry);
+    let login = user.json::<Value>().await?["login"]
+        .as_str()
+        .context("GitHub's /user has no login")?
+        .to_owned();
+    let mut repositories = Vec::new();
+    let mut more_repositories = false;
+    for page in 1..=MAX_LISTED_PAGES + 1 {
+        if page > MAX_LISTED_PAGES {
+            more_repositories = true;
+            break;
+        }
+        let items: Vec<Value> = get(format!("/user/repos?per_page={PAGE}&page={page}"))
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let last = items.len() < PAGE;
+        repositories.extend(
+            items
+                .iter()
+                .filter_map(|repo| repo["full_name"].as_str().map(str::to_owned)),
+        );
+        if last {
+            break;
+        }
+    }
+    Ok(Ok(UserToken {
+        login,
+        expires_at,
+        repositories,
+        more_repositories,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -1176,6 +1275,85 @@ mod tests {
     use axum::{Json, Router};
 
     use super::*;
+
+    /// A fake GitHub for a user's token: `github_pat_good` is octo's, expiring at the end of November, and
+    /// reaches `repos` repositories; any other token is refused.
+    async fn user_github(repos: usize) -> String {
+        async fn user(
+            headers: axum::http::HeaderMap,
+        ) -> Result<impl axum::response::IntoResponse, StatusCode> {
+            if headers.get("authorization").and_then(|h| h.to_str().ok())
+                != Some("Bearer github_pat_good")
+            {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            Ok((
+                [(
+                    "github-authentication-token-expiration",
+                    "2026-11-30 12:00:00 UTC",
+                )],
+                Json(json!({"login": "octo"})),
+            ))
+        }
+        let router =
+            Router::new().route("/user", get(user)).route(
+                "/user/repos",
+                get(
+                    move |axum::extract::Query(page): axum::extract::Query<
+                        HashMap<String, usize>,
+                    >| async move {
+                        let (per_page, page) = (page["per_page"], page["page"]);
+                        let names: Vec<Value> = ((page - 1) * per_page
+                            ..(page * per_page).min(repos))
+                            .map(|n| json!({"full_name": format!("octo/r{n}")}))
+                            .collect();
+                        Json(names)
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        api
+    }
+
+    #[tokio::test]
+    async fn a_user_token_is_known_by_its_account_expiry_and_repositories() {
+        let api = user_github(150).await;
+        let http = reqwest::Client::new();
+        let token = inspect_user_token(&http, &api, "github_pat_good")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(token.login, "octo");
+        assert_eq!(
+            token.expires_at,
+            Some("2026-11-30T12:00:00Z".parse().unwrap())
+        );
+        assert_eq!(token.repositories.len(), 150);
+        assert_eq!(token.repositories[149], "octo/r149");
+        assert!(!token.more_repositories);
+
+        let refused = inspect_user_token(&http, &api, "github_pat_revoked")
+            .await
+            .unwrap();
+        assert!(refused.unwrap_err().contains("refused"));
+
+        let many = inspect_user_token(&http, &user_github(5_000).await, "github_pat_good")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(many.repositories.len(), MAX_LISTED_PAGES * PAGE);
+        assert!(many.more_repositories);
+    }
+
+    #[test]
+    fn reads_a_tokens_expiry() {
+        let at: DateTime<Utc> = "2026-11-30T12:00:00Z".parse().unwrap();
+        assert_eq!(token_expiry("2026-11-30 12:00:00 UTC"), Some(at));
+        assert_eq!(token_expiry("2026-11-30 13:00:00 +0100"), Some(at));
+        assert_eq!(token_expiry("soon"), None);
+    }
 
     /// Installation of `o/other`, which never changes.
     const OTHER: u64 = 10;
@@ -1303,6 +1481,19 @@ mod tests {
             .ok_or(StatusCode::NOT_FOUND)
     }
 
+    /// #1 has a body; #2 has none, which GitHub gives as null.
+    async fn issue(
+        Path((_, _, number)): Path<(String, String, u64)>,
+    ) -> Result<Json<Value>, StatusCode> {
+        match number {
+            1 => Ok(Json(
+                json!({"number": 1, "title": "Flaky", "body": "It fails.\n"}),
+            )),
+            2 => Ok(Json(json!({"number": 2, "title": "Bare", "body": null}))),
+            _ => Err(StatusCode::NOT_FOUND),
+        }
+    }
+
     async fn repository() -> Json<Value> {
         Json(json!({"allow_squash_merge": true}))
     }
@@ -1383,6 +1574,7 @@ mod tests {
             .route("/repos/{owner}/{name}/stacks", get(stacks))
             .route("/repos/{owner}/{name}/stacks/{number}", get(stack))
             .route("/repos/{owner}/{name}/commits/{reference}", get(commit))
+            .route("/repos/{owner}/{name}/issues/{number}", get(issue))
             .route("/graphql", post(graphql))
             .with_state(fake.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1415,6 +1607,20 @@ mod tests {
             .filter(|p| p.2)
             .map(|p| p.0)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn reads_an_issue_as_it_is_now() {
+        let (_, app) = fake_github().await;
+        assert_eq!(
+            app.issue("o/r", 1).await.unwrap(),
+            json!({"title": "Flaky", "body": "It fails.\n"})
+        );
+        assert_eq!(
+            app.issue("o/r", 2).await.unwrap(),
+            json!({"title": "Bare", "body": ""})
+        );
+        assert!(app.issue("o/r", 3).await.is_err());
     }
 
     #[tokio::test]

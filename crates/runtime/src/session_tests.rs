@@ -381,6 +381,152 @@ async fn a_notice_waits_for_a_compaction_to_end() {
     turn.await.unwrap().unwrap();
 }
 
+fn tool_update(kind: &str, status: &str) -> Value {
+    json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "agent-session", "update": {
+        "sessionUpdate": kind, "toolCallId": "t1", "title": "cargo test", "status": status,
+    }}})
+}
+
+#[tokio::test]
+async fn a_notice_waits_for_a_tool_call_to_end() {
+    let mut h = Harness::ready().await;
+    let turn = h.prompt("First");
+    let turn_request = h.next().await;
+    from_agent(&h.hub, h.id, &h.agent, tool_update("tool_call", "pending")).await;
+    from_agent(
+        &h.hub,
+        h.id,
+        &h.agent,
+        tool_update("tool_call_update", "in_progress"),
+    )
+    .await;
+
+    h.hub
+        .notify(h.id, "sloppod: your proposal was approved.".into())
+        .await;
+    // Steering it in now would cancel the tool call, which the agent reads as the user telling it to stop.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(h.to_agent.try_recv().is_err());
+    assert_eq!(
+        kept_texts(&h).await,
+        ["sloppod: your proposal was approved."],
+        "kept while it waits"
+    );
+
+    from_agent(
+        &h.hub,
+        h.id,
+        &h.agent,
+        tool_update("tool_call_update", "completed"),
+    )
+    .await;
+    let steering = h.next().await;
+    assert_eq!(steering["method"], "_session/steering");
+    assert_eq!(
+        prompt_text(&steering),
+        ["sloppod: your proposal was approved."]
+    );
+    h.respond(&steering, json!({"outcome": "injected"})).await;
+    h.respond(&turn_request, json!({"stopReason": "end_turn"}))
+        .await;
+    turn.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_notice_waits_for_a_permission_request_to_be_answered() {
+    let mut h = Harness::ready().await;
+    let turn = h.prompt("First");
+    let turn_request = h.next().await;
+    let request = json!({"jsonrpc": "2.0", "id": "p-1", "method": "session/request_permission", "params": {
+        "sessionId": "agent-session", "toolCall": {"toolCallId": "t1"},
+        "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}],
+    }});
+    from_agent(&h.hub, h.id, &h.agent, request).await;
+
+    h.hub
+        .notify(h.id, "sloppod: your proposal was approved.".into())
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(h.to_agent.try_recv().is_err());
+
+    let (pid, _, _) = h.hub.replay(h.id).await.unwrap().permissions[0].clone();
+    let allow = json!({"outcome": {"outcome": "selected", "optionId": "allow"}});
+    h.hub
+        .answer_permission(h.id, pid, Ok(allow), "a test")
+        .await;
+    assert_eq!(h.next().await["id"], "p-1");
+    let steering = h.next().await;
+    assert_eq!(steering["method"], "_session/steering");
+    h.respond(&steering, json!({"outcome": "injected"})).await;
+    h.respond(&turn_request, json!({"stopReason": "end_turn"}))
+        .await;
+    turn.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_relinked_agents_permission_request_holds_a_notice_only_until_it_is_answered() {
+    let mut h = Harness::ready().await;
+    let _turn = h.prompt("First");
+    let turn_request = h.next().await;
+    let request = json!({"jsonrpc": "2.0", "id": "p-1", "method": "session/request_permission", "params": {
+        "sessionId": "agent-session", "toolCall": {"toolCallId": "t1"},
+        "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}],
+    }});
+    from_agent(&h.hub, h.id, &h.agent, request.clone()).await;
+    h.hub
+        .notify(h.id, "sloppod: your proposal was approved.".into())
+        .await;
+
+    // The supervisor links again before the runtime noticed the old link was gone, and reports the request still
+    // open; the old link is never detached.
+    let (tx, to_agent) = mpsc::unbounded_channel();
+    h.agent = Arc::new(AgentConn::new(tx));
+    h.to_agent = to_agent;
+    h.hub.attach_agent(h.id, h.agent.clone()).await;
+    let mut relinked = running(vec![turn_request]);
+    relinked.waiting = vec![request];
+    h.hub.adopt_agent(h.id, &h.agent, relinked).await;
+
+    let permissions = h.hub.replay(h.id).await.unwrap().permissions;
+    assert_eq!(permissions.len(), 1, "asked once, under the new link");
+    let allow = json!({"outcome": {"outcome": "selected", "optionId": "allow"}});
+    h.hub
+        .answer_permission(h.id, permissions[0].0, Ok(allow), "a test")
+        .await;
+    assert_eq!(h.next().await["id"], "p-1");
+    let steering = h.next().await;
+    assert_eq!(steering["method"], "_session/steering");
+    assert_eq!(
+        prompt_text(&steering),
+        ["sloppod: your proposal was approved."]
+    );
+}
+
+#[tokio::test]
+async fn the_users_steer_goes_in_during_a_tool_call() {
+    let mut h = Harness::ready().await;
+    let _turn = h.prompt("First");
+    h.next().await;
+    from_agent(
+        &h.hub,
+        h.id,
+        &h.agent,
+        tool_update("tool_call", "in_progress"),
+    )
+    .await;
+    let (hub, id) = (h.hub.clone(), h.id);
+    tokio::spawn(async move {
+        hub.steer(
+            id,
+            json!({"sessionId": id, "prompt": [{"type": "text", "text": "Also this"}]}),
+        )
+        .await
+    });
+    let steering = h.next().await;
+    assert_eq!(steering["method"], "_session/steering");
+    assert_eq!(prompt_text(&steering), ["Also this"]);
+}
+
 #[tokio::test]
 async fn a_turn_that_ends_mid_compaction_lets_waiting_steers_go() {
     let mut h = Harness::ready().await;
@@ -806,6 +952,7 @@ async fn an_adopted_question_is_shown_again_and_answered() {
             h.id,
             replay.permissions[0].0,
             Ok(json!({"action": "accept"})),
+            "a test",
         )
         .await;
     let answer = h.next().await;
@@ -1303,14 +1450,16 @@ async fn a_question_from_ask_user_waits_for_its_answer_without_the_agent() {
     h.hub.ask(h.id, questions).await.unwrap();
     // The agent isn't blocked on it, and cancelling a turn leaves it.
     assert_eq!(h.phase().await, "idle");
-    h.hub.cancel(h.id).await;
+    h.hub.cancel(h.id, "a test").await;
     let replay = h.hub.replay(h.id).await.unwrap();
     let (pid, method, _) = replay.permissions.first().cloned().expect("the question");
     assert_eq!(method, "elicitation/create");
 
     // Answered, it reaches the agent as a notice.
     let answer = json!({"action": "accept", "content": {"question_0": "Fixed"}});
-    h.hub.answer_permission(h.id, pid, Ok(answer)).await;
+    h.hub
+        .answer_permission(h.id, pid, Ok(answer), "a test")
+        .await;
     // Past the cancel the agent was sent.
     let request = loop {
         let message = h.next().await;
@@ -2013,4 +2162,33 @@ async fn a_message_kept_across_a_restart_tells_the_agent_how_long_it_waited() {
             "Sent while it was down"
         ]
     );
+}
+
+#[tokio::test]
+async fn usage_updates_are_handed_on_but_not_when_replayed() {
+    let h = Harness::ready().await;
+    let (tx, mut seen) = mpsc::unbounded_channel();
+    h.hub.set_usage_seen(Arc::new(move |id, update| {
+        let tx = tx.clone();
+        Box::pin(async move {
+            let _ = tx.send((id, update));
+        })
+    }));
+    let usage = |used: u64| {
+        json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "agent-session", "update": {
+            "sessionUpdate": "usage_update", "used": used, "size": 200_000,
+            "_meta": {"_claude/rateLimit": {"status": "allowed"}},
+        }}})
+    };
+    h.hub.set_loading(h.id, true).await;
+    from_agent(&h.hub, h.id, &h.agent, usage(1)).await;
+    h.hub.set_loading(h.id, false).await;
+    from_agent(&h.hub, h.id, &h.agent, usage(2)).await;
+    let (id, update) = tokio::time::timeout(Duration::from_secs(5), seen.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(id, h.id);
+    assert_eq!(update["used"], 2);
+    assert!(seen.try_recv().is_err());
 }

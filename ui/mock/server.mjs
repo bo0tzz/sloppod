@@ -46,6 +46,8 @@ const proposals = new Map();
 const reviews = new Map();
 const connections = new Set();
 const credentials = [];
+/** Set by `/_mock/quotas`: what `GET /api/v1/quotas` answers. */
+let quotas = [];
 
 const now = () => new Date().toISOString();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -428,21 +430,24 @@ async function agentScript(session, turn, prompt) {
 
   if (/ask_user/i.test(prompt)) {
     await step(1);
-    const askId = randomUUID();
-    tool({ toolCallId: askId, title: 'mcp__sloppod__ask_user', kind: 'other', status: 'pending', rawInput: { questions: [QUESTIONS[0]] } });
-    void requestFromUser(session, {
-      method: 'elicitation/create',
-      params: questionsToElicitation([QUESTIONS[0]], session.data.id),
-      cancelled: { action: 'cancel' },
-      blocking: false,
-    }).then((response) => {
-      const answers = response.action === 'accept' ? summariseAnswers([QUESTIONS[0]], response.content ?? {}) : [];
-      const notice = answers.length
-        ? `sloppod: the user answered your question:\n- ${QUESTIONS[0].question}: ${answers.join(' ')}`
-        : `sloppod: the user dismissed your question without answering it:\n- ${QUESTIONS[0].question}`;
-      void notifyAgent(session, notice, answers.length ? `Thanks, going with that. ${answers.join(' ')}` : "I'll use my own judgement then.");
-    });
-    update(askId, { status: 'completed' });
+    // "twice" asks each question with a call of its own, so the second request waits behind the first.
+    for (const question of /twice/i.test(prompt) ? QUESTIONS : [QUESTIONS[0]]) {
+      const askId = randomUUID();
+      tool({ toolCallId: askId, title: 'mcp__sloppod__ask_user', kind: 'other', status: 'pending', rawInput: { questions: [question] } });
+      void requestFromUser(session, {
+        method: 'elicitation/create',
+        params: questionsToElicitation([question], session.data.id),
+        cancelled: { action: 'cancel' },
+        blocking: false,
+      }).then((response) => {
+        const answers = response.action === 'accept' ? summariseAnswers([question], response.content ?? {}) : [];
+        const notice = answers.length
+          ? `sloppod: the user answered your question:\n- ${question.question}: ${answers.join(' ')}`
+          : `sloppod: the user dismissed your question without answering it:\n- ${question.question}`;
+        void notifyAgent(session, notice, answers.length ? `Thanks, going with that. ${answers.join(' ')}` : "I'll use my own judgement then.");
+      });
+      update(askId, { status: 'completed' });
+    }
     await say("I've asked you about the backoff; I'll carry on meanwhile.");
     await step(4);
     await say('Done with the parts that don\'t depend on your answer.');
@@ -834,9 +839,22 @@ function createIssueUpdates(session) {
       updates: [
         { number: 100, comment: 'Fixed by #148.', close: 'completed', remove_labels: ['priority'] },
         { number: 65, comment: 'Superseded by #196.', close: 'duplicate' },
-        { number: 59, add_labels: ['priority'], title: 'Startup failures show in the UI' },
+        {
+          number: 59,
+          add_labels: ['priority'],
+          title: 'Startup failures show in the UI',
+          body: 'A pod that fails to start says why in the UI.\n\nToday it only shows in the logs.',
+        },
       ],
     },
+    // Like the runtime's detail: what the rewritten issue says now.
+    current: [
+      {
+        number: 59,
+        title: 'Startup failures are only in the logs',
+        body: 'A pod that fails to start says nothing.\n\nToday it only shows in the logs.',
+      },
+    ],
     created_at: now(),
   };
   proposals.set(proposal.id, proposal);
@@ -877,7 +895,7 @@ function createStack(session) {
 }
 
 function publicProposal(proposal) {
-  const { diff: _diff, commits: _commits, layers: _layers, ...rest } = proposal;
+  const { diff: _diff, commits: _commits, layers: _layers, current: _current, ...rest } = proposal;
   return rest;
 }
 
@@ -1260,6 +1278,7 @@ async function handleApi(req, res, url) {
   }
 
   if (parts[0] === 'credentials') return handleCredentials(req, res, parts);
+  if (parts[0] === 'quotas' && parts.length === 1 && method === 'GET') return json(res, 200, quotas);
   if (parts[0] === 'standing-approvals') return handleStandingApprovals(req, res, parts);
 
   if (parts[0] === 'settings' && parts.length === 1) {
@@ -1500,7 +1519,22 @@ function handleStandingApprovals(req, res, parts) {
   return json(res, 404, { error: 'not found' });
 }
 
-const CREDENTIAL_CONFIG = { claude: [], 'github-app': ['app_id'], memini: ['url'], chatgpt: [] };
+const CREDENTIAL_CONFIG = { claude: [], 'github-app': ['app_id'], memini: ['url'], chatgpt: [], 'github-user': [] };
+
+/** What the runtime learns of a GitHub token from GitHub; a token with "soon" in it expires in three days. */
+function inspectUserToken(secret) {
+  if (secret.startsWith('ghp_')) return { error: "that's a classic token, which can't be narrowed to repositories; make a fine-grained one instead" };
+  if (!secret.startsWith('github_pat_')) return { error: 'expected a fine-grained personal access token, which starts with github_pat_' };
+  const days = secret.includes('soon') ? 3 : 60;
+  return {
+    config: {
+      login: 'bo0tzz',
+      expires_at: new Date(Date.now() + days * 24 * 3600_000).toISOString(),
+      repositories: ['bo0tzz/sloppod', 'bo0tzz/dotfiles'],
+      more_repositories: false,
+    },
+  };
+}
 
 function addCredential({ kind, name, config }) {
   const credential = {
@@ -1525,7 +1559,12 @@ async function handleCredentials(req, res, parts) {
     if (!body.name?.trim() || !body.secret?.trim()) return json(res, 400, { error: 'name and secret are required' });
     const missing = keys.filter((key) => !body.config?.[key]);
     if (missing.length) return json(res, 400, { error: `missing config: ${missing.join(', ')}` });
-    const config = Object.fromEntries(keys.map((key) => [key, String(body.config[key])]));
+    let config = Object.fromEntries(keys.map((key) => [key, String(body.config[key])]));
+    if (body.kind === 'github-user') {
+      const inspected = inspectUserToken(body.secret.trim());
+      if (inspected.error) return json(res, 400, { error: inspected.error });
+      config = inspected.config;
+    }
     return json(res, 201, addCredential({ kind: body.kind, name: body.name.trim(), config }));
   }
   const credential = credentials.find((c) => c.id === parts[1]);
@@ -1667,6 +1706,10 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   try {
     if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
+    if (url.pathname === '/_mock/quotas' && req.method === 'POST') {
+      quotas = await readBody(req);
+      return json(res, 200, {});
+    }
     if (url.pathname === '/_mock/fail-next-prompt' && req.method === 'POST') {
       failNextPrompt = true;
       return json(res, 200, { failNextPrompt });

@@ -5,13 +5,31 @@
   import type { PendingQuestion } from '#lib/session.svelte.ts';
   import Markdown from './Markdown.svelte';
 
-  let { request, onRespond }: { request: PendingQuestion; onRespond: (response: ElicitationResponse) => void } =
-    $props();
+  let {
+    request,
+    queued = 0,
+    onRespond,
+  }: {
+    request: PendingQuestion;
+    /** How many more requests wait behind this one. */
+    queued?: number;
+    onRespond: (response: ElicitationResponse) => void;
+  } = $props();
 
   const PREVIEW_KEY = '_claude/askUserQuestionOption';
 
   const fields = $derived(Object.entries(request.requestedSchema?.properties ?? {}));
   const required = $derived(new Set(request.requestedSchema?.required ?? []));
+  /** One question per step: a field, with its "Other" field (`<key>_custom`) if it has one. */
+  const steps = $derived(
+    fields.reduce<[string, ElicitationField][][]>((steps, entry) => {
+      if (kindOf(...entry) === 'other' && steps.length) steps[steps.length - 1].push(entry);
+      else steps.push([entry]);
+      return steps;
+    }, []),
+  );
+  let current = $state(0);
+  const last = $derived(current >= steps.length - 1);
 
   // svelte-ignore state_referenced_locally
   let values = $state<Record<string, unknown>>(
@@ -79,19 +97,24 @@
     return result;
   }
 
-  const missingRequired = $derived(
-    [...required].some((key) => {
-      const value = values[key];
-      return value === undefined || value === '' || (Array.isArray(value) && value.length === 0);
-    }),
-  );
+  const missing = (key: string) => {
+    const value = values[key];
+    return required.has(key) && (value === undefined || value === '' || (Array.isArray(value) && value.length === 0));
+  };
+  const missingRequired = $derived(fields.some(([key]) => missing(key)));
+  const stepMissing = $derived((steps[current] ?? []).some(([key]) => missing(key)));
 
   const answer = () => onRespond({ action: 'accept', content: content() });
 
+  /** Enter moves on to the next question, and on the last one sends the answers. */
   function submitOnEnter(event: KeyboardEvent) {
     if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
     event.preventDefault();
-    if (!missingRequired) answer();
+    if (!last) {
+      if (!stepMissing) current++;
+    } else if (!missingRequired) {
+      answer();
+    }
   }
 </script>
 
@@ -102,10 +125,13 @@
 >
   <header class="flex items-start gap-2 text-sm">
     <Icon icon={mdiChatQuestionOutline} class="text-info-700 mt-0.5 shrink-0" size="1.25em" aria-hidden />
-    <Markdown text={request.message} breaks class="min-w-0 font-semibold" />
+    <Markdown text={request.message} breaks class="min-w-0 grow font-semibold" />
+    {#if steps.length > 1}
+      <span class="text-muted shrink-0 text-xs" data-testid="question-step">Question {current + 1} of {steps.length}</span>
+    {/if}
   </header>
 
-  {#each fields as [key, field] (key)}
+  {#each steps[current] ?? [] as [key, field] (key)}
     {@const kind = kindOf(key, field)}
     <div class="flex flex-col gap-1.5 {kind === 'other' ? '-mt-1.5' : ''}" data-testid="question-field" data-key={key}>
       {#if kind !== 'other' && kind !== 'boolean' && (field.title || field.description)}
@@ -150,8 +176,11 @@
             </label>
           {/each}
         </div>
-        {#if shown}
-          <pre class="bg-light-100 border-light-200 max-h-48 overflow-auto rounded-lg border px-3 py-2 font-mono text-xs" data-testid="option-preview">{shown}</pre>
+        <!-- Its size is fixed, so previews coming and going with the pointer don't move the options under it. -->
+        {#if options.some((option) => preview(option))}
+          <pre
+            class="bg-light-100 border-light-200 h-24 overflow-auto rounded-lg border px-3 py-2 font-mono text-xs {shown ? '' : 'text-muted'}"
+            data-testid="option-preview">{shown ?? 'Point at an option to preview it.'}</pre>
         {/if}
       {:else if kind === 'other'}
         <label class="flex items-center gap-2" title={field.description}>
@@ -205,12 +234,22 @@
     </div>
   {/each}
 
-  <div class="flex flex-wrap justify-end gap-2 pt-1">
+  <div class="flex flex-wrap items-center justify-end gap-2 pt-1">
+    {#if queued > 0}
+      <span class="text-muted me-auto text-xs" data-testid="questions-queued">
+        {queued === 1 ? 'One more request after this' : `${queued} more requests after this`}
+      </span>
+    {/if}
     <Button size="small" shape="round" variant="outline" color="secondary" onclick={() => onRespond({ action: 'decline' })}>
       Skip
     </Button>
-    <Button size="small" shape="round" disabled={missingRequired} onclick={answer}>
-      Answer
-    </Button>
+    {#if current > 0}
+      <Button size="small" shape="round" variant="outline" onclick={() => current--}>Back</Button>
+    {/if}
+    {#if last}
+      <Button size="small" shape="round" disabled={missingRequired} onclick={answer}>Answer</Button>
+    {:else}
+      <Button size="small" shape="round" disabled={stepMissing} onclick={() => current++}>Next</Button>
+    {/if}
   </div>
 </section>

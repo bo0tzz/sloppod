@@ -98,7 +98,6 @@ for (const [form, device] of Object.entries(viewports)) {
         await page.goto(`/sessions/${session.id}`);
         const card = page.getByTestId('question-card');
         await card.getByRole('radio', { name: /Exponential/ }).check();
-        await card.getByRole('checkbox', { name: /End-to-end/ }).check();
         await expect(card.getByTestId('option-preview')).toBeVisible();
         await card.locator('header').scrollIntoViewIfNeeded();
         await shot(page, 'question');

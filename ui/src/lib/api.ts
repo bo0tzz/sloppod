@@ -144,12 +144,14 @@ export type Review = {
   finished_at?: string;
 };
 
-/** Pull requests add their diff and commits; other kinds add nothing. */
+/** Pull requests add their diff and commits, issue updates the current text of the issues they rewrite. */
 export type ProposalDetail = Proposal & {
   diff?: string;
   commits?: { sha: string; message: string }[];
   /** Stacks: each pull request's diff and commits, bottom first. */
   layers?: { diff: string; commits: { sha: string; message: string }[] }[];
+  /** Issue updates: each issue whose title or body they replace, as it is now. */
+  current?: { number: number; title: string; body: string }[];
 };
 
 /** Pull requests that build on each other, bottom first; each merges into the one below it. */
@@ -160,15 +162,25 @@ export type StackPayload = {
   auto_merge?: boolean;
 };
 
-export type CredentialKind = 'claude' | 'github-app' | 'memini' | 'chatgpt';
+export type CredentialKind = 'claude' | 'github-app' | 'memini' | 'chatgpt' | 'github-user';
 
 export type Credential = {
   id: string;
   kind: CredentialKind;
   name: string;
-  config: Record<string, string>;
+  /** Strings, except a `github-user`'s, which is a {@link GitHubUserConfig}. */
+  config: Record<string, unknown>;
   default: boolean;
   created_at: string;
+};
+
+/** What the runtime learned of a GitHub token when it was added. */
+export type GitHubUserConfig = {
+  login: string;
+  expires_at: string | null;
+  repositories: string[];
+  /** The list stops short: the token reaches more. */
+  more_repositories: boolean;
 };
 
 export type NewCredential = {
@@ -176,6 +188,28 @@ export type NewCredential = {
   name: string;
   config: Record<string, string>;
   secret: string;
+};
+
+/** What's left of an inference credential's usage limits, as last reported. `utilization` is a fraction, usually 0 to 1. */
+export type Quota = {
+  credential_id: string;
+  kind: CredentialKind;
+  name: string;
+  /** The provider refuses its requests now, until `resets_at`. */
+  limited: boolean;
+  resets_at: string | null;
+  windows: QuotaWindow[];
+  observed_at: string;
+};
+
+export type QuotaStatus = 'allowed' | 'warning' | 'rejected';
+
+export type QuotaWindow = {
+  /** `five_hour` and `seven_day` for the session and weekly limits. */
+  window: string;
+  utilization: number | null;
+  resets_at: string | null;
+  status: QuotaStatus;
 };
 
 /** Defaults for new sessions. `models` is what the agent offered most recently; empty before the first session. */
@@ -240,6 +274,7 @@ export const api = {
   setSessionReview: (id: string, review: ReviewPolicy) =>
     call<Session>('PUT', `/sessions/${encodeURIComponent(id)}/review`, { review }),
   listCredentials: () => call<Credential[]>('GET', '/credentials'),
+  listQuotas: () => call<Quota[]>('GET', '/quotas'),
   listStandingApprovals: () => call<StandingApproval[]>('GET', '/standing-approvals'),
   createStandingApproval: (approval: NewStandingApproval) =>
     call<StandingApproval>('POST', '/standing-approvals', approval),

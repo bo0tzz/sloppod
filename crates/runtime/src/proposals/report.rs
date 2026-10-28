@@ -11,7 +11,7 @@ use sloppod_contracts::{
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::err;
+use super::{branch_detail, err, head_branch};
 use crate::credentials::Credentials;
 use crate::db;
 
@@ -62,17 +62,19 @@ fn report_text(child: &str, payload: &Value) -> String {
     )
 }
 
-/// A report's edits: the child corrects its summary between review rounds, and the runtime adds the review's outcome
-/// when it delivers the report.
+/// A report's edits: the child corrects its title and summary between review rounds, and the runtime adds the
+/// review's outcome when it delivers the report.
 fn edit_report(payload: &Value, edits: &Value) -> Result<Value> {
     let mut payload = payload.clone();
-    if let Some(summary) = edits.get("summary") {
-        let summary = summary
-            .as_str()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| Error::new("the summary can't be empty"))?;
-        payload["summary"] = json!(summary);
+    for field in ["title", "summary"] {
+        if let Some(value) = edits.get(field) {
+            let value = value
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| Error::new(format!("the {field} can't be empty")))?;
+            payload[field] = json!(value);
+        }
     }
     if let Some(review) = edits.get("review") {
         payload["review"] = review.clone();
@@ -94,14 +96,17 @@ impl ProposalKind for Report {
         ToolSpec {
             name: "report_done".into(),
             description: "For a sub-session: report to your parent session that your task is done. Push your \
-                          commits first. Under your review policy your branch is reviewed first, and findings come \
-                          back to you like a pull request's; your parent hears once the review is over, with your \
-                          summary, your branch and the review's verdict."
+                          commits first, to your session branch or, for a later task, a branch named after it \
+                          (`<session branch>-<name>`). Under your review policy your branch is reviewed first, and \
+                          findings come back to you like a pull request's; your parent hears once the review is \
+                          over, with your summary, your branch and the review's verdict."
                 .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "summary": {"type": "string", "description": "What you did, what's left, and anything your parent should check"},
+                    "title": {"type": "string", "description": "What the task was; defaults to the session's title"},
+                    "head": {"type": "string", "description": "The branch your work is on: the session branch (the default) or `<session branch>-<name>`"},
                     "review": {"type": "boolean", "description": "Have another model review your branch first, whatever your policy", "default": false},
                 },
                 "required": ["summary"],
@@ -122,6 +127,7 @@ impl ProposalKind for Report {
             head_sha: field("head_sha")?,
             title: field("title")?,
             body: field("summary").unwrap_or_default(),
+            describes_change: true,
         })
     }
 
@@ -146,7 +152,13 @@ impl ProposalKind for Report {
         let parent = row
             .parent_id
             .ok_or_else(|| Error::new("only a sub-session reports to a parent"))?;
-        let mut payload = json!({"parent": parent, "summary": summary, "title": row.title});
+        let title = arguments["title"]
+            .as_str()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .unwrap_or(&row.title);
+        let mut payload = json!({"parent": parent, "summary": summary, "title": title});
+        let named = arguments["head"].as_str().filter(|h| !h.trim().is_empty());
         // The branch the child was given in the repository it works in, from the parent's that it started from.
         let branch = session.grants.iter().find_map(|g| {
             let repo = g.param("repo")?;
@@ -156,7 +168,13 @@ impl ProposalKind for Report {
                 .then_some(())?;
             Some((repo, g.param("branch")?, g.param("from")?))
         });
-        if let Some((repo, head, base)) = branch {
+        if named.is_some() && branch.is_none() {
+            return Err(Error::new(
+                "this session has no branch of its own to report on; leave `head` out",
+            ));
+        }
+        if let Some((repo, session_branch, base)) = branch {
+            let head = head_branch(session_branch, named)?;
             let app = self.credentials.github(&session.owner).await.map_err(err)?;
             // A child spawned before its parent pushed started from the default branch, so that's its base then. A
             // branch that was never pushed has nothing to hand over; a failed comparison is retried.
@@ -166,9 +184,14 @@ impl ProposalKind for Report {
                 base = app.default_branch(repo).await.map_err(err)?;
                 comparison = app.compare_if_found(repo, &base, head).await.map_err(err)?;
             }
-            if let Some(comparison) = comparison
-                && comparison.ahead_by > 0
-            {
+            let ahead = comparison.as_ref().is_some_and(|c| c.ahead_by > 0);
+            // A named branch is one the child means to hand over, so it has to have something to hand over.
+            if named.is_some() && !ahead {
+                return Err(Error::new(format!(
+                    "`{head}` has no commits on `{base}`; push your work to it first"
+                )));
+            }
+            if let Some(comparison) = comparison.filter(|_| ahead) {
                 payload["repo"] = json!(repo);
                 payload["base"] = json!(base);
                 payload["head"] = json!(head);
@@ -179,25 +202,8 @@ impl ProposalKind for Report {
     }
 
     async fn detail(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
-        let Some(head) = payload["head_sha"].as_str() else {
-            return Ok(json!({}));
-        };
-        let comparison = self
-            .credentials
-            .github(&session.owner)
-            .await
-            .map_err(err)?
-            .compare(
-                payload["repo"].as_str().unwrap_or_default(),
-                payload["base"].as_str().unwrap_or_default(),
-                head,
-            )
-            .await
-            .map_err(err)?;
-        Ok(json!({
-            "diff": comparison.diff,
-            "commits": comparison.commits.iter().map(|(sha, message)| json!({"sha": sha, "message": message})).collect::<Vec<_>>(),
-        }))
+        let app = self.credentials.github(&session.owner).await.map_err(err)?;
+        branch_detail(&app, payload).await
     }
 
     fn edit(&self, payload: &Value, edits: &Value) -> Result<Value> {
@@ -242,6 +248,10 @@ mod tests {
         let edited = edit_report(&payload, &json!({"summary": " Fixed it properly. "})).unwrap();
         assert_eq!(edited["summary"], "Fixed it properly.");
         assert!(edit_report(&payload, &json!({"summary": " "})).is_err());
+        let retitled = edit_report(&payload, &json!({"title": "The second task"})).unwrap();
+        assert_eq!(retitled["title"], "The second task");
+        assert_eq!(retitled["head"], payload["head"]);
+        assert!(edit_report(&payload, &json!({"title": ""})).is_err());
 
         let bare = report_text("\"Look\" (y)", &json!({"summary": "Nothing to change."}));
         assert!(bare.contains("no commits to hand over"));

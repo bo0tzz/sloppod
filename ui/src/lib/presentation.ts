@@ -22,6 +22,7 @@ import {
 import type { Color } from '@immich/ui';
 import type { ConfigSelectGroup, ConfigSelectOption, PlanEntry, ToolCallStatus, ToolKind } from './acp/types.ts';
 import type { CredentialKind, Grant, Phase, Proposal, ProposalStatus } from './api.ts';
+import { timeAgo } from './format.ts';
 
 export const phases: Record<Phase, { label: string; color: Color; description: string }> = {
   starting: { label: 'Starting', color: 'info', description: 'The pod is starting or the agent has not connected yet' },
@@ -81,6 +82,7 @@ export const proposalKinds: Record<string, { title: string; plural: string; exec
   'github.issue.update': { title: 'Issue updates', plural: 'Issue updates', executed: 'Updated' },
   'sloppod.repo.grant': { title: 'Repository access', plural: 'Repository access', executed: 'Granted' },
   'sloppod.session.report': { title: 'Report to the parent session', plural: 'Reports', executed: 'Delivered' },
+  'sloppod.code_review': { title: 'Code review', plural: 'Code reviews', executed: 'Reviewed' },
 };
 
 export function proposalStatus(proposal: Proposal): { label: string; color: Color } {
@@ -206,6 +208,20 @@ export const credentialKinds: CredentialKindSpec[] = [
     secret: { label: 'Admin key' },
   },
   {
+    kind: 'github-user',
+    title: 'GitHub accounts',
+    noun: 'GitHub account',
+    description:
+      "Your own GitHub identity, for sessions you let act as you where the GitHub App can't. Nothing uses it yet.",
+    empty: 'No GitHub account yet.',
+    fields: [],
+    secret: {
+      label: 'Fine-grained personal access token',
+      description:
+        'Make one under GitHub → Settings → Developer settings → Fine-grained tokens, limited to the repositories sessions may work on as you. Classic tokens are refused: they reach everything you can.',
+    },
+  },
+  {
     kind: 'chatgpt',
     title: 'ChatGPT logins',
     noun: 'ChatGPT login',
@@ -258,4 +274,12 @@ export function configSelectOptions(options: ConfigSelectOption[] | ConfigSelect
       ? entry.options.map((option) => ({ value: option.value, label: `${entry.name}: ${configOptionName(option)}` }))
       : [{ value: entry.value, label: configOptionName(entry) }],
   );
+}
+
+/** How a token's expiry reads, and whether it needs attention: within a week, or past. */
+export function tokenExpiry(expiresAt: string | null, now = Date.now()): { text: string; level: 'ok' | 'soon' | 'expired' } {
+  if (!expiresAt) return { text: "Doesn't expire", level: 'ok' };
+  const left = Date.parse(expiresAt) - now;
+  if (left <= 0) return { text: `Expired ${timeAgo(expiresAt, now)}`, level: 'expired' };
+  return { text: `Expires ${timeAgo(expiresAt, now)}`, level: left < 7 * 24 * 3600_000 ? 'soon' : 'ok' };
 }
