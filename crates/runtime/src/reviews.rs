@@ -118,16 +118,27 @@ enum Stall {
     Wait,
     /// A turn ended without a verdict: remind the reviewer once.
     Nudge,
+    /// A turn failed (e.g. the model API answered with an error): ask the reviewer to carry on. Doesn't count as
+    /// the reviewer stopping, up to [`FAILED_TURN_RETRIES`] times.
+    Retry,
     /// It won't finish: hand the proposal to the user unreviewed.
     GiveUp,
 }
 
-/// Decides about a round after a check: `turn_ended` says a reviewer turn ended since the last check.
-fn stall(turn_ended: bool, nudged: bool, timed_out: bool) -> Stall {
-    match (timed_out, turn_ended, nudged) {
-        (true, _, _) | (false, true, true) => Stall::GiveUp,
-        (false, true, false) => Stall::Nudge,
-        (false, false, _) => Stall::Wait,
+/// How many failed reviewer turns a round carries on after.
+const FAILED_TURN_RETRIES: u32 = 3;
+
+/// Decides about a round after a check: `turn_ended` says a reviewer turn ended since the last check, and `failed`
+/// that it ended in an error rather than by the reviewer stopping; `retries` counts failed turns carried on after.
+fn stall(turn_ended: bool, failed: bool, retries: u32, nudged: bool, timed_out: bool) -> Stall {
+    if timed_out {
+        return Stall::GiveUp;
+    }
+    match (turn_ended, failed && retries < FAILED_TURN_RETRIES, nudged) {
+        (false, _, _) => Stall::Wait,
+        (true, true, _) => Stall::Retry,
+        (true, false, false) => Stall::Nudge,
+        (true, false, true) => Stall::GiveUp,
     }
 }
 
@@ -137,7 +148,7 @@ fn stall(turn_ended: bool, nudged: bool, timed_out: bool) -> Stall {
 fn watch_round(state: &AppState, proposal: Uuid, session: Uuid, round: i32) {
     let state = state.clone();
     tokio::spawn(async move {
-        let (mut in_turn, mut nudged) = (false, false);
+        let (mut in_turn, mut nudged, mut retries) = (false, false, 0);
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
             // Errors are retried at the next check; only a confirmed outcome ends the watch.
@@ -163,8 +174,27 @@ fn watch_round(state: &AppState, proposal: Uuid, session: Uuid, round: i32) {
             let running = state.hub.turn_running(session).await;
             let turn_ended = in_turn && !running;
             in_turn = running;
-            match stall(turn_ended, nudged, timed_out) {
+            let failed = match turn_ended {
+                true => state.hub.last_turn_error(session).await,
+                false => None,
+            };
+            match stall(turn_ended, failed.is_some(), retries, nudged, timed_out) {
                 Stall::Wait => {}
+                Stall::Retry => {
+                    retries += 1;
+                    tracing::info!(%proposal, round, error = ?failed, "a review turn failed; carrying on");
+                    state
+                        .hub
+                        .notify(
+                            session,
+                            format!(
+                                "sloppod: your last turn failed ({}). Carry on with this review round where you \
+                                 left off, and finish it by calling the `submit_review` tool.",
+                                failed.unwrap_or_default()
+                            ),
+                        )
+                        .await;
+                }
                 Stall::Nudge => {
                     nudged = true;
                     state
@@ -813,18 +843,36 @@ mod tests {
         let expired = now - chrono::Duration::minutes(31);
         assert!(round_timed_out(expired, now));
         assert_eq!(
-            stall(false, false, round_timed_out(expired, now)),
+            stall(false, false, 0, false, round_timed_out(expired, now)),
             Stall::GiveUp
         );
     }
 
     #[test]
     fn a_stalled_round_is_nudged_once_then_given_up() {
-        assert_eq!(stall(false, false, false), Stall::Wait);
-        assert_eq!(stall(true, false, false), Stall::Nudge);
-        assert_eq!(stall(false, true, false), Stall::Wait);
-        assert_eq!(stall(true, true, false), Stall::GiveUp);
-        assert_eq!(stall(false, false, true), Stall::GiveUp);
+        assert_eq!(stall(false, false, 0, false, false), Stall::Wait);
+        assert_eq!(stall(true, false, 0, false, false), Stall::Nudge);
+        assert_eq!(stall(false, false, 0, true, false), Stall::Wait);
+        assert_eq!(stall(true, false, 0, true, false), Stall::GiveUp);
+        assert_eq!(stall(false, false, 0, false, true), Stall::GiveUp);
+    }
+
+    #[test]
+    fn a_failed_turn_is_carried_on_from_a_few_times() {
+        // A failed turn doesn't use up the nudge, nor count as giving up after one.
+        assert_eq!(stall(true, true, 0, false, false), Stall::Retry);
+        assert_eq!(stall(true, true, 2, true, false), Stall::Retry);
+        // After that, it counts like any other turn that ended without a verdict.
+        assert_eq!(
+            stall(true, true, FAILED_TURN_RETRIES, false, false),
+            Stall::Nudge
+        );
+        assert_eq!(
+            stall(true, true, FAILED_TURN_RETRIES, true, false),
+            Stall::GiveUp
+        );
+        // The round's time limit still holds.
+        assert_eq!(stall(true, true, 0, false, true), Stall::GiveUp);
     }
 
     #[test]

@@ -65,6 +65,8 @@ struct LiveState {
     /// The agent is replaying history for `session/load`; that replay isn't new.
     loading: bool,
     turn_running: bool,
+    /// Why the last turn the hub sent failed, if it did; a turn that ended normally clears it.
+    last_turn_error: Option<String>,
     permissions: HashMap<u64, Permission>,
     next_permission: u64,
     queue: Vec<Queued>,
@@ -773,6 +775,8 @@ impl Hub {
                 json!({"sessionId": agent_session_id, "prompt": blocks}),
             )
             .await;
+        self.live(id).state.lock().await.last_turn_error =
+            result.as_ref().err().map(|e| e.message.clone());
         self.end_turn(id, agent).await;
         result
     }
@@ -1049,6 +1053,11 @@ impl Hub {
 
     pub async fn turn_running(&self, id: Uuid) -> bool {
         self.live(id).state.lock().await.turn_running
+    }
+
+    /// Why the session's last turn failed, if it did.
+    pub async fn last_turn_error(&self, id: Uuid) -> Option<String> {
+        self.live(id).state.lock().await.last_turn_error.clone()
     }
 
     /// Parks a session between turns (ADR 5): lets go of its agent, then `suspend` ends its pod. Messages sent
