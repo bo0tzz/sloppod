@@ -260,21 +260,31 @@ function echoUser(
  * Tells the agent about something sloppod did, like deciding a proposal: recorded as a notice, steered
  * into a running turn, or answered with a short turn of its own when the agent is idle.
  */
-async function notifyAgent(session, text, ack) {
-  echoUser(session, text, { notice: true });
+async function notifyAgent(session, text, ack, echo = true) {
+  if (echo) echoUser(session, text, { notice: true });
   if (session.turn) {
     session.turn.steers.push({ text, ack });
     return;
   }
-  if (session.data.phase !== 'idle') return;
-  session.turn = { cancelled: false, steers: [] };
+  // Like the runtime, which queues a notice until the agent can take it rather than dropping it.
+  if (session.data.phase !== 'idle') {
+    if (sessions.has(session.data.id) && !['stopped', 'parked'].includes(session.data.phase)) {
+      setTimeout(() => void notifyAgent(session, text, ack, false), DELAY * 4);
+    }
+    return;
+  }
+  const turn = { cancelled: false, steers: [{ text, ack }] };
+  session.turn = turn;
   session.setPhase('working');
   try {
     await sleep(DELAY * 2);
-    const messageId = randomUUID();
-    for (const piece of chunks(ack)) {
-      session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: piece }, messageId });
-      await sleep(DELAY);
+    // This one, and any that arrive while it's answered.
+    while (turn.steers.length > 0) {
+      const messageId = randomUUID();
+      for (const piece of chunks(steerReply(turn.steers.shift()))) {
+        session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: piece }, messageId });
+        await sleep(DELAY);
+      }
     }
   } finally {
     session.turn = null;
