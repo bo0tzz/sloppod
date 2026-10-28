@@ -1,3 +1,4 @@
+  for (const image of images) session.emit({ sessionUpdate: 'user_message_chunk', content: image, messageId });
 #!/usr/bin/env node
 // A mock sloppod runtime implementing docs/api.md (REST and ACP over /acp) with a scripted fake agent.
 //
@@ -237,7 +238,11 @@ function promptText(prompt) {
     .join('');
 }
 
-function echoUser(session, text, { steering = false, notice = false, summary = null, messageId = randomUUID() } = {}) {
+function echoUser(
+  session,
+  text,
+  { steering = false, notice = false, summary = null, messageId = randomUUID(), images = [] } = {},
+) {
   const sloppod = {
     ...(steering ? { steering: true } : {}),
     ...(notice ? { notice: true } : {}),
@@ -342,11 +347,11 @@ function resolvePending(session, pending, result) {
   pending.resolve(result);
 }
 
-async function runTurn(session, text, { echo = true, messageId } = {}) {
+async function runTurn(session, text, { echo = true, messageId, images = [] } = {}) {
   const turn = { cancelled: false, steers: [] };
   session.turn = turn;
   session.setPhase('working');
-  if (echo) echoUser(session, text, { messageId });
+  if (echo) echoUser(session, text, { messageId, images });
   if (!session.data.title) {
     const title = text.split('\n')[0].slice(0, 60);
     session.emit({ sessionUpdate: 'session_info_update', title, updatedAt: now() });
@@ -1029,7 +1034,7 @@ function handleCall(conn, message) {
     case 'initialize':
       conn.respond(id, {
         protocolVersion: 1,
-        agentCapabilities: { loadSession: true, promptCapabilities: { image: false, audio: false, embeddedContext: false } },
+        agentCapabilities: { loadSession: true, promptCapabilities: { image: true, audio: false, embeddedContext: false } },
         agentInfo: { name: 'sloppod-mock', version: '0.0.0' },
         authMethods: [],
         _meta: { steering: { supported: true } },
@@ -1119,7 +1124,8 @@ function handleCall(conn, message) {
         conn.error(id, -32000, `The session is ${session.data.phase}`);
         return;
       }
-      runTurn(session, promptText(params.prompt), { messageId }).then(
+      const images = (params.prompt ?? []).filter((block) => block?.type === 'image');
+      runTurn(session, promptText(params.prompt), { messageId, images }).then(
         (stopReason) => conn.respond(id, { stopReason }),
         (error) => conn.error(id, -32603, String(error)),
       );

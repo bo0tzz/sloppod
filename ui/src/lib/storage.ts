@@ -11,12 +11,14 @@ export function readStored(key: string): string | null {
   }
 }
 
-/** Stores `value` under `key`, or removes it for `null`. */
-export function writeStored(key: string, value: string | null) {
+/** Stores `value` under `key`, or removes it for `null`; says whether it could. */
+export function writeStored(key: string, value: string | null): boolean {
   try {
     if (value === null) localStorage.removeItem(key);
     else localStorage.setItem(key, value);
+    return true;
   } catch {
     // Not kept, which only matters after a reload.
+    return false;
   }
 }
