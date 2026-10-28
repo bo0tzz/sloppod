@@ -1,25 +1,43 @@
 import { api } from './api.ts';
 
-/** Who the runtime says we are (from the authenticating proxy). Loaded once per page load. */
+/**
+ * Who the runtime says we are (from the authenticating proxy), and which runtime that is. Read again whenever the
+ * runtime may have been redeployed since: on a reconnect, and when the page becomes visible again.
+ */
 class Account {
   user = $state<string | null>(null);
   /** The runtime's version, e.g. `0.1.2-main.153`. */
   version = $state<string | null>(null);
   /** The commit or release tag the runtime was built from. */
   build = $state<string | null>(null);
-  #requested = false;
+  #loaded = false;
+  #watching = false;
+  #inFlight = false;
 
+  /** Reads it unless it has been read already, and rereads it whenever the page becomes visible again. */
   load() {
-    if (this.#requested) return;
-    this.#requested = true;
-    api.me().then(
-      ({ user, version, build }) => {
+    if (!this.#watching) {
+      this.#watching = true;
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') this.refresh();
+      });
+    }
+    if (!this.#loaded) this.refresh();
+  }
+
+  refresh() {
+    if (this.#inFlight) return;
+    this.#inFlight = true;
+    api
+      .me()
+      .then(({ user, version, build }) => {
         this.user = user;
         this.version = version;
         this.build = build;
-      },
-      () => (this.#requested = false),
-    );
+        this.#loaded = true;
+      })
+      .catch(() => {})
+      .finally(() => (this.#inFlight = false));
   }
 }
 

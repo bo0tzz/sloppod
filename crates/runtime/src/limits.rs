@@ -49,6 +49,15 @@ async fn credential(state: &AppState, owner: &str, agent: &str) -> Option<Creden
     state.credentials.default_row(owner, &kind).await.ok()?
 }
 
+/// A session's turn hit its usage limit: a review round it works on stops running out of time from now, kept at
+/// once so a restart doesn't lose the wait. Says when the limit resets, if that's known.
+pub async fn hit(state: &AppState, session: Uuid) -> Option<DateTime<Utc>> {
+    if let Err(e) = db::pause_reviewer(&state.db, session, Utc::now()).await {
+        tracing::warn!(%session, error = %e, "pausing the review a session works on");
+    }
+    reset(state, session).await
+}
+
 /// When the limit the session's credential is at resets, if its quota says it's at one.
 pub async fn reset(state: &AppState, session: Uuid) -> Option<DateTime<Utc>> {
     let row = db::get_session(&state.db, session).await.ok()??;

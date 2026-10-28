@@ -423,6 +423,22 @@ test('reconnects after the socket drops without duplicating history', async ({ p
   await expect(permissionCard(page)).toBeVisible();
 });
 
+test('the sidebar shows a redeployed runtime once the connection is back', async ({ page }) => {
+  await createSession(page, 'Reconnect me in sloppod');
+  await finishTurn(page);
+  const build = page.getByTestId('runtime-build');
+  await expect(build).toHaveText('sloppod 0.0.1-main.1');
+
+  try {
+    await page.request.post('/_mock/build?version=0.0.1-main.2&build=v0.0.2');
+    await page.request.post('/_mock/drop');
+    await expect(build).toHaveText('sloppod 0.0.1-main.2');
+    await expect(build).toHaveAttribute('href', 'https://github.com/bo0tzz/sloppod/releases/tag/v0.0.2');
+  } finally {
+    await page.request.post('/_mock/build');
+  }
+});
+
 test('a message written while reconnecting is sent once the connection is back', async ({ page }) => {
   await createSession(page, 'Reconnect me in sloppod');
   await finishTurn(page);
@@ -1368,6 +1384,25 @@ test('the sidebar shows how much of each usage limit is left', async ({ page }) 
   } finally {
     await page.request.post('/_mock/quotas', { data: [] });
   }
+});
+
+test('only the transcript scrolls, not the page around it', async ({ page }) => {
+  await page.setViewportSize({ width: 1000, height: 500 });
+  await createSession(page, 'Give me a long answer in sloppod');
+  await expect(page.getByText('The end.')).toBeInViewport({ timeout: 20_000 });
+  const transcript = page.getByTestId('transcript-scroller');
+  // Anything in the transcript laid out outside its scroller would stretch what's around it, most with the transcript
+  // scrolled to the top.
+  await transcript.evaluate((element) => element.scrollTo({ top: 0 }));
+  const overflowing = await transcript.evaluate((element) => {
+    const found = [];
+    for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+      if (ancestor.scrollHeight > ancestor.clientHeight) found.push(ancestor.className);
+    }
+    return { transcript: element.scrollHeight > element.clientHeight, found };
+  });
+  expect(overflowing).toEqual({ transcript: true, found: [] });
+  await expect(page.getByRole('textbox', { name: 'Prompt' })).toBeInViewport({ ratio: 1 });
 });
 
 test('a session at its usage limit says when it carries on', async ({ page }) => {

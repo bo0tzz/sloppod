@@ -1228,7 +1228,7 @@ async function handleApi(req, res, url) {
 
   if (parts[0] === 'repos' && parts.length === 1 && method === 'GET') return json(res, 200, availableRepos());
   if (parts[0] === 'me' && parts.length === 1 && method === 'GET') {
-    return json(res, 200, { user: req.headers['x-forwarded-user'] ?? 'bo0tzz', version: '0.0.1-main.1', build: '11396d515413b2bec5e7c052b06d5df78cc68052' });
+    return json(res, 200, { user: req.headers['x-forwarded-user'] ?? 'bo0tzz', ...runtimeBuild });
   }
 
   if (parts[0] === 'credentials') return handleCredentials(req, res, parts);
@@ -1625,6 +1625,10 @@ async function seed() {
 
 // --- server ---------------------------------------------------------------------------------
 
+const DEFAULT_BUILD = { version: '0.0.1-main.1', build: '11396d515413b2bec5e7c052b06d5df78cc68052' };
+/** What `/me` says the runtime is; `/_mock/build` changes it, as a deploy would. */
+let runtimeBuild = DEFAULT_BUILD;
+
 /** Set by `/_mock/drop-next-prompt`: drop the connection the next prompt arrives on, before or after taking it. */
 let dropNextPrompt = null;
 /** Set by `/_mock/fail-next-prompt`: refuse the next prompt that isn't dropped, without taking it. */
@@ -1668,6 +1672,13 @@ const server = http.createServer(async (req, res) => {
       const summary = url.searchParams.get('summary');
       for (const session of sessions.values()) echoUser(session, text, { notice: true, summary });
       return json(res, 200, {});
+    }
+    if (url.pathname === '/_mock/build' && req.method === 'POST') {
+      // `?version=…&build=…`; without either, back to the default.
+      const version = url.searchParams.get('version');
+      const build = url.searchParams.get('build');
+      runtimeBuild = version || build ? { version, build } : DEFAULT_BUILD;
+      return json(res, 200, runtimeBuild);
     }
     if (url.pathname === '/_mock/limit' && req.method === 'POST') {
       // Every session hits the usage limit, carrying on in `?minutes=` minutes; `0` ends the wait.
