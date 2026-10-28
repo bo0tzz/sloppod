@@ -1042,7 +1042,10 @@ async fn a_batch_taken_for_a_replaced_agent_runs_on_the_new_idle_one() {
     let old = h.agent.clone();
     let (new, mut to_new) = replace_agent(&h).await;
     let (queued, reply) = batch("Late");
-    h.hub.clone().run_queued(h.id, old, None, queued).await;
+    h.hub
+        .clone()
+        .run_queued(h.id, old, None, queued, None)
+        .await;
 
     let request = next_prompt(&mut to_new).await;
     assert_eq!(prompt_text(&request), ["Late"]);
@@ -1068,7 +1071,10 @@ async fn a_batch_for_a_replaced_agent_waits_behind_the_new_ones_turn() {
     let busy = next_prompt(&mut to_new).await;
 
     let (queued, reply) = batch("Late");
-    h.hub.clone().run_queued(h.id, old, None, queued).await;
+    h.hub
+        .clone()
+        .run_queued(h.id, old, None, queued, None)
+        .await;
     assert_eq!(h.phase().await, "working");
 
     // Only once the new agent's turn ends does the batch run on it.
@@ -1112,7 +1118,7 @@ async fn a_first_message_taken_for_a_replaced_agent_stays_stored_for_the_next() 
     let (_new, mut to_new) = replace_agent(&h).await;
     h.hub
         .clone()
-        .run_queued(h.id, old, Some("Hello".into()), Vec::new())
+        .run_queued(h.id, old, Some("Hello".into()), Vec::new(), None)
         .await;
     // Not run, not forgotten, and not queued in memory either: the next agent reads it from the store. With
     // nothing else to requeue, the new agent isn't sent an empty turn.
@@ -1200,7 +1206,10 @@ async fn a_batch_that_can_no_longer_start_in_a_stopped_session_fails() {
     let agent = h.agent.clone();
     h.hub.stop(h.id).await;
     let (queued, reply) = batch("Too late");
-    h.hub.clone().run_queued(h.id, agent, None, queued).await;
+    h.hub
+        .clone()
+        .run_queued(h.id, agent, None, queued, None)
+        .await;
     assert!(reply.await.unwrap().is_err());
 }
 
@@ -1339,4 +1348,73 @@ async fn every_turn_that_ends_is_counted_with_its_error() {
         h.hub.turns_ended(h.id).await,
         (2, Some("upstream 503".into()))
     );
+}
+
+/// The texts the store keeps for the session's queue.
+async fn kept_texts(h: &Harness) -> Vec<String> {
+    h.store
+        .queues()
+        .await
+        .unwrap()
+        .into_iter()
+        .flat_map(|(_, messages)| messages)
+        .filter_map(|m| m["blocks"][0]["text"].as_str().map(str::to_owned))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_notice_is_kept_until_it_reaches_an_idle_agent_and_survives_a_restart_before() {
+    let mut h = Harness::ready().await;
+    h.hub
+        .clone()
+        .notify(h.id, "sloppod: approved.".into())
+        .await;
+    // On its way, not there yet: a restart now would lose it if it weren't kept.
+    assert_eq!(kept_texts(&h).await, ["sloppod: approved."]);
+
+    // The runtime restarts before delivering it: a new hub on the same store.
+    let hub = Arc::new(Hub::new(h.store.clone()));
+    let (tx, mut to_agent) = mpsc::unbounded_channel();
+    let agent = Arc::new(AgentConn::new(tx));
+    hub.attach_agent(h.id, agent.clone()).await;
+    hub.restore_queues().await;
+    hub.agent_ready(h.id, &agent, "agent-session".into(), json!({}), None)
+        .await;
+    assert_eq!(
+        prompt_text(&next_prompt(&mut to_agent).await),
+        ["sloppod: approved."]
+    );
+    assert!(h.store.queues().await.unwrap().is_empty());
+
+    // Without a restart, it's let go once its turn starts.
+    let delivered = next_prompt(&mut h.to_agent).await;
+    assert_eq!(prompt_text(&delivered), ["sloppod: approved."]);
+    assert!(h.store.queues().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_notice_steered_into_a_turn_is_kept_until_the_agent_takes_it() {
+    let mut h = Harness::ready().await;
+    let turn = h.prompt("Busy");
+    let turn_request = next_prompt(&mut h.to_agent).await;
+    h.hub
+        .clone()
+        .notify(h.id, "sloppod: approved.".into())
+        .await;
+    assert_eq!(kept_texts(&h).await, ["sloppod: approved."]);
+
+    let steering = h.next().await;
+    assert_eq!(steering["method"], "_session/steering");
+    assert_eq!(
+        kept_texts(&h).await,
+        ["sloppod: approved."],
+        "sent, not yet taken"
+    );
+    h.respond(&steering, json!({"outcome": "injected"})).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(h.store.queues().await.unwrap().is_empty());
+
+    h.respond(&turn_request, json!({"stopReason": "end_turn"}))
+        .await;
+    turn.await.unwrap().unwrap();
 }
