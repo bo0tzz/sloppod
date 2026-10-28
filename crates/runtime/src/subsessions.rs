@@ -296,6 +296,15 @@ mod tests {
         assert_eq!(all[4].param("branch"), None);
         assert_eq!(all[4].param("commit"), None, "a child starts fresh");
 
+        // A grant that runs out runs out for the child too.
+        let mut expiring = parent.clone();
+        expiring[2].expires_at = Some("2026-10-28T22:00:00Z".to_owned());
+        let inherited = child_grants(&expiring, None, child);
+        assert_eq!(
+            inherited[2].expires_at.as_deref(),
+            Some("2026-10-28T22:00:00Z")
+        );
+
         // Narrowed: only what's kept, and model access always.
         let narrow = child_grants(&parent, Some(&["docs".to_owned()]), child);
         let names: Vec<&str> = narrow.iter().map(|g| g.capability.as_str()).collect();

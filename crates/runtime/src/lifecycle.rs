@@ -173,17 +173,41 @@ pub async fn apply_egress(state: &AppState, session: &db::SessionRow) -> anyhow:
 /// After a session's grants changed (`what`, for the agent): its egress policy follows them, its agent and UIs are
 /// told. A session that isn't acting gets its egress at its next placement.
 pub async fn grants_changed(state: &AppState, id: Uuid, what: &str) {
-    if let Ok(Some(session)) = db::get_session(&state.db, id).await
-        && session.not_acting().is_none()
-        && let Err(e) = apply_egress(state, &session).await
-    {
-        tracing::warn!(session = %id, error = %e, "applying egress after a grant change");
-    }
+    reapply_egress(state, id);
     state.hub.broadcast_session(id).await;
     state
         .hub
         .notify(id, format!("sloppod: {what} See them with `list_grants`."))
         .await;
+}
+
+/// Applies an acting session's egress again after its grants changed, retrying until it lands: a revoked `packages`
+/// must not keep its direct access because the control plane was briefly unreachable. A session that stops acting
+/// needs nothing more, and startup applies every acting session's egress again anyway.
+fn reapply_egress(state: &AppState, id: Uuid) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut wait = std::time::Duration::from_secs(5);
+        loop {
+            let session = match db::get_session(&state.db, id).await {
+                Ok(Some(session)) if session.not_acting().is_none() => session,
+                Ok(_) => return,
+                Err(e) => {
+                    tracing::warn!(session = %id, error = %e, "loading a session to apply its egress");
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+            };
+            match apply_egress(&state, &session).await {
+                Ok(()) => return,
+                Err(e) => {
+                    tracing::warn!(session = %id, error = %e, "applying egress after a grant change; trying again");
+                    tokio::time::sleep(wait).await;
+                    wait = (wait * 2).min(std::time::Duration::from_secs(60));
+                }
+            }
+        }
+    });
 }
 
 /// Removes the grants that have run out and tells their sessions; they already stopped counting when they ran out.

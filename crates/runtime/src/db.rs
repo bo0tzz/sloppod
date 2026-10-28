@@ -254,11 +254,12 @@ pub async fn insert_session(db: &PgPool, new: NewSessionRow<'_>) -> sqlx::Result
     .await?;
     for grant in new.grants {
         sqlx::query(
-            "insert into session_grants (session_id, capability, params) values ($1, $2, $3)",
+            "insert into session_grants (session_id, capability, params, expires_at) values ($1, $2, $3, $4::timestamptz)",
         )
         .bind(new.id)
         .bind(&grant.capability)
         .bind(&grant.params)
+        .bind(grant.expires_at.as_deref())
         .execute(&mut *tx)
         .await?;
     }
@@ -1167,41 +1168,45 @@ pub async fn session_grant(db: &PgPool, session: Uuid, id: Uuid) -> sqlx::Result
     .bind(id)
     .fetch_optional(db)
     .await?;
-    Ok(row.map(|(capability, params)| Grant { capability, params }))
+    Ok(row.map(|(capability, params)| Grant::new(&capability, params)))
 }
 
-/// Changes when one of a session's grants runs out (none: never); says whether it had the grant.
-pub async fn set_grant_expiry(
+/// Changes one of a session's grants in one transaction: new params (e.g. narrowed), a new expiry (`Some(None)`: never),
+/// or both. Says whether the session had it.
+pub async fn change_grant(
     db: &PgPool,
     session: Uuid,
     id: Uuid,
-    expires_at: Option<DateTime<Utc>>,
+    params: Option<&Value>,
+    expires_at: Option<Option<DateTime<Utc>>>,
 ) -> sqlx::Result<bool> {
-    let result =
-        sqlx::query("update session_grants set expires_at = $3 where id = $2 and session_id = $1")
-            .bind(session)
-            .bind(id)
-            .bind(expires_at)
-            .execute(db)
-            .await?;
-    Ok(result.rows_affected() > 0)
-}
-
-/// Replaces a grant's params, e.g. to narrow it; says whether the session had it.
-pub async fn set_grant_params(
-    db: &PgPool,
-    session: Uuid,
-    id: Uuid,
-    params: &Value,
-) -> sqlx::Result<bool> {
-    let result =
-        sqlx::query("update session_grants set params = $3 where id = $2 and session_id = $1")
-            .bind(session)
-            .bind(id)
-            .bind(params)
-            .execute(db)
-            .await?;
-    Ok(result.rows_affected() > 0)
+    let mut tx = db.begin().await?;
+    let mut found = false;
+    if let Some(params) = params {
+        found |=
+            sqlx::query("update session_grants set params = $3 where id = $2 and session_id = $1")
+                .bind(session)
+                .bind(id)
+                .bind(params)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+                > 0;
+    }
+    if let Some(expires_at) = expires_at {
+        found |= sqlx::query(
+            "update session_grants set expires_at = $3 where id = $2 and session_id = $1",
+        )
+        .bind(session)
+        .bind(id)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+    }
+    tx.commit().await?;
+    Ok(found)
 }
 
 /// Revokes one of a session's grants; returns what it was.
@@ -1213,7 +1218,7 @@ pub async fn revoke_grant(db: &PgPool, session: Uuid, id: Uuid) -> sqlx::Result<
     .bind(id)
     .fetch_optional(db)
     .await?;
-    Ok(row.map(|(capability, params)| Grant { capability, params }))
+    Ok(row.map(|(capability, params)| Grant::new(&capability, params)))
 }
 
 /// Removes the grants that have run out, and returns them with their sessions, for telling those sessions.
@@ -1225,7 +1230,7 @@ pub async fn sweep_expired_grants(db: &PgPool) -> sqlx::Result<Vec<(Uuid, Grant)
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(session, capability, params)| (session, Grant { capability, params }))
+        .map(|(session, capability, params)| (session, Grant::new(&capability, params)))
         .collect())
 }
 

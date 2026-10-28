@@ -43,6 +43,9 @@ pub struct Grant {
     pub capability: String,
     #[serde(default)]
     pub params: Value,
+    /// When it runs out (RFC 3339), if it does. Copies of it, e.g. a sub-session's, run out with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
 }
 
 impl Grant {
@@ -50,6 +53,7 @@ impl Grant {
         Self {
             capability: capability.to_owned(),
             params,
+            expires_at: None,
         }
     }
 

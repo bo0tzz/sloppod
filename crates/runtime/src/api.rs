@@ -350,13 +350,31 @@ async fn change_grant(
     let grant = db::session_grant(&state.db, id, grant_id)
         .await?
         .ok_or_else(not_found)?;
+    // Everything is checked before anything is written, and then written together.
+    if !body.narrow && body.expires_at.is_none() {
+        return Err(bad_request("give expires_at or narrow"));
+    }
+    if body
+        .expires_at
+        .flatten()
+        .is_some_and(|at| at <= chrono::Utc::now())
+    {
+        return Err(bad_request(
+            "expires_at is in the past; revoke the grant instead",
+        ));
+    }
+    let narrower = match body.narrow {
+        true => Some(
+            crate::grants::narrowed(&grant)
+                .ok_or_else(|| bad_request("this grant can't be narrowed"))?,
+        ),
+        false => None,
+    };
+    db::change_grant(&state.db, id, grant_id, narrower.as_ref(), body.expires_at).await?;
     let mut changes = Vec::new();
-    if body.narrow {
-        let narrower = crate::grants::narrowed(&grant)
-            .ok_or_else(|| bad_request("this grant can't be narrowed"))?;
-        db::set_grant_params(&state.db, id, grant_id, &narrower).await?;
+    if let Some(params) = narrower {
         let narrowed = Grant {
-            params: narrower,
+            params,
             ..grant.clone()
         };
         changes.push(format!(
@@ -365,19 +383,10 @@ async fn change_grant(
         ));
     }
     if let Some(expires_at) = body.expires_at {
-        if expires_at.is_some_and(|at| at <= chrono::Utc::now()) {
-            return Err(bad_request(
-                "expires_at is in the past; revoke the grant instead",
-            ));
-        }
-        db::set_grant_expiry(&state.db, id, grant_id, expires_at).await?;
         changes.push(match expires_at {
             Some(at) => format!("now runs out at {}", at.to_rfc3339()),
             None => "no longer runs out".to_owned(),
         });
-    }
-    if changes.is_empty() {
-        return Err(bad_request("give expires_at or narrow"));
     }
     let what = format!(
         "the user changed this session's grant {} ({}): {}.",

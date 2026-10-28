@@ -1203,15 +1203,25 @@ async fn a_grant_can_run_out_be_narrowed_and_be_revoked(db: PgPool) {
     // Narrowed: the repository becomes read only.
     let narrower =
         crate::grants::narrowed(&db::session_grant(&db, s, repo).await.unwrap().unwrap()).unwrap();
-    assert!(db::set_grant_params(&db, s, repo, &narrower).await.unwrap());
+    assert!(
+        db::change_grant(&db, s, repo, Some(&narrower), None)
+            .await
+            .unwrap()
+    );
     let row = db::get_session(&db, s).await.unwrap().unwrap();
     assert_eq!(row.grants()[1].param("access"), Some("ro"));
 
     // Run out: gone from the session at once, before the sweeper removes it.
     assert!(
-        db::set_grant_expiry(&db, s, soon, Some(Utc::now() - Duration::seconds(1)))
-            .await
-            .unwrap()
+        db::change_grant(
+            &db,
+            s,
+            soon,
+            None,
+            Some(Some(Utc::now() - Duration::seconds(1)))
+        )
+        .await
+        .unwrap()
     );
     let row = db::get_session(&db, s).await.unwrap().unwrap();
     assert_eq!(capabilities(&row), ["repo"]);
@@ -1230,4 +1240,49 @@ async fn a_grant_can_run_out_be_narrowed_and_be_revoked(db: PgPool) {
         .await
         .unwrap();
     assert!(db::revoke_grant(&db, s, theirs).await.unwrap().is_none());
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_sub_session_s_copy_of_a_grant_runs_out_with_it(db: PgPool) {
+    use sloppod_contracts::Grant;
+
+    // A parent's grant that runs out, as a sub-session gets it (its expiry travels with it).
+    let parent = session(&db, "dev").await;
+    let soon = Utc::now() + Duration::hours(1);
+    db::grant(&db, parent, &Grant::new("packages", json!({})), Some(soon))
+        .await
+        .unwrap();
+    let inherited = db::get_session(&db, parent)
+        .await
+        .unwrap()
+        .unwrap()
+        .grants();
+    assert!(inherited[0].expires_at.is_some());
+    let child = Uuid::now_v7();
+    db::insert_session(
+        &db,
+        NewSessionRow {
+            id: child,
+            owner: "dev",
+            title: "child",
+            custom_title: false,
+            pending_prompt: "",
+            agent: "claude-code",
+            kind: SessionKind::Work,
+            review: ReviewPolicy::Off,
+            model: None,
+            repo: None,
+            grants: &inherited,
+        },
+    )
+    .await
+    .unwrap();
+    let row = db::get_session(&db, child).await.unwrap().unwrap();
+    let expires = row.to_api().grants[0].expires_at.clone().unwrap();
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(&expires)
+            .unwrap()
+            .timestamp(),
+        soon.timestamp()
+    );
 }
