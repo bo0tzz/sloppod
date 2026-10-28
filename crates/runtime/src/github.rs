@@ -203,10 +203,20 @@ fn push_permissions(installation: &BTreeMap<String, String>) -> BTreeMap<String,
     permissions
 }
 
+/// The span to run a user-token client's calls in, so each logged call names the session and credential it's for.
+pub fn acting_span(session: &str, credential: Option<&str>) -> tracing::Span {
+    tracing::info_span!("acting", session = %session, credential = credential.unwrap_or("app"))
+}
+
+/// A GitHub client acting with one identity (ADR 29): the owner's GitHub App, through its installations' tokens, or
+/// one of the owner's personal access tokens, used as it is.
 pub struct GitHubApp {
     api: String,
     app_id: String,
-    key: EncodingKey,
+    /// The App's key; none when acting with a user's token.
+    key: Option<EncodingKey>,
+    /// The user's token and login, when acting as them instead of the App.
+    user: Option<(String, String)>,
     http: reqwest::Client,
     /// Repository (lowercase) to installation, or `None` for not installed, with when it was looked up.
     installations: Mutex<HashMap<String, (Option<u64>, Instant)>>,
@@ -262,8 +272,11 @@ impl GitHubApp {
         Ok(Self {
             api: api.to_owned(),
             app_id,
-            key: EncodingKey::from_rsa_pem(private_key_pem)
-                .context("parsing the GitHub App private key")?,
+            key: Some(
+                EncodingKey::from_rsa_pem(private_key_pem)
+                    .context("parsing the GitHub App private key")?,
+            ),
+            user: None,
             http: reqwest::Client::builder()
                 .user_agent("sloppod")
                 .timeout(Duration::from_secs(60))
@@ -275,8 +288,54 @@ impl GitHubApp {
         })
     }
 
-    /// The app's bot user as a git identity, so commits are attributed to it on GitHub.
+    /// A client acting as a user, with their fine-grained token: every repository call carries the token as it is.
+    pub fn for_user(token: String, login: String) -> anyhow::Result<Self> {
+        Self::for_user_with_api(API, token, login)
+    }
+
+    fn for_user_with_api(api: &str, token: String, login: String) -> anyhow::Result<Self> {
+        Ok(Self {
+            api: api.to_owned(),
+            app_id: String::new(),
+            key: None,
+            user: Some((token, login)),
+            http: reqwest::Client::builder()
+                .user_agent("sloppod")
+                .timeout(Duration::from_secs(60))
+                .build()?,
+            installations: Mutex::default(),
+            permissions: Mutex::default(),
+            tokens: Mutex::default(),
+            identity: OnceCell::new(),
+        })
+    }
+
+    /// Who this client acts as: the user's login, or none for the App.
+    pub fn user_login(&self) -> Option<&str> {
+        self.user.as_ref().map(|(_, login)| login.as_str())
+    }
+
+    /// Logs a call the runtime makes with a user's token (ADR 28's audit). Callers run it inside a span naming the
+    /// session and credential it's made for (`acting_span`).
+    fn audit(&self, method: &str, path: &str) {
+        if let Some(login) = self.user_login() {
+            tracing::info!(as_user = login, %method, %path, "runtime call with the owner's GitHub token");
+        }
+    }
+
+    /// The user's token, when acting as a user: it's used for every repository, whatever the scope asked for.
+    fn user_token(&self) -> Option<String> {
+        self.user.as_ref().map(|(token, _)| token.clone())
+    }
+
+    /// The app's bot user as a git identity, so commits are attributed to it on GitHub; the user, for a user's token.
     pub async fn identity(&self) -> anyhow::Result<GitIdentity> {
+        if let Some(login) = self.user_login() {
+            return Ok(GitIdentity {
+                name: login.to_owned(),
+                email: format!("{login}@users.noreply.github.com"),
+            });
+        }
         self.identity
             .get_or_try_init(|| async {
                 let app: Value = self
@@ -317,7 +376,9 @@ impl GitHubApp {
         Ok(jsonwebtoken::encode(
             &Header::new(Algorithm::RS256),
             &claims,
-            &self.key,
+            self.key
+                .as_ref()
+                .context("acting with a user's token, not as the GitHub App")?,
         )?)
     }
 
@@ -488,6 +549,9 @@ impl GitHubApp {
 
     /// A token with everything the installation on `repo` has. Only for the runtime's own calls, never sessions.
     pub async fn token_for(&self, repo: &str) -> anyhow::Result<String> {
+        if let Some(token) = self.user_token() {
+            return Ok(token);
+        }
         self.mint_scoped(|| async move {
             Ok(Some(TokenScope::full(self.installation_for(repo).await?)))
         })
@@ -498,6 +562,9 @@ impl GitHubApp {
     /// A session's read-only token, through the installation on `repo`: it covers the repositories in `granted`
     /// that share that installation (`repo` among them), with [`READ_PERMISSIONS`].
     pub async fn read_token(&self, repo: &str, granted: &[&str]) -> anyhow::Result<String> {
+        if let Some(token) = self.user_token() {
+            return Ok(token);
+        }
         self.mint_scoped(|| async move {
             let installation = self.installation_for(repo).await?;
             let mut covered = vec![repo];
@@ -523,6 +590,9 @@ impl GitHubApp {
 
     /// A session's token for pushing to `repo`: that repository only, with [`push_permissions`].
     pub async fn push_token(&self, repo: &str) -> anyhow::Result<String> {
+        if let Some(token) = self.user_token() {
+            return Ok(token);
+        }
         self.mint_scoped(|| async move {
             let installation = self.installation_for(repo).await?;
             let Some(permissions) = self.installation_permissions(installation).await? else {
@@ -540,6 +610,9 @@ impl GitHubApp {
 
     /// A token from any of the app's installations, for the runtime's reads that aren't tied to one repository.
     pub async fn any_token(&self) -> anyhow::Result<String> {
+        if let Some(token) = self.user_token() {
+            return Ok(token);
+        }
         self.mint_scoped(|| async move {
             let cached = self
                 .installations
@@ -625,6 +698,7 @@ impl GitHubApp {
         accept: &str,
     ) -> anyhow::Result<reqwest::Response> {
         let token = self.token_for(repo).await?;
+        self.audit("GET", &format!("/repos/{repo}{path}"));
         Ok(self
             .http
             .get(self.url(&format!("/repos/{repo}{path}")))
@@ -768,6 +842,7 @@ impl GitHubApp {
         variables: Value,
     ) -> anyhow::Result<Value> {
         let token = self.token_for(repo).await?;
+        self.audit("POST", &format!("/graphql ({repo})"));
         let response: Value = self
             .http
             .post(self.url("/graphql"))
@@ -812,6 +887,7 @@ impl GitHubApp {
         payload: Option<&Value>,
     ) -> anyhow::Result<Value> {
         let token = self.token_for(repo).await?;
+        self.audit(method.as_str(), &format!("/repos/{repo}{path}"));
         let mut request = self
             .http
             .request(method, self.url(&format!("/repos/{repo}{path}")))
@@ -2046,6 +2122,22 @@ mod tests {
         let (fake, app) = fake_github().await;
         app.token_for("o/r").await.unwrap();
         assert_eq!(*fake.minted.lock().unwrap(), vec![(1, json!({}))]);
+    }
+
+    #[tokio::test]
+    async fn a_client_acting_as_a_user_uses_their_token_for_everything() {
+        let user =
+            GitHubApp::for_user_with_api("http://127.0.0.1:9", "github_pat_x".into(), "ada".into())
+                .unwrap();
+        assert_eq!(user.user_login(), Some("ada"));
+        assert_eq!(user.token_for("o/r").await.unwrap(), "github_pat_x");
+        assert_eq!(
+            user.read_token("o/r", &["o/s"]).await.unwrap(),
+            "github_pat_x"
+        );
+        assert_eq!(user.push_token("o/r").await.unwrap(), "github_pat_x");
+        assert_eq!(user.identity().await.unwrap().name, "ada");
+        assert!(user.jwt().is_err(), "it never acts as the App");
     }
 
     #[test]

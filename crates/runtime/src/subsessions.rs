@@ -41,6 +41,9 @@ fn child_grants(parent: &[Grant], keep: Option<&[String]>, child: Uuid) -> Vec<G
                 }
                 if let Some(params) = grant.params.as_object_mut() {
                     params.remove("commit");
+                    // Acting as the owner is never inherited (ADR 29): the child acts as the GitHub App.
+                    params.remove("credential");
+                    params.remove("as");
                 }
             }
             grant
@@ -282,7 +285,7 @@ mod tests {
             ),
             grant(
                 capability::REPO,
-                json!({"repo": "o/docs", "access": "ro", "commit": "f00"}),
+                json!({"repo": "o/docs", "access": "ro", "commit": "f00", "credential": "c", "as": "ada"}),
             ),
         ];
         let child = Uuid::parse_str("0123456789abcdef0123456789abcdef").unwrap();
@@ -295,6 +298,12 @@ mod tests {
         assert_eq!(rw.param("access"), Some("rw"));
         assert_eq!(all[4].param("branch"), None);
         assert_eq!(all[4].param("commit"), None, "a child starts fresh");
+        assert_eq!(
+            all[4].param("credential"),
+            None,
+            "acting as the owner isn't inherited"
+        );
+        assert_eq!(all[4].param("as"), None);
 
         // A grant that runs out runs out for the child too.
         let mut expiring = parent.clone();

@@ -1243,6 +1243,52 @@ async fn a_grant_can_run_out_be_narrowed_and_be_revoked(db: PgPool) {
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_repository_grant_switches_to_the_owner_s_token_and_back(db: PgPool) {
+    use sloppod_contracts::Grant;
+
+    let id = session(&db, "dev").await;
+    db::add_grant(
+        &db,
+        id,
+        &Grant::new(
+            "repo",
+            json!({"repo": "Dev/App", "access": "rw", "branch": "sloppod/x"}),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(
+        db::set_repo_credential(&db, id, "dev/app", Some(("c1", "dev")))
+            .await
+            .unwrap()
+    );
+    let context = db::get_session(&db, id).await.unwrap().unwrap().context();
+    assert_eq!(context.repo_credential("dev/app"), Some("c1"));
+    assert_eq!(
+        crate::grants::describe(&context.grants[0]),
+        "Dev/App: read, and push the session branch `sloppod/x` and branches named after it, as dev (the user's own \
+         GitHub token)."
+    );
+    assert_eq!(
+        context.writable_repo_for("dev/app").map(|g| g.branch),
+        Some("sloppod/x")
+    );
+
+    assert!(
+        db::set_repo_credential(&db, id, "dev/app", None)
+            .await
+            .unwrap()
+    );
+    let context = db::get_session(&db, id).await.unwrap().unwrap().context();
+    assert_eq!(context.repo_credential("dev/app"), None);
+    assert!(
+        !db::set_repo_credential(&db, id, "dev/other", None)
+            .await
+            .unwrap()
+    );
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
 async fn a_sub_session_s_copy_of_a_grant_runs_out_with_it(db: PgPool) {
     use sloppod_contracts::Grant;
 

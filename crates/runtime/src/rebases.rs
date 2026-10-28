@@ -16,6 +16,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tokio::sync::mpsc;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::github::GitHubApp;
@@ -47,6 +48,9 @@ pub fn fingerprint(diff: &str) -> Option<String> {
 #[derive(Debug, Clone)]
 pub struct Recheck {
     pub owner: String,
+    /// The owner's GitHub token the session pushed with, by id, or none for the GitHub App (ADR 29); the recheck acts
+    /// with the same identity.
+    pub credential: Option<String>,
     pub session: Uuid,
     pub repo: String,
     pub branch: String,
@@ -195,15 +199,35 @@ pub async fn run(state: AppState, mut rechecks: mpsc::UnboundedReceiver<Recheck>
     while let Some(recheck) = rechecks.recv().await {
         let state = state.clone();
         tokio::spawn(async move {
-            let app = match state.credentials.github(&recheck.owner).await {
+            let span = crate::github::acting_span(
+                &recheck.session.to_string(),
+                recheck.credential.as_deref(),
+            );
+            let app = match state
+                .credentials
+                .github_as(&recheck.owner, recheck.credential.as_deref())
+                .await
+            {
                 Ok(app) => app,
                 Err(e) => {
-                    tracing::warn!(error = %e, "no GitHub App to recheck a push with");
+                    tracing::warn!(error = %e, "nothing to recheck a push with");
+                    state
+                        .hub
+                        .notify(
+                            recheck.session,
+                            format!(
+                                "sloppod: your push to `{}` turned auto-merge off, and it couldn't be checked to turn it \
+                                 back on ({e}), so it needs merging by hand. Tell the user.",
+                                recheck.branch
+                            ),
+                        )
+                        .await;
                     return;
                 }
             };
-            let outcomes =
-                recheck_push(&state.rechecks, app.as_ref(), &recheck, LANDING, POLL).await;
+            let outcomes = recheck_push(&state.rechecks, app.as_ref(), &recheck, LANDING, POLL)
+                .instrument(span)
+                .await;
             for (pull, outcome) in outcomes {
                 if let Some(text) = notice(&recheck.branch, pull, &outcome) {
                     state.hub.notify(recheck.session, text).await;
@@ -479,6 +503,7 @@ index 3333333..4444444 100644
         let pulls = admission.recheck(vec![(7, fingerprint(REVIEWED).unwrap())]);
         Recheck {
             owner: "dev".into(),
+            credential: None,
             session: Uuid::nil(),
             repo: "o/r".into(),
             branch: "s-1".into(),

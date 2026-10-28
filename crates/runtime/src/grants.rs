@@ -48,11 +48,15 @@ pub fn describe(grant: &Grant) -> String {
         },
         capability::REPO => {
             let repo = grant.param("repo").unwrap_or("?");
-            match (grant.param("access"), grant.param("branch")) {
+            let access = match (grant.param("access"), grant.param("branch")) {
                 (Some(READ_WRITE), Some(branch)) => format!(
-                    "{repo}: read, and push the session branch `{branch}` and branches named after it."
+                    "{repo}: read, and push the session branch `{branch}` and branches named after it"
                 ),
-                _ => format!("{repo}: read only."),
+                _ => format!("{repo}: read only"),
+            };
+            match grant.param("as") {
+                Some(login) => format!("{access}, as {login} (the user's own GitHub token)."),
+                None => format!("{access}."),
             }
         }
         other => format!("{other}."),

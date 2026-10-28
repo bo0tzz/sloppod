@@ -10,7 +10,9 @@ use sloppod_contracts::{
 use sloppod_contracts::{repo_from_git_path, same_repo};
 
 use crate::credentials::Credentials;
-use crate::github::{GitHubApp, PushLog};
+use tracing::Instrument;
+
+use crate::github::{GitHubApp, PushLog, acting_span};
 use crate::proposals::is_session_branch;
 use crate::rebases::{Recheck, Rechecks};
 
@@ -44,6 +46,29 @@ impl GitHubPolicy {
         self.credentials.github(&session.owner).await.ok()
     }
 
+    /// The identity the session acts with on `repo` (ADR 29): the GitHub App, or the owner's token its grant names.
+    /// `None` for the App when there's none; a named token that's gone is a refusal, never a fallback to the App.
+    async fn acting_as(
+        &self,
+        session: &SessionContext,
+        repo: &str,
+    ) -> std::result::Result<Option<Arc<GitHubApp>>, Decision> {
+        let Some(credential) = session.repo_credential(repo) else {
+            return Ok(self.app(session).await);
+        };
+        match self
+            .credentials
+            .github_as(&session.owner, Some(credential))
+            .await
+        {
+            Ok(client) => Ok(Some(client)),
+            Err(e) => Err(Decision::deny(format!(
+                "sloppod: this session acts on {repo} with a GitHub token of the user's that can't be used ({e}). \
+                 Tell the user; they can switch the grant to another token in the session's grants.\n"
+            ))),
+        }
+    }
+
     async fn git(
         &self,
         session: &SessionContext,
@@ -55,11 +80,21 @@ impl GitHubPolicy {
                 // Granted repositories are read with a token covering only the grants. Anything else goes out
                 // without one, so it's readable only if it's public.
                 let granted: Vec<&str> = session.repos().collect();
-                let token = match self.app(session).await {
-                    Some(app) if granted.iter().any(|r| same_repo(r, &git.repo)) => {
-                        app.read_token(&git.repo, &granted).await.ok()
+                let token = if granted.iter().any(|r| same_repo(r, &git.repo)) {
+                    match self.acting_as(session, &git.repo).await {
+                        Ok(Some(client)) => {
+                            let token = client
+                                .read_token(&git.repo, &app_repos(session, &granted))
+                                .await
+                                .ok();
+                            audit(session, &client, &git.repo, request);
+                            token
+                        }
+                        Ok(None) => None,
+                        Err(refusal) => return Ok(refusal),
                     }
-                    _ => None,
+                } else {
+                    None
                 };
                 let headers = token
                     .map(|t| vec![("authorization".into(), basic(&t))])
@@ -81,12 +116,18 @@ impl GitHubPolicy {
                     )));
                 };
                 let (repo, branch) = (grant.repo, grant.branch);
-                let Some(app) = self.app(session).await else {
-                    return Ok(Decision::deny(format!(
-                        "sloppod: {} has no GitHub App configured.\n",
-                        session.owner
-                    )));
+                let app = match self.acting_as(session, repo).await {
+                    Ok(Some(app)) => app,
+                    Ok(None) => {
+                        return Ok(Decision::deny(format!(
+                            "sloppod: {} has no GitHub App configured.\n",
+                            session.owner
+                        )));
+                    }
+                    Err(refusal) => return Ok(refusal),
                 };
+                // Before the guard, which may refuse the push, so every push made as the user is logged.
+                audit(session, &app, repo, request);
                 if !git.advertisement {
                     match pushed_refs(&request.body) {
                         Some(push) if !push.refs.is_empty() => {
@@ -135,6 +176,9 @@ impl GitHubPolicy {
                                     let number = admission.number;
                                     self.rechecks.send(Recheck {
                                         owner: session.owner.clone(),
+                                        credential: session
+                                            .repo_credential(repo)
+                                            .map(str::to_owned),
                                         session: session_id,
                                         repo: repo.to_owned(),
                                         branch: pushed.to_owned(),
@@ -219,7 +263,27 @@ impl GitHubPolicy {
         // Reads carry a read-only token covering the granted repositories in one installation, which also reads
         // public data: the installation of the repository the path names, if it's granted, or else the first granted
         // repository whose installation still works. Without any, or without a GitHub App, reads are unauthenticated.
+        // A repository the session acts on with one of the owner's tokens is read with that token, and only when the
+        // path names it; the App's tokens never cover it.
         let granted: Vec<&str> = session.repos().collect();
+        if let Some(named) = named_repo(path)
+            && granted.iter().any(|g| same_repo(g, &named))
+            && session.repo_credential(&named).is_some()
+        {
+            return match self.acting_as(session, &named).await {
+                Ok(Some(client)) => {
+                    let token = client.read_token(&named, &[]).await.map_err(err)?;
+                    audit(session, &client, &named, request);
+                    Ok(Decision::allow_with(
+                        vec![("authorization".into(), format!("token {token}"))],
+                        Vec::new(),
+                    ))
+                }
+                Ok(None) => Ok(Decision::allow_with(Vec::new(), Vec::new())),
+                Err(refusal) => Ok(refusal),
+            };
+        }
+        let granted = app_repos(session, &granted);
         let token = match self.app(session).await {
             Some(app) => {
                 let order = read_token_order(path, &granted);
@@ -257,7 +321,8 @@ impl RequestPolicy for GitHubPolicy {
             "api.github.com" => self.api(session, request).await,
             _ => {
                 if let Some(git) = GitRequest::parse(request) {
-                    return self.git(session, request, git).await;
+                    let span = acting_span(&session.session_id, session.repo_credential(&git.repo));
+                    return self.git(session, request, git).instrument(span).await;
                 }
                 if matches!(request.method.as_str(), "GET" | "HEAD") {
                     return Ok(Decision::allow_with(Vec::new(), Vec::new()));
@@ -327,12 +392,41 @@ where
         })
 }
 
-/// Granted repositories to mint a read token through, in order: the one the API path names first, if any.
-fn read_token_order<'a>(path: &str, granted: &[&'a str]) -> Vec<&'a str> {
-    let named = path.strip_prefix("/repos/").and_then(|rest| {
+/// The repository an API path names, `/repos/<owner>/<name>/…`.
+fn named_repo(path: &str) -> Option<String> {
+    path.strip_prefix("/repos/").and_then(|rest| {
         let mut parts = rest.splitn(3, '/');
         Some(format!("{}/{}", parts.next()?, parts.next()?))
-    });
+    })
+}
+
+/// The granted repositories the session acts on as the GitHub App, the only ones its tokens may cover.
+fn app_repos<'a>(session: &SessionContext, granted: &[&'a str]) -> Vec<&'a str> {
+    granted
+        .iter()
+        .copied()
+        .filter(|repo| session.repo_credential(repo).is_none())
+        .collect()
+}
+
+/// Every request made with one of the owner's tokens is logged with the session and the grant's credential (ADR 28).
+fn audit(session: &SessionContext, client: &GitHubApp, repo: &str, request: &HttpRequest) {
+    if let Some(login) = client.user_login() {
+        tracing::info!(
+            session = %session.session_id,
+            credential = session.repo_credential(repo).unwrap_or_default(),
+            as_user = login,
+            %repo,
+            method = %request.method,
+            path = %request.path_only(),
+            "request with the owner's GitHub token"
+        );
+    }
+}
+
+/// Granted repositories to mint a read token through, in order: the one the API path names first, if any.
+fn read_token_order<'a>(path: &str, granted: &[&'a str]) -> Vec<&'a str> {
+    let named = named_repo(path);
     let first = named.and_then(|named| granted.iter().find(|g| same_repo(g, &named)).copied());
     first
         .into_iter()

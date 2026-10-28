@@ -521,6 +521,50 @@ impl Credentials {
         Ok(app)
     }
 
+    /// The client to act with on a repository (ADR 29): the owner's GitHub App, or, when the session's grant names one,
+    /// one of the owner's GitHub tokens. A credential that's gone, or isn't the owner's token, is an error, never the App.
+    pub async fn github_as(
+        &self,
+        owner: &str,
+        credential: Option<&str>,
+    ) -> anyhow::Result<Arc<GitHubApp>> {
+        let Some(credential) = credential else {
+            return self.github(owner).await;
+        };
+        let row = self
+            .github_user(owner, credential)
+            .await?
+            .with_context(|| {
+                format!("the GitHub token {credential} this session acts with is gone")
+            })?;
+        let mut cache = self.github.lock().await;
+        if let Some(client) = cache.get(&row.id) {
+            return Ok(client.clone());
+        }
+        let token = self.vault.decrypt_string(&row.secret)?;
+        let client = Arc::new(GitHubApp::for_user(
+            token,
+            row.config("login").unwrap_or_default().to_owned(),
+        )?);
+        cache.insert(row.id, client.clone());
+        Ok(client)
+    }
+
+    /// One of the owner's GitHub tokens (`github-user`), by id.
+    pub async fn github_user(&self, owner: &str, id: &str) -> sqlx::Result<Option<CredentialRow>> {
+        let Ok(id) = id.parse::<Uuid>() else {
+            return Ok(None);
+        };
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "select {COLUMNS} from credentials where id = $1 and owner = $2 and kind = $3"
+        )))
+        .bind(id)
+        .bind(owner)
+        .bind(GITHUB_USER)
+        .fetch_optional(&self.db)
+        .await
+    }
+
     pub async fn memini(
         &self,
         owner: &str,
@@ -604,6 +648,46 @@ mod tests {
             .filter(|r| r.is_default)
             .map(|r| r.name)
             .collect()
+    }
+
+    #[sqlx::test]
+    async fn a_grant_s_github_token_is_used_as_it_is_and_never_swapped_for_the_app(db: PgPool) {
+        let credentials = credentials(db.clone()).await;
+        let id = Uuid::now_v7();
+        let sealed = credentials.vault.encrypt(b"github_pat_x").unwrap();
+        sqlx::query(
+            "insert into credentials (id, owner, kind, name, config, secret, is_default) \
+             values ($1, 'dev', $2, 'mine', '{\"login\": \"dev\"}', $3, true)",
+        )
+        .bind(id)
+        .bind(GITHUB_USER)
+        .bind(&sealed)
+        .execute(&db)
+        .await
+        .unwrap();
+        let id = id.to_string();
+
+        // Without a GitHub App configured, as on a repository only the token reaches.
+        let client = credentials.github_as("dev", Some(&id)).await.unwrap();
+        assert_eq!(client.user_login(), Some("dev"));
+        assert_eq!(
+            client.token_for("dev/private").await.unwrap(),
+            "github_pat_x"
+        );
+        assert!(
+            credentials.github_as("dev", None).await.is_err(),
+            "no App to fall back to"
+        );
+        assert!(
+            credentials.github_as("other", Some(&id)).await.is_err(),
+            "not another owner's"
+        );
+        assert!(
+            credentials
+                .github_as("dev", Some("nonsense"))
+                .await
+                .is_err()
+        );
     }
 
     #[sqlx::test]

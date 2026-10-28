@@ -9,7 +9,7 @@ use axum::routing::{delete, get, post, put};
 use serde::Deserialize;
 use serde_json::json;
 use sloppod_contracts::capability;
-use sloppod_contracts::{Grant, READ_WRITE, find_repo};
+use sloppod_contracts::{Grant, READ_WRITE, find_repo, is_repo_name};
 use sloppod_protocol::api::{
     Decision, NewCredential, NewSession, NewStandingApproval, ProposalStatus, ReviewPolicy,
 };
@@ -223,6 +223,9 @@ async fn get_session(
 #[derive(Deserialize)]
 struct AddRepo {
     repo: String,
+    /// One of the owner's GitHub tokens to act with on it (ADR 29), by id; none for the GitHub App.
+    #[serde(default)]
+    credential: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -276,6 +279,9 @@ async fn add_repo(
         .await?
         .ok_or_else(not_found)?;
     let wanted = body.repo.trim();
+    if let Some(credential) = body.credential.as_deref() {
+        return add_repo_as(&state, &user, id, wanted, credential).await;
+    }
     let accessible = accessible_repos(&state, &user).await;
     let repo = find_repo(&accessible, wanted)
         .cloned()
@@ -293,6 +299,66 @@ async fn add_repo(
             )
             .await;
     }
+    let session = db::get_session(&state.db, id)
+        .await?
+        .ok_or_else(not_found)?;
+    Ok(Json(session.to_api()))
+}
+
+/// Has a session act on `repo` with one of the owner's GitHub tokens (ADR 29): write access to it if the session
+/// lacks it, and its grant switched to the token. Only the owner does this; the token has to reach the repository.
+async fn add_repo_as(
+    state: &AppState,
+    user: &str,
+    id: Uuid,
+    wanted: &str,
+    credential: &str,
+) -> ApiResult<Json<sloppod_protocol::api::Session>> {
+    let row = state
+        .credentials
+        .github_user(user, credential)
+        .await?
+        .ok_or_else(|| bad_request("that isn't one of your GitHub tokens"))?;
+    let reach: Vec<String> = row.config["repositories"]
+        .as_array()
+        .map(|repos| {
+            repos
+                .iter()
+                .filter_map(|r| r.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let more = row.config["more_repositories"].as_bool() == Some(true);
+    let repo = match find_repo(&reach, wanted) {
+        Some(repo) => repo.clone(),
+        // The token lists more repositories than were read when it was added; GitHub decides when it's used.
+        None if more && is_repo_name(wanted) => wanted.to_owned(),
+        None => {
+            return Err(bad_request(format!(
+                "the token {} doesn't reach {wanted}",
+                row.name
+            )));
+        }
+    };
+    let login = row.config("login").unwrap_or_default().to_owned();
+    let session = db::get_session(&state.db, id)
+        .await?
+        .ok_or_else(not_found)?;
+    proposals::grant_repo(&state.db, &session.context(), &repo).await?;
+    let credential = row.id.to_string();
+    db::set_repo_credential(&state.db, id, &repo, Some((&credential, &login))).await?;
+    state.hub.broadcast_session(id).await;
+    state
+        .hub
+        .notify(
+            id,
+            format!(
+                "sloppod: the user gave this session write access to {repo}, as {login}: on {repo}, git and GitHub's \
+                 API now act with their own GitHub token, so what you push there is attributed to them. {}",
+                proposals::repo_granted(&repo, id)
+            ),
+        )
+        .await;
     let session = db::get_session(&state.db, id)
         .await?
         .ok_or_else(not_found)?;

@@ -1244,6 +1244,30 @@ pub async fn add_grant(db: &PgPool, session: Uuid, grant: &Grant) -> sqlx::Resul
         .map(|_| ())
 }
 
+/// Has the session act on `repo` with one of the owner's GitHub tokens (ADR 29), `credential` its id and `login` whose
+/// it is, or with the GitHub App again (`None`). Says whether the session had a grant of `repo` to change.
+pub async fn set_repo_credential(
+    db: &PgPool,
+    session: Uuid,
+    repo: &str,
+    credential: Option<(&str, &str)>,
+) -> sqlx::Result<bool> {
+    let params = match credential {
+        Some((id, login)) => serde_json::json!({"credential": id, "as": login}),
+        None => serde_json::json!({}),
+    };
+    sqlx::query(
+        "update session_grants set params = (params - 'credential' - 'as') || $3 \
+         where session_id = $1 and capability = 'repo' and lower(params->>'repo') = lower($2)",
+    )
+    .bind(session)
+    .bind(repo)
+    .bind(params)
+    .execute(db)
+    .await
+    .map(|done| done.rows_affected() > 0)
+}
+
 pub async fn set_session_model(db: &PgPool, id: Uuid, model: &str) -> sqlx::Result<()> {
     sqlx::query("update sessions set model = $2 where id = $1")
         .bind(id)
