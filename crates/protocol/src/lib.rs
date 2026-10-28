@@ -18,6 +18,12 @@ pub mod api {
         /// The agent to run, e.g. `claude-code` (the default) or `codex`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub agent: Option<String>,
+        /// The capabilities it starts with, from the defaults (#232); all of them when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub capabilities: Option<Vec<String>>,
+        /// The model to run, instead of the user's default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub model: Option<String>,
     }
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

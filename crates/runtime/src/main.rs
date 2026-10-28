@@ -31,6 +31,7 @@ mod reviews;
 mod session;
 #[cfg(test)]
 mod session_tests;
+mod starting;
 mod store;
 mod subsessions;
 mod tls;
@@ -80,6 +81,7 @@ pub struct Inner {
     pub instructions: Option<String>,
     /// The runtime's own small model calls (ADR 26).
     pub inference: inference::Inference,
+    pub suggestions: starting::Suggestions,
     /// Sessions asked to quiet down for a new session image (#230).
     pub image_nudges: lifecycle::ImageNudges,
     /// Pushes to heads of pull requests set to merge themselves, waiting to be rechecked (#106).
@@ -229,6 +231,7 @@ async fn main() -> anyhow::Result<()> {
         agents,
         instructions,
         inference: inference::Inference::default(),
+        suggestions: starting::Suggestions::default(),
         image_nudges: lifecycle::ImageNudges::default(),
         rechecks,
         quotas: quota::Quotas::new()?,

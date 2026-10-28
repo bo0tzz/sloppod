@@ -116,6 +116,15 @@ fn reply(output: &str) -> anyhow::Result<Value> {
     Ok(serde_json::from_str(text.trim())?)
 }
 
+/// Has the owner's utility session's pod come up, so a judgement asked for soon doesn't wait for it: e.g. when the
+/// user starts writing a first message (#232).
+pub async fn warm(state: &AppState, owner: &str) {
+    match utility_session(state, owner).await {
+        Ok(session) => state.inference.used(session),
+        Err(e) => tracing::warn!(%owner, error = %e, "warming the utility session"),
+    }
+}
+
 /// The owner's utility session, made if they have none, and woken or placed so its pod is coming up.
 async fn utility_session(state: &AppState, owner: &str) -> anyhow::Result<Uuid> {
     if let Some(session) = db::utility_session(&state.db, owner).await? {
