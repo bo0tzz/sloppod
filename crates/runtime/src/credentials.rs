@@ -154,10 +154,6 @@ impl Credentials {
         })
     }
 
-    pub fn vault(&self) -> &Vault {
-        &self.vault
-    }
-
     pub async fn list(&self, owner: &str) -> sqlx::Result<Vec<CredentialRow>> {
         sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "select {COLUMNS} from credentials where owner = $1 order by kind, created_at"
@@ -324,7 +320,17 @@ impl Credentials {
         Ok(true)
     }
 
-    async fn default_row(&self, owner: &str, kind: &str) -> sqlx::Result<Option<CredentialRow>> {
+    /// Whether the owner has a credential of a kind, without decrypting it.
+    pub async fn has_default(&self, owner: &str, kind: &str) -> sqlx::Result<bool> {
+        Ok(self.default_row(owner, kind).await?.is_some())
+    }
+
+    /// The owner's default credential of a kind, still sealed.
+    pub async fn default_row(
+        &self,
+        owner: &str,
+        kind: &str,
+    ) -> sqlx::Result<Option<CredentialRow>> {
         sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "select {COLUMNS} from credentials where owner = $1 and kind = $2 and is_default"
         )))
