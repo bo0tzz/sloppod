@@ -405,6 +405,45 @@ async fn a_notice_waits_for_a_permission_request_to_be_answered() {
 }
 
 #[tokio::test]
+async fn a_relinked_agents_permission_request_holds_a_notice_only_until_it_is_answered() {
+    let mut h = Harness::ready().await;
+    let _turn = h.prompt("First");
+    let turn_request = h.next().await;
+    let request = json!({"jsonrpc": "2.0", "id": "p-1", "method": "session/request_permission", "params": {
+        "sessionId": "agent-session", "toolCall": {"toolCallId": "t1"},
+        "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}],
+    }});
+    from_agent(&h.hub, h.id, &h.agent, request.clone()).await;
+    h.hub
+        .notify(h.id, "sloppod: your proposal was approved.".into())
+        .await;
+
+    // The supervisor links again before the runtime noticed the old link was gone, and reports the request still
+    // open; the old link is never detached.
+    let (tx, to_agent) = mpsc::unbounded_channel();
+    h.agent = Arc::new(AgentConn::new(tx));
+    h.to_agent = to_agent;
+    h.hub.attach_agent(h.id, h.agent.clone()).await;
+    let mut relinked = running(vec![turn_request]);
+    relinked.waiting = vec![request];
+    h.hub.adopt_agent(h.id, &h.agent, relinked).await;
+
+    let permissions = h.hub.replay(h.id).await.unwrap().permissions;
+    assert_eq!(permissions.len(), 1, "asked once, under the new link");
+    let allow = json!({"outcome": {"outcome": "selected", "optionId": "allow"}});
+    h.hub
+        .answer_permission(h.id, permissions[0].0, Ok(allow), "a test")
+        .await;
+    assert_eq!(h.next().await["id"], "p-1");
+    let steering = h.next().await;
+    assert_eq!(steering["method"], "_session/steering");
+    assert_eq!(
+        prompt_text(&steering),
+        ["sloppod: your proposal was approved."]
+    );
+}
+
+#[tokio::test]
 async fn the_users_steer_goes_in_during_a_tool_call() {
     let mut h = Harness::ready().await;
     let _turn = h.prompt("First");

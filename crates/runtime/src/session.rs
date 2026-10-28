@@ -425,15 +425,33 @@ impl Hub {
     }
 
     pub async fn attach_agent(&self, id: Uuid, agent: Arc<AgentConn>) {
-        let live = self.live(id);
-        let mut state = live.state.lock().await;
-        if let Some(old) = state.agent.replace(agent) {
-            old.close();
+        let resolved = {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            if let Some(old) = state.agent.replace(agent) {
+                old.close();
+            }
+            state.agent_session_id = None;
+            state.turn_running = false;
+            state.commands = None;
+            live.end_work(&mut state);
+            // The new link reports the requests the agent still has open, and they're asked again under it.
+            take_agent_permissions(&mut state)
+        };
+        self.resolve_permissions(id, resolved);
+    }
+
+    /// Tells the UIs that these permission requests are no longer open.
+    fn resolve_permissions(&self, id: Uuid, resolved: Vec<(u64, Option<String>)>) {
+        for (pid, tool_call_id) in resolved {
+            self.broadcast(
+                id,
+                UiEvent::PermissionResolved {
+                    id: pid,
+                    tool_call_id,
+                },
+            );
         }
-        state.agent_session_id = None;
-        state.turn_running = false;
-        state.commands = None;
-        live.end_work(&mut state);
     }
 
     /// What the supervisor of `agent`, the session's current one, says about the agent's running commands.
@@ -973,21 +991,9 @@ impl Hub {
             state.commands = None;
             live.end_work(&mut state);
             self.set_phase(id, Phase::Disconnected).await;
-            state
-                .permissions
-                .extract_if(|_, p| matches!(p.asker, Asker::Agent { .. }))
-                .map(|(pid, p)| (pid, tool_call_id(&p.params)))
-                .collect()
+            take_agent_permissions(&mut state)
         };
-        for (pid, tool_call_id) in resolved {
-            self.broadcast(
-                id,
-                UiEvent::PermissionResolved {
-                    id: pid,
-                    tool_call_id,
-                },
-            );
-        }
+        self.resolve_permissions(id, resolved);
     }
 
     pub async fn on_agent_notification(&self, id: Uuid, message: Value) {
@@ -1915,6 +1921,15 @@ fn answer_outcome(result: &Result<Value, RpcError>) -> String {
         },
         Err(e) => format!("error {}: {}", e.code, e.message),
     }
+}
+
+/// Removes the agent's permission requests, whose agent connection is gone: their ids and tool calls.
+fn take_agent_permissions(state: &mut LiveState) -> Vec<(u64, Option<String>)> {
+    state
+        .permissions
+        .extract_if(|_, p| matches!(p.asker, Asker::Agent { .. }))
+        .map(|(pid, p)| (pid, tool_call_id(&p.params)))
+        .collect()
 }
 
 fn tool_call_id(params: &Value) -> Option<String> {
