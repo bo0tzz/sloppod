@@ -148,7 +148,8 @@ fn stall(turn_ended: bool, failed: bool, retries: u32, nudged: bool, timed_out: 
 fn watch_round(state: &AppState, proposal: Uuid, session: Uuid, round: i32) {
     let state = state.clone();
     tokio::spawn(async move {
-        let (mut in_turn, mut nudged, mut retries) = (false, false, 0);
+        let (mut nudged, mut retries) = (false, 0);
+        let (mut seen, _) = state.hub.turns_ended(session).await;
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
             // Errors are retried at the next check; only a confirmed outcome ends the watch.
@@ -171,13 +172,11 @@ fn watch_round(state: &AppState, proposal: Uuid, session: Uuid, round: i32) {
                 return;
             }
             let timed_out = round_timed_out(this.created_at, Utc::now());
-            let running = state.hub.turn_running(session).await;
-            let turn_ended = in_turn && !running;
-            in_turn = running;
-            let failed = match turn_ended {
-                true => state.hub.last_turn_error(session).await,
-                false => None,
-            };
+            // Counted, not sampled: a turn that starts and ends between two looks still counts.
+            let (ended, error) = state.hub.turns_ended(session).await;
+            let turn_ended = ended > seen;
+            seen = ended;
+            let failed = error.filter(|_| turn_ended);
             match stall(turn_ended, failed.is_some(), retries, nudged, timed_out) {
                 Stall::Wait => {}
                 Stall::Retry => {
