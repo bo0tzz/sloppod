@@ -70,6 +70,10 @@ RUN curl -fsSL -o /usr/local/bin/gh-stack \
 RUN npm install -g @agentclientprotocol/claude-agent-acp@${ADAPTER_VERSION} \
         @agentclientprotocol/codex-acp@${CODEX_ADAPTER_VERSION} \
     && npm cache clean --force
+# The adapter's Claude Code, as `claude`: the runtime's judgements run it one-shot (ADR 26).
+RUN test -x /usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude \
+    && ln -s /usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude \
+        /usr/local/bin/claude
 COPY --from=memini /memini/plugin /opt/sloppod/plugins/memini
 COPY --from=build /out/sloppod-supervisor /usr/local/bin/sloppod-supervisor
 # The node image's `node` user is uid 1000, which session pods run as.
