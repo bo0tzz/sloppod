@@ -17,7 +17,16 @@ use crate::{AppState, db};
 
 /// Gives a session its memini key when its owner has memini and it has none, e.g. because it was just created, or
 /// its key was lost (ADR 22). Keeps the namespace of an existing memory grant.
+/// Whether a session of `kind` gets the owner's memory when they have memini. A utility session (ADR 26) only has
+/// model access.
+fn gets_memory(kind: sloppod_protocol::api::SessionKind) -> bool {
+    kind != sloppod_protocol::api::SessionKind::Utility
+}
+
 async fn ensure_memini_key(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
+    if !gets_memory(session.kind) {
+        return Ok(());
+    }
     let Some((admin, memini)) = state.credentials.memini(&session.owner).await? else {
         return Ok(());
     };
@@ -323,6 +332,14 @@ pub async fn remove_session(state: &AppState, session: &db::SessionRow) -> anyho
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_utility_session_gets_no_memory() {
+        use sloppod_protocol::api::SessionKind;
+        assert!(gets_memory(SessionKind::Work));
+        assert!(gets_memory(SessionKind::Review));
+        assert!(!gets_memory(SessionKind::Utility));
+    }
+
     #[test]
     fn a_session_long_on_an_old_image_is_nudged_once() {
         let now = chrono::Utc::now();

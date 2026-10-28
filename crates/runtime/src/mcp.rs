@@ -109,8 +109,10 @@ fn review_tools() -> Vec<Value> {
 }
 
 fn tools(state: &AppState, kind: SessionKind) -> Vec<Value> {
-    if kind == SessionKind::Review {
-        return review_tools();
+    match kind {
+        SessionKind::Review => return review_tools(),
+        SessionKind::Utility => return Vec::new(),
+        SessionKind::Work => {}
     }
     let mut tools: Vec<Value> = state
         .proposals

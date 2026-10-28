@@ -578,6 +578,70 @@ async fn a_command_run_in_the_pod_gets_its_own_result() {
 }
 
 #[tokio::test]
+async fn a_turn_that_ends_well_is_handed_on_for_checking() {
+    let mut h = Harness::ready().await;
+    let (tx, mut ended) = mpsc::unbounded_channel();
+    h.hub.set_turn_ended(Arc::new(move |id| {
+        let tx = tx.clone();
+        Box::pin(async move {
+            let _ = tx.send(id);
+        })
+    }));
+    let turn = h.prompt("Fine");
+    let request = h.next().await;
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+    let id = tokio::time::timeout(Duration::from_secs(5), ended.recv())
+        .await
+        .unwrap();
+    assert_eq!(id, Some(h.id));
+
+    // One that fails isn't.
+    let _failed = h.prompt("Fails");
+    let request = h.next().await;
+    let error = json!({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32603, "message": "upstream 503"}});
+    from_agent(&h.hub, h.id, &h.agent, error).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(ended.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn a_conditional_notice_goes_only_to_the_session_as_it_was_seen() {
+    let mut h = Harness::ready().await;
+    let (seen, running) = h.hub.turn_state(h.id).await;
+    assert!(!running);
+
+    // A turn ends after it was seen: the notice is about the past.
+    let turn = h.prompt("Meanwhile");
+    let request = h.next().await;
+    assert!(
+        !h.hub
+            .notify_when_idle(h.id, Some(seen), "stale".into())
+            .await,
+        "not while a turn runs"
+    );
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+    assert!(
+        !h.hub
+            .notify_when_idle(h.id, Some(seen), "stale".into())
+            .await
+    );
+    h.agent_sent_nothing();
+
+    // As it was seen, the notice runs as a turn, and nothing else can start in between.
+    let (seen, _) = h.hub.turn_state(h.id).await;
+    assert!(
+        h.hub
+            .notify_when_idle(h.id, Some(seen), "sloppod: start it.".into())
+            .await
+    );
+    assert!(h.hub.turn_state(h.id).await.1, "its turn is reserved");
+    let request = h.next().await;
+    assert_eq!(prompt_text(&request), ["sloppod: start it."]);
+}
+
+#[tokio::test]
 async fn a_notice_for_an_idle_session_is_never_steered_into_a_turn() {
     let mut h = Harness::ready().await;
     let turn = h.prompt("Busy");

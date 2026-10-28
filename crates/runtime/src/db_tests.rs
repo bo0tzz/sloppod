@@ -724,3 +724,24 @@ async fn only_a_live_session_acts(db: PgPool) {
     let row = db::get_session(&db, deleted).await.unwrap().unwrap();
     assert_eq!(row.not_acting(), Some("deleted"));
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn an_owner_has_one_utility_session_that_isnt_listed(db: PgPool) {
+    use sloppod_protocol::api::Phase;
+
+    assert!(db::utility_session(&db, "dev").await.unwrap().is_none());
+    let utility = session_of_kind(&db, "dev", SessionKind::Utility).await;
+    session_of_kind(&db, "other", SessionKind::Work).await;
+    assert_eq!(
+        db::utility_session(&db, "dev").await.unwrap().map(|s| s.id),
+        Some(utility)
+    );
+    assert!(db::utility_session(&db, "other").await.unwrap().is_none());
+    // Not among the owner's sessions in the UI.
+    assert!(db::list_sessions(&db, "dev").await.unwrap().is_empty());
+    assert_eq!(db::utility_sessions(&db).await.unwrap().len(), 1);
+    // A stopped one is no longer theirs to use.
+    db::set_phase(&db, utility, Phase::Stopped).await.unwrap();
+    assert!(db::utility_session(&db, "dev").await.unwrap().is_none());
+    assert!(db::utility_sessions(&db).await.unwrap().is_empty());
+}
