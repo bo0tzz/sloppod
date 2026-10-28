@@ -1044,6 +1044,33 @@ test('lists the session grants from the session menu', async ({ page }) => {
   await expect(grants.getByText(/^bo0tzz\/sloppod: read, and push the session branch `sloppod\//)).toBeVisible();
 });
 
+test('reviews and approves updates to existing issues', async ({ page }) => {
+  await createSession(page, 'Tidy the issues in sloppod');
+  const card = page.getByTestId('proposal-card');
+  await expect(card).toHaveAttribute('data-kind', 'github.issue.update');
+  await card.getByRole('button', { name: 'Review' }).click();
+  const updates = page.getByTestId('issue-update');
+  await expect(updates).toHaveCount(3);
+  await expect(updates.nth(0)).toContainText('#100');
+  await expect(updates.nth(0)).toContainText('close as completed');
+  await expect(updates.nth(0)).toContainText('Remove labels: priority');
+  await expect(updates.nth(1)).toContainText('close as a duplicate');
+  await expect(updates.nth(2)).toContainText('New title: Startup failures show in the UI');
+
+  // Drop the duplicate close, and reword the first comment.
+  await updates.nth(1).getByRole('checkbox', { name: 'Make this update' }).click();
+  await page.getByRole('button', { name: 'Edit' }).click();
+  await updates.nth(0).getByRole('textbox', { name: 'Comment' }).fill('Fixed by #148, closing.');
+  await page.getByRole('button', { name: 'Make 2 updates' }).click();
+  await expect(page.getByTestId('system-notice').last()).toContainText('Your issue updates were approved and made');
+  const proposals: { kind: string; payload: { updates: { number: number; comment?: string }[] } }[] = await (
+    await page.request.get('/api/v1/proposals')
+  ).json();
+  const made = proposals.filter((p) => p.kind === 'github.issue.update').at(-1)!;
+  expect(made.payload.updates.map((u) => u.number)).toEqual([100, 59]);
+  expect(made.payload.updates[0].comment).toBe('Fixed by #148, closing.');
+});
+
 test('a draft survives a page reload', async ({ page }) => {
   await createSession(page, 'Keep my draft in sloppod');
   await finishTurn(page);

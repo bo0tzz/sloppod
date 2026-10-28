@@ -765,15 +765,28 @@ impl GitHubApp {
     }
 
     async fn repo_post(&self, repo: &str, path: &str, payload: &Value) -> anyhow::Result<Value> {
+        self.repo_send(reqwest::Method::POST, repo, path, Some(payload))
+            .await
+    }
+
+    /// A write to the repository's REST API with its installation's token; GitHub's refusal comes back as an error.
+    async fn repo_send(
+        &self,
+        method: reqwest::Method,
+        repo: &str,
+        path: &str,
+        payload: Option<&Value>,
+    ) -> anyhow::Result<Value> {
         let token = self.token_for(repo).await?;
-        let response = self
+        let mut request = self
             .http
-            .post(self.url(&format!("/repos/{repo}{path}")))
+            .request(method, self.url(&format!("/repos/{repo}{path}")))
             .bearer_auth(token)
-            .header("accept", "application/vnd.github+json")
-            .json(payload)
-            .send()
-            .await?;
+            .header("accept", "application/vnd.github+json");
+        if let Some(payload) = payload {
+            request = request.json(payload);
+        }
+        let response = request.send().await?;
         let status = response.status();
         let body: Value = response.json().await.unwrap_or(Value::Null);
         if !status.is_success() {
@@ -1034,6 +1047,71 @@ impl GitHubApp {
     pub async fn create_issue(&self, repo: &str, payload: &Value) -> anyhow::Result<Value> {
         let body = self.repo_post(repo, "/issues", payload).await?;
         Ok(json!({"url": body["html_url"], "number": body["number"]}))
+    }
+
+    /// Changes an issue's fields: `title`, `body`, `state`, `state_reason`, as given.
+    pub async fn update_issue(&self, repo: &str, number: u64, patch: &Value) -> anyhow::Result<()> {
+        self.repo_send(
+            reqwest::Method::PATCH,
+            repo,
+            &format!("/issues/{number}"),
+            Some(patch),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn comment_on_issue(
+        &self,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> anyhow::Result<()> {
+        self.repo_post(
+            repo,
+            &format!("/issues/{number}/comments"),
+            &json!({"body": body}),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// The bodies of an issue's comments, oldest first.
+    pub async fn issue_comments(&self, repo: &str, number: u64) -> anyhow::Result<Vec<String>> {
+        let comments = all_pages(|page| async move {
+            self.repo_json(
+                repo,
+                &format!("/issues/{number}/comments?per_page={PAGE}&page={page}"),
+            )
+            .await
+        })
+        .await?;
+        Ok(comments
+            .iter()
+            .filter_map(|c| c["body"].as_str().map(str::to_owned))
+            .collect())
+    }
+
+    pub async fn add_labels(&self, repo: &str, number: u64, labels: &[&str]) -> anyhow::Result<()> {
+        self.repo_post(
+            repo,
+            &format!("/issues/{number}/labels"),
+            &json!({"labels": labels}),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Takes a label off an issue; one it doesn't have is fine.
+    pub async fn remove_label(&self, repo: &str, number: u64, label: &str) -> anyhow::Result<()> {
+        let path = format!("/issues/{number}/labels/{}", branch_in_path(label));
+        match self
+            .repo_send(reqwest::Method::DELETE, repo, &path, None)
+            .await
+        {
+            Err(e) if e.to_string().contains("404") => Ok(()),
+            other => other.map(|_| ()),
+        }
     }
 
     /// Creates the labels in `names` that `repo` doesn't have yet.
