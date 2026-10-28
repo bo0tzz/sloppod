@@ -18,6 +18,8 @@ pub trait SessionStore: Send + Sync {
     async fn append_event(&self, id: Uuid, payload: &Value) -> sqlx::Result<i64>;
     /// The sequence number of the session's latest event; 0 when it has none.
     async fn last_event(&self, id: Uuid) -> sqlx::Result<i64>;
+    /// Whether the session has a user message with this id, as its UI gave it.
+    async fn has_message(&self, id: Uuid, message_id: Uuid) -> sqlx::Result<bool>;
     /// Up to `limit` of the session's latest events before `before`, in order.
     async fn events_before(
         &self,
@@ -61,6 +63,10 @@ impl SessionStore for PgStore {
 
     async fn last_event(&self, id: Uuid) -> sqlx::Result<i64> {
         db::last_event(&self.0, id).await
+    }
+
+    async fn has_message(&self, id: Uuid, message_id: Uuid) -> sqlx::Result<bool> {
+        db::has_message(&self.0, id, message_id).await
     }
 
     async fn events_before(
@@ -162,6 +168,15 @@ pub mod memory {
             let seq = events.len() as i64 + 1;
             events.push((id, seq, payload.clone()));
             Ok(seq)
+        }
+
+        async fn has_message(&self, id: Uuid, message_id: Uuid) -> sqlx::Result<bool> {
+            let events = self.events.lock().unwrap();
+            Ok(events.iter().any(|(s, _, p)| {
+                *s == id
+                    && p["sessionUpdate"] == "user_message_chunk"
+                    && p["messageId"] == message_id.to_string().as_str()
+            }))
         }
 
         async fn last_event(&self, id: Uuid) -> sqlx::Result<i64> {

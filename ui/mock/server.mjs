@@ -1053,6 +1053,14 @@ function handleCall(conn, message) {
     case 'session/prompt': {
       if (!needLoaded()) return;
       const messageId = params._meta?.sloppod?.messageId ?? randomUUID();
+      // Like the runtime: a message sent again isn't run twice.
+      const received = session.log.some(
+        (entry) => entry.update.sessionUpdate === 'user_message_chunk' && entry.update.messageId === messageId,
+      );
+      if (received || waitingList(session).some((waiting) => waiting.id === messageId)) {
+        conn.respond(id, { stopReason: 'end_turn', _meta: { sloppod: { alreadyReceived: true } } });
+        return;
+      }
       // Tests drop the connection as a prompt arrives, before or after the runtime takes it.
       const drop = dropNextPrompt;
       dropNextPrompt = null;
