@@ -8,7 +8,7 @@ use envoy_types::ext_authz::v3::pb::{
     HttpStatusCode,
 };
 use envoy_types::ext_authz::v3::{
-    CheckRequestExt, CheckResponseExt, DeniedHttpResponseBuilder, OkHttpResponseBuilder,
+    CheckResponseExt, DeniedHttpResponseBuilder, OkHttpResponseBuilder,
 };
 use sloppod_contracts::{Decision, HttpRequest};
 use tonic::{Request, Response, Status};
@@ -57,9 +57,13 @@ fn deny_with(status: u16, message: &str, content_type: Option<&str>) -> CheckRes
 
 impl Authorizer {
     async fn decide(&self, check: CheckRequest) -> CheckResponse {
-        let Some(ip) = check.get_client_address().cloned() else {
-            return deny("sloppod: request without a source address.\n");
-        };
+        // Which session's listener the request came through, stamped by the listener itself (#196); Cilium chooses
+        // the listener from the session's own policy, so the pod can't name another.
+        let session_id = check
+            .attributes
+            .as_ref()
+            .and_then(|a| a.context_extensions.get("session"))
+            .and_then(|s| s.parse::<uuid::Uuid>().ok());
         let Some(http) = check
             .attributes
             .as_ref()
@@ -74,9 +78,9 @@ impl Authorizer {
             .next()
             .unwrap_or_default()
             .to_ascii_lowercase();
-        let Some(session_id) = self.state.pods.session_for_ip(&ip) else {
-            tracing::warn!(%ip, %host, "request from an unknown pod");
-            return deny("sloppod: request from a pod that isn't a known session.\n");
+        let Some(session_id) = session_id else {
+            tracing::warn!(%host, "request through a listener that names no session");
+            return deny("sloppod: request through a listener that names no session.\n");
         };
         let session = match db::get_session(&self.state.db, session_id).await {
             Ok(Some(session)) => session,

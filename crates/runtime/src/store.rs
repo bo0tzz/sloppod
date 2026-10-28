@@ -16,7 +16,10 @@ pub trait SessionStore: Send + Sync {
     async fn set_session_model(&self, id: Uuid, model: &str) -> sqlx::Result<()>;
     /// Appends to the session's event log and returns the event's sequence number.
     async fn append_event(&self, id: Uuid, payload: &Value) -> sqlx::Result<i64>;
-    async fn events(&self, id: Uuid) -> sqlx::Result<Vec<(i64, Value)>>;
+    /// The sequence number of the session's latest event; 0 when it has none.
+    async fn last_event(&self, id: Uuid) -> sqlx::Result<i64>;
+    /// Up to `limit` of the session's events after `after`, in order.
+    async fn events(&self, id: Uuid, after: i64, limit: i64) -> sqlx::Result<Vec<(i64, Value)>>;
     /// Keeps a session's queued messages, `{id, blocks}` each, replacing what was kept; none clears them.
     async fn save_queue(&self, id: Uuid, queue: &[Value]) -> sqlx::Result<()>;
     /// Every session's kept queue, for after a restart.
@@ -51,8 +54,12 @@ impl SessionStore for PgStore {
         db::append_event(&self.0, id, payload).await
     }
 
-    async fn events(&self, id: Uuid) -> sqlx::Result<Vec<(i64, Value)>> {
-        db::events(&self.0, id).await
+    async fn last_event(&self, id: Uuid) -> sqlx::Result<i64> {
+        db::last_event(&self.0, id).await
+    }
+
+    async fn events(&self, id: Uuid, after: i64, limit: i64) -> sqlx::Result<Vec<(i64, Value)>> {
+        db::events(&self.0, id, after, limit).await
     }
 
     async fn pending_prompt(&self, id: Uuid) -> sqlx::Result<Option<String>> {
@@ -147,11 +154,27 @@ pub mod memory {
             Ok(seq)
         }
 
-        async fn events(&self, id: Uuid) -> sqlx::Result<Vec<(i64, Value)>> {
+        async fn last_event(&self, id: Uuid) -> sqlx::Result<i64> {
             let events = self.events.lock().unwrap();
             Ok(events
                 .iter()
                 .filter(|(s, _, _)| *s == id)
+                .map(|(_, seq, _)| *seq)
+                .max()
+                .unwrap_or(0))
+        }
+
+        async fn events(
+            &self,
+            id: Uuid,
+            after: i64,
+            limit: i64,
+        ) -> sqlx::Result<Vec<(i64, Value)>> {
+            let events = self.events.lock().unwrap();
+            Ok(events
+                .iter()
+                .filter(|(s, seq, _)| *s == id && *seq > after)
+                .take(limit as usize)
                 .map(|(_, seq, p)| (*seq, p.clone()))
                 .collect())
         }

@@ -292,6 +292,22 @@ async fn reconcile(state: &AppState) {
                 .await;
         }
     }
+    // Parking releases a session's egress, but one that failed to, or was parked before it did, still holds it.
+    match db::parked_sessions(&state.db).await {
+        Ok(parked) => {
+            for session in parked {
+                let id = session.id.to_string();
+                if let Err(e) = state
+                    .enforcer
+                    .release(&id, &lifecycle::pod_labels(&id))
+                    .await
+                {
+                    tracing::warn!(session = %session.id, error = %e, "releasing a parked session's egress");
+                }
+            }
+        }
+        Err(e) => tracing::error!(error = %e, "listing parked sessions"),
+    }
     // After the pods are placed, so a queue for a running session waits for its agent and a parked one wakes for it;
     // before anything that can queue a notice, which would otherwise replace the kept queue before it's read.
     state.hub.restore_queues().await;
