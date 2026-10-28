@@ -90,6 +90,9 @@ enum Start {
     Stopped(Vec<Queued>),
     /// Back in the queue, and run on a newer agent that was up and idle.
     Requeued(Option<(Arc<AgentConn>, Vec<Queued>)>),
+    /// The first message couldn't be marked as taken, so running it could run it twice: nothing runs, its callers
+    /// get an error, and the first message stays stored for the agent's next start.
+    Failed(Vec<Queued>),
 }
 
 /// Why a session couldn't be parked.
@@ -291,9 +294,23 @@ impl Hub {
         }
         .unwrap_or_else(|| json!({}));
         match turn {
+            // An agent that came up but never got its first message (the link dropped before it ran) gets it now.
             None => {
-                self.agent_ready(id, agent, running.ready.agent_session_id, agent_state, None)
-                    .await
+                let pending = match self.store.pending_prompt(id).await {
+                    Ok(pending) => pending,
+                    Err(e) => {
+                        tracing::warn!(session = %id, error = %e, "reading the first message");
+                        None
+                    }
+                };
+                self.agent_ready(
+                    id,
+                    agent,
+                    running.ready.agent_session_id,
+                    agent_state,
+                    pending,
+                )
+                .await
             }
             Some(turn) => {
                 {
@@ -386,13 +403,22 @@ impl Hub {
                         let agent_session_id = agent_session_id.clone();
                         // The first message is kept until now, so an agent that went before it ran leaves it for
                         // the next; from here this turn has it.
-                        if pending.is_some()
-                            && let Err(e) = self.store.clear_pending_prompt(id).await
-                        {
-                            tracing::warn!(session = %id, error = %e, "clearing the first message");
+                        let cleared = match pending {
+                            Some(_) => self.store.clear_pending_prompt(id).await,
+                            None => Ok(()),
+                        };
+                        match cleared {
+                            Ok(()) => {
+                                self.set_phase(id, Phase::Working).await;
+                                Start::Run(agent_session_id, queued)
+                            }
+                            Err(e) => {
+                                tracing::error!(session = %id, error = %e, "clearing the first message");
+                                state.turn_running = false;
+                                self.set_phase(id, Phase::Idle).await;
+                                Start::Failed(queued)
+                            }
                         }
-                        self.set_phase(id, Phase::Working).await;
-                        Start::Run(agent_session_id, queued)
                     }
                     _ if state.stopped => Start::Stopped(queued),
                     _ => {
@@ -421,6 +447,15 @@ impl Hub {
                 Start::Stopped(queued) => {
                     for reply in queued.into_iter().filter_map(|q| q.reply) {
                         let _ = reply.send(Err(RpcError::new(-32002, "the session was stopped")));
+                    }
+                    return;
+                }
+                Start::Failed(queued) => {
+                    for reply in queued.into_iter().filter_map(|q| q.reply) {
+                        let _ = reply.send(Err(RpcError::new(
+                            -32603,
+                            "the session's store failed; try again",
+                        )));
                     }
                     return;
                 }

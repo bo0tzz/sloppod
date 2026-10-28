@@ -17,6 +17,8 @@ pub trait SessionStore: Send + Sync {
     /// Appends to the session's event log and returns the event's sequence number.
     async fn append_event(&self, id: Uuid, payload: &Value) -> sqlx::Result<i64>;
     async fn events(&self, id: Uuid) -> sqlx::Result<Vec<(i64, Value)>>;
+    /// The session's first message, until a turn has started with it.
+    async fn pending_prompt(&self, id: Uuid) -> sqlx::Result<Option<String>>;
     /// Forgets the session's first message, once a turn has started with it.
     async fn clear_pending_prompt(&self, id: Uuid) -> sqlx::Result<()>;
 }
@@ -49,6 +51,10 @@ impl SessionStore for PgStore {
         db::events(&self.0, id).await
     }
 
+    async fn pending_prompt(&self, id: Uuid) -> sqlx::Result<Option<String>> {
+        db::pending_prompt(&self.0, id).await
+    }
+
     async fn clear_pending_prompt(&self, id: Uuid) -> sqlx::Result<()> {
         db::clear_pending_prompt(&self.0, id).await
     }
@@ -66,8 +72,12 @@ pub mod memory {
     pub struct MemoryStore {
         sessions: Mutex<HashMap<Uuid, SessionRow>>,
         events: Mutex<Vec<(Uuid, i64, Value)>>,
+        /// Sessions' first messages, until a turn starts with them.
+        pub pending_prompts: Mutex<HashMap<Uuid, String>>,
         /// Sessions whose first message a turn has started with.
         pub cleared_prompts: Mutex<Vec<Uuid>>,
+        /// Makes clearing a first message fail, as a lost database would.
+        pub fail_clearing: std::sync::atomic::AtomicBool,
     }
 
     impl MemoryStore {
@@ -132,7 +142,15 @@ pub mod memory {
                 .collect())
         }
 
+        async fn pending_prompt(&self, id: Uuid) -> sqlx::Result<Option<String>> {
+            Ok(self.pending_prompts.lock().unwrap().get(&id).cloned())
+        }
+
         async fn clear_pending_prompt(&self, id: Uuid) -> sqlx::Result<()> {
+            if self.fail_clearing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(sqlx::Error::PoolTimedOut);
+            }
+            self.pending_prompts.lock().unwrap().remove(&id);
             self.cleared_prompts.lock().unwrap().push(id);
             Ok(())
         }

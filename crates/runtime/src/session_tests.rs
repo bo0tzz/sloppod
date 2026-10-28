@@ -719,6 +719,78 @@ async fn a_first_message_taken_for_a_replaced_agent_stays_stored_for_the_next() 
 }
 
 #[tokio::test]
+async fn an_adopted_idle_agent_runs_the_first_message_it_never_got() {
+    // The agent came up, then the link dropped before its first turn started: the message is still stored.
+    let mut h = Harness::starting().await;
+    h.store
+        .pending_prompts
+        .lock()
+        .unwrap()
+        .insert(h.id, "Hello".into());
+    h.hub
+        .adopt_agent(
+            h.id,
+            &h.agent,
+            RunningAgent {
+                ready: AgentReady {
+                    agent_session_id: "agent-session".into(),
+                    capabilities: json!({}),
+                },
+                open: Vec::new(),
+                waiting: Vec::new(),
+            },
+        )
+        .await;
+    let request = loop {
+        let message = h.next().await;
+        if message["method"] == "session/prompt" {
+            break message;
+        }
+    };
+    assert_eq!(prompt_text(&request), ["Hello"]);
+    assert!(h.store.pending_prompts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_first_message_that_cant_be_marked_taken_isnt_run() {
+    let mut h = Harness::starting().await;
+    h.store
+        .pending_prompts
+        .lock()
+        .unwrap()
+        .insert(h.id, "Hello".into());
+    h.store
+        .fail_clearing
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    h.hub
+        .agent_ready(
+            h.id,
+            &h.agent,
+            "agent-session".into(),
+            json!({}),
+            Some("Hello".into()),
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Nothing reached the agent, the message is still stored for the next start, and the session isn't stuck.
+    while let Ok(message) = h.to_agent.try_recv() {
+        if let ToSupervisor::Acp { message } = message {
+            assert_ne!(message["method"], "session/prompt");
+        }
+    }
+    assert_eq!(
+        h.store
+            .pending_prompts
+            .lock()
+            .unwrap()
+            .get(&h.id)
+            .map(String::as_str),
+        Some("Hello")
+    );
+    assert_eq!(h.phase().await, "idle");
+}
+
+#[tokio::test]
 async fn a_batch_that_can_no_longer_start_in_a_stopped_session_fails() {
     let h = Harness::ready().await;
     let agent = h.agent.clone();
