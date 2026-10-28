@@ -59,6 +59,47 @@ test('creates a session and streams the agent output', async ({ page }) => {
   await expect(page.getByTestId('session-row').filter({ hasText: prompt })).toBeVisible();
 });
 
+test("copies an agent message's Markdown", async ({ page, context }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  await createSession(page, 'Add backoff to the reconnect logic in sloppod');
+  await finishTurn(page);
+
+  const message = agentMessages(page).filter({ hasText: FINAL });
+  const copy = message.getByRole('button', { name: 'Copy message' });
+  const actions = message.getByTestId('message-actions');
+  await page.mouse.move(0, 0);
+  await expect(actions).toHaveCSS('opacity', '0');
+  await message.hover();
+  await expect(actions).toHaveCSS('opacity', '1');
+
+  await copy.click();
+  await expect(message.getByRole('button', { name: 'Copied' })).toBeVisible();
+  const copied = await page.evaluate(() => navigator.clipboard.readText());
+  expect(copied).toMatch(/^Done\. The tests pass and I've proposed a pull request, \*\*.+\*\*, from `sloppod\/.+`\./);
+  await expect(message.getByRole('button', { name: 'Copy message' })).toBeVisible();
+
+  await expect(userMessages(page).getByRole('button', { name: 'Copy message' })).toHaveCount(0);
+
+  // A denied clipboard says so on the button.
+  await page.evaluate(() => {
+    navigator.clipboard.writeText = () => Promise.reject(new DOMException('Denied', 'NotAllowedError'));
+  });
+  await message.getByRole('button', { name: 'Copy message' }).click();
+  await expect(message.getByRole('button', { name: "Couldn't copy" })).toBeVisible();
+  await expect(message.getByRole('status')).toHaveText("Couldn't copy the message");
+});
+
+test('touch screens always show the copy button', async ({ page, browser }) => {
+  await createSession(page, 'Add backoff to the reconnect logic in sloppod');
+  await finishTurn(page);
+
+  const touch = await browser.newContext({ hasTouch: true, isMobile: true, viewport: { width: 412, height: 915 } });
+  const phone = await touch.newPage();
+  await phone.goto(page.url());
+  await expect(agentMessages(phone).filter({ hasText: FINAL }).getByTestId('message-actions')).toHaveCSS('opacity', '1');
+  await touch.close();
+});
+
 test('answers a permission request', async ({ page }) => {
   await createSession(page, 'Answer my permission request in sloppod');
 
