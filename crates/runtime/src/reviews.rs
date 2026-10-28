@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+use sloppod_contracts::capability;
 use sloppod_contracts::{Grant, READ_ONLY, ReviewSubject};
 use sloppod_protocol::api::{ProposalStatus, ReviewPolicy, SessionKind};
 use uuid::Uuid;
@@ -64,11 +65,11 @@ pub async fn start(
         .ok_or_else(|| anyhow::anyhow!("the proposing session is gone"))?;
     let id = Uuid::new_v4();
     let grants = [
-        Grant::new("codex", json!({})),
-        Grant::new("github", json!({})),
-        Grant::new("packages", json!({})),
+        Grant::new(capability::CODEX, json!({})),
+        Grant::new(capability::GITHUB, json!({})),
+        Grant::new(capability::PACKAGES, json!({})),
         Grant::new(
-            "repo",
+            capability::REPO,
             json!({"repo": subject.repo, "access": READ_ONLY, "branch": subject.head, "commit": subject.head_sha}),
         ),
     ];

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use base64::Engine;
 use graphql_parser::query::{Definition, OperationDefinition};
+use sloppod_contracts::capability;
 use sloppod_contracts::{
     Decision, Error, HttpRequest, Manifest, RequestPolicy, Result, SessionContext,
 };
@@ -197,7 +198,7 @@ impl RequestPolicy for GitHubPolicy {
     }
 
     async fn decide(&self, session: &SessionContext, request: &HttpRequest) -> Result<Decision> {
-        if !session.has("github") {
+        if !session.has(capability::GITHUB) {
             return Ok(Decision::deny(
                 "sloppod: this session has no GitHub access.\n",
             ));

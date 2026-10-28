@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use sloppod_contracts::capability;
 use sloppod_contracts::{
     Decision, Error, HttpRequest, Manifest, RequestPolicy, Result, SessionContext,
 };
@@ -45,7 +46,7 @@ impl RequestPolicy for CodexPolicy {
     }
 
     async fn decide(&self, session: &SessionContext, request: &HttpRequest) -> Result<Decision> {
-        if !session.has("codex") {
+        if !session.has(capability::CODEX) {
             return Ok(Decision::deny(
                 "sloppod: this session has no Codex access.\n",
             ));
