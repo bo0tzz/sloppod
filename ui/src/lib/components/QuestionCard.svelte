@@ -3,7 +3,7 @@
   import { mdiChatQuestionOutline } from '@mdi/js';
   import type { ElicitationField, ElicitationResponse, EnumOption } from '#lib/acp/types.ts';
   import { loadAnswer, saveAnswer } from '#lib/drafts.ts';
-  import { questionKey, type PendingQuestion } from '#lib/session.svelte.ts';
+  import type { PendingQuestion } from '#lib/session.svelte.ts';
   import Markdown from './Markdown.svelte';
 
   let {
@@ -30,10 +30,11 @@
     }, []),
   );
   // The answer being written survives a reload or a reconnect, which sends the question again (#300).
+  // Only a question with an identity of its own keeps its answer: another one might come back under the same key.
   // svelte-ignore state_referenced_locally
-  const key = questionKey(request);
+  const { key, stable } = request;
   // svelte-ignore state_referenced_locally
-  const kept = loadAnswer(request.sessionId, key);
+  const kept = stable ? loadAnswer(request.sessionId, key) : null;
   let current = $state(kept?.step ?? 0);
   const last = $derived(current >= steps.length - 1);
 
@@ -47,13 +48,13 @@
       ),
   );
   $effect(() => {
-    saveAnswer(request.sessionId, key, { values: $state.snapshot(values), step: current });
+    if (stable) saveAnswer(request.sessionId, key, { values: $state.snapshot(values), step: current });
   });
 
   /** Answers or skips the question, and forgets the answer kept for it. */
   function respond(response: ElicitationResponse) {
     if (request.stale) return;
-    saveAnswer(request.sessionId, key, null);
+    if (stable) saveAnswer(request.sessionId, key, null);
     onRespond(response);
   }
   /** The option whose preview is shown, per field: the one hovered or focused, else the one picked. */

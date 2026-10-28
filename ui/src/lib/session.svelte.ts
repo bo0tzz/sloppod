@@ -28,15 +28,27 @@ export type PendingPermission = RequestPermissionRequest & { rpcId: RequestId };
  * A question from the agent. `stale` while the connection is down: it can't be answered then, and the runtime sends
  * it again once the session has loaded, as a new request that takes its place.
  */
-export type PendingQuestion = ElicitationRequest & { rpcId: RequestId; stale?: boolean };
+export type PendingQuestion = ElicitationRequest & {
+  rpcId: RequestId;
+  stale?: boolean;
+  /** What tells it apart: see `questionKey`. */
+  key: string;
+  /** Whether `key` stays the same when it's sent again, so it can be matched and its answer kept across reloads. */
+  stable: boolean;
+};
+
+/** Numbers questions that have no identity of their own, uniquely for as long as the page lives. */
+let unidentified = 0;
 
 /**
- * What stays the same about a question across reconnects, unlike the request id it comes with: an `ask_user`
- * question's own id, or the agent's tool call. A question with neither is only itself, and isn't matched when it's
- * sent again.
+ * What tells a question apart, across reconnects too: an `ask_user` question's own id, or the agent's tool call. A
+ * question with neither gets a key of its own for this page, never matched with another; request ids can't serve,
+ * since every connection numbers them from 1.
  */
-export const questionKey = (question: PendingQuestion) =>
-  question._meta?.sloppod?.questionId ?? question.toolCallId ?? `request:${String(question.rpcId)}`;
+export function questionKey(question: ElicitationRequest): { key: string; stable: boolean } {
+  const stable = question._meta?.sloppod?.questionId ?? question.toolCallId;
+  return stable ? { key: stable, stable: true } : { key: `unidentified:${++unidentified}`, stable: false };
+}
 
 /** How long a question shown while reconnecting waits to be sent again before it's taken down. */
 const STALE_QUESTION_GRACE_MS = 10_000;
@@ -267,9 +279,11 @@ export class SessionView {
           this.#conn.respondError(rpcId, -32602, `Unsupported elicitation mode: ${request.mode}`);
           return;
         }
-        const pending = { ...request, rpcId };
-        const key = questionKey(pending);
-        this.questions = [...this.questions.filter((question) => questionKey(question) !== key), pending];
+        const pending = { ...request, rpcId, ...questionKey(request) };
+        this.questions = [
+          ...this.questions.filter((question) => !(pending.stable && question.key === pending.key)),
+          pending,
+        ];
         return;
       }
     }
@@ -452,7 +466,7 @@ export class SessionView {
 
   /** Takes down questions that are no longer open (answered elsewhere, say), with the answers kept for them. */
   #closeQuestions(closed: (question: PendingQuestion) => boolean) {
-    for (const question of this.questions.filter(closed)) saveAnswer(this.id, questionKey(question), null);
+    for (const question of this.questions.filter(closed)) if (question.stable) saveAnswer(this.id, question.key, null);
     this.questions = this.questions.filter((question) => !closed(question));
   }
 
