@@ -1349,3 +1349,22 @@ test('a browser whose storage is full still sends', async ({ page }) => {
   await expect(userMessages(page).filter({ hasText: 'Sent anyway' })).toHaveCount(1);
   await finishTurn(page);
 });
+
+test('only the transcript scrolls, not the page around it', async ({ page }) => {
+  await page.setViewportSize({ width: 1000, height: 500 });
+  await createSession(page, 'Give me a long answer in sloppod');
+  await expect(page.getByText('The end.')).toBeInViewport({ timeout: 20_000 });
+  const transcript = page.getByTestId('transcript-scroller');
+  // Anything in the transcript laid out outside its scroller would stretch what's around it, most with the transcript
+  // scrolled to the top.
+  await transcript.evaluate((element) => element.scrollTo({ top: 0 }));
+  const overflowing = await transcript.evaluate((element) => {
+    const found = [];
+    for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+      if (ancestor.scrollHeight > ancestor.clientHeight) found.push(ancestor.className);
+    }
+    return { transcript: element.scrollHeight > element.clientHeight, found };
+  });
+  expect(overflowing).toEqual({ transcript: true, found: [] });
+  await expect(page.getByRole('textbox', { name: 'Prompt' })).toBeInViewport({ ratio: 1 });
+});
