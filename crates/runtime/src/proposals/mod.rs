@@ -212,6 +212,8 @@ pub async fn propose(
     // error, as is asking when the owner has no login for the reviewer. Under the policy those just skip review.
     let asked = arguments["review"].as_bool() == Some(true) || kind.is_review();
     let required = session.review == ReviewPolicy::Required;
+    // A sub-session's passed report whose review this one carries over (#247).
+    let from_sub_session = arguments["from_sub_session"].as_str().map(str::to_owned);
     let context = session.context();
     let payload = prepared(kind.as_ref(), &context, arguments)
         .await
@@ -240,6 +242,17 @@ pub async fn propose(
         }
         subject = None;
     }
+    let carried = match (&from_sub_session, &subject) {
+        (Some(child), Some(subject)) => {
+            reviews::carried_over(state, &session, child, subject).await?
+        }
+        (Some(_), None) => {
+            return Err(
+                "`from_sub_session` carries a review over, so this proposal needs one: add `review: true`".into(),
+            );
+        }
+        (None, _) => None,
+    };
     let status = if subject.is_some() {
         ProposalStatus::InReview
     } else {
@@ -255,7 +268,7 @@ pub async fn propose(
             .await
             .map_err(|e| e.to_string());
     };
-    if let Err(e) = reviews::start(state, &row, &subject, None).await {
+    if let Err(e) = reviews::start(state, &row, &subject, None, carried.as_ref()).await {
         tracing::warn!(proposal = %row.id, error = %e, "starting a review");
         let row = db::move_proposal(
             &state.db,

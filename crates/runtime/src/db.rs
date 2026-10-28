@@ -1394,6 +1394,18 @@ pub async fn move_proposal(
     .await
 }
 
+/// Review sessions none of whose proposals is still being reviewed, or was decided after `since`.
+pub async fn idle_review_sessions(db: &PgPool, since: DateTime<Utc>) -> sqlx::Result<Vec<Uuid>> {
+    sqlx::query_scalar(
+        "select s.id from sessions s where s.kind = 'review' and s.deleted_at is null \
+         and not exists (select 1 from proposals p where p.review_session_id = s.id \
+           and (p.status in ('in_review', 'changes_requested') or coalesce(p.decided_at, p.created_at) > $1))",
+    )
+    .bind(since)
+    .fetch_all(db)
+    .await
+}
+
 pub async fn set_review_session(db: &PgPool, proposal: Uuid, session: Uuid) -> sqlx::Result<()> {
     sqlx::query("update proposals set review_session_id = $2 where id = $1")
         .bind(proposal)
