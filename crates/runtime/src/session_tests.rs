@@ -828,3 +828,26 @@ async fn a_question_from_ask_user_waits_for_its_answer_without_the_agent() {
     );
     assert!(h.hub.replay(h.id).await.unwrap().permissions.is_empty());
 }
+
+#[tokio::test]
+async fn every_turn_that_ends_is_counted_with_its_error() {
+    let mut h = Harness::ready().await;
+    assert_eq!(h.hub.turns_ended(h.id).await, (0, None));
+
+    let _ok = h.prompt("Fine");
+    let request = next_prompt(&mut h.to_agent).await;
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.hub.turns_ended(h.id).await, (1, None));
+
+    // A failed turn is counted too, with its error, however quickly it ends.
+    let _failed = h.prompt("Fails");
+    let request = next_prompt(&mut h.to_agent).await;
+    let error = json!({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32603, "message": "upstream 503"}});
+    from_agent(&h.hub, h.id, &h.agent, error).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        h.hub.turns_ended(h.id).await,
+        (2, Some("upstream 503".into()))
+    );
+}

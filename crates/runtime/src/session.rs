@@ -65,6 +65,10 @@ struct LiveState {
     /// The agent is replaying history for `session/load`; that replay isn't new.
     loading: bool,
     turn_running: bool,
+    /// How many turns the hub sent have ended, and why the last one failed, if it did. A watcher compares the count
+    /// with the one it saw, so no turn's end is missed between its looks.
+    turns_ended: u64,
+    last_turn_error: Option<String>,
     permissions: HashMap<u64, Permission>,
     next_permission: u64,
     queue: Vec<Queued>,
@@ -327,9 +331,14 @@ impl Hub {
                 }
                 let (hub, agent) = (self.clone(), agent.clone());
                 tokio::spawn(async move {
-                    if let Ok(Err(e)) = turn.await {
-                        tracing::warn!(session = %id, error = %e, "adopted turn failed");
-                    }
+                    let error = match turn.await {
+                        Ok(Err(e)) => {
+                            tracing::warn!(session = %id, error = %e, "adopted turn failed");
+                            Some(e.message)
+                        }
+                        _ => None,
+                    };
+                    hub.turn_finished(id, error).await;
                     hub.end_turn(id, &agent).await;
                 });
             }
@@ -773,6 +782,8 @@ impl Hub {
                 json!({"sessionId": agent_session_id, "prompt": blocks}),
             )
             .await;
+        self.turn_finished(id, result.as_ref().err().map(|e| e.message.clone()))
+            .await;
         self.end_turn(id, agent).await;
         result
     }
@@ -1049,6 +1060,21 @@ impl Hub {
 
     pub async fn turn_running(&self, id: Uuid) -> bool {
         self.live(id).state.lock().await.turn_running
+    }
+
+    /// Counts a turn the hub sent as ended, failed with `error` or not.
+    async fn turn_finished(&self, id: Uuid, error: Option<String>) {
+        let live = self.live(id);
+        let mut state = live.state.lock().await;
+        state.turns_ended += 1;
+        state.last_turn_error = error;
+    }
+
+    /// How many of the session's turns have ended, and why the last one failed, if it did.
+    pub async fn turns_ended(&self, id: Uuid) -> (u64, Option<String>) {
+        let live = self.live(id);
+        let state = live.state.lock().await;
+        (state.turns_ended, state.last_turn_error.clone())
     }
 
     /// Parks a session between turns (ADR 5): lets go of its agent, then `suspend` ends its pod. Messages sent
