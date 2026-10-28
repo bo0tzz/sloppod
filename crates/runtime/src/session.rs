@@ -1,6 +1,6 @@
 //! Live session state between the agent (over the supervisor link) and any number of UIs (over `/acp`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -112,6 +112,9 @@ struct LiveState {
     /// The agent is compacting its context; steers wait for it to end. A turn's end ends it too, in case the
     /// compaction's own end never came.
     compacting: bool,
+    /// The agent's tool calls that have started and not yet completed or failed, by id; notices wait for them. A
+    /// turn's end ends them too.
+    tools: HashSet<String>,
     /// How many turns the hub sent have ended, and why the last one failed, if it did. A watcher compares the count
     /// with the one it saw, so no turn's end is missed between its looks.
     turns_ended: u64,
@@ -129,9 +132,11 @@ struct LiveState {
 }
 
 impl Live {
-    fn end_compaction(&self, state: &mut LiveState) {
+    /// Nothing of the agent's work is under way any more: its turn ended, or it was replaced, parked or stopped.
+    fn end_work(&self, state: &mut LiveState) {
         state.compacting = false;
-        self.compaction_ended.notify_waiters();
+        state.tools.clear();
+        self.boundary.notify_waiters();
     }
 }
 
@@ -141,7 +146,8 @@ pub struct Live {
     state: Mutex<LiveState>,
     /// Held while the session is parked or woken, so the two never overlap.
     transition: Mutex<()>,
-    compaction_ended: Notify,
+    /// Notified when something a steer waits for ends: a compaction, a tool call, a permission request, the turn.
+    boundary: Notify,
 }
 
 /// What `run_queued` does with its batch.
@@ -251,7 +257,7 @@ impl Hub {
                     events: broadcast::channel(4096).0,
                     state: Mutex::default(),
                     transition: Mutex::default(),
-                    compaction_ended: Notify::new(),
+                    boundary: Notify::new(),
                 })
             })
             .clone()
@@ -332,7 +338,7 @@ impl Hub {
         state.agent_session_id = None;
         state.turn_running = false;
         state.commands = None;
-        live.end_compaction(&mut state);
+        live.end_work(&mut state);
     }
 
     /// What the supervisor of `agent`, the session's current one, says about the agent's running commands.
@@ -869,7 +875,7 @@ impl Hub {
             state.agent_session_id = None;
             state.turn_running = false;
             state.commands = None;
-            live.end_compaction(&mut state);
+            live.end_work(&mut state);
             self.set_phase(id, Phase::Disconnected).await;
             state
                 .permissions
@@ -909,7 +915,24 @@ impl Hub {
                 if update["status"] == "in_progress" {
                     state.compacting = true;
                 } else {
-                    live.end_compaction(&mut state);
+                    state.compacting = false;
+                    live.boundary.notify_waiters();
+                }
+            }
+            if let Some(tool) = update["toolCallId"].as_str() {
+                match update["status"].as_str() {
+                    Some("completed" | "failed") => {
+                        if state.tools.remove(tool) {
+                            live.boundary.notify_waiters();
+                        }
+                    }
+                    Some("pending" | "in_progress") => {
+                        state.tools.insert(tool.to_owned());
+                    }
+                    _ if update["sessionUpdate"] == "tool_call" => {
+                        state.tools.insert(tool.to_owned());
+                    }
+                    _ => {}
                 }
             }
         }
@@ -980,22 +1003,24 @@ impl Hub {
         );
     }
 
-    /// The first answer to a permission request wins; later ones are ignored.
+    /// The first answer to a permission request wins; later ones are ignored. `by` says who answered, for the log.
     pub async fn answer_permission(
         self: &Arc<Self>,
         id: Uuid,
         pid: u64,
         result: Result<Value, RpcError>,
+        by: &str,
     ) {
         let permission = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
             let permission = state.permissions.remove(&pid);
             let blocked = |p: &Permission| matches!(p.asker, Asker::Agent { .. });
-            if permission.as_ref().is_some_and(blocked)
-                && !state.permissions.values().any(blocked)
-                && state.agent.is_some()
-            {
+            let agent_asked = permission.as_ref().is_some_and(blocked);
+            if agent_asked {
+                live.boundary.notify_waiters();
+            }
+            if agent_asked && !state.permissions.values().any(blocked) && state.agent.is_some() {
                 let phase = if state.turn_running {
                     Phase::Working
                 } else {
@@ -1005,8 +1030,20 @@ impl Hub {
             }
             permission
         };
-        let Some(permission) = permission else { return };
+        let Some(permission) = permission else {
+            tracing::debug!(session = %id, permission = pid, by, "ignoring an answer to a settled permission request");
+            return;
+        };
         let tool_call_id = tool_call_id(&permission.params);
+        tracing::info!(
+            session = %id,
+            permission = pid,
+            method = %permission.method,
+            tool_call = tool_call_id.as_deref().unwrap_or_default(),
+            outcome = %answer_outcome(&result),
+            by,
+            "permission request answered"
+        );
         match permission.asker {
             Asker::Agent { request_id, agent } => agent.respond(request_id, result),
             Asker::Tool { questions } => {
@@ -1177,7 +1214,7 @@ impl Hub {
             if !state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
                 return;
             }
-            live.end_compaction(&mut state);
+            live.end_work(&mut state);
             let agent_up = state.agent_session_id.is_some();
             state.turn_running = agent_up && !state.queue.is_empty();
             let next = state.turn_running.then(|| std::mem::take(&mut state.queue));
@@ -1225,7 +1262,7 @@ impl Hub {
         self.broadcast_queue(id).await;
         self.record_user_message(id, &json!(queued.blocks), true, queued.id)
             .await;
-        let result = self.steer_in(id, queued.blocks, None).await;
+        let result = self.steer_in(id, queued.blocks, None, false).await;
         if let Some(reply) = queued.reply {
             let _ = reply.send(result.clone());
         }
@@ -1327,7 +1364,7 @@ impl Hub {
             Delivery::Steer(held) => {
                 let hub = self.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = hub.steer_in(id, blocks.clone(), held).await {
+                    if let Err(e) = hub.steer_in(id, blocks.clone(), held, true).await {
                         tracing::warn!(session = %id, error = %e, "steering a notice in");
                         if let Some(key) = held {
                             hub.requeue_held(id, key).await;
@@ -1358,15 +1395,16 @@ impl Hub {
 
     /// Steers blocks into the running turn. If that turn has just ended they start a new one here, so the turn
     /// is tracked like any other rather than run detached by the adapter. `held` is released once they reach the
-    /// agent.
+    /// agent. A `notice` waits for a moment between the agent's tool calls (see `before_steer`).
     async fn steer_in(
         self: &Arc<Self>,
         id: Uuid,
         blocks: Vec<Value>,
         held: Option<Uuid>,
+        notice: bool,
     ) -> Result<Value, RpcError> {
         for _ in 0..10 {
-            self.after_compaction(id).await;
+            self.before_steer(id, notice).await;
             let (agent, agent_session_id) = self.agent_for(id).await?;
             let (request, answer) = agent.send_request(
                 "_session/steering",
@@ -1407,16 +1445,27 @@ impl Hub {
         ))
     }
 
-    /// A steer pre-empts whatever the agent is generating, and a compaction it pre-empts is cancelled rather than
-    /// resumed. So steers wait for one to end, however long it takes.
-    async fn after_compaction(&self, id: Uuid) {
+    /// A steer pre-empts whatever the agent is doing (the adapter doesn't let us ask it to wait), and a compaction it
+    /// pre-empts is cancelled rather than resumed. So steers wait for one to end, however long it takes. A notice
+    /// also waits for the agent's tool calls and permission requests to end, or its turn: one it pre-empts is
+    /// cancelled, which the agent reads as the user telling it to stop. The user's own steers go in at once.
+    async fn before_steer(&self, id: Uuid, notice: bool) {
         let live = self.live(id);
         loop {
-            let ended = live.compaction_ended.notified();
-            if !live.state.lock().await.compacting {
-                return;
+            let changed = live.boundary.notified();
+            {
+                let state = live.state.lock().await;
+                let busy = notice
+                    && (!state.tools.is_empty()
+                        || state
+                            .permissions
+                            .values()
+                            .any(|p| matches!(p.asker, Asker::Agent { .. })));
+                if !state.compacting && !busy {
+                    return;
+                }
             }
-            ended.await;
+            changed.await;
         }
     }
 
@@ -1442,10 +1491,12 @@ impl Hub {
         }
         self.record_user_message(id, &params["prompt"], true, message_id)
             .await;
-        self.steer_in(id, blocks, None).await
+        self.steer_in(id, blocks, None, false).await
     }
 
-    pub async fn cancel(self: &Arc<Self>, id: Uuid) {
+    /// Cancels the running turn; `by` says who did, for the log.
+    pub async fn cancel(self: &Arc<Self>, id: Uuid, by: &str) {
+        tracing::info!(session = %id, by, "cancelling the turn");
         if let Ok((agent, agent_session_id)) = self.agent_for(id).await {
             agent.notify("session/cancel", json!({"sessionId": agent_session_id}));
         }
@@ -1467,7 +1518,8 @@ impl Hub {
             } else {
                 json!({"outcome": {"outcome": "cancelled"}})
             };
-            self.answer_permission(id, pid, Ok(answer)).await;
+            self.answer_permission(id, pid, Ok(answer), &format!("the cancel by {by}"))
+                .await;
         }
     }
 
@@ -1616,7 +1668,7 @@ impl Hub {
             if state.turn_running {
                 return Err(ParkError::InTurn);
             }
-            live.end_compaction(&mut state);
+            live.end_work(&mut state);
             (state.agent.take(), state.agent_session_id.take())
         };
         // Parked before the pod ends, so its supervisor's attempts to reconnect meanwhile are turned away.
@@ -1723,7 +1775,7 @@ impl Hub {
             let live = self.live(id);
             let mut state = live.state.lock().await;
             state.stopped = true;
-            live.end_compaction(&mut state);
+            live.end_work(&mut state);
             let queued = std::mem::take(&mut state.queue);
             state.in_flight.clear();
             self.save_queue(id, &state).await;
@@ -1744,6 +1796,21 @@ fn client_message_id(params: &Value) -> Option<Uuid> {
     params["_meta"]["sloppod"]["messageId"]
         .as_str()
         .and_then(|s| s.parse().ok())
+}
+
+/// What a permission request or question was answered with, for the log.
+fn answer_outcome(result: &Result<Value, RpcError>) -> String {
+    match result {
+        Ok(answer) => match (
+            answer["outcome"]["outcome"].as_str(),
+            answer["action"].as_str(),
+        ) {
+            (Some("selected"), _) => format!("selected {}", answer["outcome"]["optionId"]),
+            (Some(outcome), _) | (None, Some(outcome)) => outcome.to_owned(),
+            (None, None) => answer.to_string(),
+        },
+        Err(e) => format!("error {}: {}", e.code, e.message),
+    }
 }
 
 fn tool_call_id(params: &Value) -> Option<String> {
