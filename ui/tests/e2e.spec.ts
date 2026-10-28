@@ -1059,3 +1059,18 @@ test('a message a reload cut off is sent once the session loads', async ({ page 
   await expect(userMessages(page).filter({ hasText: 'Sent just before the reload' })).toHaveCount(1);
   expect(await page.evaluate((session) => localStorage.getItem(`sloppod.unconfirmed.${session}`), id)).toBeNull();
 });
+
+test('a browser whose storage is full still sends', async ({ page }) => {
+  await page.addInitScript(() => {
+    Storage.prototype.setItem = () => {
+      throw new DOMException('full', 'QuotaExceededError');
+    };
+  });
+  await createSession(page, 'Work without storage in sloppod');
+  await finishTurn(page);
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Sent anyway');
+  await box.press('Enter');
+  await expect(userMessages(page).filter({ hasText: 'Sent anyway' })).toHaveCount(1);
+  await finishTurn(page);
+});
