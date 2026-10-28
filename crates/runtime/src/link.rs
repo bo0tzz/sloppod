@@ -475,7 +475,10 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
                 from_agent(&state.hub, session_id, &agent, message).await
             }
             FromSupervisor::Transcript { files } => {
-                for file in files {
+                for file in files
+                    .into_iter()
+                    .filter(|f| transcript_name_ok(session_id, &f.name))
+                {
                     let Ok(content) =
                         base64::engine::general_purpose::STANDARD.decode(&file.content_b64)
                     else {
@@ -492,7 +495,7 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
                 name,
                 offset,
                 content_b64,
-            } => {
+            } if transcript_name_ok(session_id, &name) => {
                 let Ok(content) = base64::engine::general_purpose::STANDARD.decode(&content_b64)
                 else {
                     tracing::warn!(session = %session_id, file = %name, "undecodable transcript sync");
@@ -516,6 +519,8 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
                     }
                 }
             }
+            // Its name was refused above.
+            FromSupervisor::TranscriptAppend { .. } => {}
             FromSupervisor::AgentExited { code } => {
                 tracing::warn!(session = %session_id, ?code, "agent exited");
             }
@@ -528,6 +533,15 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
     agent.close();
     state.hub.detach_agent(session_id, &agent).await;
     writer.abort();
+}
+
+/// A transcript file name the session's pod can be given back; one that isn't is dropped and logged.
+fn transcript_name_ok(session: Uuid, name: &str) -> bool {
+    let ok = sloppod_protocol::link::is_transcript_file_name(name);
+    if !ok {
+        tracing::warn!(%session, file = %name, "not storing a transcript file with that name");
+    }
+    ok
 }
 
 async fn start_agent_session(
