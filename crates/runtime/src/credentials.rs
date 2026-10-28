@@ -27,13 +27,22 @@ const CHATGPT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CHATGPT_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
 /// A ChatGPT login's tokens, as stored. Refresh tokens are single-use, so the runtime is their only holder.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChatGptTokens {
     pub access_token: String,
     refresh_token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     id_token: Option<String>,
     pub account_id: String,
+}
+
+/// Leaves the tokens out, so logging them can't leak them.
+impl std::fmt::Debug for ChatGptTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatGptTokens")
+            .field("account_id", &self.account_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ChatGptTokens {
