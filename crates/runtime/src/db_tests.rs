@@ -357,6 +357,8 @@ async fn an_agent_failure_is_news_once_until_the_agent_is_ready(db: PgPool) {
     let row = db::get_session(&db, s).await.unwrap().unwrap().to_api();
     assert_eq!(row.agent_status.as_deref(), Some("cloning"));
     assert!(db::set_agent_error(&db, s, "clone failed").await.unwrap());
+    // The next attempt fails the same way: not news, but its status still clears.
+    db::set_agent_status(&db, s, "cloning").await.unwrap();
     assert!(!db::set_agent_error(&db, s, "clone failed").await.unwrap());
     let row = db::get_session(&db, s).await.unwrap().unwrap().to_api();
     assert_eq!(row.agent_status, None);

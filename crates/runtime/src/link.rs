@@ -85,6 +85,7 @@ pub struct AgentConn {
     tx: mpsc::UnboundedSender<ToSupervisor>,
     pending: Mutex<HashMap<i64, oneshot::Sender<Result<Value, RpcError>>>>,
     next_id: AtomicI64,
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl AgentConn {
@@ -93,6 +94,7 @@ impl AgentConn {
             tx,
             pending: Mutex::default(),
             next_id: AtomicI64::new(1),
+            closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -157,7 +159,13 @@ impl AgentConn {
     }
 
     /// Fails every outstanding request; the link is gone.
+    /// Whether the link this connection was on has gone.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
     pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
         self.pending.lock().expect("pending lock").clear();
     }
 }
@@ -500,14 +508,17 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
                         start_agent_session(&state, &agent, &session, &agent_launch).await
                     {
                         tracing::error!(session = %session.id, error = %e, "starting agent session");
-                        agent_failed(
-                            &state,
-                            session.id,
-                            "The agent couldn't start",
-                            &format!("{e:#}"),
-                        )
-                        .await;
-                        let _ = start_failed.send(());
+                        // A link that went down took the startup's requests with it; that isn't the agent failing.
+                        if !agent.is_closed() {
+                            agent_failed(
+                                &state,
+                                session.id,
+                                "The agent couldn't start",
+                                &format!("{e:#}"),
+                            )
+                            .await;
+                            let _ = start_failed.send(());
+                        }
                     }
                 });
             }

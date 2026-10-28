@@ -296,14 +296,15 @@ pub async fn set_agent_status(db: &PgPool, id: Uuid, status: &str) -> sqlx::Resu
 
 /// Records why the agent failed; returns whether that's news, rather than the failure it had last time.
 pub async fn set_agent_error(db: &PgPool, id: Uuid, error: &str) -> sqlx::Result<bool> {
-    let result = sqlx::query(
-        "update sessions set agent_status = null, agent_error = $2 where id = $1 and agent_error is distinct from $2",
+    let (news,): (bool,) = sqlx::query_as(
+        "update sessions s set agent_status = null, agent_error = $2 from sessions old \
+         where s.id = $1 and old.id = s.id returning old.agent_error is distinct from $2",
     )
     .bind(id)
     .bind(error)
-    .execute(db)
+    .fetch_one(db)
     .await?;
-    Ok(result.rows_affected() > 0)
+    Ok(news)
 }
 
 /// The agent is ready: what it was doing and why it failed before no longer apply.
