@@ -2,6 +2,7 @@
 //! session, and a default-deny CiliumNetworkPolicy that redirects the session's intercepted hosts to it. The clusters
 //! and the listeners' certificate are shared, in one CiliumEnvoyConfig the session ones refer to (#196).
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
 use async_trait::async_trait;
@@ -293,6 +294,50 @@ fn gone_or_deleted<T>(result: kube::Result<T>) -> Result<()> {
     }
 }
 
+impl Cilium {
+    async fn patch_policy(&self, session_id: &str, policy: Value) -> Result<()> {
+        self.policies
+            .patch(
+                &policy_name(session_id),
+                &PatchParams::apply("sloppod").force(),
+                &Patch::Apply(&policy),
+            )
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+}
+
+/// A session's CiliumNetworkPolicy: the pod is denied all egress but what `rules` (under `key`) allow, and all
+/// ingress.
+fn session_policy(
+    session_id: &str,
+    pod_labels: &BTreeMap<String, String>,
+    key: &str,
+    rules: Vec<Value>,
+) -> Value {
+    let mut policy = json!({
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "metadata": {"name": policy_name(session_id), "labels": {"sloppod.dev/session": session_id}},
+        "spec": {
+            "endpointSelector": {"matchLabels": pod_labels},
+            "enableDefaultDeny": {"egress": true, "ingress": true},
+            // With Cilium's `policyDenyResponse: icmp`, refused connections get a Destination Unreachable that
+            // has to pass ingress policy; otherwise they still hang until the client times out.
+            "ingress": [{
+                "fromEntities": ["all"],
+                "icmps": [{"fields": [
+                    {"family": "IPv4", "type": "DestinationUnreachable"},
+                    {"family": "IPv6", "type": "DestinationUnreachable"},
+                ]}],
+            }],
+        },
+    });
+    policy["spec"][key] = Value::from(rules);
+    policy
+}
+
 #[async_trait]
 impl Enforcer for Cilium {
     fn manifest(&self) -> Manifest {
@@ -341,34 +386,26 @@ impl Enforcer for Cilium {
                 "toPorts": [{"ports": [{"port": "443", "protocol": "TCP"}, {"port": "80", "protocol": "TCP"}]}],
             }));
         }
-        let policy = json!({
-            "apiVersion": "cilium.io/v2",
-            "kind": "CiliumNetworkPolicy",
-            "metadata": {"name": policy_name(&egress.session_id), "labels": {"sloppod.dev/session": egress.session_id}},
-            "spec": {
-                "endpointSelector": {"matchLabels": egress.pod_labels},
-                "enableDefaultDeny": {"egress": true, "ingress": true},
-                "egress": rules,
-                // With Cilium's `policyDenyResponse: icmp`, refused connections get a Destination Unreachable that
-                // has to pass ingress policy; otherwise they still hang until the client times out.
-                "ingress": [{
-                    "fromEntities": ["all"],
-                    "icmps": [{"fields": [
-                        {"family": "IPv4", "type": "DestinationUnreachable"},
-                        {"family": "IPv6", "type": "DestinationUnreachable"},
-                    ]}],
-                }],
-            },
-        });
-        self.policies
-            .patch(
-                &policy_name(&egress.session_id),
-                &PatchParams::apply("sloppod").force(),
-                &Patch::Apply(&policy),
-            )
-            .await
-            .map_err(err)?;
-        Ok(())
+        self.patch_policy(
+            &egress.session_id,
+            session_policy(&egress.session_id, &egress.pod_labels, "egress", rules),
+        )
+        .await
+    }
+
+    async fn release(&self, session_id: &str, pod_labels: &BTreeMap<String, String>) -> Result<()> {
+        // The pod may run on for a while after it's told to stop, so it's fenced in before its listener goes.
+        let deny = vec![json!({"toEntities": ["all"]})];
+        self.patch_policy(
+            session_id,
+            session_policy(session_id, pod_labels, "egressDeny", deny),
+        )
+        .await?;
+        gone_or_deleted(
+            self.envoy_configs
+                .delete(&listener_name(session_id), &DeleteParams::default())
+                .await,
+        )
     }
 
     async fn remove(&self, session_id: &str) -> Result<()> {
@@ -447,6 +484,28 @@ mod tests {
             manager["http_filters"][0]["typed_config"]["grpc_service"]["envoy_grpc"]["cluster_name"],
             "slop/sloppod-egress/sloppod-authz"
         );
+    }
+
+    #[test]
+    fn a_released_session_is_denied_all_egress() {
+        let labels = BTreeMap::from([("sloppod.dev/session".to_owned(), "s1".to_owned())]);
+        let policy = session_policy(
+            "s1",
+            &labels,
+            "egressDeny",
+            vec![json!({"toEntities": ["all"]})],
+        );
+        let spec = &policy["spec"];
+        assert_eq!(policy["metadata"]["name"], policy_name("s1"));
+        assert_eq!(
+            spec["endpointSelector"]["matchLabels"]["sloppod.dev/session"],
+            "s1"
+        );
+        assert_eq!(spec["enableDefaultDeny"]["egress"], true);
+        assert_eq!(spec["egressDeny"], json!([{"toEntities": ["all"]}]));
+        // Nothing allowed, and no listener left to redirect to.
+        assert!(spec.get("egress").is_none());
+        assert!(!policy.to_string().contains("listener"));
     }
 
     #[test]

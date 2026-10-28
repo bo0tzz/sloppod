@@ -287,6 +287,9 @@ pub struct EgressSpec {
 pub trait Enforcer: Send + Sync {
     fn manifest(&self) -> Manifest;
     async fn apply(&self, egress: &EgressSpec) -> Result<()>;
+    /// For a session whose pod is stopping: its pod is denied all egress, and what it held for it is freed.
+    /// `apply` restores it.
+    async fn release(&self, session_id: &str, pod_labels: &BTreeMap<String, String>) -> Result<()>;
     async fn remove(&self, session_id: &str) -> Result<()>;
 }
 

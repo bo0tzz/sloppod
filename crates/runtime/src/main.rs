@@ -292,12 +292,17 @@ async fn reconcile(state: &AppState) {
                 .await;
         }
     }
-    // Parking removes a session's egress policy, but one that failed to, or was parked before it did, still has it.
+    // Parking releases a session's egress, but one that failed to, or was parked before it did, still holds it.
     match db::parked_sessions(&state.db).await {
         Ok(parked) => {
             for session in parked {
-                if let Err(e) = state.enforcer.remove(&session.id.to_string()).await {
-                    tracing::warn!(session = %session.id, error = %e, "removing a parked session's egress policy");
+                let id = session.id.to_string();
+                if let Err(e) = state
+                    .enforcer
+                    .release(&id, &lifecycle::pod_labels(&id))
+                    .await
+                {
+                    tracing::warn!(session = %session.id, error = %e, "releasing a parked session's egress");
                 }
             }
         }
