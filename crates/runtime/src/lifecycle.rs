@@ -11,6 +11,8 @@ use crate::placement::{TOKEN_DIR, WORKDIR};
 use crate::pods::SESSION_LABEL;
 use crate::policies::SESSION_KEY;
 use crate::session::ParkError;
+use uuid::Uuid;
+
 use crate::{AppState, db};
 
 /// Gives a session its memini key when its owner has memini and it has none, e.g. because it was just created, or
@@ -168,6 +170,40 @@ const ROLL_AFTER_IDLE: chrono::Duration = chrono::Duration::minutes(15);
 /// could), so it's given longer for background work to finish.
 const ROLL_AFTER_IDLE_UNKNOWN: chrono::Duration = chrono::Duration::hours(2);
 
+/// How long a session's pod may run an older image before its agent is asked to find a quiet moment (#230).
+const NUDGE_AFTER: chrono::Duration = chrono::Duration::hours(24);
+
+/// Sessions whose agent was asked to quiet down for an image, so it's asked once per image.
+#[derive(Default)]
+pub struct ImageNudges(std::sync::Mutex<std::collections::HashSet<(Uuid, String)>>);
+
+impl ImageNudges {
+    /// Whether to nudge the session about `image` now; true only the first time.
+    fn first(&self, session: Uuid, image: &str) -> bool {
+        self.0.lock().unwrap().insert((session, image.to_owned()))
+    }
+}
+
+/// Whether a session that can't be given a new pod yet should be asked to find a quiet moment: its pod has run an
+/// older image for long enough, and no turn is running for the notice to interrupt.
+fn due_for_nudge(
+    pod_made: Option<chrono::DateTime<chrono::Utc>>,
+    running: Option<&str>,
+    current: &str,
+    in_turn: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    !in_turn
+        && running.is_some_and(|image| image != current)
+        && pod_made.is_some_and(|made| now - made >= NUDGE_AFTER)
+}
+
+const NUDGE: &str = "sloppod: a newer session image is out, and this session's pod has run the old one for over a \
+                     day. The pod is replaced with a new one the next time the session is quiet: idle, with nothing \
+                     queued and none of your commands running. When it suits your work, wrap up or stop what you \
+                     have running in the background, so that can happen. Anything still running then is ended, and \
+                     you're told what was.";
+
 /// Whether a session's pod is due to be replaced for the current session image: it runs another, and the session
 /// has been idle long enough that the replacement interrupts nothing. `busy` is [`Hub::busy`](crate::session::Hub::busy).
 fn due_for_image(
@@ -200,15 +236,22 @@ pub async fn roll_images(state: &AppState) {
     };
     let current = &state.config.session_image;
     for session in sessions {
-        let running = state.pods.session_image(session.id);
+        let pod = state.pods.session_pod(session.id);
+        let running = pod.as_ref().map(|pod| pod.image.clone());
         let busy = state.hub.busy(session.id).await;
-        if !due_for_image(
-            &session,
-            running.as_deref(),
-            current,
-            busy,
-            chrono::Utc::now(),
-        ) {
+        let now = chrono::Utc::now();
+        if !due_for_image(&session, running.as_deref(), current, busy, now) {
+            let in_turn = state.hub.turn_running(session.id).await;
+            if due_for_nudge(
+                pod.and_then(|pod| pod.made),
+                running.as_deref(),
+                current,
+                in_turn,
+                now,
+            ) && state.image_nudges.first(session.id, current)
+            {
+                state.hub.notify(session.id, NUDGE.to_owned()).await;
+            }
             continue;
         }
         let id = session.id.to_string();
@@ -273,6 +316,51 @@ pub async fn remove_session(state: &AppState, session: &db::SessionRow) -> anyho
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_session_long_on_an_old_image_is_nudged_once() {
+        let now = chrono::Utc::now();
+        let day_ago = Some(now - chrono::Duration::hours(25));
+        assert!(due_for_nudge(
+            day_ago,
+            Some("session:old"),
+            "session:new",
+            false,
+            now
+        ));
+        // Not before a day, not on the current image, not mid-turn, not without a pod.
+        assert!(!due_for_nudge(
+            Some(now - chrono::Duration::hours(2)),
+            Some("session:old"),
+            "session:new",
+            false,
+            now
+        ));
+        assert!(!due_for_nudge(
+            day_ago,
+            Some("session:new"),
+            "session:new",
+            false,
+            now
+        ));
+        assert!(!due_for_nudge(
+            day_ago,
+            Some("session:old"),
+            "session:new",
+            true,
+            now
+        ));
+        assert!(!due_for_nudge(day_ago, None, "session:new", false, now));
+
+        let nudges = ImageNudges::default();
+        let session = Uuid::now_v7();
+        assert!(nudges.first(session, "session:new"));
+        assert!(!nudges.first(session, "session:new"));
+        assert!(
+            nudges.first(session, "session:newer"),
+            "again for the next image"
+        );
+    }
+
     use chrono::{Duration, Utc};
     use sloppod_protocol::api::Phase;
     use uuid::Uuid;

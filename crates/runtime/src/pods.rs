@@ -37,19 +37,32 @@ fn sole_session(pods: &[std::sync::Arc<Pod>], ip: &str) -> Option<Uuid> {
     sessions.all(|other| other == session).then_some(session)
 }
 
-/// The image the session's live pod runs, if it has one.
-fn session_image(pods: &[std::sync::Arc<Pod>], session: Uuid) -> Option<String> {
+/// The session's live pod: the image it runs, and when it was made.
+fn session_pod(pods: &[std::sync::Arc<Pod>], session: Uuid) -> Option<SessionPod> {
     pods.iter()
         .filter(|pod| session_of(pod) == Some(session) && is_live(pod))
         .find_map(|pod| {
-            pod.spec
+            let image = pod
+                .spec
                 .as_ref()?
                 .containers
                 .iter()
                 .find(|c| c.name == "session")?
                 .image
-                .clone()
+                .clone()?;
+            let made = pod
+                .metadata
+                .creation_timestamp
+                .as_ref()
+                .and_then(|t| chrono::DateTime::from_timestamp(t.0.as_second(), 0));
+            Some(SessionPod { image, made })
         })
+}
+
+/// What's known of a session's live pod.
+pub struct SessionPod {
+    pub image: String,
+    pub made: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn is_live(pod: &Pod) -> bool {
@@ -89,7 +102,12 @@ impl PodIndex {
     /// the IP goes to another pod, so only live ones count; if two still claim it, neither gets it.
     /// The image the session's live pod runs, if it has one.
     pub fn session_image(&self, session: Uuid) -> Option<String> {
-        session_image(&self.store.state(), session)
+        self.session_pod(session).map(|pod| pod.image)
+    }
+
+    /// The session's live pod, if it has one.
+    pub fn session_pod(&self, session: Uuid) -> Option<SessionPod> {
+        session_pod(&self.store.state(), session)
     }
 
     pub fn session_for_ip(&self, ip: &str) -> Option<Uuid> {
@@ -159,14 +177,23 @@ mod tests {
         let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
         let old = with_image(deleting(pod(a, "Running", IP)), "session:old");
         let new = with_image(pod(a, "Running", IP), "session:new");
+        let image = |pods: &[Arc<Pod>], session| session_pod(pods, session).map(|pod| pod.image);
         assert_eq!(
-            session_image(&[old.clone(), new], a).as_deref(),
+            image(&[old.clone(), new.clone()], a).as_deref(),
             Some("session:new")
         );
-        assert_eq!(session_image(&[old], a), None);
+        assert_eq!(image(&[old], a), None);
+        assert_eq!(image(&[with_image(pod(b, "Running", IP), "x")], a), None);
+        // And when it was made.
+        let mut made = (*new).clone();
+        made.metadata.creation_timestamp = Some(Time(
+            k8s_openapi::jiff::Timestamp::from_second(1_800_000_000).unwrap(),
+        ));
         assert_eq!(
-            session_image(&[with_image(pod(b, "Running", IP), "x")], a),
-            None
+            session_pod(&[Arc::new(made)], a)
+                .and_then(|pod| pod.made)
+                .map(|t| t.timestamp()),
+            Some(1_800_000_000)
         );
     }
 

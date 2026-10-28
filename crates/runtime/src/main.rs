@@ -73,6 +73,8 @@ pub struct Inner {
     pub authz_addr: SocketAddr,
     pub agents: adapter::Agents,
     pub instructions: Option<String>,
+    /// Sessions asked to quiet down for a new session image (#230).
+    pub image_nudges: lifecycle::ImageNudges,
     /// Pushes to heads of pull requests set to merge themselves, waiting to be rechecked (#106).
     pub rechecks: Arc<rebases::Rechecks>,
 }
@@ -208,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
         authz_addr,
         agents,
         instructions,
+        image_nudges: lifecycle::ImageNudges::default(),
         rechecks,
     }));
     // A message queued for a parked session's absent agent wakes the session.
