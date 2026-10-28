@@ -1894,7 +1894,10 @@ impl Hub {
         Ok(())
     }
 
-    async fn show_question(&self, id: Uuid, key: Uuid, questions: Value, params: Value) {
+    async fn show_question(&self, id: Uuid, key: Uuid, questions: Value, mut params: Value) {
+        // The question's own id, the same every time it's shown, e.g. again after a reconnect or a restart: UIs tell
+        // questions apart by it, two identical ones included (#300).
+        params["_meta"] = json!({"sloppod": {"questionId": key.to_string()}});
         let pid = {
             let live = self.live(id);
             let mut state = live.state.lock().await;

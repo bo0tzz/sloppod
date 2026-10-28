@@ -2,6 +2,7 @@
   import { Badge, Button, Icon, Input, NumberInput, Select } from '@immich/ui';
   import { mdiChatQuestionOutline } from '@mdi/js';
   import type { ElicitationField, ElicitationResponse, EnumOption } from '#lib/acp/types.ts';
+  import { loadAnswer, saveAnswer } from '#lib/drafts.ts';
   import type { PendingQuestion } from '#lib/session.svelte.ts';
   import Markdown from './Markdown.svelte';
 
@@ -28,17 +29,34 @@
       return steps;
     }, []),
   );
-  let current = $state(0);
+  // The answer being written survives a reload or a reconnect, which sends the question again (#300).
+  // Only a question with an identity of its own keeps its answer: another one might come back under the same key.
+  // svelte-ignore state_referenced_locally
+  const { key, stable } = request;
+  // svelte-ignore state_referenced_locally
+  const kept = stable ? loadAnswer(request.sessionId, key) : null;
+  let current = $state(kept?.step ?? 0);
   const last = $derived(current >= steps.length - 1);
 
   // svelte-ignore state_referenced_locally
   let values = $state<Record<string, unknown>>(
-    Object.fromEntries(
-      Object.entries(request.requestedSchema?.properties ?? {})
-        .filter(([, field]) => field.default !== undefined)
-        .map(([key, field]) => [key, field.default]),
-    ),
+    kept?.values ??
+      Object.fromEntries(
+        Object.entries(request.requestedSchema?.properties ?? {})
+          .filter(([, field]) => field.default !== undefined)
+          .map(([key, field]) => [key, field.default]),
+      ),
   );
+  $effect(() => {
+    if (stable) saveAnswer(request.sessionId, key, { values: $state.snapshot(values), step: current });
+  });
+
+  /** Answers or skips the question, and forgets the answer kept for it. */
+  function respond(response: ElicitationResponse) {
+    if (request.stale) return;
+    if (stable) saveAnswer(request.sessionId, key, null);
+    onRespond(response);
+  }
   /** The option whose preview is shown, per field: the one hovered or focused, else the one picked. */
   let previewing = $state<Record<string, string | undefined>>({});
 
@@ -104,7 +122,7 @@
   const missingRequired = $derived(fields.some(([key]) => missing(key)));
   const stepMissing = $derived((steps[current] ?? []).some(([key]) => missing(key)));
 
-  const answer = () => onRespond({ action: 'accept', content: content() });
+  const answer = () => respond({ action: 'accept', content: content() });
 
   /** Enter moves on to the next question, and on the last one sends the answers. */
   function submitOnEnter(event: KeyboardEvent) {
@@ -119,8 +137,11 @@
 </script>
 
 <section
-  class="border-info-300 bg-info-50 dark:bg-info-100/40 flex flex-col gap-3 rounded-2xl border p-3"
+  class="border-info-300 bg-info-50 dark:bg-info-100/40 flex flex-col gap-3 rounded-2xl border p-3 {request.stale
+    ? 'opacity-60'
+    : ''}"
   data-testid="question-card"
+  data-stale={request.stale || undefined}
   aria-label="Question from the agent"
 >
   <header class="flex items-start gap-2 text-sm">
@@ -235,19 +256,21 @@
   {/each}
 
   <div class="flex flex-wrap items-center justify-end gap-2 pt-1">
-    {#if queued > 0}
+    {#if request.stale}
+      <span class="text-muted me-auto text-xs" data-testid="question-reconnecting">Reconnecting… your answer is kept</span>
+    {:else if queued > 0}
       <span class="text-muted me-auto text-xs" data-testid="questions-queued">
         {queued === 1 ? 'One more request after this' : `${queued} more requests after this`}
       </span>
     {/if}
-    <Button size="small" shape="round" variant="outline" color="secondary" onclick={() => onRespond({ action: 'decline' })}>
+    <Button size="small" shape="round" variant="outline" color="secondary" disabled={request.stale} onclick={() => respond({ action: 'decline' })}>
       Skip
     </Button>
     {#if current > 0}
       <Button size="small" shape="round" variant="outline" onclick={() => current--}>Back</Button>
     {/if}
     {#if last}
-      <Button size="small" shape="round" disabled={missingRequired} onclick={answer}>Answer</Button>
+      <Button size="small" shape="round" disabled={missingRequired || request.stale} onclick={answer}>Answer</Button>
     {:else}
       <Button size="small" shape="round" disabled={stepMissing} onclick={() => current++}>Next</Button>
     {/if}

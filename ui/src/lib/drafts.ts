@@ -21,6 +21,25 @@ export function saveDraft(session: string, text: string) {
   write(draftKey(session), text.trim() ? text : null);
 }
 
+const answerKey = (session: string, question: string) => `sloppod.answer.${session}.${question}`;
+
+/** The answer being written to a question, by its key (`questionKey`): its fields' values and the step it's on. */
+export type AnswerDraft = { values: Record<string, unknown>; step: number };
+
+export function loadAnswer(session: string, question: string): AnswerDraft | null {
+  try {
+    const stored = JSON.parse(read(answerKey(session, question)) ?? 'null');
+    return stored && typeof stored.values === 'object' && typeof stored.step === 'number' ? stored : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Keeps the answer being written, or forgets it (`null`) once the question is answered or dismissed. */
+export function saveAnswer(session: string, question: string, draft: AnswerDraft | null) {
+  write(answerKey(session, question), draft ? JSON.stringify(draft) : null);
+}
+
 export function loadUnconfirmed(session: string): Outgoing[] {
   try {
     const stored = JSON.parse(read(unconfirmedKey(session)) ?? '[]');

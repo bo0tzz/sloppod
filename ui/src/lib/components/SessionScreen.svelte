@@ -248,7 +248,7 @@
 
 {#snippet waitingItems()}
       <!-- One request at a time; the rest wait their turn behind it. -->
-      {#each view.questions.slice(0, 1) as question (question.rpcId)}
+      {#each view.questions.slice(0, 1) as question (question.key)}
         <QuestionCard
           request={question}
           queued={view.questions.length - 1}
