@@ -61,7 +61,7 @@ impl RequestPolicy for ModelPolicy {
         };
         Ok(Decision::allow_with(
             vec![("authorization".into(), format!("Bearer {token}"))],
-            vec!["x-api-key".into()],
+            Vec::new(),
         ))
     }
 }

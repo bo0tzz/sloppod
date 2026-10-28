@@ -57,7 +57,7 @@ impl GitHubPolicy {
                 let headers = token
                     .map(|t| vec![("authorization".into(), basic(&t))])
                     .unwrap_or_default();
-                Ok(Decision::allow_with(headers, vec!["authorization".into()]))
+                Ok(Decision::allow_with(headers, Vec::new()))
             }
             Service::ReceivePack => {
                 let Some(grant) = session.writable_repo_for(&git.repo) else {
@@ -191,7 +191,7 @@ impl GitHubPolicy {
         let headers = token
             .map(|t| vec![("authorization".into(), format!("token {t}"))])
             .unwrap_or_default();
-        Ok(Decision::allow_with(headers, vec!["authorization".into()]))
+        Ok(Decision::allow_with(headers, Vec::new()))
     }
 }
 
@@ -218,10 +218,7 @@ impl RequestPolicy for GitHubPolicy {
                     return self.git(session, request, git).await;
                 }
                 if matches!(request.method.as_str(), "GET" | "HEAD") {
-                    return Ok(Decision::allow_with(
-                        Vec::new(),
-                        vec!["authorization".into(), "cookie".into()],
-                    ));
+                    return Ok(Decision::allow_with(Vec::new(), Vec::new()));
                 }
                 Ok(Decision::deny(proposal_hint(
                     &format!(

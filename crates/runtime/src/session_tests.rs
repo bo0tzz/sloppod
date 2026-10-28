@@ -300,6 +300,67 @@ async fn a_notice_waits_for_a_compaction_to_end() {
 }
 
 #[tokio::test]
+async fn a_turn_that_ends_mid_compaction_lets_waiting_steers_go() {
+    let mut h = Harness::ready().await;
+    let turn = h.prompt("First");
+    let turn_request = h.next().await;
+    let compacting = json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "agent-session", "update": {
+        "sessionUpdate": "compaction_update", "compactionId": "c1", "status": "in_progress",
+    }}});
+    from_agent(&h.hub, h.id, &h.agent, compacting).await;
+    h.hub
+        .notify(h.id, "sloppod: your proposal was approved.".into())
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(h.to_agent.try_recv().is_err());
+
+    // The compaction's own end never comes; the turn's does.
+    h.respond(&turn_request, json!({"stopReason": "end_turn"}))
+        .await;
+    turn.await.unwrap().unwrap();
+    let steering = h.next().await;
+    assert_eq!(steering["method"], "_session/steering");
+    h.respond(&steering, json!({"outcome": "promptRequired"}))
+        .await;
+    let notice_turn = h.next().await;
+    assert_eq!(notice_turn["method"], "session/prompt");
+    assert_eq!(
+        prompt_text(&notice_turn),
+        ["sloppod: your proposal was approved."]
+    );
+    h.respond(&notice_turn, json!({"stopReason": "end_turn"}))
+        .await;
+}
+
+#[tokio::test]
+async fn stopping_a_session_mid_compaction_fails_waiting_steers() {
+    let mut h = Harness::ready().await;
+    let _turn = h.prompt("First");
+    h.next().await;
+    let compacting = json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "agent-session", "update": {
+        "sessionUpdate": "compaction_update", "compactionId": "c1", "status": "in_progress",
+    }}});
+    from_agent(&h.hub, h.id, &h.agent, compacting).await;
+    let (hub, id) = (h.hub.clone(), h.id);
+    let steer = tokio::spawn(async move {
+        hub.steer(
+            id,
+            json!({"sessionId": id, "prompt": [{"type": "text", "text": "Also this"}]}),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!steer.is_finished());
+
+    h.hub.stop(h.id).await;
+    let result = tokio::time::timeout(Duration::from_secs(5), steer)
+        .await
+        .expect("the steer is still waiting")
+        .unwrap();
+    assert!(result.is_err());
+}
+
+#[tokio::test]
 async fn a_notice_waits_for_the_agent_to_be_up() {
     let mut h = Harness::starting().await;
     h.hub
@@ -859,6 +920,91 @@ async fn a_question_from_ask_user_waits_for_its_answer_without_the_agent() {
         ["sloppod: the user answered your question:\n- Which backoff?: Fixed"]
     );
     assert!(h.hub.replay(h.id).await.unwrap().permissions.is_empty());
+}
+
+#[tokio::test]
+async fn a_queued_message_is_kept_until_its_turn_takes_it() {
+    let mut h = Harness::ready().await;
+    let _busy = h.prompt("Busy");
+    let busy = next_prompt(&mut h.to_agent).await;
+    let _later = h.prompt("Later");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let kept = h.store.queues().await.unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].1[0]["blocks"][0]["text"], "Later");
+
+    h.respond(&busy, json!({"stopReason": "end_turn"})).await;
+    let later = next_prompt(&mut h.to_agent).await;
+    assert_eq!(prompt_text(&later), ["Later"]);
+    assert!(h.store.queues().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_queue_kept_before_a_restart_runs_once_the_agent_is_up() {
+    // A restarted runtime: the store has the queue, the hub has nothing yet.
+    let mut h = Harness::starting().await;
+    h.store
+        .save_queue(
+            h.id,
+            &[json!({"id": null, "blocks": [{"type": "text", "text": "Sent before the restart"}]})],
+        )
+        .await
+        .unwrap();
+    h.hub.restore_queues().await;
+    h.agent_ready().await;
+    let restored = next_prompt(&mut h.to_agent).await;
+    assert_eq!(prompt_text(&restored), ["Sent before the restart"]);
+    assert!(h.store.queues().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_message_steered_before_the_agent_is_up_is_kept() {
+    let mut h = Harness::starting().await;
+    let steered = h
+        .hub
+        .clone()
+        .steer(
+            h.id,
+            json!({"sessionId": h.id, "prompt": [{"type": "text", "text": "Steered early"}]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(steered["outcome"], "queued");
+    let kept = h.store.queues().await.unwrap();
+    assert_eq!(kept[0].1[0]["blocks"][0]["text"], "Steered early");
+
+    h.agent_ready().await;
+    assert_eq!(
+        prompt_text(&next_prompt(&mut h.to_agent).await),
+        ["Steered early"]
+    );
+}
+
+#[tokio::test]
+async fn a_notice_after_a_restore_joins_the_kept_queue() {
+    let mut h = Harness::starting().await;
+    h.store
+        .save_queue(
+            h.id,
+            &[json!({"id": null, "blocks": [{"type": "text", "text": "Kept"}]})],
+        )
+        .await
+        .unwrap();
+    h.hub.restore_queues().await;
+    h.hub.clone().notify(h.id, "A notice".into()).await;
+    let kept = h.store.queues().await.unwrap();
+    let texts: Vec<&str> = kept[0]
+        .1
+        .iter()
+        .filter_map(|m| m["blocks"][0]["text"].as_str())
+        .collect();
+    assert_eq!(texts, ["Kept", "A notice"]);
+
+    h.agent_ready().await;
+    assert_eq!(
+        prompt_text(&next_prompt(&mut h.to_agent).await),
+        ["Kept", "A notice"]
+    );
 }
 
 #[tokio::test]

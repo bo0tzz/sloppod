@@ -234,6 +234,32 @@ pub enum Decision {
     },
 }
 
+/// Headers a client could carry a credential in. A request through the authorizer never keeps them, whatever its policy
+/// says: an intercepted service's credentials only ever come from the runtime.
+pub const CLIENT_CREDENTIAL_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "x-api-key",
+];
+
+/// What an allowed request's headers become, for whatever applies the decision: the headers to remove (the client's
+/// credentials and the ones the policy names, unless it sets them itself) and the headers to set.
+pub fn header_ops(
+    set_headers: Vec<(String, String)>,
+    remove_headers: Vec<String>,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut remove: Vec<String> = CLIENT_CREDENTIAL_HEADERS
+        .iter()
+        .map(|h| (*h).to_owned())
+        .chain(remove_headers.into_iter().map(|h| h.to_ascii_lowercase()))
+        .filter(|h| !set_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(h)))
+        .collect();
+    remove.sort();
+    remove.dedup();
+    (set_headers, remove)
+}
+
 impl Decision {
     pub fn allow() -> Self {
         Self::Allow {
@@ -305,6 +331,9 @@ pub struct EgressSpec {
 pub trait Enforcer: Send + Sync {
     fn manifest(&self) -> Manifest;
     async fn apply(&self, egress: &EgressSpec) -> Result<()>;
+    /// For a session whose pod is stopping: its pod is denied all egress, and what it held for it is freed.
+    /// `apply` restores it.
+    async fn release(&self, session_id: &str, pod_labels: &BTreeMap<String, String>) -> Result<()>;
     async fn remove(&self, session_id: &str) -> Result<()>;
 }
 
@@ -443,6 +472,38 @@ mod repo_tests {
         assert_eq!(repo_from_git_path("sloppod.git"), "sloppod");
         assert_eq!(repo_from_git_path("sloppod.git.git"), "sloppod.git");
         assert_eq!(repo_from_git_path("sloppod"), "sloppod");
+    }
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    #[test]
+    fn a_client_never_keeps_its_own_credentials() {
+        let (set, remove) = header_ops(
+            vec![("Authorization".into(), "Bearer runtime".into())],
+            vec!["X-Extra".into()],
+        );
+        assert_eq!(
+            set,
+            [("Authorization".to_owned(), "Bearer runtime".to_owned())]
+        );
+        // The policy's credential replaces the client's; every other credential header goes.
+        assert_eq!(
+            remove,
+            ["cookie", "proxy-authorization", "x-api-key", "x-extra"]
+        );
+        let (_, remove) = header_ops(Vec::new(), Vec::new());
+        assert_eq!(
+            remove,
+            [
+                "authorization",
+                "cookie",
+                "proxy-authorization",
+                "x-api-key"
+            ]
+        );
     }
 }
 

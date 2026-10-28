@@ -14,9 +14,6 @@ use uuid::Uuid;
 use crate::link::{AgentConn, RpcError};
 use crate::store::SessionStore;
 
-/// The longest a steer waits for a compaction to end.
-const COMPACTION_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
-
 #[derive(Clone, Debug)]
 pub enum UiEvent {
     /// A notification to forward as-is; `seq` is the event-log position for recorded updates.
@@ -68,7 +65,8 @@ struct LiveState {
     /// The agent is replaying history for `session/load`; that replay isn't new.
     loading: bool,
     turn_running: bool,
-    /// The agent is compacting its context; steers wait for it to end.
+    /// The agent is compacting its context; steers wait for it to end. A turn's end ends it too, in case the
+    /// compaction's own end never came.
     compacting: bool,
     /// How many turns the hub sent have ended, and why the last one failed, if it did. A watcher compares the count
     /// with the one it saw, so no turn's end is missed between its looks.
@@ -81,6 +79,13 @@ struct LiveState {
     restart_notice: Option<String>,
     /// The session was stopped: nothing queued for it runs any more.
     stopped: bool,
+}
+
+impl Live {
+    fn end_compaction(&self, state: &mut LiveState) {
+        state.compacting = false;
+        self.compaction_ended.notify_waiters();
+    }
 }
 
 pub struct Live {
@@ -139,7 +144,6 @@ pub fn session_update(session: Uuid, update: &Value) -> Value {
 }
 
 pub struct Replay {
-    pub events: Vec<(i64, Value)>,
     pub agent_state: Value,
     /// Open permission requests and questions: id, method, params.
     pub permissions: Vec<(u64, String, Value)>,
@@ -266,8 +270,7 @@ impl Hub {
         }
         state.agent_session_id = None;
         state.turn_running = false;
-        state.compacting = false;
-        live.compaction_ended.notify_waiters();
+        live.end_compaction(&mut state);
     }
 
     pub async fn set_restart_notice(&self, id: Uuid, notice: String) {
@@ -376,6 +379,7 @@ impl Hub {
             state.agent_state = agent_state;
             state.loading = false;
             let queued = std::mem::take(&mut state.queue);
+            self.save_queue(id, &state.queue).await;
             if pending.is_some() || !queued.is_empty() {
                 state.turn_running = true;
             } else {
@@ -447,13 +451,16 @@ impl Hub {
                         let requeued = queued.into_iter().map(|q| Queued { id: None, ..q });
                         let rest = std::mem::take(&mut state.queue);
                         state.queue = requeued.chain(rest).collect();
+                        self.save_queue(id, &state.queue).await;
                         let idle = state.agent_session_id.is_some()
                             && !state.turn_running
                             && !state.queue.is_empty();
                         match (state.agent.clone(), idle) {
                             (Some(agent), true) => {
                                 state.turn_running = true;
-                                Start::Requeued(Some((agent, std::mem::take(&mut state.queue))))
+                                let taken = std::mem::take(&mut state.queue);
+                                self.save_queue(id, &state.queue).await;
+                                Start::Requeued(Some((agent, taken)))
                             }
                             _ => Start::Requeued(None),
                         }
@@ -495,6 +502,55 @@ impl Hub {
         })
     }
 
+    /// Keeps the session's queue in the store as it is now, so a restart doesn't lose it (#39). Called under the
+    /// session's state lock, right after the queue changes.
+    async fn save_queue(&self, id: Uuid, queue: &[Queued]) {
+        let stored: Vec<Value> = queue
+            .iter()
+            .map(|q| json!({"id": q.id, "blocks": q.blocks}))
+            .collect();
+        if let Err(e) = self.store.save_queue(id, &stored).await {
+            tracing::warn!(session = %id, error = %e, "keeping the session's queue");
+        }
+    }
+
+    /// Puts back the queues a restart left in the store: ahead of anything queued since, and run once each session's
+    /// agent is up, waking a parked session for them as a new message would. Their callers are gone, so nobody
+    /// waits on the outcome; the transcript shows it.
+    pub async fn restore_queues(self: &Arc<Self>) {
+        let queues = match self.store.queues().await {
+            Ok(queues) => queues,
+            Err(e) => {
+                tracing::error!(error = %e, "loading queued messages");
+                return;
+            }
+        };
+        for (id, stored) in queues {
+            let restored: Vec<Queued> = stored
+                .into_iter()
+                .map(|q| Queued {
+                    id: q["id"].as_str().and_then(|s| s.parse().ok()),
+                    blocks: q["blocks"].as_array().cloned().unwrap_or_default(),
+                    reply: None,
+                })
+                .collect();
+            if restored.is_empty() {
+                continue;
+            }
+            {
+                let live = self.live(id);
+                let mut state = live.state.lock().await;
+                let since = std::mem::take(&mut state.queue);
+                state.queue = restored.into_iter().chain(since).collect();
+                self.save_queue(id, &state.queue).await;
+            }
+            self.broadcast_queue(id).await;
+            if let Err(e) = self.wake_for_message(id).await {
+                tracing::warn!(session = %id, error = %e.message, "waking a session for its queued messages");
+            }
+        }
+    }
+
     /// The `_sloppod/queue` notification for the messages waiting behind the running turn.
     fn queue_notification(id: Uuid, queue: &[Queued]) -> Value {
         let messages: Vec<Value> = queue
@@ -530,6 +586,7 @@ impl Hub {
             state.agent = None;
             state.agent_session_id = None;
             state.turn_running = false;
+            live.end_compaction(&mut state);
             self.set_phase(id, Phase::Disconnected).await;
             state
                 .permissions
@@ -566,9 +623,10 @@ impl Hub {
                 state.agent_state["modes"]["currentModeId"] = mode.clone();
             }
             if update["sessionUpdate"] == "compaction_update" {
-                state.compacting = update["status"] == "in_progress";
-                if !state.compacting {
-                    live.compaction_ended.notify_waiters();
+                if update["status"] == "in_progress" {
+                    state.compacting = true;
+                } else {
+                    live.end_compaction(&mut state);
                 }
             }
         }
@@ -733,6 +791,7 @@ impl Hub {
                     blocks: blocks.clone(),
                     reply: Some(reply),
                 });
+                self.save_queue(id, &state.queue).await;
                 (Some(receiver), agent_up)
             }
         };
@@ -812,9 +871,13 @@ impl Hub {
             if !state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
                 return;
             }
+            live.end_compaction(&mut state);
             let agent_up = state.agent_session_id.is_some();
             state.turn_running = agent_up && !state.queue.is_empty();
             let next = state.turn_running.then(|| std::mem::take(&mut state.queue));
+            if next.is_some() {
+                self.save_queue(id, &state.queue).await;
+            }
             if next.is_none() && agent_up {
                 self.set_phase(id, Phase::Idle).await;
             }
@@ -845,7 +908,9 @@ impl Hub {
                 .iter()
                 .position(|q| q.id == Some(qid))
                 .ok_or_else(|| RpcError::new(-32002, "that message isn't queued any more"))?;
-            state.queue.remove(index)
+            let queued = state.queue.remove(index);
+            self.save_queue(id, &state.queue).await;
+            queued
         };
         self.broadcast_queue(id).await;
         self.record_user_message(id, &json!(queued.blocks), true, queued.id)
@@ -870,6 +935,7 @@ impl Hub {
                     blocks: blocks.clone(),
                     reply: None,
                 });
+                self.save_queue(id, &state.queue).await;
                 None
             } else if state.turn_running {
                 Some(false)
@@ -952,19 +1018,16 @@ impl Hub {
     }
 
     /// A steer pre-empts whatever the agent is generating, and a compaction it pre-empts is cancelled rather than
-    /// resumed. So steers wait for one to end: a few minutes at most, so a missed end can't hold them forever.
+    /// resumed. So steers wait for one to end, however long it takes.
     async fn after_compaction(&self, id: Uuid) {
         let live = self.live(id);
-        let ended = async {
-            loop {
-                let notified = live.compaction_ended.notified();
-                if !live.state.lock().await.compacting {
-                    return;
-                }
-                notified.await;
+        loop {
+            let ended = live.compaction_ended.notified();
+            if !live.state.lock().await.compacting {
+                return;
             }
-        };
-        let _ = tokio::time::timeout(COMPACTION_WAIT, ended).await;
+            ended.await;
+        }
     }
 
     /// Delivers a message into the running turn; before the agent is up it joins the queue instead.
@@ -972,11 +1035,16 @@ impl Hub {
         let blocks = params["prompt"].as_array().cloned().unwrap_or_default();
         let message_id = client_message_id(&params);
         if self.agent_for(id).await.is_err() {
-            self.live(id).state.lock().await.queue.push(Queued {
-                id: None,
-                blocks,
-                reply: None,
-            });
+            {
+                let live = self.live(id);
+                let mut state = live.state.lock().await;
+                state.queue.push(Queued {
+                    id: None,
+                    blocks,
+                    reply: None,
+                });
+                self.save_queue(id, &state.queue).await;
+            }
             self.record_user_message(id, &params["prompt"], false, message_id)
                 .await;
             self.wake_for_message(id).await?;
@@ -1036,8 +1104,23 @@ impl Hub {
     }
 
     /// Everything a UI needs when it loads a session.
+    /// Up to `limit` of the session's recorded updates after `after`; a UI replays the log a page at a time, so
+    /// the whole of a long session's log is never in memory at once.
+    pub async fn events(
+        &self,
+        id: Uuid,
+        after: i64,
+        limit: i64,
+    ) -> Result<Vec<(i64, Value)>, sqlx::Error> {
+        self.store.events(id, after, limit).await
+    }
+
+    /// The sequence number of the session's latest recorded update; 0 when it has none.
+    pub async fn last_event(&self, id: Uuid) -> Result<i64, sqlx::Error> {
+        self.store.last_event(id).await
+    }
+
     pub async fn replay(&self, id: Uuid) -> Result<Replay, sqlx::Error> {
-        let events = self.store.events(id).await?;
         let live = self.live(id);
         let state = live.state.lock().await;
         let agent_state = if state.agent_state.is_null() {
@@ -1056,7 +1139,6 @@ impl Hub {
             .collect();
         permissions.sort_by_key(|(pid, _, _)| *pid);
         Ok(Replay {
-            events,
             agent_state,
             permissions,
             queue: Self::queue_notification(id, &state.queue),
@@ -1137,6 +1219,7 @@ impl Hub {
             if state.turn_running {
                 return Err(ParkError::InTurn);
             }
+            live.end_compaction(&mut state);
             (state.agent.take(), state.agent_session_id.take())
         };
         // Parked before the pod ends, so its supervisor's attempts to reconnect meanwhile are turned away.
@@ -1166,6 +1249,7 @@ impl Hub {
         match agent.filter(|_| up) {
             Some(agent) if !state.queue.is_empty() => {
                 let queued = std::mem::take(&mut state.queue);
+                self.save_queue(id, &state.queue).await;
                 state.turn_running = true;
                 self.set_phase(id, Phase::Working).await;
                 tokio::spawn(self.clone().run_queued(id, agent, None, queued));
@@ -1205,7 +1289,10 @@ impl Hub {
             let live = self.live(id);
             let mut state = live.state.lock().await;
             state.stopped = true;
-            (state.agent.take(), std::mem::take(&mut state.queue))
+            live.end_compaction(&mut state);
+            let queued = std::mem::take(&mut state.queue);
+            self.save_queue(id, &state.queue).await;
+            (state.agent.take(), queued)
         };
         for reply in queued.into_iter().filter_map(|q| q.reply) {
             let _ = reply.send(Err(RpcError::new(-32002, "the session was stopped")));

@@ -61,6 +61,11 @@ async fn ensure_memini_key(state: &AppState, session: &db::SessionRow) -> anyhow
     Ok(())
 }
 
+/// The labels a session's egress policy selects its pod by.
+pub fn pod_labels(session_id: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([(SESSION_LABEL.to_owned(), session_id.to_owned())])
+}
+
 /// Makes sure a session's pod and egress policy exist.
 pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
     if let Err(e) = ensure_memini_key(state, session).await {
@@ -84,7 +89,7 @@ pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result
         .enforcer
         .apply(&EgressSpec {
             session_id: id.clone(),
-            pod_labels: BTreeMap::from([(SESSION_LABEL.to_owned(), id.clone())]),
+            pod_labels: pod_labels(&id),
             intercepted_hosts: state.policies.hosts(),
             direct_hosts: if context.has(capability::PACKAGES) {
                 state.config.direct_hosts.clone()
@@ -103,6 +108,8 @@ pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result
                 ("SLOPPOD_URL".into(), state.config.runtime_url()),
                 ("SLOPPOD_TOKEN_FILE".into(), format!("{TOKEN_DIR}/token")),
                 ("HOME".into(), format!("{WORKDIR}/home")),
+                // On the volume, so scratch work outlives a restart of the pod.
+                ("TMPDIR".into(), format!("{WORKDIR}/tmp")),
             ],
             cpu: state.config.session_cpu.clone(),
             memory: state.config.session_memory.clone(),
@@ -145,11 +152,12 @@ pub async fn park(state: &AppState, session: &db::SessionRow) -> Result<(), Park
     state
         .hub
         .park(session.id, || async {
-            state
-                .placement
-                .suspend(&id)
-                .await
-                .map_err(anyhow::Error::from)
+            state.placement.suspend(&id).await?;
+            // A parked session holds no listener; waking applies its policy again. Startup releases what's left here.
+            if let Err(e) = state.enforcer.release(&id, &pod_labels(&id)).await {
+                tracing::warn!(session = %id, error = %e, "releasing a parked session's egress");
+            }
+            Ok(())
         })
         .await
 }

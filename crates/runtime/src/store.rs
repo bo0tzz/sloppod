@@ -16,7 +16,14 @@ pub trait SessionStore: Send + Sync {
     async fn set_session_model(&self, id: Uuid, model: &str) -> sqlx::Result<()>;
     /// Appends to the session's event log and returns the event's sequence number.
     async fn append_event(&self, id: Uuid, payload: &Value) -> sqlx::Result<i64>;
-    async fn events(&self, id: Uuid) -> sqlx::Result<Vec<(i64, Value)>>;
+    /// The sequence number of the session's latest event; 0 when it has none.
+    async fn last_event(&self, id: Uuid) -> sqlx::Result<i64>;
+    /// Up to `limit` of the session's events after `after`, in order.
+    async fn events(&self, id: Uuid, after: i64, limit: i64) -> sqlx::Result<Vec<(i64, Value)>>;
+    /// Keeps a session's queued messages, `{id, blocks}` each, replacing what was kept; none clears them.
+    async fn save_queue(&self, id: Uuid, queue: &[Value]) -> sqlx::Result<()>;
+    /// Every session's kept queue, for after a restart.
+    async fn queues(&self) -> sqlx::Result<Vec<(Uuid, Vec<Value>)>>;
     /// The session's first message, until a turn has started with it.
     async fn pending_prompt(&self, id: Uuid) -> sqlx::Result<Option<String>>;
     /// Forgets the session's first message, once a turn has started with it.
@@ -47,12 +54,24 @@ impl SessionStore for PgStore {
         db::append_event(&self.0, id, payload).await
     }
 
-    async fn events(&self, id: Uuid) -> sqlx::Result<Vec<(i64, Value)>> {
-        db::events(&self.0, id).await
+    async fn last_event(&self, id: Uuid) -> sqlx::Result<i64> {
+        db::last_event(&self.0, id).await
+    }
+
+    async fn events(&self, id: Uuid, after: i64, limit: i64) -> sqlx::Result<Vec<(i64, Value)>> {
+        db::events(&self.0, id, after, limit).await
     }
 
     async fn pending_prompt(&self, id: Uuid) -> sqlx::Result<Option<String>> {
         db::pending_prompt(&self.0, id).await
+    }
+
+    async fn save_queue(&self, id: Uuid, queue: &[Value]) -> sqlx::Result<()> {
+        db::save_queue(&self.0, id, queue).await
+    }
+
+    async fn queues(&self) -> sqlx::Result<Vec<(Uuid, Vec<Value>)>> {
+        db::queues(&self.0).await
     }
 
     async fn clear_pending_prompt(&self, id: Uuid) -> sqlx::Result<()> {
@@ -72,6 +91,8 @@ pub mod memory {
     pub struct MemoryStore {
         sessions: Mutex<HashMap<Uuid, SessionRow>>,
         events: Mutex<Vec<(Uuid, i64, Value)>>,
+        /// Sessions' kept queues.
+        pub queues: Mutex<HashMap<Uuid, Vec<Value>>>,
         /// Sessions' first messages, until a turn starts with them.
         pub pending_prompts: Mutex<HashMap<Uuid, String>>,
         /// Sessions whose first message a turn has started with.
@@ -133,13 +154,43 @@ pub mod memory {
             Ok(seq)
         }
 
-        async fn events(&self, id: Uuid) -> sqlx::Result<Vec<(i64, Value)>> {
+        async fn last_event(&self, id: Uuid) -> sqlx::Result<i64> {
             let events = self.events.lock().unwrap();
             Ok(events
                 .iter()
                 .filter(|(s, _, _)| *s == id)
+                .map(|(_, seq, _)| *seq)
+                .max()
+                .unwrap_or(0))
+        }
+
+        async fn events(
+            &self,
+            id: Uuid,
+            after: i64,
+            limit: i64,
+        ) -> sqlx::Result<Vec<(i64, Value)>> {
+            let events = self.events.lock().unwrap();
+            Ok(events
+                .iter()
+                .filter(|(s, seq, _)| *s == id && *seq > after)
+                .take(limit as usize)
                 .map(|(_, seq, p)| (*seq, p.clone()))
                 .collect())
+        }
+
+        async fn save_queue(&self, id: Uuid, queue: &[Value]) -> sqlx::Result<()> {
+            let mut queues = self.queues.lock().unwrap();
+            if queue.is_empty() {
+                queues.remove(&id);
+            } else {
+                queues.insert(id, queue.to_vec());
+            }
+            Ok(())
+        }
+
+        async fn queues(&self) -> sqlx::Result<Vec<(Uuid, Vec<Value>)>> {
+            Ok(self.queues.lock().unwrap().clone().into_iter().collect())
         }
 
         async fn pending_prompt(&self, id: Uuid) -> sqlx::Result<Option<String>> {
