@@ -15,7 +15,7 @@ use sloppod_protocol::api::{Proposal, ProposalStatus, ReviewPolicy};
 use uuid::Uuid;
 
 use crate::github::StackWatch;
-use crate::{AppState, db, reviews};
+use crate::{AppState, db, lifecycle, reviews};
 
 pub use issue_updates::IssueUpdates;
 pub use issues::Issues;
@@ -169,6 +169,21 @@ pub async fn propose(
         .map_err(|e| e.to_string())?
         .ok_or("the proposal changed meanwhile")?;
         state.hub.broadcast_proposal(&row.to_api());
+        if !kind.outward() {
+            settle(
+                state,
+                &session,
+                kind.as_ref(),
+                row.to_api(),
+                Some(json!({"verdict": "stalled"})),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            return Err(format!(
+                "the review couldn't start ({e}), so proposal {} is being carried out without one",
+                row.id
+            ));
+        }
         return Err(format!(
             "the review couldn't start ({e}), so proposal {} went to the user without one",
             row.id
@@ -402,7 +417,9 @@ async fn carry_out(
     };
     let proposal = finished.to_api();
     state.hub.broadcast_proposal(&proposal);
-    // What it has to tell other sessions, e.g. a report for a sub-session's parent.
+    // What it has to tell other sessions, e.g. a report for a sub-session's parent, which is woken for it if it
+    // parked meanwhile. Not held to the tree's limit (ADR 27): the reporting sub-session is done, so its place is
+    // about to free up, and a report left unread would leave its work with nobody.
     if let Some(result) = &proposal.result {
         for notice in result["notify"].as_array().into_iter().flatten() {
             if let (Some(to), Some(text)) = (
@@ -410,6 +427,11 @@ async fn carry_out(
                 notice["text"].as_str(),
             ) {
                 state.hub.notify(to, text.to_owned()).await;
+                if let Ok(Some(recipient)) = db::get_session(&state.db, to).await
+                    && let Err(e) = lifecycle::wake(state, &recipient).await
+                {
+                    tracing::warn!(session = %to, error = %e, "waking a session for a notice");
+                }
             }
         }
     }

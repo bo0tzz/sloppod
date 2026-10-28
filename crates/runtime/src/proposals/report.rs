@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use sloppod_contracts::{
-    Error, Manifest, ProposalKind, Result, ReviewSubject, SessionContext, ToolSpec,
+    Error, Manifest, ProposalKind, Result, ReviewSubject, SessionContext, ToolSpec, same_repo,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -60,6 +60,24 @@ fn report_text(child: &str, payload: &Value) -> String {
          you integrate it.",
         field("summary")
     )
+}
+
+/// A report's edits: the child corrects its summary between review rounds, and the runtime adds the review's outcome
+/// when it delivers the report.
+fn edit_report(payload: &Value, edits: &Value) -> Result<Value> {
+    let mut payload = payload.clone();
+    if let Some(summary) = edits.get("summary") {
+        let summary = summary
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Error::new("the summary can't be empty"))?;
+        payload["summary"] = json!(summary);
+    }
+    if let Some(review) = edits.get("review") {
+        payload["review"] = review.clone();
+    }
+    Ok(payload)
 }
 
 #[async_trait]
@@ -129,15 +147,19 @@ impl ProposalKind for Report {
             .parent_id
             .ok_or_else(|| Error::new("only a sub-session reports to a parent"))?;
         let mut payload = json!({"parent": parent, "summary": summary, "title": row.title});
-        // The branch the child was given, from the parent's that it started from.
-        let branch = session
-            .grants
-            .iter()
-            .find_map(|g| Some((g.param("repo")?, g.param("branch")?, g.param("from")?)));
+        // The branch the child was given in the repository it works in, from the parent's that it started from.
+        let branch = session.grants.iter().find_map(|g| {
+            let repo = g.param("repo")?;
+            row.repo
+                .as_deref()
+                .is_some_and(|working| same_repo(working, repo))
+                .then_some(())?;
+            Some((repo, g.param("branch")?, g.param("from")?))
+        });
         if let Some((repo, head, base)) = branch {
             let app = self.credentials.github(&session.owner).await.map_err(err)?;
-            // A branch that was never pushed has nothing to hand over.
-            if let Ok(comparison) = app.compare(repo, base, head).await
+            // A branch that was never pushed has nothing to hand over; a failed comparison is retried.
+            if let Some(comparison) = app.compare_if_found(repo, base, head).await.map_err(err)?
                 && comparison.ahead_by > 0
             {
                 payload["repo"] = json!(repo);
@@ -171,13 +193,8 @@ impl ProposalKind for Report {
         }))
     }
 
-    /// The runtime adds the review's outcome when it delivers the report.
     fn edit(&self, payload: &Value, edits: &Value) -> Result<Value> {
-        let mut payload = payload.clone();
-        if let Some(review) = edits.get("review") {
-            payload["review"] = review.clone();
-        }
-        Ok(payload)
+        edit_report(payload, edits)
     }
 
     async fn execute(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
@@ -210,6 +227,10 @@ mod tests {
             text.contains("`sloppod/abcd1234-01234567` in o/r, at f00, from `sloppod/abcd1234`")
         );
         assert!(text.contains("still had findings after the last round:\n\n- [1.1] p1 a bug"));
+
+        let edited = edit_report(&payload, &json!({"summary": " Fixed it properly. "})).unwrap();
+        assert_eq!(edited["summary"], "Fixed it properly.");
+        assert!(edit_report(&payload, &json!({"summary": " "})).is_err());
 
         let bare = report_text("\"Look\" (y)", &json!({"summary": "Nothing to change."}));
         assert!(bare.contains("no commits to hand over"));
