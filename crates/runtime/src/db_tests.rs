@@ -1531,6 +1531,10 @@ async fn a_proposal_carries_over_the_review_its_sub_session_s_report_passed(db: 
             .unwrap()
             .contains(&reviewer)
     );
+    assert!(
+        !db::has_active_review(&db, reviewer).await.unwrap(),
+        "the report is done"
+    );
     let pr = db::insert_proposal(
         &db,
         parent,
@@ -1540,11 +1544,39 @@ async fn a_proposal_carries_over_the_review_its_sub_session_s_report_passed(db: 
     )
     .await
     .unwrap();
-    db::set_review_session(&db, pr.id, reviewer).await.unwrap();
+    assert!(db::claim_reviewer(&db, pr.id, reviewer).await.unwrap());
+    assert!(db::has_active_review(&db, reviewer).await.unwrap());
     assert!(
         !db::idle_review_sessions(&db, day_ago)
             .await
             .unwrap()
             .contains(&reviewer)
+    );
+    // Its verdict is the PR's, not the executed report's, though both name the reviewer.
+    assert_eq!(
+        db::reviewed_proposal(&db, reviewer)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        pr.id
+    );
+    // A second proposal carrying the same review over doesn't get the busy reviewer, and starts afresh.
+    let again = db::insert_proposal(
+        &db,
+        parent,
+        "github.pr.create",
+        ProposalStatus::InReview,
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    assert!(!db::claim_reviewer(&db, again.id, reviewer).await.unwrap());
+    assert!(
+        crate::reviews::carried_over_in(&db, &parent_row, &child.to_string(), &subject, reports)
+            .await
+            .unwrap()
+            .is_none(),
+        "a reviewer that's reviewing something isn't offered"
     );
 }

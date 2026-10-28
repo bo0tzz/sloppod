@@ -104,7 +104,10 @@ pub(crate) async fn carried_over_in(
     let kept = db::get_session(db, reviewer)
         .await
         .map_err(|e| e.to_string())?
-        .is_some_and(|row| row.deleted_at.is_none());
+        .is_some_and(|row| row.deleted_at.is_none())
+        && !db::has_active_review(db, reviewer)
+            .await
+            .map_err(|e| e.to_string())?;
     Ok((same_repo && kept).then(|| CarriedOver {
         reviewer,
         sha: sha.to_owned(),
@@ -119,6 +122,13 @@ pub async fn start(
     replies: Option<&str>,
     carried: Option<&CarriedOver>,
 ) -> anyhow::Result<()> {
+    // A kept reviewer is only taken if nothing else has it; otherwise the review starts afresh.
+    let carried = match carried {
+        Some(carried) if db::claim_reviewer(&state.db, proposal.id, carried.reviewer).await? => {
+            Some(carried)
+        }
+        _ => None,
+    };
     let previous = db::reviews(&state.db, proposal.id).await?.pop();
     let round = db::start_review_round(&state.db, proposal.id, &subject.head_sha, replies).await?;
     let prompt = match &previous {
@@ -138,9 +148,6 @@ pub async fn start(
             None => first_round_prompt(subject),
         },
     };
-    if let Some(carried) = carried {
-        db::set_review_session(&state.db, proposal.id, carried.reviewer).await?;
-    }
     if let Some(session) = carried.map(|c| c.reviewer).or(proposal.review_session_id) {
         db::set_repo_commit(&state.db, session, &subject.repo, &subject.head_sha).await?;
         // Queued first, so the round reaches the reviewer however long waking it takes.
@@ -977,15 +984,29 @@ fn keep(state: &AppState, session: Uuid) {
     let state = state.clone();
     tokio::spawn(async move {
         turn_ended(&state, session).await;
-        let result: anyhow::Result<()> = match db::get_session(&state.db, session).await {
-            Ok(Some(row)) => lifecycle::park(&state, &row).await.map_err(Into::into),
-            Ok(None) => Ok(()),
-            Err(e) => Err(e.into()),
-        };
+        let result = park_kept(&state, session).await;
         if let Err(e) = result {
             tracing::warn!(%session, error = %e, "parking a review session to keep");
         }
     });
+}
+
+/// Parks a kept reviewer unless a proposal has carried its review over meanwhile, and wakes it again if one did while
+/// it was being parked: that proposal's round is queued, and its wake found the reviewer still running.
+async fn park_kept(state: &AppState, session: Uuid) -> anyhow::Result<()> {
+    if db::has_active_review(&state.db, session).await? {
+        return Ok(());
+    }
+    let Some(row) = db::get_session(&state.db, session).await? else {
+        return Ok(());
+    };
+    lifecycle::park(state, &row).await?;
+    if db::has_active_review(&state.db, session).await?
+        && let Some(row) = db::get_session(&state.db, session).await?
+    {
+        lifecycle::wake(state, &row).await?;
+    }
+    Ok(())
 }
 
 /// How long a kept reviewer waits for a proposal to carry its review over.
