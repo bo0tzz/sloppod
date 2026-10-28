@@ -472,7 +472,7 @@ async fn park_ending_turn(state: &AppState, session: &db::SessionRow) -> ApiResu
             Ok(()) | Err(ParkError::Stopped) => return Ok(()),
             Err(ParkError::InTurn) => {
                 if attempt == 0 {
-                    state.hub.cancel(session.id).await;
+                    state.hub.cancel(session.id, "deleting the session").await;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
