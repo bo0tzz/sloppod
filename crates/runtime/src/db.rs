@@ -532,6 +532,33 @@ pub async fn set_limited_until(
     .await
 }
 
+/// Ends a session's wait for its usage limit at `at`, and in the same transaction the wait of a review round it works
+/// on as a reviewer, so no restart can come between the two and count its downtime as waiting.
+pub async fn end_limit(
+    db: &PgPool,
+    id: Uuid,
+    at: DateTime<Utc>,
+) -> sqlx::Result<Option<SessionRow>> {
+    let mut tx = db.begin().await?;
+    let row = sqlx::query_as(AssertSqlSafe(format!(
+        "update sessions set limited_until = null where id = $1 returning {SESSION_COLUMNS}"
+    )))
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    sqlx::query(
+        "update reviews r set paused_seconds = r.paused_seconds + greatest(0, extract(epoch from $2 - r.paused_since))::bigint, \
+         paused_since = null from proposals p \
+         where p.review_session_id = $1 and r.proposal_id = p.id and r.paused_since is not null",
+    )
+    .bind(id)
+    .bind(at)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
 /// The sessions waiting for their usage limit, and when they carry on.
 pub async fn limited_sessions(db: &PgPool) -> sqlx::Result<Vec<(Uuid, DateTime<Utc>)>> {
     sqlx::query_as(
@@ -1272,21 +1299,6 @@ pub async fn pause_reviewer(db: &PgPool, reviewer: Uuid, at: DateTime<Utc>) -> s
          where p.review_session_id = $1 and p.status = 'in_review' and r.proposal_id = p.id \
          and r.verdict is null and r.paused_since is null \
          and r.round = (select max(round) from reviews where proposal_id = p.id)",
-    )
-    .bind(reviewer)
-    .bind(at)
-    .execute(db)
-    .await
-    .map(|_| ())
-}
-
-/// Ends the wait of the review round a reviewer session works on at `at`, adding it to the time the round has waited;
-/// done as the session's wait ends, so a restart before the round's watcher looks doesn't count downtime as waiting.
-pub async fn unpause_reviewer(db: &PgPool, reviewer: Uuid, at: DateTime<Utc>) -> sqlx::Result<()> {
-    sqlx::query(
-        "update reviews r set paused_seconds = r.paused_seconds + greatest(0, extract(epoch from $2 - r.paused_since))::bigint, \
-         paused_since = null from proposals p \
-         where p.review_session_id = $1 and r.proposal_id = p.id and r.paused_since is not null",
     )
     .bind(reviewer)
     .bind(at)

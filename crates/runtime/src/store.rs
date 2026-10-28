@@ -42,6 +42,8 @@ pub trait SessionStore: Send + Sync {
         id: Uuid,
         until: Option<DateTime<Utc>>,
     ) -> sqlx::Result<Option<SessionRow>>;
+    /// Ends the session's wait for its usage limit at `at`, with a review round's wait it works on as a reviewer.
+    async fn end_limit(&self, id: Uuid, at: DateTime<Utc>) -> sqlx::Result<Option<SessionRow>>;
     /// The sessions waiting for their usage limit, for after a restart.
     async fn limited_sessions(&self) -> sqlx::Result<Vec<(Uuid, DateTime<Utc>)>>;
 }
@@ -111,6 +113,10 @@ impl SessionStore for PgStore {
         db::set_limited_until(&self.0, id, until).await
     }
 
+    async fn end_limit(&self, id: Uuid, at: DateTime<Utc>) -> sqlx::Result<Option<SessionRow>> {
+        db::end_limit(&self.0, id, at).await
+    }
+
     async fn limited_sessions(&self) -> sqlx::Result<Vec<(Uuid, DateTime<Utc>)>> {
         db::limited_sessions(&self.0).await
     }
@@ -126,6 +132,8 @@ pub mod memory {
     /// Sessions and their event logs in memory.
     #[derive(Default)]
     pub struct MemoryStore {
+        /// The waits for a usage limit ended, and when, for tests.
+        pub limits_ended: Mutex<Vec<(Uuid, DateTime<Utc>)>>,
         sessions: Mutex<HashMap<Uuid, SessionRow>>,
         events: Mutex<Vec<(Uuid, i64, Value)>>,
         /// Sessions' kept queues.
@@ -265,6 +273,11 @@ pub mod memory {
                 row.limited_until = until;
                 row.clone()
             }))
+        }
+
+        async fn end_limit(&self, id: Uuid, at: DateTime<Utc>) -> sqlx::Result<Option<SessionRow>> {
+            self.limits_ended.lock().unwrap().push((id, at));
+            self.set_limited_until(id, None).await
         }
 
         async fn limited_sessions(&self) -> sqlx::Result<Vec<(Uuid, DateTime<Utc>)>> {

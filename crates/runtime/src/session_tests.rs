@@ -2212,22 +2212,21 @@ async fn a_carry_on_kept_before_a_restart_is_queued_once() {
 }
 
 #[tokio::test]
-async fn the_end_of_a_wait_is_handed_on_as_it_happens() {
+async fn the_end_of_a_wait_is_kept_as_it_happens() {
     let mut h = Harness::ready().await;
-    let (tx, mut ended) = mpsc::unbounded_channel();
-    h.hub.set_limit_ended(Arc::new(move |id, _| {
-        let tx = tx.clone();
-        Box::pin(async move {
-            let _ = tx.send(id);
-        })
-    }));
     let turn = h.prompt("Work");
     let request = h.next().await;
     hit_the_limit(&h, &request).await;
     assert!(turn.await.unwrap().is_err());
     let until = limited(&h).await;
-    assert!(ended.try_recv().is_err(), "still waiting");
+    assert!(
+        h.store.limits_ended.lock().unwrap().is_empty(),
+        "still waiting"
+    );
 
+    // Ending the wait is one write with ending a review round's wait (`end_limit`), at the time it ends.
     h.hub.resume_after_limit(h.id, until).await;
-    assert_eq!(ended.try_recv().unwrap(), h.id);
+    let ended = h.store.limits_ended.lock().unwrap().clone();
+    assert_eq!(ended.len(), 1);
+    assert_eq!(ended[0].0, h.id);
 }

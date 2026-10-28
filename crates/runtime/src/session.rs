@@ -258,11 +258,6 @@ pub type UsageSeen =
 pub type LimitHit =
     Arc<dyn Fn(Uuid) -> Pin<Box<dyn Future<Output = Option<DateTime<Utc>>> + Send>> + Send + Sync>;
 
-/// Called when a session's wait for its usage limit ends, with when, to keep what depends on it (a review round's
-/// pause).
-pub type LimitEnded =
-    Arc<dyn Fn(Uuid, DateTime<Utc>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
-
 pub struct Hub {
     store: Arc<dyn SessionStore>,
     waker: StdMutex<Option<Waker>>,
@@ -273,7 +268,6 @@ pub struct Hub {
     /// The time the tests say it is, instead of the clock's.
     now: StdMutex<Option<DateTime<Utc>>>,
     limit_hit: StdMutex<Option<LimitHit>>,
-    limit_ended: StdMutex<Option<LimitEnded>>,
 }
 
 fn notification(method: &str, params: Value) -> Value {
@@ -305,7 +299,6 @@ impl Hub {
             sessions: StdMutex::default(),
             agent_capabilities: StdMutex::default(),
             limit_hit: StdMutex::default(),
-            limit_ended: StdMutex::default(),
             now: StdMutex::default(),
         }
     }
@@ -348,18 +341,6 @@ impl Hub {
 
     pub fn set_limit_hit(&self, limit_hit: LimitHit) {
         *self.limit_hit.lock().unwrap() = Some(limit_hit);
-    }
-
-    pub fn set_limit_ended(&self, limit_ended: LimitEnded) {
-        *self.limit_ended.lock().unwrap() = Some(limit_ended);
-    }
-
-    /// A session's wait for its usage limit ended at `at`.
-    async fn limit_ended(&self, id: Uuid, at: DateTime<Utc>) {
-        let limit_ended = self.limit_ended.lock().unwrap().clone();
-        if let Some(limit_ended) = limit_ended {
-            limit_ended(id, at).await;
-        }
     }
 
     /// The session's agent, if it's up.
@@ -1856,14 +1837,13 @@ impl Hub {
             let changed = until != state.limited_until;
             if changed {
                 state.limited_until = until;
-                self.save_limit(id, until).await;
+                match until {
+                    Some(_) => self.save_limit(id, until).await,
+                    None => self.end_limit(id, now).await,
+                }
             }
-            (until.filter(|_| changed), changed && until.is_none())
+            until.filter(|_| changed)
         };
-        let (limited, ended) = limited;
-        if ended {
-            self.limit_ended(id, now).await;
-        }
         if let Some(until) = limited {
             tracing::info!(session = %id, %until, "the session hit its usage limit; it carries on then");
             self.resume_at(id, until);
@@ -1875,8 +1855,17 @@ impl Hub {
     }
 
     /// Keeps when a session waiting for its usage limit carries on, and tells the UIs; under the state lock.
+    /// Ends the session's wait for its usage limit at `at`, and a review round's it works on, in one write.
+    async fn end_limit(&self, id: Uuid, at: DateTime<Utc>) {
+        self.limit_saved(id, self.store.end_limit(id, at).await);
+    }
+
     async fn save_limit(&self, id: Uuid, until: Option<DateTime<Utc>>) {
-        match self.store.set_limited_until(id, until).await {
+        self.limit_saved(id, self.store.set_limited_until(id, until).await);
+    }
+
+    fn limit_saved(&self, id: Uuid, saved: sqlx::Result<Option<crate::db::SessionRow>>) {
+        match saved {
             Ok(Some(row)) => self.broadcast(
                 id,
                 UiEvent::Notification {
@@ -1935,7 +1924,7 @@ impl Hub {
             // A turn the user started meanwhile carries on by itself, and the queue runs after it.
             if state.turn_running {
                 state.limited_until = None;
-                self.save_limit(id, None).await;
+                self.end_limit(id, self.now()).await;
                 (None, false)
             } else {
                 let up = state.agent.is_some() && state.agent_session_id.is_some();
@@ -1955,11 +1944,10 @@ impl Hub {
                     None
                 };
                 state.limited_until = None;
-                self.save_limit(id, None).await;
+                self.end_limit(id, self.now()).await;
                 (start, !up)
             }
         };
-        self.limit_ended(id, self.now()).await;
         self.record_notice(id, &block, None).await;
         if let Some((agent, queued, held)) = start {
             self.broadcast_queue(id).await;

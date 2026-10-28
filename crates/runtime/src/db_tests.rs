@@ -1095,9 +1095,14 @@ async fn a_review_round_keeps_a_wait_the_runtime_went_down_in_before_its_watcher
         at(21)
     ));
 
-    // Ended as the session's wait ends, not at the watcher's next look: a restart later counts no downtime.
+    // Ended in the same write as the reviewer session's wait, not at the watcher's next look: a restart later
+    // counts no downtime.
     db::pause_reviewer(&db, reviewer, at(30)).await.unwrap();
-    db::unpause_reviewer(&db, reviewer, at(40)).await.unwrap();
+    db::set_limited_until(&db, reviewer, Some(at(40)))
+        .await
+        .unwrap();
+    let ended = db::end_limit(&db, reviewer, at(40)).await.unwrap().unwrap();
+    assert_eq!(ended.limited_until, None);
     db::unpause_review(&db, p, round, at(100)).await.unwrap();
     let row = &db::reviews(&db, p).await.unwrap()[0];
     assert_eq!(row.paused_seconds, 70 * 60);
