@@ -30,8 +30,22 @@ export type Session = {
 export type NewSession = {
   /** The first message. The runtime records it right away and derives the repository from it. */
   prompt: string;
-  repo?: string;
+  /** Absent, it's derived from the prompt; `null` means no repository. */
+  repo?: string | null;
   title?: string;
+  /** What it starts with, from the starting set's capabilities; all of them when absent. */
+  capabilities?: string[];
+  /** Instead of the user's default model. */
+  model?: string;
+};
+
+/** What the runtime suggests a new session starts with for a first message as it's written (#232); advisory. */
+export type StartingSet = {
+  title: string;
+  repo: string | null;
+  capabilities: string[];
+  /** A judgement made it, or matching the message's words did (the fallback). */
+  source: 'judgement' | 'match';
 };
 
 export type Grant = {
@@ -279,6 +293,7 @@ export const api = {
   listSessions: () => call<Session[]>('GET', '/sessions'),
   getSession: (id: string) => call<Session>('GET', `/sessions/${encodeURIComponent(id)}`),
   createSession: (body: NewSession) => call<Session>('POST', '/sessions', body),
+  suggestSession: (prompt: string) => call<StartingSet>('POST', '/sessions/suggest', { prompt }),
   deleteSession: (id: string) => call<void>('DELETE', `/sessions/${encodeURIComponent(id)}`),
   listDeletedSessions: () => call<Session[]>('GET', '/sessions/deleted'),
   restoreSession: (id: string) => call<Session>('POST', `/sessions/${encodeURIComponent(id)}/restore`, {}),
