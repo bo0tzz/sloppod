@@ -1736,3 +1736,33 @@ async fn an_adopted_turn_that_ends_counts_as_hearing_from_the_agent() {
     h.respond(&request, json!({"stopReason": "end_turn"})).await;
     next.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn a_message_kept_across_a_restart_tells_the_agent_how_long_it_waited() {
+    let h = Harness::starting().await;
+    let (id, hub) = (h.id, h.hub.clone());
+    tokio::spawn(async move {
+        let params = json!({"sessionId": id, "prompt": [{"type": "text", "text": "Sent while it was down"}]});
+        hub.prompt(id, params).await
+    });
+    for _ in 0..100 {
+        if kept_texts(&h).await == ["Sent while it was down"] {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The restarted runtime records nothing before the kept message runs.
+    let (hub, agent, mut to_agent) = restarted(&h).await;
+    hub.set_now(later(3 * 60));
+    hub.agent_ready(h.id, &agent, "agent-session".into(), json!({}), None)
+        .await;
+    let request = next_prompt(&mut to_agent).await;
+    assert_eq!(
+        all_text(&request),
+        [
+            "[sloppod: it's 2026-10-27 18:40 UTC, 3 hours since the last message]",
+            "Sent while it was down"
+        ]
+    );
+}

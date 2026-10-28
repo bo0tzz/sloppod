@@ -272,8 +272,8 @@ impl Hub {
     }
 
     /// `blocks` as the agent gets them: after a gap, and always for a notice, led by a line with the time.
-    fn with_time(&self, id: Uuid, blocks: Vec<Value>, notice: bool) -> Vec<Value> {
-        let heard_at = *self.live(id).heard_at.lock().expect("hub lock");
+    async fn with_time(&self, id: Uuid, blocks: Vec<Value>, notice: bool) -> Vec<Value> {
+        let heard_at = self.heard_at(id).await;
         match time_line(self.now(), heard_at, notice) {
             Some(line) => std::iter::once(json!({"type": "text", "text": line}))
                 .chain(blocks)
@@ -379,18 +379,33 @@ impl Hub {
         );
     }
 
+    /// When the agent was last heard from. Until this runtime has heard from it, that's the session's last activity,
+    /// read before this runtime records or sends anything for the session.
+    async fn heard_at(&self, id: Uuid) -> Option<DateTime<Utc>> {
+        let live = self.live(id);
+        let known = *live.heard_at.lock().expect("hub lock");
+        if known.is_some() {
+            return known;
+        }
+        let active_at = match self.store.get_session(id).await {
+            Ok(row) => row?.active_at,
+            Err(e) => {
+                tracing::warn!(session = %id, error = %e, "reading the session's last activity");
+                return None;
+            }
+        };
+        Some(
+            *live
+                .heard_at
+                .lock()
+                .expect("hub lock")
+                .get_or_insert(active_at),
+        )
+    }
+
     /// Appends an update to the event log and sends it to every UI.
     pub async fn record(&self, id: Uuid, update: Value) {
-        let live = self.live(id);
-        if live.heard_at.lock().expect("hub lock").is_none() {
-            // The session's last activity before this runtime recorded anything for it.
-            if let Ok(Some(row)) = self.store.get_session(id).await {
-                live.heard_at
-                    .lock()
-                    .expect("hub lock")
-                    .get_or_insert(row.active_at);
-            }
-        }
+        self.heard_at(id).await;
         match self.store.append_event(id, &update).await {
             Ok(seq) => self.broadcast(
                 id,
@@ -1235,9 +1250,10 @@ impl Hub {
         notice: bool,
         held: Option<Uuid>,
     ) -> Result<Value, RpcError> {
+        let prompt = self.with_time(id, blocks, notice).await;
         let (request, answer) = agent.send_request(
             "session/prompt",
-            json!({"sessionId": agent_session_id, "prompt": self.with_time(id, blocks, notice)}),
+            json!({"sessionId": agent_session_id, "prompt": prompt}),
         );
         self.sent(id, held, request).await;
         let result = answer.await;
@@ -1453,11 +1469,12 @@ impl Hub {
         for _ in 0..10 {
             self.after_compaction(id).await;
             let (agent, agent_session_id) = self.agent_for(id).await?;
+            let prompt = self.with_time(id, blocks.clone(), notice).await;
             let (request, answer) = agent.send_request(
                 "_session/steering",
                 json!({
                     "sessionId": agent_session_id,
-                    "prompt": self.with_time(id, blocks.clone(), notice),
+                    "prompt": prompt,
                     "_meta": {"steering": {"idleBehavior": "promptRequired"}},
                 }),
             );
