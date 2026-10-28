@@ -1277,7 +1277,8 @@ async fn a_queue_kept_before_a_restart_runs_once_the_agent_is_up() {
     h.agent_ready().await;
     let restored = next_prompt(&mut h.to_agent).await;
     assert_eq!(prompt_text(&restored), ["Sent before the restart"]);
-    h.respond(&restored, json!({"stopReason": "end_turn"})).await;
+    h.respond(&restored, json!({"stopReason": "end_turn"}))
+        .await;
     wait_until_nothing_kept(&h).await;
 }
 
