@@ -1,5 +1,6 @@
-//! Cilium as the enforcer (ADR 11): a shared Envoy listener whose `ext_authz` calls the runtime, and a
-//! default-deny CiliumNetworkPolicy per session that redirects intercepted hosts to it.
+//! Cilium as the enforcer (ADR 11): per session, an Envoy listener whose `ext_authz` calls the runtime and names the
+//! session, and a default-deny CiliumNetworkPolicy that redirects the session's intercepted hosts to it. The clusters
+//! and the listeners' certificate are shared, in one CiliumEnvoyConfig the session ones refer to (#196).
 
 use std::net::SocketAddr;
 
@@ -12,7 +13,20 @@ use sloppod_contracts::{EgressSpec, Enforcer, Error, Manifest, Result};
 
 use crate::tls::Ca;
 
-const LISTENER: &str = "sloppod-egress";
+/// The shared CiliumEnvoyConfig: the upstream and authorizer clusters, and the listeners' certificate.
+const SHARED: &str = "sloppod-egress";
+const CERT: &str = "sloppod-egress-cert";
+
+/// A session's CiliumEnvoyConfig, and its one listener.
+pub fn listener_name(session_id: &str) -> String {
+    format!("sloppod-egress-{session_id}")
+}
+
+/// A resource in the shared config, as another CiliumEnvoyConfig names it: Cilium prefixes every resource with
+/// `<namespace>/<config>/`, and leaves a name that already has slashes alone.
+fn shared(namespace: &str, name: &str) -> String {
+    format!("{namespace}/{SHARED}/{name}")
+}
 
 pub struct Cilium {
     namespace: String,
@@ -59,8 +73,9 @@ impl Cilium {
         }
     }
 
-    /// Writes the shared listener: TLS terminated with a certificate from the runtime's CA, `ext_authz`
-    /// to the runtime at `authz`, and TLS re-originated to the original destination.
+    /// Writes the shared config: the certificate the session listeners terminate TLS with, issued by the runtime's
+    /// CA, the cluster their `ext_authz` reaches the runtime at `authz` by, and the one TLS is re-originated to the
+    /// original destination by.
     pub async fn install_listener(
         &self,
         ca: &Ca,
@@ -69,10 +84,10 @@ impl Cilium {
         trusted_ca: &str,
     ) -> anyhow::Result<()> {
         let (cert, key) = ca.issue(hosts)?;
-        let config = envoy_config(&self.namespace, &cert, &key, authz, trusted_ca);
+        let config = shared_config(&cert, &key, authz, trusted_ca);
         self.envoy_configs
             .patch(
-                LISTENER,
+                SHARED,
                 &PatchParams::apply("sloppod").force(),
                 &Patch::Apply(&config),
             )
@@ -81,32 +96,36 @@ impl Cilium {
     }
 }
 
-fn envoy_config(
-    namespace: &str,
-    cert: &str,
-    key: &str,
-    authz: SocketAddr,
-    trusted_ca: &str,
-) -> Value {
-    let manager = json!({
+/// The HTTP side of a session's listener: paths normalised, every request authorized by the runtime with the
+/// session named in `context_extensions`, then sent on to its original destination.
+fn connection_manager(namespace: &str, session_id: &str) -> Value {
+    json!({
         "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
-        "stat_prefix": LISTENER,
-        // One canonical path for the authorizer and the upstream alike: dot segments resolved and
-        // repeated slashes merged before any policy looks, so no policy has to get that right
-        // itself. Escaped slashes are left as sent.
+        "stat_prefix": listener_name(session_id),
+        // One canonical path for the authorizer and the upstream alike: dot segments resolved and repeated slashes
+        // merged before any policy looks, so no policy has to get that right itself. Escaped slashes are left as
+        // sent.
         "normalize_path": true,
         "merge_slashes": true,
         "stream_idle_timeout": "900s",
         "request_timeout": "0s",
         "route_config": {
-            "name": LISTENER,
+            "name": listener_name(session_id),
             "virtual_hosts": [{
                 "name": "all",
                 "domains": ["*"],
                 "routes": [{
                     "match": {"prefix": "/"},
-                    "route": {"cluster": "sloppod-upstream", "timeout": "0s"},
+                    "route": {"cluster": shared(namespace, "sloppod-upstream"), "timeout": "0s"},
                 }],
+                // Which session this is: the listener is the session's own, chosen by Cilium from the session's
+                // policy, so the pod can't pick another.
+                "typed_per_filter_config": {
+                    "envoy.filters.http.ext_authz": {
+                        "@type": "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute",
+                        "check_settings": {"context_extensions": {"session": session_id}},
+                    },
+                },
             }],
         },
         "http_filters": [
@@ -123,11 +142,9 @@ fn envoy_config(
                         "pack_as_bytes": true,
                     },
                     "grpc_service": {
-                        // Cilium prefixes resource names with `<namespace>/<config>/`, but only
-                        // rewrites the references it knows about. The authority must not
-                        // contain those slashes: HTTP/2 servers reject it.
+                        // The authority must not contain the qualified name's slashes: HTTP/2 servers reject it.
                         "envoy_grpc": {
-                            "cluster_name": format!("{namespace}/{LISTENER}/sloppod-authz"),
+                            "cluster_name": shared(namespace, "sloppod-authz"),
                             "authority": "sloppod-authz",
                         },
                         "timeout": "10s",
@@ -139,38 +156,60 @@ fn envoy_config(
                 "typed_config": {"@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"},
             },
         ],
-    });
+    })
+}
+
+/// A session's CiliumEnvoyConfig: one listener, terminating TLS with the shared certificate.
+fn session_config(namespace: &str, session_id: &str) -> Value {
     json!({
         "apiVersion": "cilium.io/v2",
         "kind": "CiliumEnvoyConfig",
         "metadata": {
-            "name": LISTENER,
+            "name": listener_name(session_id),
+            "labels": {"sloppod.dev/session": session_id},
             // Upstream connections come from Envoy itself, as in the ADR 11 spike.
+            "annotations": {"cec.cilium.io/use-original-source-address": "false"},
+        },
+        "spec": {"resources": [{
+            "@type": "type.googleapis.com/envoy.config.listener.v3.Listener",
+            "name": listener_name(session_id),
+            "filter_chains": [{
+                "transport_socket": {
+                    "name": "envoy.transport_sockets.tls",
+                    "typed_config": {
+                        "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
+                        "common_tls_context": {
+                            "alpn_protocols": ["http/1.1"],
+                            "tls_certificate_sds_secret_configs": [{"name": shared(namespace, CERT)}],
+                        },
+                    },
+                },
+                "filters": [{
+                    "name": "envoy.filters.network.http_connection_manager",
+                    "typed_config": connection_manager(namespace, session_id),
+                }],
+            }],
+        }]},
+    })
+}
+
+/// The shared CiliumEnvoyConfig: the listeners' certificate and the clusters they send to.
+fn shared_config(cert: &str, key: &str, authz: SocketAddr, trusted_ca: &str) -> Value {
+    json!({
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumEnvoyConfig",
+        "metadata": {
+            "name": SHARED,
             "annotations": {"cec.cilium.io/use-original-source-address": "false"},
         },
         "spec": {"resources": [
             {
-                "@type": "type.googleapis.com/envoy.config.listener.v3.Listener",
-                "name": LISTENER,
-                "filter_chains": [{
-                    "transport_socket": {
-                        "name": "envoy.transport_sockets.tls",
-                        "typed_config": {
-                            "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
-                            "common_tls_context": {
-                                "alpn_protocols": ["http/1.1"],
-                                "tls_certificates": [{
-                                    "certificate_chain": {"inline_string": cert},
-                                    "private_key": {"inline_string": key},
-                                }],
-                            },
-                        },
-                    },
-                    "filters": [{
-                        "name": "envoy.filters.network.http_connection_manager",
-                        "typed_config": manager,
-                    }],
-                }],
+                "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret",
+                "name": CERT,
+                "tls_certificate": {
+                    "certificate_chain": {"inline_string": cert},
+                    "private_key": {"inline_string": key},
+                },
             },
             {
                 "@type": "type.googleapis.com/envoy.config.cluster.v3.Cluster",
@@ -245,6 +284,15 @@ fn dns_rules(egress: &EgressSpec, cluster_domain: &str) -> Vec<Value> {
         .collect()
 }
 
+/// A delete's outcome: done, or already gone.
+fn gone_or_deleted<T>(result: kube::Result<T>) -> Result<()> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+        Err(e) => Err(err(e)),
+    }
+}
+
 #[async_trait]
 impl Enforcer for Cilium {
     fn manifest(&self) -> Manifest {
@@ -252,6 +300,15 @@ impl Enforcer for Cilium {
     }
 
     async fn apply(&self, egress: &EgressSpec) -> Result<()> {
+        // The listener first, so the policy that redirects to it never points at nothing.
+        self.envoy_configs
+            .patch(
+                &listener_name(&egress.session_id),
+                &PatchParams::apply("sloppod").force(),
+                &Patch::Apply(&session_config(&self.namespace, &egress.session_id)),
+            )
+            .await
+            .map_err(err)?;
         let fqdns = |hosts: &[String]| hosts.iter().map(|h| fqdn_selector(h)).collect::<Vec<_>>();
         let runtime: serde_json::Map<String, Value> = self
             .runtime_labels
@@ -271,7 +328,10 @@ impl Enforcer for Cilium {
                 "toFQDNs": fqdns(&egress.intercepted_hosts),
                 "toPorts": [{
                     "ports": [{"port": "443", "protocol": "TCP"}],
-                    "listener": {"envoyConfig": {"kind": "CiliumEnvoyConfig", "name": LISTENER}, "name": LISTENER},
+                    "listener": {
+                        "envoyConfig": {"kind": "CiliumEnvoyConfig", "name": listener_name(&egress.session_id)},
+                        "name": listener_name(&egress.session_id),
+                    },
                 }],
             }),
         ];
@@ -312,15 +372,17 @@ impl Enforcer for Cilium {
     }
 
     async fn remove(&self, session_id: &str) -> Result<()> {
-        match self
-            .policies
-            .delete(&policy_name(session_id), &DeleteParams::default())
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
-            Err(e) => Err(err(e)),
-        }
+        // The policy first, so nothing is redirected to a listener that's gone.
+        gone_or_deleted(
+            self.policies
+                .delete(&policy_name(session_id), &DeleteParams::default())
+                .await,
+        )?;
+        gone_or_deleted(
+            self.envoy_configs
+                .delete(&listener_name(session_id), &DeleteParams::default())
+                .await,
+        )
     }
 }
 
@@ -359,29 +421,49 @@ mod tests {
     }
 
     #[test]
-    fn the_listener_hands_policies_a_normalised_path() {
-        let config = envoy_config(
-            "slop",
-            "cert",
-            "key",
-            "127.0.0.1:9001".parse().unwrap(),
-            "/ca.crt",
+    fn a_session_listener_names_its_session_and_uses_the_shared_parts() {
+        let config = session_config("slop", "s1");
+        assert_eq!(config["metadata"]["name"], "sloppod-egress-s1");
+        let chain = &config["spec"]["resources"][0]["filter_chains"][0];
+        assert_eq!(
+            chain["transport_socket"]["typed_config"]["common_tls_context"]["tls_certificate_sds_secret_configs"]
+                [0]["name"],
+            "slop/sloppod-egress/sloppod-egress-cert"
         );
-        let manager =
-            &config["spec"]["resources"][0]["filter_chains"][0]["filters"][0]["typed_config"];
+        let manager = &chain["filters"][0]["typed_config"];
         assert_eq!(manager["normalize_path"], true);
         assert_eq!(manager["merge_slashes"], true);
+        let host = &manager["route_config"]["virtual_hosts"][0];
+        assert_eq!(
+            host["routes"][0]["route"]["cluster"],
+            "slop/sloppod-egress/sloppod-upstream"
+        );
+        assert_eq!(
+            host["typed_per_filter_config"]["envoy.filters.http.ext_authz"]["check_settings"]["context_extensions"]
+                ["session"],
+            "s1"
+        );
+        assert_eq!(
+            manager["http_filters"][0]["typed_config"]["grpc_service"]["envoy_grpc"]["cluster_name"],
+            "slop/sloppod-egress/sloppod-authz"
+        );
+    }
+
+    #[test]
+    fn the_shared_config_has_no_listener_of_its_own() {
+        let config = shared_config("cert", "key", "127.0.0.1:9001".parse().unwrap(), "/ca.crt");
+        let resources = config["spec"]["resources"].as_array().unwrap();
+        assert!(
+            resources
+                .iter()
+                .all(|r| !r["@type"].as_str().unwrap().ends_with(".Listener"))
+        );
+        assert!(resources.iter().any(|r| r["name"] == "sloppod-egress-cert"));
     }
 
     #[test]
     fn upstream_connections_never_resume_tls_sessions() {
-        let config = envoy_config(
-            "slop",
-            "cert",
-            "key",
-            "127.0.0.1:9001".parse().unwrap(),
-            "/ca.crt",
-        );
+        let config = shared_config("cert", "key", "127.0.0.1:9001".parse().unwrap(), "/ca.crt");
         let upstream = config["spec"]["resources"]
             .as_array()
             .unwrap()
