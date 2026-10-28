@@ -432,6 +432,13 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
                 }
                 Err(e) => {
                     tracing::error!(session = %session_id, error = %e, "building launch spec");
+                    agent_failed(
+                        &state,
+                        session_id,
+                        "The agent couldn't be launched",
+                        &format!("{e:#}"),
+                    )
+                    .await;
                     state.hub.detach_agent(session_id, &agent).await;
                     writer.abort();
                     return;
