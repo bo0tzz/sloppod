@@ -818,7 +818,7 @@ impl GitHubApp {
             .bearer_auth(token)
             .header("accept", "application/vnd.github+json");
         if let Some(payload) = payload {
-            request = request.json(payload);
+            request = request.json(&without_agent_credits_in(payload));
         }
         let response = request.send().await?;
         let status = response.status();
@@ -1280,6 +1280,40 @@ pub async fn inspect_user_token(
         repositories,
         more_repositories,
     }))
+}
+
+/// A payload's `body` (a pull request's description, an issue's body, a comment) without agents' credits.
+fn without_agent_credits_in(payload: &Value) -> Value {
+    let mut payload = payload.clone();
+    if let Some(body) = payload.get_mut("body")
+        && let Some(text) = body.as_str()
+    {
+        *body = json!(without_agent_credits(text));
+    }
+    payload
+}
+
+/// What sloppod writes to GitHub carries no credits an agent added for itself ("Co-Authored-By: Claude …",
+/// "Generated with Claude Code"), whatever the agent wrote: the owner decides how their work is attributed.
+pub fn without_agent_credits(text: &str) -> String {
+    let credit = |line: &str| {
+        let line = line.trim().to_ascii_lowercase();
+        (line.starts_with("co-authored-by:")
+            && (line.contains("anthropic.com") || line.contains("claude")))
+            || {
+                // The footer alone on its line, with or without its emoji and link; not prose about it.
+                let footer = line.trim_start_matches('🤖').trim_start();
+                footer == "generated with claude code"
+                    || footer == "generated with [claude code]"
+                    || (footer.starts_with("generated with [claude code](")
+                        && footer.ends_with(')'))
+            }
+    };
+    if !text.lines().any(credit) {
+        return text.to_owned();
+    }
+    let kept: Vec<&str> = text.lines().filter(|line| !credit(line)).collect();
+    kept.join("\n").trim_end().to_owned()
 }
 
 #[cfg(test)]
@@ -2012,5 +2046,22 @@ mod tests {
         let (fake, app) = fake_github().await;
         app.token_for("o/r").await.unwrap();
         assert_eq!(*fake.minted.lock().unwrap(), vec![(1, json!({}))]);
+    }
+
+    #[test]
+    fn agents_credits_are_left_out() {
+        let text = "Fixes the build.\n\nCo-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n";
+        assert_eq!(without_agent_credits(text), "Fixes the build.");
+        let plain = "Done.\nGenerated with Claude Code";
+        assert_eq!(without_agent_credits(plain), "Done.");
+        let kept = "Co-authored-by: Ada <ada@example.com>\nThanks to Claude Shannon.\nThe parser rejects files generated with \
+                    Claude Code; steps follow.\n- It drops \"Generated with Claude Code\" lines.\n";
+        assert_eq!(without_agent_credits(kept), kept);
+        assert_eq!(
+            without_agent_credits_in(
+                &json!({"title": "T", "body": "B\nCo-authored-by: Claude <noreply@anthropic.com>"})
+            ),
+            json!({"title": "T", "body": "B"})
+        );
     }
 }
