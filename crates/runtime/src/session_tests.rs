@@ -1356,7 +1356,7 @@ async fn a_queue_kept_before_a_restart_runs_once_the_agent_is_up() {
         )
         .await
         .unwrap();
-    h.hub.restore_queues().await;
+    h.hub.restore_queues().await.unwrap();
     h.agent_ready().await;
     let restored = next_prompt(&mut h.to_agent).await;
     assert_eq!(prompt_text(&restored), ["Sent before the restart"]);
@@ -1381,7 +1381,7 @@ async fn a_message_taken_back_before_a_restart_does_not_run_from_the_kept_queue(
         .await
         .unwrap();
     h.store.remove_message(h.id, taken).await.unwrap();
-    h.hub.restore_queues().await;
+    h.hub.restore_queues().await.unwrap();
     assert_eq!(h.queued().await, [kept.to_string()]);
     h.agent_ready().await;
     let restored = next_prompt(&mut h.to_agent).await;
@@ -1424,41 +1424,26 @@ async fn a_message_sent_again_while_it_is_taken_back_does_not_run() {
 }
 
 #[tokio::test]
-async fn a_restart_keeps_messages_whose_removal_it_cannot_read_until_it_can() {
+async fn a_restore_that_cannot_read_removals_changes_nothing_until_it_can() {
     let mut h = Harness::starting().await;
     let (taken, kept) = (Uuid::new_v4(), Uuid::new_v4());
-    h.store
-        .save_queue(
-            h.id,
-            &[
-                json!({"id": taken, "blocks": [{"type": "text", "text": "Taken back"}]}),
-                json!({"id": kept, "blocks": [{"type": "text", "text": "Kept"}]}),
-            ],
-        )
-        .await
-        .unwrap();
+    let queue = [
+        json!({"id": taken, "blocks": [{"type": "text", "text": "Taken back"}]}),
+        json!({"id": kept, "blocks": [{"type": "text", "text": "Kept"}]}),
+    ];
+    h.store.save_queue(h.id, &queue).await.unwrap();
     h.store.remove_message(h.id, taken).await.unwrap();
     h.store.fail_removal_lookups.store(true, Ordering::SeqCst);
-    h.hub.restore_queues().await;
-    // Neither is queued yet, and both stay stored, even as the queue changes.
+    assert!(h.hub.restore_queues().await.is_err());
     assert!(h.queued().await.is_empty());
-    let _later = h.prompt("Later");
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let stored: Vec<String> = h.store.queues().await.unwrap()[0]
-        .1
-        .iter()
-        .filter_map(|m| m["blocks"][0]["text"].as_str().map(str::to_owned))
-        .collect();
-    assert_eq!(stored, ["Taken back", "Kept", "Later"]);
+    assert_eq!(h.store.queues().await.unwrap(), [(h.id, queue.to_vec())]);
 
-    // Once it can be read, the one taken back is dropped and the other runs, ahead of what came since.
+    // Tried again once it can be read: the one taken back is dropped and the other runs.
     h.store.fail_removal_lookups.store(false, Ordering::SeqCst);
-    wait_for_queue(&h, 1).await;
+    h.hub.restore_queues().await.unwrap();
+    assert_eq!(h.queued().await, [kept.to_string()]);
     h.agent_ready().await;
-    assert_eq!(
-        prompt_text(&next_prompt(&mut h.to_agent).await),
-        ["Kept", "Later"]
-    );
+    assert_eq!(prompt_text(&next_prompt(&mut h.to_agent).await), ["Kept"]);
 }
 
 #[tokio::test]
@@ -1473,7 +1458,7 @@ async fn a_message_taken_back_before_a_restart_leaves_nothing_kept() {
         .await
         .unwrap();
     h.store.remove_message(h.id, taken).await.unwrap();
-    h.hub.restore_queues().await;
+    h.hub.restore_queues().await.unwrap();
     assert!(h.queued().await.is_empty());
     assert!(h.store.queues().await.unwrap().is_empty());
 }
@@ -1511,7 +1496,7 @@ async fn a_notice_after_a_restore_joins_the_kept_queue() {
         )
         .await
         .unwrap();
-    h.hub.restore_queues().await;
+    h.hub.restore_queues().await.unwrap();
     h.hub.clone().notify(h.id, "A notice".into()).await;
     let kept = h.store.queues().await.unwrap();
     let texts: Vec<&str> = kept[0]
@@ -1587,7 +1572,7 @@ async fn restarted(
     let (tx, to_agent) = mpsc::unbounded_channel();
     let agent = Arc::new(AgentConn::new(tx));
     hub.attach_agent(h.id, agent.clone()).await;
-    hub.restore_queues().await;
+    hub.restore_queues().await.unwrap();
     (hub, agent, to_agent)
 }
 
