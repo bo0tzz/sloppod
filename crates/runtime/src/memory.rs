@@ -13,6 +13,7 @@ use axum::http::{HeaderName, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use sloppod_contracts::{Decision, HttpRequest, RequestPolicy};
 
+use crate::credentials::MEMINI;
 use crate::{AppState, db};
 
 /// Where sessions find memini on the runtime's sessions port.
@@ -97,7 +98,12 @@ async fn forward(state: &AppState, peer: SocketAddr, request: Request) -> anyhow
     let session = db::get_session(&state.db, session)
         .await?
         .context("unknown session")?;
-    let Some((_, credential)) = state.credentials.memini(&session.owner).await? else {
+    // Only its URL is needed here; the admin key stays sealed.
+    let Some(credential) = state
+        .credentials
+        .default_row(&session.owner, MEMINI)
+        .await?
+    else {
         return Ok((StatusCode::NOT_FOUND, "sloppod: no memini is configured\n").into_response());
     };
     let base = credential

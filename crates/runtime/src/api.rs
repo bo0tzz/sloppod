@@ -337,7 +337,7 @@ async fn create_session(
     };
     let needed = adapter.credential();
     let (kind, account) = (needed.kind.as_str(), needed.name.as_str());
-    if state.credentials.secret(&user, kind).await?.is_none() {
+    if !state.credentials.has_default(&user, kind).await? {
         return Err(ApiError(
             StatusCode::CONFLICT,
             format!("add {account} in settings before starting a session"),
@@ -363,7 +363,7 @@ async fn create_session(
         Grant::new(capability::GITHUB, json!({})),
         Grant::new(capability::PACKAGES, json!({})),
     ];
-    if state.credentials.secret(&user, CHATGPT).await?.is_some() {
+    if state.credentials.has_default(&user, CHATGPT).await? {
         grants.push(Grant::new(capability::CODEX, json!({})));
     }
     if let Some(repo) = &repo {
