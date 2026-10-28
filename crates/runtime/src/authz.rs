@@ -10,7 +10,7 @@ use envoy_types::ext_authz::v3::pb::{
 use envoy_types::ext_authz::v3::{
     CheckResponseExt, DeniedHttpResponseBuilder, OkHttpResponseBuilder,
 };
-use sloppod_contracts::{Decision, HttpRequest};
+use sloppod_contracts::{Decision, HttpRequest, header_ops};
 use tonic::{Request, Response, Status};
 
 use crate::{AppState, db};
@@ -137,14 +137,10 @@ impl Authorizer {
                 remove_headers,
             } => {
                 tracing::info!(session = %session_id, method = %request.method, %host, path = %request.path_only(), "allow");
+                let (set_headers, remove_headers) = header_ops(set_headers, remove_headers);
                 let mut ok = OkHttpResponseBuilder::new();
                 for name in remove_headers {
-                    if !set_headers
-                        .iter()
-                        .any(|(k, _)| k.eq_ignore_ascii_case(&name))
-                    {
-                        ok.remove_header(name);
-                    }
+                    ok.remove_header(name);
                 }
                 for (name, value) in set_headers {
                     ok.add_header(

@@ -87,6 +87,7 @@ pub struct AgentConn {
     tx: mpsc::UnboundedSender<ToSupervisor>,
     pending: Mutex<HashMap<i64, oneshot::Sender<Result<Value, RpcError>>>>,
     next_id: AtomicI64,
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl AgentConn {
@@ -95,6 +96,7 @@ impl AgentConn {
             tx,
             pending: Mutex::default(),
             next_id: AtomicI64::new(1),
+            closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -159,7 +161,13 @@ impl AgentConn {
     }
 
     /// Fails every outstanding request; the link is gone.
+    /// Whether the link this connection was on has gone.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
     pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
         self.pending.lock().expect("pending lock").clear();
     }
 }
@@ -500,6 +508,13 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
                 }
                 Err(e) => {
                     tracing::error!(session = %session_id, error = %e, "building launch spec");
+                    agent_failed(
+                        &state,
+                        session_id,
+                        "The agent couldn't be launched",
+                        &format!("{e:#}"),
+                    )
+                    .await;
                     state.hub.detach_agent(session_id, &agent).await;
                     writer.abort();
                     return;
@@ -510,8 +525,14 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
 
     // Transcript replacements being put together on this link: file name -> its whole length.
     let mut staging = HashMap::new();
+    // An agent that couldn't start its session ends the link, so the supervisor starts it again after a pause.
+    let (start_failed, mut start_failures) = mpsc::unbounded_channel::<()>();
     loop {
-        let message = match tokio::time::timeout(LINK_TIMEOUT, stream.next()).await {
+        let next = tokio::select! {
+            next = tokio::time::timeout(LINK_TIMEOUT, stream.next()) => next,
+            _ = start_failures.recv() => break,
+        };
+        let message = match next {
             Ok(Some(Ok(message))) => message,
             Ok(Some(Err(e))) => {
                 tracing::warn!(session = %session_id, error = %e, "the supervisor link failed");
@@ -539,17 +560,35 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
             FromSupervisor::Hello { .. } => {}
             FromSupervisor::Status { message } => {
                 tracing::info!(session = %session_id, %message, "supervisor status");
+                match db::set_agent_status(&state.db, session_id, &message).await {
+                    Ok(()) => state.hub.broadcast_session(session_id).await,
+                    Err(e) => {
+                        tracing::warn!(session = %session_id, error = %e, "storing the agent's status")
+                    }
+                }
             }
             FromSupervisor::AgentStarted => {
                 let Some(agent_launch) = agent_launch.clone() else {
                     continue;
                 };
                 let (state, agent, session) = (state.clone(), agent.clone(), session.clone());
+                let start_failed = start_failed.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
                         start_agent_session(&state, &agent, &session, &agent_launch).await
                     {
                         tracing::error!(session = %session.id, error = %e, "starting agent session");
+                        // A link that went down took the startup's requests with it; that isn't the agent failing.
+                        if !agent.is_closed() {
+                            agent_failed(
+                                &state,
+                                session.id,
+                                "The agent couldn't start",
+                                &format!("{e:#}"),
+                            )
+                            .await;
+                            let _ = start_failed.send(());
+                        }
                     }
                 });
             }
@@ -609,9 +648,27 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
             FromSupervisor::TranscriptAppend { .. } => {}
             FromSupervisor::AgentExited { code } => {
                 tracing::warn!(session = %session_id, ?code, "agent exited");
+                if code != Some(0) {
+                    let how =
+                        code.map_or("was killed".to_owned(), |c| format!("exited with code {c}"));
+                    agent_failed(
+                        &state,
+                        session_id,
+                        "The agent stopped",
+                        &format!("The agent {how}; it's started again."),
+                    )
+                    .await;
+                }
             }
             FromSupervisor::Error { message } => {
                 tracing::error!(session = %session_id, %message, "supervisor error");
+                agent_failed(
+                    &state,
+                    session_id,
+                    "The session's pod couldn't start the agent",
+                    &message,
+                )
+                .await;
             }
         }
     }
@@ -658,6 +715,24 @@ pub(crate) async fn store_transcript_piece(
         db::promote_transcript(db, session, name).await?;
     }
     Ok(true)
+}
+
+/// Shows why the agent failed: on the session while it's started again, and in the transcript the first time.
+async fn agent_failed(state: &AppState, session: Uuid, title: &str, error: &str) {
+    match db::set_agent_error(&state.db, session, error).await {
+        Ok(true) => {
+            state
+                .hub
+                .record(
+                    session,
+                    json!({"sessionUpdate": "notice", "severity": "error", "title": title, "description": error}),
+                )
+                .await;
+            state.hub.broadcast_session(session).await;
+        }
+        Ok(false) => state.hub.broadcast_session(session).await,
+        Err(e) => tracing::warn!(%session, error = %e, "storing the agent's error"),
+    }
 }
 
 /// A transcript file name the session's pod can be given back; one that isn't is dropped and logged.
@@ -715,6 +790,7 @@ async fn start_agent_session(
     };
     let agent_state = adapter::agent_state(&response);
     db::set_agent_session(&state.db, session.id, &agent_session_id, &agent_state).await?;
+    db::clear_agent_status(&state.db, session.id).await?;
     // Cleared once a turn starts with it, so an agent that goes before then leaves it for the next.
     let pending = db::pending_prompt(&state.db, session.id).await?;
     agent.ready(AgentReady {
