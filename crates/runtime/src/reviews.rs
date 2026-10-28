@@ -106,10 +106,18 @@ pub async fn start(
 /// The longest a review round may take, from its start to its verdict.
 const ROUND_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+/// How long a round's reviewer has waited for its usage limit by `now`, the wait that's still on included.
+pub(crate) fn paused(round: &db::ReviewRow, now: DateTime<Utc>) -> chrono::Duration {
+    chrono::Duration::seconds(round.paused_seconds)
+        + round
+            .paused_since
+            .map_or(chrono::Duration::zero(), |since| now - since)
+}
+
 /// Whether a round that started at `started` has run out of time, counted from its stored start so a restart
 /// doesn't reset it. Time its reviewer waited for the usage limit (`paused`, kept with the round) doesn't count,
 /// and a round doesn't run out while its reviewer is `limited`.
-fn round_timed_out(
+pub(crate) fn round_timed_out(
     started: DateTime<Utc>,
     paused: chrono::Duration,
     limited: bool,
@@ -159,19 +167,17 @@ fn watch_round(state: &AppState, proposal: Uuid, session: Uuid, round: i32) {
     tokio::spawn(async move {
         let (mut nudged, mut retries) = (false, 0);
         let (mut seen, _) = state.hub.turns_ended(session).await;
-        let mut looked = Utc::now();
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
             let now = Utc::now();
             let limited = state.hub.limited_until(session).await.is_some();
-            if limited
-                && let Err(e) =
-                    db::add_review_pause(&state.db, proposal, round, (now - looked).num_seconds())
-                        .await
-            {
+            let kept = match limited {
+                true => db::pause_review(&state.db, proposal, round, now).await,
+                false => db::unpause_review(&state.db, proposal, round, now).await,
+            };
+            if let Err(e) = kept {
                 tracing::warn!(%proposal, error = %e, "keeping how long a review waited for its usage limit");
             }
-            looked = now;
             // Errors are retried at the next check; only a confirmed outcome ends the watch.
             let (rounds, current) = match tokio::try_join!(
                 db::reviews(&state.db, proposal),
@@ -191,8 +197,7 @@ fn watch_round(state: &AppState, proposal: Uuid, session: Uuid, round: i32) {
             {
                 return;
             }
-            let paused = chrono::Duration::seconds(this.paused_seconds);
-            let timed_out = round_timed_out(this.created_at, paused, limited, now);
+            let timed_out = round_timed_out(this.created_at, paused(&this, now), limited, now);
             // Counted, not sampled: a turn that starts and ends between two looks still counts.
             let (count, last) = state.hub.turns_ended(session).await;
             let ended = last.filter(|_| count > seen);
