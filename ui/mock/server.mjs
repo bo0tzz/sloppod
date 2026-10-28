@@ -308,7 +308,10 @@ const newGrant = (capability, params, description, expires_at) => ({
 function addRepoAs(res, session, body) {
   const token = credentials.find((c) => c.id === body.credential && c.kind === 'github-user');
   if (!token) return json(res, 400, { error: "that isn't one of your GitHub tokens" });
-  const repo = token.config.repositories.find((r) => r.toLowerCase() === String(body.repo).toLowerCase());
+  const listed = token.config.repositories.find((r) => r.toLowerCase() === String(body.repo).toLowerCase());
+  // A token that reaches more than it lists can take any well-formed name; GitHub decides when it's used.
+  const wellFormed = /^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/.test(String(body.repo)) && !['.', '..'].includes(String(body.repo).split('/')[1]);
+  const repo = listed ?? (token.config.more_repositories && wellFormed ? body.repo : undefined);
   if (!repo) return json(res, 400, { error: `the token ${token.name} doesn't reach ${body.repo}` });
   grantRepo(session, repo);
   const grant = session.data.grants.find((g) => g.capability === 'repo' && g.params.repo === repo);
@@ -1626,7 +1629,7 @@ function inspectUserToken(secret) {
       login: 'bo0tzz',
       expires_at: new Date(Date.now() + days * 24 * 3600_000).toISOString(),
       repositories: ['bo0tzz/sloppod', 'bo0tzz/dotfiles'],
-      more_repositories: false,
+      more_repositories: secret.includes('many'),
     },
   };
 }

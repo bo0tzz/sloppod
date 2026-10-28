@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Alert, Button, Field, LoadingSpinner, Modal, ModalBody, ModalFooter, Select, Text } from '@immich/ui';
+  import { Alert, Button, Field, Input, LoadingSpinner, Modal, ModalBody, ModalFooter, Select, Text } from '@immich/ui';
   import { mdiSourceRepository } from '@mdi/js';
   import { onMount } from 'svelte';
   import { api, type GitHubUserConfig, type Session } from '#lib/api.ts';
@@ -13,9 +13,10 @@
   const APP = 'app';
 
   let repos = $state<string[] | null>(null);
-  let tokens = $state<{ id: string; label: string; repositories: string[] }[]>([]);
+  let tokens = $state<{ id: string; label: string; repositories: string[]; more: boolean }[]>([]);
   let actAs = $state(APP);
   let repo = $state<string>();
+  let typed = $state('');
   let saving = $state(false);
   let error = $state<string | null>(null);
 
@@ -33,6 +34,9 @@
         .map((grant) => String(grant.params.repo)),
     ),
   );
+  // A token that reaches more repositories than were listed when it was added can be given one that isn't listed.
+  const unlisted = $derived(token?.more ?? false);
+  const wanted = $derived(unlisted && typed.trim() ? typed.trim() : repo);
   const available = $derived((token ? token.repositories : (repos ?? [])).filter((candidate) => !granted.has(candidate)));
 
   onMount(async () => {
@@ -44,7 +48,12 @@
           .filter((credential) => credential.kind === 'github-user')
           .map((credential) => {
             const config = credential.config as unknown as GitHubUserConfig;
-            return { id: credential.id, label: `${config.login} (${credential.name})`, repositories: config.repositories };
+            return {
+              id: credential.id,
+              label: `${config.login} (${credential.name})`,
+              repositories: config.repositories,
+              more: config.more_repositories,
+            };
           });
       })
       .catch(() => {});
@@ -57,11 +66,11 @@
   });
 
   async function add() {
-    if (!repo || saving) return;
+    if (!wanted || saving) return;
     saving = true;
     error = null;
     try {
-      onAdded(await api.addSessionRepo(session.id, repo, token?.id), repo);
+      onAdded(await api.addSessionRepo(session.id, wanted, token?.id), wanted);
       onClose();
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -76,7 +85,10 @@
       <Text color="muted" size="small">The session gets write access to its own branch in the repository.</Text>
       {#if tokens.length > 0}
         <Field label="Act as">
-          <Select options={identities} bind:value={actAs} onChange={() => (repo = undefined)} />
+          <Select options={identities} bind:value={actAs} onChange={() => {
+              repo = undefined;
+              typed = '';
+            }} />
         </Field>
         {#if token}
           <Text color="muted" size="small">What the session pushes there is attributed to that person.</Text>
@@ -84,7 +96,7 @@
       {/if}
       {#if repos === null}
         <div class="flex justify-center py-4"><LoadingSpinner /></div>
-      {:else if available.length === 0 && !error}
+      {:else if available.length === 0 && !error && !unlisted}
         <Text size="small">
           No more repositories available.
           <a href="/settings" class="text-primary underline">Check your {token ? 'GitHub account' : 'GitHub App'} in settings</a>.
@@ -94,6 +106,12 @@
           <Select options={available} bind:value={repo} placeholder="Choose a repository" />
         </Field>
       {/if}
+      {#if unlisted}
+        <Field label={available.length > 0 ? 'Or another repository' : 'Repository'}>
+          <Input bind:value={typed} placeholder="owner/name" autocomplete="off" data-testid="unlisted-repo" />
+        </Field>
+        <Text color="muted" size="small">This token reaches more repositories than are listed. GitHub decides whether it reaches this one.</Text>
+      {/if}
       {#if error}
         <Alert color="danger" size="small">{error}</Alert>
       {/if}
@@ -102,7 +120,7 @@
   <ModalFooter>
     <div class="flex w-full justify-end gap-2">
       <Button color="secondary" variant="ghost" shape="round" onclick={onClose}>Cancel</Button>
-      <Button shape="round" disabled={!repo} loading={saving} onclick={add}>Add</Button>
+      <Button shape="round" disabled={!wanted} loading={saving} onclick={add}>Add</Button>
     </div>
   </ModalFooter>
 </Modal>

@@ -874,6 +874,14 @@ test('approves a repository access request', async ({ page }) => {
   await expect(agentMessages(page).filter({ hasText: 'I can push to immich-app/static-pages now' })).toBeVisible();
 });
 
+// The mock is shared by the other tests, which expect no GitHub account.
+async function deleteGitHubTokens(page: Page) {
+  const credentials: { id: string; kind: string }[] = await (await page.request.get('/api/v1/credentials')).json();
+  for (const credential of credentials.filter((entry) => entry.kind === 'github-user')) {
+    await page.request.delete(`/api/v1/credentials/${credential.id}`);
+  }
+}
+
 test('adds a repository from the session menu', async ({ page }) => {
   await createSession(page, 'Just chat for now');
   await expect(page.getByTestId('session-subtitle')).toHaveText('No repository');
@@ -940,11 +948,37 @@ test("adds a repository as one of the user's GitHub tokens", async ({ page }) =>
   await expect(page.getByRole('option', { name: 'bo0tzz/sloppod' })).toBeVisible();
   await expect(page.getByRole('option', { name: 'bo0tzz/dotfiles' })).toHaveCount(0);
 
-  // The mock is shared by the other tests, which expect no GitHub account.
-  const credentials: { id: string; kind: string }[] = await (await page.request.get('/api/v1/credentials')).json();
-  for (const credential of credentials.filter((entry) => entry.kind === 'github-user')) {
-    await page.request.delete(`/api/v1/credentials/${credential.id}`);
-  }
+  await deleteGitHubTokens(page);
+});
+
+test('a token that reaches more repositories than it lists can add one that is not listed', async ({ page }) => {
+  await page.request.post('/api/v1/credentials', {
+    data: { kind: 'github-user', name: 'wide', secret: 'github_pat_many', config: {} },
+  });
+  await createSession(page, 'Just chat for now');
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await page.getByRole('menuitem', { name: 'Add repository…' }).click();
+
+  const picker = page.getByTestId('add-repo');
+  await picker.getByRole('combobox', { name: 'Act as' }).click();
+  await page.getByRole('option', { name: 'bo0tzz (wide)' }).click();
+  await picker.getByTestId('unlisted-repo').fill('someone/else');
+  await page.getByRole('button', { name: 'Add', exact: true }).click();
+  await expect(page.getByTestId('session-subtitle')).toHaveText('someone/else');
+
+  // The listed repositories are still offered, and a name that isn't one is refused.
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await page.getByRole('menuitem', { name: 'Add repository…' }).click();
+  await picker.getByRole('combobox', { name: 'Act as' }).click();
+  await page.getByRole('option', { name: 'bo0tzz (wide)' }).click();
+  await picker.getByRole('combobox', { name: 'Repository' }).click();
+  await expect(page.getByRole('option', { name: 'bo0tzz/dotfiles' })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await picker.getByTestId('unlisted-repo').fill('not a repository');
+  await page.getByRole('button', { name: 'Add', exact: true }).click();
+  await expect(picker.getByText("doesn't reach not a repository")).toBeVisible();
+
+  await deleteGitHubTokens(page);
 });
 
 test('shows a proposal of an unknown kind generically', async ({ page }) => {
