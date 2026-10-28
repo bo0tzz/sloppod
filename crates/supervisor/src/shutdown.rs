@@ -2,6 +2,7 @@
 //! the background, which ending the pod cuts off. The runtime tells the agent, so it can start them again.
 
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use sloppod_protocol::link::RunningProcess;
@@ -71,13 +72,17 @@ fn read_procs(root: &Path) -> HashMap<u32, Proc> {
 /// The last lines a process wrote to its standard output, if that's a file (as for background commands).
 fn output_tail(root: &Path, pid: u32) -> Option<String> {
     let target = std::fs::read_link(root.join(pid.to_string()).join("fd/1")).ok()?;
-    let metadata = std::fs::metadata(&target).ok()?;
+    let mut file = std::fs::File::open(&target).ok()?;
+    let metadata = file.metadata().ok()?;
     if !metadata.is_file() {
         return None;
     }
-    let content = std::fs::read(&target).ok()?;
-    let start = content.len().saturating_sub(TAIL_BYTES as usize);
-    let text = String::from_utf8_lossy(&content[start..]);
+    // Only the end is read: a long-running command's output can be large, and this runs in the grace period.
+    file.seek(SeekFrom::Start(metadata.len().saturating_sub(TAIL_BYTES)))
+        .ok()?;
+    let mut content = Vec::new();
+    file.take(TAIL_BYTES).read_to_end(&mut content).ok()?;
+    let text = String::from_utf8_lossy(&content);
     let lines: Vec<&str> = text.lines().collect();
     let tail = lines[lines.len().saturating_sub(TAIL_LINES)..].join("\n");
     (!tail.trim().is_empty()).then_some(tail)
@@ -110,6 +115,8 @@ fn running_in(root: &Path, agent: u32) -> Vec<RunningProcess> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
     fn procs(table: &[(u32, u32, &str)]) -> HashMap<u32, Proc> {
@@ -168,6 +175,26 @@ mod tests {
 
         let running = running_in(&root, 10);
         assert_eq!(running.len(), 1);
+        // A huge output file is only read at its end.
+        let huge = root.join("huge.output");
+        let file = std::fs::File::create(&huge).unwrap();
+        file.set_len(64 << 30).unwrap();
+        drop(file);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&huge)
+            .unwrap()
+            .write_all(b"\nthe end\n")
+            .unwrap();
+        std::fs::remove_file(root.join("20/fd/1")).unwrap();
+        std::os::unix::fs::symlink(&huge, root.join("20/fd/1")).unwrap();
+        assert!(
+            output_tail(&root, 20).unwrap().ends_with("the end"),
+            "read from the end of a 64 GiB sparse file"
+        );
+        std::fs::remove_file(root.join("20/fd/1")).unwrap();
+        std::os::unix::fs::symlink(&output, root.join("20/fd/1")).unwrap();
+        let running = running_in(&root, 10);
         assert_eq!(running[0].command, "/bin/bash -c cargo test 2>&1");
         let tail = running[0].output_tail.as_deref().unwrap();
         assert!(tail.starts_with("line 11\n") && tail.ends_with("line 30"));

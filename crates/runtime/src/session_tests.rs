@@ -387,6 +387,33 @@ async fn a_message_sent_again_does_not_run_twice() {
 }
 
 #[tokio::test]
+async fn a_notice_for_the_next_agent_skips_the_one_still_attached() {
+    let mut h = Harness::ready().await;
+    // The pod is going away with its agent still attached and idle.
+    h.hub
+        .notify_next(h.id, "sloppod: your pod was stopped.".into())
+        .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    while let Ok(message) = h.to_agent.try_recv() {
+        assert!(
+            !matches!(message, ToSupervisor::Acp { .. }),
+            "the dying agent was sent {message:?}"
+        );
+    }
+    // It's kept through the restart, and the next agent gets it.
+    assert_eq!(h.store.queues().await.unwrap().len(), 1);
+    h.hub.detach_agent(h.id, &h.agent).await;
+    let (tx, to_agent) = mpsc::unbounded_channel();
+    h.agent = Arc::new(AgentConn::new(tx));
+    h.to_agent = to_agent;
+    h.hub.attach_agent(h.id, h.agent.clone()).await;
+    h.agent_ready().await;
+    let request = h.next().await;
+    assert_eq!(request["method"], "session/prompt");
+    assert_eq!(prompt_text(&request), ["sloppod: your pod was stopped."]);
+}
+
+#[tokio::test]
 async fn a_notice_waits_for_the_agent_to_be_up() {
     let mut h = Harness::starting().await;
     h.hub

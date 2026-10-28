@@ -939,6 +939,36 @@ impl Hub {
 
     /// Tells the agent something happened outside its turns, e.g. a proposal was decided: a new turn when it's
     /// idle, steered into the running one, or queued until it's up.
+    /// Leaves a notice for the session's next agent: it waits in the queue even while an agent is attached, e.g. one
+    /// whose pod is going away, and runs once the next one is up.
+    pub async fn notify_next(&self, id: Uuid, text: String) {
+        let blocks = vec![json!({"type": "text", "text": text})];
+        {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            state.queue.push(Queued {
+                id: None,
+                blocks: blocks.clone(),
+                reply: None,
+            });
+            self.save_queue(id, &state.queue).await;
+        }
+        self.record_notice(id, &blocks[0]).await;
+    }
+
+    async fn record_notice(&self, id: Uuid, block: &Value) {
+        self.record(
+            id,
+            json!({
+                "sessionUpdate": "user_message_chunk",
+                "messageId": Uuid::new_v4(),
+                "content": block,
+                "_meta": {"sloppod": {"notice": true}},
+            }),
+        )
+        .await;
+    }
+
     pub async fn notify(self: &Arc<Self>, id: Uuid, text: String) {
         let blocks = vec![json!({"type": "text", "text": text})];
         let delivery = {
@@ -959,16 +989,7 @@ impl Hub {
                 Some(true)
             }
         };
-        self.record(
-            id,
-            json!({
-                "sessionUpdate": "user_message_chunk",
-                "messageId": Uuid::new_v4(),
-                "content": blocks[0],
-                "_meta": {"sloppod": {"notice": true}},
-            }),
-        )
-        .await;
+        self.record_notice(id, &blocks[0]).await;
         match delivery {
             None => {}
             Some(true) => {
