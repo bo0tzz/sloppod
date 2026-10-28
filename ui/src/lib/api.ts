@@ -160,15 +160,25 @@ export type StackPayload = {
   auto_merge?: boolean;
 };
 
-export type CredentialKind = 'claude' | 'github-app' | 'memini' | 'chatgpt';
+export type CredentialKind = 'claude' | 'github-app' | 'memini' | 'chatgpt' | 'github-user';
 
 export type Credential = {
   id: string;
   kind: CredentialKind;
   name: string;
-  config: Record<string, string>;
+  /** Strings, except a `github-user`'s, which is a {@link GitHubUserConfig}. */
+  config: Record<string, unknown>;
   default: boolean;
   created_at: string;
+};
+
+/** What the runtime learned of a GitHub token when it was added. */
+export type GitHubUserConfig = {
+  login: string;
+  expires_at: string | null;
+  repositories: string[];
+  /** The list stops short: the token reaches more. */
+  more_repositories: boolean;
 };
 
 export type NewCredential = {

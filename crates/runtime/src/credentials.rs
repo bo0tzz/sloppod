@@ -20,7 +20,9 @@ pub const GITHUB_APP: &str = "github-app";
 pub const MEMINI: &str = "memini";
 /// A ChatGPT subscription's Codex login, for review sessions (ADR 24).
 pub const CHATGPT: &str = "chatgpt";
-const KINDS: &[&str] = &[CLAUDE, GITHUB_APP, MEMINI, CHATGPT];
+/// A user's fine-grained GitHub token, for acting as them where they grant it (ADR 28). Nothing uses it yet.
+pub const GITHUB_USER: &str = "github-user";
+const KINDS: &[&str] = &[CLAUDE, GITHUB_APP, MEMINI, CHATGPT, GITHUB_USER];
 
 /// Codex's OAuth client and token endpoint, which refresh a ChatGPT login.
 const CHATGPT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -143,6 +145,20 @@ fn host_of(url: &str) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
+/// Whether a token is one a `github-user` credential can hold: a fine-grained one, which can be narrowed to
+/// repositories, and not a classic one, which reaches everything its user can.
+fn user_token_shape(token: &str) -> Result<(), &'static str> {
+    if token.starts_with("ghp_") {
+        Err(
+            "that's a classic token, which can't be narrowed to repositories; make a fine-grained one instead",
+        )
+    } else if !token.starts_with("github_pat_") {
+        Err("expected a fine-grained personal access token, which starts with github_pat_")
+    } else {
+        Ok(())
+    }
+}
+
 /// Serialises changes to which of an owner's credentials of a kind is the default, until the transaction ends.
 async fn lock_kind(tx: &mut sqlx::PgConnection, owner: &str, kind: &str) -> sqlx::Result<()> {
     sqlx::query("select pg_advisory_xact_lock(hashtext($1 || '/' || $2))")
@@ -240,6 +256,27 @@ impl Credentials {
                 };
                 secret = serde_json::to_string(&tokens)?;
                 serde_json::json!({"account_id": tokens.account_id})
+            }
+            GITHUB_USER => {
+                if let Err(why) = user_token_shape(&secret) {
+                    return Ok(Err(Invalid(why.into())));
+                }
+                let token = match crate::github::inspect_user_token(
+                    &self.http,
+                    crate::github::API,
+                    &secret,
+                )
+                .await?
+                {
+                    Ok(token) => token,
+                    Err(why) => return Ok(Err(Invalid(why))),
+                };
+                serde_json::json!({
+                    "login": token.login,
+                    "expires_at": token.expires_at.map(|at| at.to_rfc3339()),
+                    "repositories": token.repositories,
+                    "more_repositories": token.more_repositories,
+                })
             }
             _ => serde_json::json!({}),
         };
@@ -567,6 +604,26 @@ mod tests {
             .filter(|r| r.is_default)
             .map(|r| r.name)
             .collect()
+    }
+
+    #[sqlx::test]
+    async fn a_github_user_token_has_to_be_fine_grained(db: PgPool) {
+        let credentials = credentials(db).await;
+        for (secret, why) in [
+            ("ghp_0123456789abcdef", "classic token"),
+            ("gho_0123456789abcdef", "starts with github_pat_"),
+        ] {
+            let new = NewCredential {
+                kind: GITHUB_USER.into(),
+                name: "me".into(),
+                config: Default::default(),
+                secret: secret.into(),
+            };
+            let refused = credentials.create("dev", new).await.unwrap().unwrap_err();
+            assert!(refused.0.contains(why), "{secret}: {}", refused.0);
+        }
+        assert!(credentials.list("dev").await.unwrap().is_empty());
+        assert_eq!(user_token_shape("github_pat_11ABC"), Ok(()));
     }
 
     #[sqlx::test]

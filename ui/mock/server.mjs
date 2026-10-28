@@ -1473,7 +1473,22 @@ function handleStandingApprovals(req, res, parts) {
   return json(res, 404, { error: 'not found' });
 }
 
-const CREDENTIAL_CONFIG = { claude: [], 'github-app': ['app_id'], memini: ['url'], chatgpt: [] };
+const CREDENTIAL_CONFIG = { claude: [], 'github-app': ['app_id'], memini: ['url'], chatgpt: [], 'github-user': [] };
+
+/** What the runtime learns of a GitHub token from GitHub; a token with "soon" in it expires in three days. */
+function inspectUserToken(secret) {
+  if (secret.startsWith('ghp_')) return { error: "that's a classic token, which can't be narrowed to repositories; make a fine-grained one instead" };
+  if (!secret.startsWith('github_pat_')) return { error: 'expected a fine-grained personal access token, which starts with github_pat_' };
+  const days = secret.includes('soon') ? 3 : 60;
+  return {
+    config: {
+      login: 'bo0tzz',
+      expires_at: new Date(Date.now() + days * 24 * 3600_000).toISOString(),
+      repositories: ['bo0tzz/sloppod', 'bo0tzz/dotfiles'],
+      more_repositories: false,
+    },
+  };
+}
 
 function addCredential({ kind, name, config }) {
   const credential = {
@@ -1498,7 +1513,12 @@ async function handleCredentials(req, res, parts) {
     if (!body.name?.trim() || !body.secret?.trim()) return json(res, 400, { error: 'name and secret are required' });
     const missing = keys.filter((key) => !body.config?.[key]);
     if (missing.length) return json(res, 400, { error: `missing config: ${missing.join(', ')}` });
-    const config = Object.fromEntries(keys.map((key) => [key, String(body.config[key])]));
+    let config = Object.fromEntries(keys.map((key) => [key, String(body.config[key])]));
+    if (body.kind === 'github-user') {
+      const inspected = inspectUserToken(body.secret.trim());
+      if (inspected.error) return json(res, 400, { error: inspected.error });
+      config = inspected.config;
+    }
     return json(res, 201, addCredential({ kind: body.kind, name: body.name.trim(), config }));
   }
   const credential = credentials.find((c) => c.id === parts[1]);

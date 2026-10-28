@@ -88,6 +88,8 @@ type Phase =
 
 Accounts and keys the runtime uses on a user's behalf ([ADR 21](adr/0021-credentials-live-in-the-runtime.md)). Secrets are write-only: the API never returns them. The first credential of a kind becomes the default for it; deleting the default promotes the oldest remaining one. Running sessions use whichever is the default when they make a request. An invalid credential (unknown kind, a private key that doesn't parse, a URL without a host) gets `400` with `{error}`.
 
+A `github-user` credential is the user's own GitHub identity, for acting as them where they grant it ([ADR 28](adr/0028-acting-as-the-owner.md), #54); nothing uses it yet. Only fine-grained tokens (`github_pat_…`) are taken: a classic one (`ghp_…`) reaches everything its user can, so it's refused. When one is added, the runtime asks GitHub whose it is (`GET /user`), when it expires (the `github-authentication-token-expiration` header; `expires_at` is `null` for one that doesn't), and which repositories it reaches (`GET /user/repos`, the first thousand, with `more_repositories` when there are more), and keeps that as its config. A token GitHub refuses gets `400`. Like the other secrets, the token stays in the runtime, sealed (ADR 21).
+
 ```
 GET    /api/v1/credentials                -> Credential[]
 POST   /api/v1/credentials                -> Credential   body: NewCredential
@@ -100,7 +102,8 @@ type CredentialKind =
   | "claude"             // secret: a token from `claude setup-token`; config: {}
   | "github-app"         // secret: the app's private key (PEM); config: {app_id: string}
   | "memini"             // secret: a memini admin key; config: {url: string, home?: string} (home: your personal namespace)
-  | "chatgpt";           // secret: the auth.json of a `codex login` only sloppod uses; config: {account_id} (derived)
+  | "chatgpt"            // secret: the auth.json of a `codex login` only sloppod uses; config: {account_id} (derived)
+  | "github-user";       // secret: a fine-grained GitHub personal access token; config: {login, expires_at, repositories, more_repositories} (derived)
 
 type NewCredential = { kind: CredentialKind; name: string; config: Record<string, string>; secret: string };
 

@@ -14,8 +14,9 @@
     toastManager,
   } from '@immich/ui';
   import { mdiPlus, mdiTrashCanOutline } from '@mdi/js';
-  import { api, type Credential } from '#lib/api.ts';
-  import type { CredentialKindSpec } from '#lib/presentation.ts';
+  import { api, type Credential, type GitHubUserConfig } from '#lib/api.ts';
+  import { absoluteTime } from '#lib/format.ts';
+  import { tokenExpiry, type CredentialKindSpec } from '#lib/presentation.ts';
 
   let {
     spec,
@@ -111,9 +112,25 @@
                 <Badge size="tiny" shape="round" color="primary" data-testid="default-badge">Default</Badge>
               {/if}
             </div>
-            {#each Object.entries(credential.config) as [key, value] (key)}
-              <span class="text-muted truncate text-xs">{fieldLabel(key)}: <span class="font-mono">{value}</span></span>
-            {/each}
+            {#if spec.kind === 'github-user'}
+              {@const token = credential.config as GitHubUserConfig}
+              {@const expiry = tokenExpiry(token.expires_at)}
+              <span class="text-muted truncate text-xs">Account: <span class="font-mono">{token.login}</span></span>
+              <span
+                class="truncate text-xs {expiry.level === 'ok' ? 'text-muted' : expiry.level === 'soon' ? 'text-warning-700' : 'text-danger'}"
+                title={token.expires_at ? absoluteTime(token.expires_at) : undefined}
+                data-testid="token-expiry"
+                data-level={expiry.level}>{expiry.text}{expiry.level === 'ok' ? '' : '; make a new token and replace this one'}</span
+              >
+              <span class="text-muted truncate text-xs" title={token.repositories.join('\n')} data-testid="token-repositories">
+                Reaches {token.repositories.length}{token.more_repositories ? '+' : ''}
+                {token.repositories.length === 1 ? 'repository' : 'repositories'}
+              </span>
+            {:else}
+              {#each Object.entries(credential.config) as [key, value] (key)}
+                <span class="text-muted truncate text-xs">{fieldLabel(key)}: <span class="font-mono">{value}</span></span>
+              {/each}
+            {/if}
           </div>
           <div class="flex items-center gap-1">
             {#if !credential.default}
