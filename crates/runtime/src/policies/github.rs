@@ -18,7 +18,7 @@ use crate::rebases::{Recheck, Rechecks};
 pub struct GitHubPolicy {
     credentials: Arc<Credentials>,
     pushes: Arc<PushLog>,
-    rechecks: Rechecks,
+    rechecks: Arc<Rechecks>,
 }
 
 fn err(e: impl std::fmt::Display) -> Error {
@@ -26,7 +26,11 @@ fn err(e: impl std::fmt::Display) -> Error {
 }
 
 impl GitHubPolicy {
-    pub fn new(credentials: Arc<Credentials>, pushes: Arc<PushLog>, rechecks: Rechecks) -> Self {
+    pub fn new(
+        credentials: Arc<Credentials>,
+        pushes: Arc<PushLog>,
+        rechecks: Arc<Rechecks>,
+    ) -> Self {
         Self {
             credentials,
             pushes,
@@ -98,33 +102,50 @@ impl GitHubPolicy {
                                 return Ok(push.reject(&message));
                             }
                             // Auto-merge must only merge what was reviewed (ADR 3): new commits on its head turn
-                            // it off. A push to a branch goes through, and once it has landed, auto-merge goes back
-                            // on if the change is still the one reviewed (#106); the agent hears either way. Otherwise
-                            // it hears before the push goes through.
+                            // it off. If every pull request it's turned off for knows what was reviewed, the push goes
+                            // through and is rechecked once it lands: auto-merge goes back on if the change is still
+                            // the one reviewed (#106), and the agent hears either way. Otherwise the agent hears
+                            // before the push goes through.
                             for (name, new) in push.refs.iter().zip(&push.new) {
                                 let Some(pushed) = name.strip_prefix("refs/heads/") else {
                                     continue;
                                 };
                                 self.pushes.admit(repo, pushed);
+                                // Counted before auto-merge is touched, so no earlier recheck turns it back on for this.
+                                let waiting = self.rechecks.admitting(repo, pushed);
                                 let disabled =
                                     app.disable_auto_merge(repo, pushed).await.map_err(err)?;
-                                if disabled.is_empty() {
+                                if disabled.is_empty() && waiting.is_empty() {
                                     continue;
                                 }
-                                if let (Ok(session_id), false) =
-                                    (session.session_id.parse(), is_deletion(new))
+                                let reviewed = match (session.session_id.parse(), is_deletion(new))
                                 {
-                                    self.rechecks.send(Recheck {
+                                    (Ok(session_id), false) => self
+                                        .rechecks
+                                        .reviewed(repo, &disabled)
+                                        .await
+                                        .map_err(err)?
+                                        .map(|pulls| (session_id, pulls)),
+                                    _ => None,
+                                };
+                                if let Some((session_id, pulls)) = reviewed {
+                                    self.rechecks.recheck(Recheck {
                                         owner: session.owner.clone(),
                                         session: session_id,
                                         repo: repo.to_owned(),
                                         branch: pushed.to_owned(),
-                                        pulls: disabled,
+                                        pulls,
                                         sha: new.clone(),
+                                        generation: 0,
                                     });
                                 } else {
+                                    self.rechecks.forget(repo, pushed);
+                                    let mut affected = disabled.clone();
+                                    affected.extend(waiting.iter().map(|(n, _)| *n));
+                                    affected.sort_unstable();
+                                    affected.dedup();
                                     let pulls: Vec<String> =
-                                        disabled.iter().map(|n| format!("#{n}")).collect();
+                                        affected.iter().map(|n| format!("#{n}")).collect();
                                     let message = format!(
                                         "sloppod: `{pushed}` is the head of {}, which was set to merge once its checks \
                                          pass. New commits there haven't been reviewed, so auto-merge is now off and it \

@@ -988,6 +988,18 @@ impl GitHubApp {
         unread.map_or(Ok(StackWatch::Holding), Err)
     }
 
+    /// The diff from `base` to the commit `sha`, as of their merge base. A commit, unlike a branch, can't move
+    /// between being named and being read.
+    pub async fn diff_to(&self, repo: &str, base: &str, sha: &str) -> anyhow::Result<String> {
+        let range = format!("/compare/{}...{sha}", branch_in_path(base));
+        Ok(self
+            .repo_get(repo, &range, "application/vnd.github.diff")
+            .await?
+            .error_for_status()?
+            .text()
+            .await?)
+    }
+
     /// A pull request as GitHub's REST API has it: its state, head and base, and node id.
     pub async fn pull(&self, repo: &str, number: u64) -> anyhow::Result<Value> {
         self.repo_json(repo, &format!("/pulls/{number}")).await

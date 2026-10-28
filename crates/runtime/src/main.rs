@@ -72,6 +72,8 @@ pub struct Inner {
     pub authz_addr: SocketAddr,
     pub agents: adapter::Agents,
     pub instructions: Option<String>,
+    /// Pushes to heads of pull requests set to merge themselves, waiting to be rechecked (#106).
+    pub rechecks: Arc<rebases::Rechecks>,
 }
 
 #[derive(Clone)]
@@ -137,11 +139,11 @@ async fn main() -> anyhow::Result<()> {
     policies.register(Arc::new(ModelPolicy::new(credentials.clone())));
     policies.register(Arc::new(CodexPolicy::new(credentials.clone())));
     let pushes = Arc::new(github::PushLog::default());
-    let (rechecks, pushes_to_recheck) = rebases::Rechecks::new();
+    let (rechecks, pushes_to_recheck) = rebases::Rechecks::new(db.clone());
     policies.register(Arc::new(GitHubPolicy::new(
         credentials.clone(),
         pushes.clone(),
-        rechecks,
+        rechecks.clone(),
     )));
 
     let mut proposals = ProposalKinds::default();
@@ -204,6 +206,7 @@ async fn main() -> anyhow::Result<()> {
         authz_addr,
         agents,
         instructions,
+        rechecks,
     }));
     // A message queued for a parked session's absent agent wakes the session.
     let waker = state.clone();
