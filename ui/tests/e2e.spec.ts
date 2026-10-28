@@ -985,7 +985,8 @@ test('the new-session page suggests a starting set, and sends the one the user e
 async function delaySuggestion(page: Page, prompt: string, ms: number) {
   await page.route('**/api/v1/sessions/suggest', async (route) => {
     if (route.request().postDataJSON().prompt === prompt) await new Promise((resolve) => setTimeout(resolve, ms));
-    await route.continue();
+    // The page may be gone by then, after a test that doesn't wait for it.
+    await route.continue().catch(() => {});
   });
 }
 
@@ -1043,6 +1044,19 @@ test('a session starts with the suggestion for the message sent, though the draf
   await expect(page.getByTestId('starting-source')).toHaveText('Suggested by the model');
   await expect(page).toHaveURL(/\/sessions\/[0-9a-f-]+$/);
   await expect(page.getByTestId('session-title')).toHaveText('Fix the build in bo0tzz/sloppod');
+  await expect(page.getByTestId('session-subtitle')).toHaveText('bo0tzz/sloppod');
+});
+
+test('a slow suggestion doesn\'t hold up starting the session', async ({ page }) => {
+  // A cold judgement can take a minute; sending waits for it only a few seconds.
+  await delaySuggestion(page, 'Fix the build in bo0tzz/sloppod', 60_000);
+  await openNewSession(page);
+  await expect(page.getByTestId('starting-card')).toBeVisible();
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Fix the build in bo0tzz/sloppod');
+  await box.press('Enter');
+  await expect(page).toHaveURL(/\/sessions\/[0-9a-f-]+$/, { timeout: 8000 });
+  // Without the suggestion the runtime derives the rest, as it did before there were suggestions.
   await expect(page.getByTestId('session-subtitle')).toHaveText('bo0tzz/sloppod');
 });
 
