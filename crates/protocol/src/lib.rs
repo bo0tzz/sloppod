@@ -213,6 +213,39 @@ pub mod api {
         pub created_at: String,
     }
 
+    /// What's left of an inference credential's usage limits, as last reported (#140).
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct Quota {
+        pub credential_id: Uuid,
+        pub kind: String,
+        pub name: String,
+        /// The provider refuses its requests now, until `resets_at`.
+        pub limited: bool,
+        pub resets_at: Option<String>,
+        pub windows: Vec<QuotaWindow>,
+        pub observed_at: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct QuotaWindow {
+        /// `five_hour` and `seven_day` for the session and weekly limits; other names for other limits.
+        pub window: String,
+        /// The fraction used, usually 0 to 1.
+        pub utilization: Option<f64>,
+        pub resets_at: Option<String>,
+        pub status: QuotaStatus,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum QuotaStatus {
+        Allowed,
+        /// Past a warning threshold the provider set.
+        Warning,
+        /// At or past the limit.
+        Rejected,
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct Proposal {
         pub id: Uuid,

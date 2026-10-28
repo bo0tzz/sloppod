@@ -16,6 +16,9 @@ use crate::session::{Hub, TurnEnd};
 use crate::store::SessionStore;
 use crate::store::memory::MemoryStore;
 
+/// What the harness's clock says, and when its session was last active.
+const START: &str = "2026-10-27T15:40:00Z";
+
 struct Harness {
     hub: Arc<Hub>,
     store: Arc<MemoryStore>,
@@ -29,8 +32,11 @@ impl Harness {
     async fn starting() -> Self {
         let store = Arc::new(MemoryStore::default());
         let id = Uuid::new_v4();
-        store.add_session(SessionRow::for_test(id, "dev"));
+        let mut row = SessionRow::for_test(id, "dev");
+        row.active_at = START.parse().unwrap();
+        store.add_session(row);
         let hub = Arc::new(Hub::new(store.clone()));
+        hub.set_now(START.parse().unwrap());
         let (tx, to_agent) = mpsc::unbounded_channel();
         let agent = Arc::new(AgentConn::new(tx));
         hub.attach_agent(id, agent.clone()).await;
@@ -144,13 +150,30 @@ impl Harness {
     }
 }
 
+/// The text of what a request sent the agent, without the line telling it the time.
 fn prompt_text(request: &Value) -> Vec<String> {
+    let mut text = all_text(request);
+    if time_line(request).is_some() {
+        text.remove(0);
+    }
+    text
+}
+
+fn all_text(request: &Value) -> Vec<String> {
     request["params"]["prompt"]
         .as_array()
         .into_iter()
         .flatten()
         .map(|block| block["text"].as_str().unwrap_or_default().to_owned())
         .collect()
+}
+
+/// The line telling the agent the time that a request leads with, if it does.
+fn time_line(request: &Value) -> Option<String> {
+    all_text(request)
+        .into_iter()
+        .next()
+        .filter(|text| text.starts_with("[sloppod: it's "))
 }
 
 /// Waits until the hub has queued `n` messages; prompting happens on another task.
@@ -1008,6 +1031,7 @@ fn batch(
     let queued = crate::session::Queued {
         id: None,
         blocks: vec![json!({"type": "text", "text": text})],
+        notice: false,
         reply: Some(reply),
     };
     (vec![queued], receiver)
@@ -1387,6 +1411,7 @@ async fn restarted(
     mpsc::UnboundedReceiver<ToSupervisor>,
 ) {
     let hub = Arc::new(Hub::new(h.store.clone()));
+    hub.set_now(START.parse().unwrap());
     let (tx, to_agent) = mpsc::unbounded_channel();
     let agent = Arc::new(AgentConn::new(tx));
     hub.attach_agent(h.id, agent.clone()).await;
@@ -1569,6 +1594,208 @@ async fn a_steer_a_restart_left_open_and_the_agent_then_refuses_still_delivers_i
     );
 }
 
+/// `START`, moved on by `minutes`.
+fn later(minutes: i64) -> chrono::DateTime<chrono::Utc> {
+    START.parse::<chrono::DateTime<chrono::Utc>>().unwrap() + chrono::Duration::minutes(minutes)
+}
+
+/// Runs a prompt as a turn that ends at once, and returns what the agent was sent.
+async fn prompt_and_answer(h: &mut Harness, text: &str) -> Value {
+    let turn = h.prompt(text);
+    let request = h.next().await;
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+    request
+}
+
+#[tokio::test]
+async fn a_prompt_after_a_gap_tells_the_agent_the_time() {
+    let mut h = Harness::ready().await;
+    let first = prompt_and_answer(&mut h, "First").await;
+    assert_eq!(time_line(&first), None);
+
+    h.hub.set_now(later(20));
+    let soon = prompt_and_answer(&mut h, "Soon after").await;
+    assert_eq!(time_line(&soon), None, "20 minutes isn't a gap");
+
+    h.hub.set_now(later(20 + 3 * 60 + 5));
+    let after_gap = prompt_and_answer(&mut h, "Is CI done?").await;
+    assert_eq!(
+        all_text(&after_gap),
+        [
+            "[sloppod: it's 2026-10-27 19:05 UTC, 3 hours since the last message]",
+            "Is CI done?"
+        ]
+    );
+    // Only the agent gets the line; the log has the message as it was sent.
+    assert_eq!(
+        h.user_messages().last().unwrap(),
+        &("Is CI done?".to_owned(), false)
+    );
+}
+
+#[tokio::test]
+async fn a_prompt_on_a_new_day_tells_the_agent_the_time() {
+    let mut h = Harness::ready().await;
+    h.hub.set_now("2026-10-27T23:55:00Z".parse().unwrap());
+    prompt_and_answer(&mut h, "Late").await;
+    h.hub.set_now("2026-10-28T00:05:00Z".parse().unwrap());
+    let request = prompt_and_answer(&mut h, "Early").await;
+    assert_eq!(
+        time_line(&request).as_deref(),
+        Some("[sloppod: it's 2026-10-28 00:05 UTC, 10 minutes since the last message]")
+    );
+}
+
+#[tokio::test]
+async fn a_gap_counts_from_the_agents_last_output_not_the_turns_start() {
+    let mut h = Harness::ready().await;
+    let turn = h.prompt("Long job");
+    let request = h.next().await;
+    h.hub.set_now(later(2 * 60));
+    let chunk = json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "agent-session", "update": {
+        "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Done."},
+    }}});
+    from_agent(&h.hub, h.id, &h.agent, chunk).await;
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+
+    h.hub.set_now(later(2 * 60 + 10));
+    let next = prompt_and_answer(&mut h, "Thanks").await;
+    assert_eq!(time_line(&next), None);
+}
+
+#[tokio::test]
+async fn a_notice_always_carries_the_time() {
+    let mut h = Harness::ready().await;
+    h.hub.notify(h.id, "sloppod: approved.".into()).await;
+    let request = h.next().await;
+    assert_eq!(
+        all_text(&request),
+        ["[sloppod: it's 2026-10-27 15:40 UTC]", "sloppod: approved."]
+    );
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+
+    // Steered into a running turn, too.
+    let turn = h.prompt("First");
+    let turn_request = h.next().await;
+    h.hub.notify(h.id, "sloppod: merged.".into()).await;
+    let steering = h.next().await;
+    assert_eq!(steering["method"], "_session/steering");
+    assert_eq!(
+        time_line(&steering).as_deref(),
+        Some("[sloppod: it's 2026-10-27 15:40 UTC]")
+    );
+    let recorded: Vec<Value> = h
+        .store
+        .updates(h.id)
+        .into_iter()
+        .filter(|u| u["_meta"]["sloppod"]["notice"] == true)
+        .map(|u| u["content"]["text"].clone())
+        .collect();
+    assert_eq!(recorded, ["sloppod: approved.", "sloppod: merged."]);
+    h.respond(&steering, json!({"outcome": "injected"})).await;
+    h.respond(&turn_request, json!({"stopReason": "end_turn"}))
+        .await;
+    turn.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn after_a_restart_a_gap_counts_from_the_sessions_last_activity() {
+    let h = Harness::ready().await;
+    let (hub, agent, mut to_agent) = restarted(&h).await;
+    hub.set_now(later(2 * 24 * 60 + 30));
+    hub.agent_ready(h.id, &agent, "agent-session".into(), json!({}), None)
+        .await;
+    let (id, prompting) = (h.id, hub.clone());
+    tokio::spawn(async move {
+        let params = json!({"sessionId": id, "prompt": [{"type": "text", "text": "Back"}]});
+        prompting.prompt(id, params).await
+    });
+    let request = next_prompt(&mut to_agent).await;
+    assert_eq!(
+        time_line(&request).as_deref(),
+        Some("[sloppod: it's 2026-10-29 16:10 UTC, 2 days since the last message]")
+    );
+}
+
+#[tokio::test]
+async fn an_adopted_turn_that_ends_counts_as_hearing_from_the_agent() {
+    let turn = json!({"jsonrpc": "2.0", "id": 7, "method": "session/prompt", "params": {"sessionId": "agent-session", "prompt": []}});
+    let mut h = Harness::adopted(vec![turn.clone()], Vec::new()).await;
+    let chunk = json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "agent-session", "update": {
+        "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Working on it."},
+    }}});
+    from_agent(&h.hub, h.id, &h.agent, chunk).await;
+    h.hub.set_now(later(3 * 60));
+    let next = h.prompt("Next");
+    wait_for_queue(&h, 1).await;
+    h.respond(&turn, json!({"stopReason": "end_turn"})).await;
+    let request = h.next().await;
+    assert_eq!(time_line(&request), None);
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    next.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_message_kept_across_a_restart_tells_the_agent_how_long_it_waited() {
+    let h = Harness::starting().await;
+    let (id, hub) = (h.id, h.hub.clone());
+    tokio::spawn(async move {
+        let params = json!({"sessionId": id, "prompt": [{"type": "text", "text": "Sent while it was down"}]});
+        hub.prompt(id, params).await
+    });
+    for _ in 0..100 {
+        if kept_texts(&h).await == ["Sent while it was down"] {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The restarted runtime records nothing before the kept message runs.
+    let (hub, agent, mut to_agent) = restarted(&h).await;
+    hub.set_now(later(3 * 60));
+    hub.agent_ready(h.id, &agent, "agent-session".into(), json!({}), None)
+        .await;
+    let request = next_prompt(&mut to_agent).await;
+    assert_eq!(
+        all_text(&request),
+        [
+            "[sloppod: it's 2026-10-27 18:40 UTC, 3 hours since the last message]",
+            "Sent while it was down"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn usage_updates_are_handed_on_but_not_when_replayed() {
+    let h = Harness::ready().await;
+    let (tx, mut seen) = mpsc::unbounded_channel();
+    h.hub.set_usage_seen(Arc::new(move |id, update| {
+        let tx = tx.clone();
+        Box::pin(async move {
+            let _ = tx.send((id, update));
+        })
+    }));
+    let usage = |used: u64| {
+        json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "agent-session", "update": {
+            "sessionUpdate": "usage_update", "used": used, "size": 200_000,
+            "_meta": {"_claude/rateLimit": {"status": "allowed"}},
+        }}})
+    };
+    h.hub.set_loading(h.id, true).await;
+    from_agent(&h.hub, h.id, &h.agent, usage(1)).await;
+    h.hub.set_loading(h.id, false).await;
+    from_agent(&h.hub, h.id, &h.agent, usage(2)).await;
+    let (id, update) = tokio::time::timeout(Duration::from_secs(5), seen.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(id, h.id);
+    assert_eq!(update["used"], 2);
+    assert!(seen.try_recv().is_err());
+}
+
 /// Fails the turn `request` carries as claude-agent-acp does when the account is at its usage limit.
 async fn hit_the_limit(h: &Harness, request: &Value) {
     let error = json!({"jsonrpc": "2.0", "id": request["id"], "error": {
@@ -1638,7 +1865,7 @@ async fn a_session_at_its_usage_limit_waits_then_carries_on_with_what_queued() {
 #[tokio::test]
 async fn a_limited_session_tries_again_later_when_the_reset_is_unknown() {
     let mut h = Harness::ready().await;
-    let before = chrono::Utc::now();
+    let before = START.parse::<chrono::DateTime<chrono::Utc>>().unwrap();
     let _turn = h.prompt("Work");
     let request = h.next().await;
     hit_the_limit(&h, &request).await;
@@ -1688,14 +1915,136 @@ async fn a_message_steered_in_while_limited_tries_now_and_ends_the_wait() {
 }
 
 #[tokio::test]
-async fn a_wait_for_the_usage_limit_survives_a_restart() {
-    let store = Arc::new(MemoryStore::default());
-    let id = Uuid::new_v4();
-    let mut row = SessionRow::for_test(id, "dev");
+async fn a_wait_for_the_usage_limit_moves_with_the_quota() {
+    let mut h = Harness::ready().await;
+    let _turn = h.prompt("Work");
+    let request = h.next().await;
+    hit_the_limit(&h, &request).await;
+    let probe = limited(&h).await;
+
+    // The quota learns when the limit resets: the wait moves there.
+    let reset = chrono::Utc::now() + chrono::Duration::hours(3);
+    h.hub.move_limit(h.id, reset).await;
+    assert_eq!(h.hub.limited_until(h.id).await, Some(reset));
+    let row = h.store.get_session(h.id).await.unwrap().unwrap();
+    assert_eq!(row.limited_until, Some(reset));
+    h.hub.resume_after_limit(h.id, probe).await;
+    h.agent_sent_nothing();
+
+    // The credential isn't limited any more: the session carries on now.
+    h.hub.move_limit(h.id, START.parse().unwrap()).await;
+    let request = h.next().await;
+    assert!(prompt_text(&request)[0].contains("usage limit"));
+    assert_eq!(h.hub.limited_until(h.id).await, None);
+}
+
+impl Harness {
+    /// A runtime that restarted while the session waited for its usage limit until `until`, with `kept` in its
+    /// stored queue; its agent is attached but not up yet. Restored in startup's order.
+    async fn restarted_limited(until: chrono::DateTime<chrono::Utc>, kept: &[&str]) -> Self {
+        let store = Arc::new(MemoryStore::default());
+        let id = Uuid::new_v4();
+        let mut row = SessionRow::for_test(id, "dev");
+        row.limited_until = Some(until);
+        store.add_session(row);
+        let stored: Vec<Value> = kept
+            .iter()
+            .map(|text| json!({"id": Uuid::new_v4(), "blocks": [{"type": "text", "text": text}]}))
+            .collect();
+        store.save_queue(id, &stored).await.unwrap();
+        let hub = Arc::new(Hub::new(store.clone()));
+        let (tx, to_agent) = mpsc::unbounded_channel();
+        let agent = Arc::new(AgentConn::new(tx));
+        hub.attach_agent(id, agent.clone()).await;
+        let limited = hub.restore_limits().await;
+        assert_eq!(limited, [(id, until)]);
+        hub.restore_queues().await;
+        hub.resume_limits(limited);
+        Self {
+            hub,
+            store,
+            id,
+            agent,
+            to_agent,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_wait_that_ended_during_a_restart_carries_on_with_the_kept_queue() {
+    let past = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let mut h = Harness::restarted_limited(past, &["Kept"]).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.hub.limited_until(h.id).await, None);
+    let kept = kept_texts(&h).await;
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    assert!(kept[0].contains("usage limit"));
+    assert_eq!(kept[1], "Kept");
+
+    h.agent_ready().await;
+    let request = h.next().await;
+    let text = prompt_text(&request);
+    assert!(text.iter().any(|t| t.contains("usage limit")), "{text:?}");
+    assert_eq!(text.last().map(String::as_str), Some("Kept"));
+}
+
+#[tokio::test]
+async fn an_agent_that_comes_back_during_the_wait_keeps_the_queue_until_it_ends() {
     let until = chrono::Utc::now() + chrono::Duration::hours(1);
-    row.limited_until = Some(until);
-    store.add_session(row);
-    let hub = Arc::new(Hub::new(store.clone()));
-    hub.restore_limits().await;
-    assert_eq!(hub.limited_until(id).await, Some(until));
+    let mut h = Harness::restarted_limited(until, &["Kept"]).await;
+    assert_eq!(h.hub.limited_until(h.id).await, Some(until));
+
+    h.agent_ready().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    h.agent_sent_nothing();
+    assert_eq!(kept_texts(&h).await, ["Kept"]);
+    assert_eq!(h.phase().await, "idle");
+
+    h.hub.resume_after_limit(h.id, until).await;
+    let request = h.next().await;
+    let text = prompt_text(&request);
+    assert!(text.iter().any(|t| t.contains("usage limit")), "{text:?}");
+    assert_eq!(text.last().map(String::as_str), Some("Kept"));
+}
+
+#[tokio::test]
+async fn a_message_to_a_limited_session_without_its_agent_waits_and_steering_it_carries_on() {
+    let until = chrono::Utc::now() + chrono::Duration::hours(1);
+    let mut h = Harness::restarted_limited(until, &[]).await;
+    let woken = Arc::new(std::sync::Mutex::new(0));
+    {
+        let woken = woken.clone();
+        h.hub.set_waker(Arc::new(move |_| {
+            let woken = woken.clone();
+            Box::pin(async move {
+                *woken.lock().unwrap() += 1;
+                Ok(())
+            })
+        }));
+    }
+
+    // It waits, shown in the queue, and doesn't wake the session.
+    let message = h.prompt("Later");
+    let queued = wait_for_queue(&h, 1).await;
+    assert_eq!(*woken.lock().unwrap(), 0);
+
+    // Steering it in ends the wait: the session is woken to carry on with it.
+    let result = h
+        .hub
+        .steer_queued(h.id, json!({"id": queued[0]}))
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "queued");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.hub.limited_until(h.id).await, None);
+    assert_eq!(*woken.lock().unwrap(), 1);
+
+    h.agent_ready().await;
+    let request = h.next().await;
+    assert_eq!(
+        prompt_text(&request).last().map(String::as_str),
+        Some("Later")
+    );
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    message.await.unwrap().unwrap();
 }

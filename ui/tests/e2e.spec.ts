@@ -59,6 +59,47 @@ test('creates a session and streams the agent output', async ({ page }) => {
   await expect(page.getByTestId('session-row').filter({ hasText: prompt })).toBeVisible();
 });
 
+test("copies an agent message's Markdown", async ({ page, context }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  await createSession(page, 'Add backoff to the reconnect logic in sloppod');
+  await finishTurn(page);
+
+  const message = agentMessages(page).filter({ hasText: FINAL });
+  const copy = message.getByRole('button', { name: 'Copy message' });
+  const actions = message.getByTestId('message-actions');
+  await page.mouse.move(0, 0);
+  await expect(actions).toHaveCSS('opacity', '0');
+  await message.hover();
+  await expect(actions).toHaveCSS('opacity', '1');
+
+  await copy.click();
+  await expect(message.getByRole('button', { name: 'Copied' })).toBeVisible();
+  const copied = await page.evaluate(() => navigator.clipboard.readText());
+  expect(copied).toMatch(/^Done\. The tests pass and I've proposed a pull request, \*\*.+\*\*, from `sloppod\/.+`\./);
+  await expect(message.getByRole('button', { name: 'Copy message' })).toBeVisible();
+
+  await expect(userMessages(page).getByRole('button', { name: 'Copy message' })).toHaveCount(0);
+
+  // A denied clipboard says so on the button.
+  await page.evaluate(() => {
+    navigator.clipboard.writeText = () => Promise.reject(new DOMException('Denied', 'NotAllowedError'));
+  });
+  await message.getByRole('button', { name: 'Copy message' }).click();
+  await expect(message.getByRole('button', { name: "Couldn't copy" })).toBeVisible();
+  await expect(message.getByRole('status')).toHaveText("Couldn't copy the message");
+});
+
+test('touch screens always show the copy button', async ({ page, browser }) => {
+  await createSession(page, 'Add backoff to the reconnect logic in sloppod');
+  await finishTurn(page);
+
+  const touch = await browser.newContext({ hasTouch: true, isMobile: true, viewport: { width: 412, height: 915 } });
+  const phone = await touch.newPage();
+  await phone.goto(page.url());
+  await expect(agentMessages(phone).filter({ hasText: FINAL }).getByTestId('message-actions')).toHaveCSS('opacity', '1');
+  await touch.close();
+});
+
 test('answers a permission request', async ({ page }) => {
   await createSession(page, 'Answer my permission request in sloppod');
 
@@ -1291,6 +1332,42 @@ test('a browser whose storage is full still sends', async ({ page }) => {
   await box.press('Enter');
   await expect(userMessages(page).filter({ hasText: 'Sent anyway' })).toHaveCount(1);
   await finishTurn(page);
+});
+
+test('the sidebar shows how much of each usage limit is left', async ({ page }) => {
+  const inTwoHours = new Date(Date.now() + 2 * 3600_000).toISOString();
+  const quota = (kind: string, name: string, limited: boolean, windows: [string, number, string][]) => ({
+    credential_id: `${kind}-${name}`,
+    kind,
+    name,
+    limited,
+    resets_at: limited ? inTwoHours : null,
+    windows: windows.map(([window, utilization, status]) => ({ window, utilization, resets_at: inTwoHours, status })),
+    observed_at: new Date().toISOString(),
+  });
+  await page.request.post('/_mock/quotas', {
+    data: [
+      quota('claude', 'work', false, [
+        ['five_hour', 0.2, 'allowed'],
+        ['seven_day', 0.95, 'warning'],
+      ]),
+      quota('chatgpt', 'reviews', true, [['five_hour', 1, 'rejected']]),
+    ],
+  });
+  try {
+    await page.goto('/settings');
+    const meters = page.getByTestId('sidebar').getByTestId('quota');
+    await expect(meters).toHaveCount(2);
+    const claude = meters.filter({ hasText: 'Claude' });
+    await expect(claude).toContainText('95% of week');
+    await expect(claude).toHaveAttribute('data-level', 'warning');
+    await expect(claude).toHaveAttribute('title', /session: 20% used, resets in 2 hours/);
+    const chatgpt = meters.filter({ hasText: 'ChatGPT' });
+    await expect(chatgpt).toContainText('limit reached');
+    await expect(chatgpt).toHaveAttribute('data-level', 'danger');
+  } finally {
+    await page.request.post('/_mock/quotas', { data: [] });
+  }
 });
 
 test('a session at its usage limit says when it carries on', async ({ page }) => {

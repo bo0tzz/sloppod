@@ -25,6 +25,7 @@ mod policies;
 mod proposals;
 mod pulls;
 mod questions;
+mod quota;
 mod rebases;
 mod reviews;
 mod session;
@@ -83,6 +84,8 @@ pub struct Inner {
     pub image_nudges: lifecycle::ImageNudges,
     /// Pushes to heads of pull requests set to merge themselves, waiting to be rechecked (#106).
     pub rechecks: Arc<rebases::Rechecks>,
+    /// What's left of each inference credential's usage limits (#140).
+    pub quotas: quota::Quotas,
 }
 
 #[derive(Clone)]
@@ -223,6 +226,7 @@ async fn main() -> anyhow::Result<()> {
         inference: inference::Inference::default(),
         image_nudges: lifecycle::ImageNudges::default(),
         rechecks,
+        quotas: quota::Quotas::new()?,
     }));
     // A message queued for a parked session's absent agent wakes the session.
     let waker = state.clone();
@@ -235,6 +239,17 @@ async fn main() -> anyhow::Result<()> {
             }
         })
     }));
+    let usage = state.clone();
+    state.hub.set_usage_seen(Arc::new(move |id, update| {
+        let (state, at) = (usage.clone(), chrono::Utc::now());
+        Box::pin(async move { quota::seen(&state, id, update, at).await })
+    }));
+    let resets = state.clone();
+    state.hub.set_limit_reset(Arc::new(move |id| {
+        let state = resets.clone();
+        Box::pin(async move { limits::reset(&state, id).await })
+    }));
+    limits::follow_quotas(&state);
     let checker = state.clone();
     state.hub.set_turn_ended(Arc::new(move |id| {
         let state = checker.clone();
@@ -269,6 +284,16 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::spawn(rebases::run(state.clone(), pushes_to_recheck));
     tokio::spawn(pulls::run(state.clone()));
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                every.tick().await;
+                quota::read_chatgpt(&state).await;
+            }
+        });
+    }
     {
         let state = state.clone();
         tokio::spawn(async move {
@@ -367,10 +392,11 @@ async fn reconcile(state: &AppState) {
         Err(e) => tracing::error!(error = %e, "listing parked sessions"),
     }
     // Before the queues, so a session waiting for its usage limit keeps what was queued for it until then.
-    state.hub.restore_limits().await;
+    let limited = state.hub.restore_limits().await;
     // After the pods are placed, so a queue for a running session waits for its agent and a parked one wakes for it;
     // before anything that can queue a notice, which would otherwise replace the kept queue before it's read.
     state.hub.restore_queues().await;
+    state.hub.resume_limits(limited);
     proposals::resume_approved(state).await;
     reviews::resume_round_watches(state).await;
     proposals::resume_stack_watches(state).await;

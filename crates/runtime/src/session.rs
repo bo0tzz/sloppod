@@ -39,12 +39,13 @@ pub(crate) struct Queued {
     /// recorded when they run.
     pub(crate) id: Option<Uuid>,
     pub(crate) blocks: Vec<Value>,
+    pub(crate) notice: bool,
     pub(crate) reply: Option<oneshot::Sender<Result<Value, RpcError>>>,
 }
 
 /// How a queued prompt is kept in the store.
 fn stored(q: &Queued) -> Value {
-    json!({"id": q.id, "blocks": q.blocks})
+    json!({"id": q.id, "blocks": q.blocks, "notice": q.notice})
 }
 
 /// A queued prompt from how it's kept in the store.
@@ -52,6 +53,7 @@ fn unstored(q: &Value) -> Queued {
     Queued {
         id: q["id"].as_str().and_then(|s| s.parse().ok()),
         blocks: q["blocks"].as_array().cloned().unwrap_or_default(),
+        notice: q["notice"] == true,
         reply: None,
     }
 }
@@ -61,10 +63,46 @@ fn notice_queued(text: &str) -> Queued {
     Queued {
         id: None,
         blocks: vec![json!({"type": "text", "text": text})],
+        notice: true,
         reply: None,
     }
 }
 
+/// How long the agent has to have been quiet before a prompt tells it the time.
+const TIME_AFTER: chrono::Duration = chrono::Duration::minutes(30);
+
+/// The line telling the agent the time (#105): its agent only knows the date it started on. Sent after a gap, or
+/// once the date has changed, since the agent was last heard from (`heard_at`), and with every notice.
+fn time_line(now: DateTime<Utc>, heard_at: Option<DateTime<Utc>>, notice: bool) -> Option<String> {
+    let gap = heard_at
+        .filter(|h| now - *h >= TIME_AFTER || h.date_naive() != now.date_naive())
+        .map(|h| now - h);
+    if gap.is_none() && !notice {
+        return None;
+    }
+    let time = now.format("%Y-%m-%d %H:%M");
+    Some(match gap {
+        Some(gap) => format!(
+            "[sloppod: it's {time} UTC, {} since the last message]",
+            how_long(gap)
+        ),
+        None => format!("[sloppod: it's {time} UTC]"),
+    })
+}
+
+/// A gap in the largest whole unit that fits it.
+fn how_long(gap: chrono::Duration) -> String {
+    let (n, unit) = if gap.num_hours() >= 48 {
+        (gap.num_days(), "day")
+    } else if gap.num_minutes() >= 60 {
+        (gap.num_hours(), "hour")
+    } else if gap.num_minutes() >= 1 {
+        (gap.num_minutes(), "minute")
+    } else {
+        return "under a minute".to_owned();
+    };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
 /// How a turn the hub sent ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TurnEnd {
@@ -170,6 +208,8 @@ pub struct Live {
     /// Held while the session is parked or woken, so the two never overlap.
     transition: Mutex<()>,
     compaction_ended: Notify,
+    /// When the agent was last heard from, for telling it the time after a gap; `None` until this runtime knows.
+    heard_at: StdMutex<Option<DateTime<Utc>>>,
 }
 
 /// What `run_queued` does with its batch.
@@ -203,6 +243,9 @@ pub type Waker =
 /// Called when a turn the hub sent ends well, e.g. to check what it ended on (ADR 26).
 pub type TurnEnded = Arc<dyn Fn(Uuid) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+/// Called with each `usage_update` an agent sends, e.g. to keep the rate limits it reports (#140).
+pub type UsageSeen =
+    Arc<dyn Fn(Uuid, Value) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 /// When the usage limit a session's account is at resets, if that's known (#140's quotas).
 pub type LimitReset =
     Arc<dyn Fn(Uuid) -> Pin<Box<dyn Future<Output = Option<DateTime<Utc>>> + Send>> + Send + Sync>;
@@ -211,8 +254,11 @@ pub struct Hub {
     store: Arc<dyn SessionStore>,
     waker: StdMutex<Option<Waker>>,
     turn_ended: StdMutex<Option<TurnEnded>>,
+    usage_seen: StdMutex<Option<UsageSeen>>,
     sessions: StdMutex<HashMap<Uuid, Arc<Live>>>,
     agent_capabilities: StdMutex<Option<Value>>,
+    /// The time the tests say it is, instead of the clock's.
+    now: StdMutex<Option<DateTime<Utc>>>,
     limit_reset: StdMutex<Option<LimitReset>>,
 }
 
@@ -241,9 +287,35 @@ impl Hub {
             store,
             waker: StdMutex::default(),
             turn_ended: StdMutex::default(),
+            usage_seen: StdMutex::default(),
             sessions: StdMutex::default(),
             agent_capabilities: StdMutex::default(),
             limit_reset: StdMutex::default(),
+            now: StdMutex::default(),
+        }
+    }
+
+    fn now(&self) -> DateTime<Utc> {
+        self.now.lock().expect("hub lock").unwrap_or_else(Utc::now)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_now(&self, now: DateTime<Utc>) {
+        *self.now.lock().expect("hub lock") = Some(now);
+    }
+
+    fn heard_from_agent(&self, id: Uuid) {
+        *self.live(id).heard_at.lock().expect("hub lock") = Some(self.now());
+    }
+
+    /// `blocks` as the agent gets them: after a gap, and always for a notice, led by a line with the time.
+    async fn with_time(&self, id: Uuid, blocks: Vec<Value>, notice: bool) -> Vec<Value> {
+        let heard_at = self.heard_at(id).await;
+        match time_line(self.now(), heard_at, notice) {
+            Some(line) => std::iter::once(json!({"type": "text", "text": line}))
+                .chain(blocks)
+                .collect(),
+            None => blocks,
         }
     }
 
@@ -253,6 +325,10 @@ impl Hub {
 
     pub fn set_turn_ended(&self, turn_ended: TurnEnded) {
         *self.turn_ended.lock().unwrap() = Some(turn_ended);
+    }
+
+    pub fn set_usage_seen(&self, usage_seen: UsageSeen) {
+        *self.usage_seen.lock().unwrap() = Some(usage_seen);
     }
 
     pub fn set_limit_reset(&self, limit_reset: LimitReset) {
@@ -290,6 +366,7 @@ impl Hub {
                     state: Mutex::default(),
                     transition: Mutex::default(),
                     compaction_ended: Notify::new(),
+                    heard_at: StdMutex::default(),
                 })
             })
             .clone()
@@ -347,8 +424,33 @@ impl Hub {
         );
     }
 
+    /// When the agent was last heard from. Until this runtime has heard from it, that's the session's last activity,
+    /// read before this runtime records or sends anything for the session.
+    async fn heard_at(&self, id: Uuid) -> Option<DateTime<Utc>> {
+        let live = self.live(id);
+        let known = *live.heard_at.lock().expect("hub lock");
+        if known.is_some() {
+            return known;
+        }
+        let active_at = match self.store.get_session(id).await {
+            Ok(row) => row?.active_at,
+            Err(e) => {
+                tracing::warn!(session = %id, error = %e, "reading the session's last activity");
+                return None;
+            }
+        };
+        Some(
+            *live
+                .heard_at
+                .lock()
+                .expect("hub lock")
+                .get_or_insert(active_at),
+        )
+    }
+
     /// Appends an update to the event log and sends it to every UI.
     pub async fn record(&self, id: Uuid, update: Value) {
+        self.heard_at(id).await;
         match self.store.append_event(id, &update).await {
             Ok(seq) => self.broadcast(
                 id,
@@ -529,7 +631,11 @@ impl Hub {
             state.agent_state = agent_state;
             state.loading = false;
             self.settle_restored(id, &mut state, &[]).await;
-            let queued = std::mem::take(&mut state.queue);
+            // A session waiting for its usage limit keeps its queue until then.
+            let queued = match state.limited_until {
+                Some(_) => Vec::new(),
+                None => std::mem::take(&mut state.queue),
+            };
             let held = self.hold(id, &mut state, &queued).await;
             if pending.is_some() || !queued.is_empty() {
                 state.turn_running = true;
@@ -568,6 +674,7 @@ impl Hub {
                 .map(|text| json!({"type": "text", "text": text}))
                 .collect();
             blocks.extend(queued.iter().flat_map(|q| q.blocks.iter().cloned()));
+            let notice = queued.iter().any(|q| q.notice);
             // One decision under the lock, so no other agent's readiness or turn can slip in between.
             let started = {
                 let live = self.live(id);
@@ -654,7 +761,7 @@ impl Hub {
             };
             let agent = taken_for;
             let result = self
-                .turn_on(id, &agent, &agent_session_id, blocks, held)
+                .turn_on(id, &agent, &agent_session_id, blocks, notice, held)
                 .await;
             if let Err(e) = &result {
                 tracing::warn!(session = %id, error = %e, "queued prompt failed");
@@ -870,6 +977,10 @@ impl Hub {
                 self.save_queue(id, &state).await;
             }
             self.broadcast_queue(id).await;
+            // One waiting for its usage limit is woken when that ends.
+            if self.limited_until(id).await.is_some() {
+                continue;
+            }
             if let Err(e) = self.wake_for_message(id).await {
                 tracing::warn!(session = %id, error = %e.message, "waking a session for its queued messages");
             }
@@ -942,6 +1053,12 @@ impl Hub {
             let mut state = live.state.lock().await;
             if state.loading {
                 return;
+            }
+            self.heard_from_agent(id);
+            if update["sessionUpdate"] == "usage_update"
+                && let Some(usage_seen) = self.usage_seen.lock().unwrap().clone()
+            {
+                tokio::spawn(usage_seen(id, update.clone()));
             }
             if update["sessionUpdate"] == "current_mode_update"
                 && let Some(mode) = update.get("currentModeId")
@@ -1127,14 +1244,17 @@ impl Hub {
                 state.turn_running = true;
                 (None, false)
             } else {
+                // Shown as waiting, and not waking a parked session, unless it waits only for the agent to be up.
+                let waiting = agent_up || state.limited_until.is_some();
                 let (reply, receiver) = oneshot::channel();
                 state.queue.push(Queued {
-                    id: agent_up.then(|| message_id.unwrap_or_else(Uuid::new_v4)),
+                    id: waiting.then(|| message_id.unwrap_or_else(Uuid::new_v4)),
                     blocks: blocks.clone(),
+                    notice: false,
                     reply: Some(reply),
                 });
                 self.save_queue(id, &state).await;
-                (Some(receiver), agent_up)
+                (Some(receiver), waiting)
             }
         };
         if behind_turn {
@@ -1166,7 +1286,7 @@ impl Hub {
                 "the session's agent isn't running yet; try again shortly",
             ));
         };
-        self.turn_on(id, &agent, &agent_session_id, blocks, None)
+        self.turn_on(id, &agent, &agent_session_id, blocks, false, None)
             .await
     }
 
@@ -1193,11 +1313,13 @@ impl Hub {
         agent: &Arc<AgentConn>,
         agent_session_id: &str,
         blocks: Vec<Value>,
+        notice: bool,
         held: Option<Uuid>,
     ) -> Result<Value, RpcError> {
+        let prompt = self.with_time(id, blocks, notice).await;
         let (request, answer) = agent.send_request(
             "session/prompt",
-            json!({"sessionId": agent_session_id, "prompt": blocks}),
+            json!({"sessionId": agent_session_id, "prompt": prompt}),
         );
         self.sent(id, held, request).await;
         let result = answer.await;
@@ -1254,6 +1376,17 @@ impl Hub {
             .as_str()
             .and_then(|q| q.parse::<Uuid>().ok())
             .ok_or_else(|| RpcError::new(-32602, "missing or invalid id"))?;
+        // Waiting for its usage limit with no agent to steer into, the session carries on now, with all it has queued.
+        let try_now = {
+            let live = self.live(id);
+            let state = live.state.lock().await;
+            let up = state.agent.is_some() && state.agent_session_id.is_some();
+            !up && state.limited_until.is_some() && state.queue.iter().any(|q| q.id == Some(qid))
+        };
+        if try_now {
+            self.move_limit(id, self.now()).await;
+            return Ok(json!({"outcome": "queued"}));
+        }
         let queued = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
@@ -1269,7 +1402,7 @@ impl Hub {
         self.broadcast_queue(id).await;
         self.record_user_message(id, &json!(queued.blocks), true, queued.id)
             .await;
-        let result = self.steer_in(id, queued.blocks, None).await;
+        let result = self.steer_in(id, queued.blocks, false, None).await;
         if let Some(reply) = queued.reply {
             let _ = reply.send(result.clone());
         }
@@ -1376,7 +1509,7 @@ impl Hub {
             Delivery::Steer(held) => {
                 let hub = self.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = hub.steer_in(id, blocks.clone(), held).await {
+                    if let Err(e) = hub.steer_in(id, blocks.clone(), true, held).await {
                         tracing::warn!(session = %id, error = %e, "steering a notice in");
                         if let Some(key) = held {
                             hub.requeue_held(id, key).await;
@@ -1412,16 +1545,18 @@ impl Hub {
         self: &Arc<Self>,
         id: Uuid,
         blocks: Vec<Value>,
+        notice: bool,
         held: Option<Uuid>,
     ) -> Result<Value, RpcError> {
         for _ in 0..10 {
             self.after_compaction(id).await;
             let (agent, agent_session_id) = self.agent_for(id).await?;
+            let prompt = self.with_time(id, blocks.clone(), notice).await;
             let (request, answer) = agent.send_request(
                 "_session/steering",
                 json!({
                     "sessionId": agent_session_id,
-                    "prompt": blocks,
+                    "prompt": prompt,
                     "_meta": {"steering": {"idleBehavior": "promptRequired"}},
                 }),
             );
@@ -1442,6 +1577,7 @@ impl Hub {
                 let queued = vec![Queued {
                     id: None,
                     blocks,
+                    notice,
                     reply: None,
                 }];
                 tokio::spawn(self.clone().run_queued(id, agent, None, queued, held));
@@ -1480,6 +1616,7 @@ impl Hub {
                 state.queue.push(Queued {
                     id: None,
                     blocks,
+                    notice: false,
                     reply: None,
                 });
                 self.save_queue(id, &state).await;
@@ -1491,7 +1628,7 @@ impl Hub {
         }
         self.record_user_message(id, &params["prompt"], true, message_id)
             .await;
-        self.steer_in(id, blocks, None).await
+        self.steer_in(id, blocks, false, None).await
     }
 
     pub async fn cancel(self: &Arc<Self>, id: Uuid) {
@@ -1621,7 +1758,8 @@ impl Hub {
     /// Counts a turn the hub sent as ended. One that hit the usage limit leaves the session waiting for the reset;
     /// one that ended well ends any such wait.
     async fn turn_finished(self: &Arc<Self>, id: Uuid, end: TurnEnd) {
-        let now = Utc::now();
+        self.heard_from_agent(id);
+        let now = self.now();
         let limit_reset = self.limit_reset.lock().unwrap().clone();
         let reset = match (&end, limit_reset) {
             (TurnEnd::Limited, Some(limit_reset)) => limit_reset(id).await,
@@ -1676,11 +1814,26 @@ impl Hub {
         self.live(id).state.lock().await.limited_until
     }
 
+    /// Moves a session's wait for its usage limit to end at `until`, e.g. now that its credential isn't limited any
+    /// more; a session that isn't waiting is left alone.
+    pub async fn move_limit(self: &Arc<Self>, id: Uuid, until: DateTime<Utc>) {
+        {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            if state.limited_until.is_none_or(|current| current == until) {
+                return;
+            }
+            state.limited_until = Some(until);
+            self.save_limit(id, Some(until)).await;
+        }
+        self.resume_at(id, until);
+    }
+
     /// Carries the session on at `until`, unless its wait has ended or moved meanwhile.
     fn resume_at(self: &Arc<Self>, id: Uuid, until: DateTime<Utc>) {
         let hub = self.clone();
         tokio::spawn(async move {
-            let wait = (until - Utc::now()).to_std().unwrap_or_default();
+            let wait = (until - hub.now()).to_std().unwrap_or_default();
             tokio::time::sleep(wait).await;
             hub.resume_after_limit(id, until).await;
         });
@@ -1728,17 +1881,25 @@ impl Hub {
         }
     }
 
-    /// Puts back the waits for usage limits a restart left, each carrying on when it was to.
-    pub async fn restore_limits(self: &Arc<Self>) {
+    /// Puts back the waits for usage limits a restart left, and returns them for [`Self::resume_limits`] once the
+    /// queues are back too, so none carries on, and keeps its queue, before its queue is restored.
+    pub async fn restore_limits(&self) -> Vec<(Uuid, DateTime<Utc>)> {
         let limited = match self.store.limited_sessions().await {
             Ok(limited) => limited,
             Err(e) => {
                 tracing::error!(error = %e, "loading sessions waiting for their usage limit");
-                return;
+                return Vec::new();
             }
         };
+        for (id, until) in &limited {
+            self.live(*id).state.lock().await.limited_until = Some(*until);
+        }
+        limited
+    }
+
+    /// Has the restored waits carry on when they were to.
+    pub fn resume_limits(self: &Arc<Self>, limited: Vec<(Uuid, DateTime<Utc>)>) {
         for (id, until) in limited {
-            self.live(id).state.lock().await.limited_until = Some(until);
             self.resume_at(id, until);
         }
     }

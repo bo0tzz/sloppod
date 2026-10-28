@@ -82,6 +82,17 @@ function blockToPart(block: ContentBlock): MessagePart | null {
   }
 }
 
+/** A message as the Markdown it arrived as; images have no Markdown form and are left out. */
+export function messageMarkdown(message: MessageItem): string {
+  return message.parts
+    .flatMap((part) => {
+      if (part.type === 'text') return [part.text];
+      if (part.type === 'link') return [`[${part.name}](${part.uri})`];
+      return [];
+    })
+    .join('\n\n');
+}
+
 export function blockText(block: ContentBlock): string {
   const part = blockToPart(block);
   return part?.type === 'text' ? part.text : '';

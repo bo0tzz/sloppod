@@ -107,9 +107,16 @@ pub async fn start(
 const ROUND_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Whether a round that started at `started` has run out of time, counted from its stored start so a restart
-/// doesn't reset it.
-fn round_timed_out(started: DateTime<Utc>, now: DateTime<Utc>) -> bool {
-    now - started > chrono::Duration::from_std(ROUND_TIMEOUT).unwrap_or_default()
+/// doesn't reset it. Time its reviewer waited for the usage limit (`paused`, kept with the round) doesn't count,
+/// and a round doesn't run out while its reviewer is `limited`.
+fn round_timed_out(
+    started: DateTime<Utc>,
+    paused: chrono::Duration,
+    limited: bool,
+    now: DateTime<Utc>,
+) -> bool {
+    !limited
+        && now - started - paused > chrono::Duration::from_std(ROUND_TIMEOUT).unwrap_or_default()
 }
 
 /// What's left to do about a review round that hasn't reached a verdict.
@@ -152,13 +159,17 @@ fn watch_round(state: &AppState, proposal: Uuid, session: Uuid, round: i32) {
     tokio::spawn(async move {
         let (mut nudged, mut retries) = (false, 0);
         let (mut seen, _) = state.hub.turns_ended(session).await;
-        // Time the reviewer spends waiting for its usage limit doesn't count towards the round's.
-        let (mut limited, mut looked) = (chrono::Duration::zero(), Utc::now());
+        let mut looked = Utc::now();
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
             let now = Utc::now();
-            if state.hub.limited_until(session).await.is_some() {
-                limited += now - looked;
+            let limited = state.hub.limited_until(session).await.is_some();
+            if limited
+                && let Err(e) =
+                    db::add_review_pause(&state.db, proposal, round, (now - looked).num_seconds())
+                        .await
+            {
+                tracing::warn!(%proposal, error = %e, "keeping how long a review waited for its usage limit");
             }
             looked = now;
             // Errors are retried at the next check; only a confirmed outcome ends the watch.
@@ -180,7 +191,8 @@ fn watch_round(state: &AppState, proposal: Uuid, session: Uuid, round: i32) {
             {
                 return;
             }
-            let timed_out = round_timed_out(this.created_at + limited, now);
+            let paused = chrono::Duration::seconds(this.paused_seconds);
+            let timed_out = round_timed_out(this.created_at, paused, limited, now);
             // Counted, not sampled: a turn that starts and ends between two looks still counts.
             let (count, last) = state.hub.turns_ended(session).await;
             let ended = last.filter(|_| count > seen);
@@ -869,12 +881,18 @@ mod tests {
     #[test]
     fn a_round_times_out_from_its_stored_start() {
         let now = Utc::now();
-        assert!(!round_timed_out(now - chrono::Duration::minutes(29), now));
+        let none = chrono::Duration::zero();
+        assert!(!round_timed_out(
+            now - chrono::Duration::minutes(29),
+            none,
+            false,
+            now
+        ));
         // Started before a restart and expired meanwhile: given up at the first check after it.
         let expired = now - chrono::Duration::minutes(31);
-        assert!(round_timed_out(expired, now));
+        assert!(round_timed_out(expired, none, false, now));
         assert_eq!(
-            stall(None, 0, false, round_timed_out(expired, now)),
+            stall(None, 0, false, round_timed_out(expired, none, false, now)),
             Stall::GiveUp
         );
     }
@@ -907,6 +925,28 @@ mod tests {
         );
         // The round's time limit still holds.
         assert_eq!(stall(failed, 0, false, true), Stall::GiveUp);
+    }
+
+    #[test]
+    fn time_waiting_for_the_usage_limit_does_not_count_towards_a_round() {
+        let now = Utc::now();
+        let started = now - chrono::Duration::hours(3);
+        // Still waiting, e.g. right after a restart: the round doesn't run out.
+        assert!(!round_timed_out(
+            started,
+            chrono::Duration::zero(),
+            true,
+            now
+        ));
+        // It waited most of that time, kept with the round across restarts.
+        let paused = chrono::Duration::minutes(160);
+        assert!(!round_timed_out(started, paused, false, now));
+        assert!(round_timed_out(
+            started,
+            paused,
+            false,
+            now + chrono::Duration::minutes(15)
+        ));
     }
 
     #[test]
