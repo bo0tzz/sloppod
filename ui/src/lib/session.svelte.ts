@@ -79,6 +79,8 @@ export class SessionView {
   loadingHistory = $state(false);
   /** Messages a dropped connection cut off before the runtime confirmed them; the next load settles each. */
   #unconfirmed: { id: string; text: string }[] = [];
+  /** Messages written while the connection was down, shown as waiting; the next load sends them. */
+  unsent = $state<{ id: string; text: string }[]>([]);
   /** Messages that couldn't be delivered, kept until the user puts each back or dismisses it. */
   undelivered = $state<{ id: string; text: string }[]>([]);
 
@@ -93,6 +95,8 @@ export class SessionView {
       onStateChange: (state, error) => {
         this.connection = state;
         this.connectionError = error ?? null;
+        // Once the connection is fully up: messages cut off by the last drop, or written while it was down.
+        if (state === 'open' && this.loaded) this.#settleUnconfirmed();
         if (state !== 'open') {
           // Requests from a dropped socket can no longer be answered; a reload re-sends live ones.
           this.permissions = [];
@@ -179,7 +183,6 @@ export class SessionView {
       this.#replayUpdates = null;
     }
     this.loaded = true;
-    this.#settleUnconfirmed();
     await rest;
   }
 
@@ -322,6 +325,16 @@ export class SessionView {
     }
   }
 
+  /**
+   * Keeps a message written while the connection is down and sends it once the session has loaded again, the same
+   * way as one a dropped connection cut off: under its id, so it can't arrive twice.
+   */
+  sendWhenConnected(text: string, id: string = crypto.randomUUID()) {
+    this.#keepSending(id, text);
+    this.#unconfirmed.push({ id, text });
+    this.unsent.push({ id, text });
+  }
+
   #keepSending(id: string, text: string) {
     const kept = loadUnconfirmed(this.id).filter((message) => message.id !== id);
     saveUnconfirmed(this.id, [...kept, { id, text }]);
@@ -345,6 +358,7 @@ export class SessionView {
   /** After a load: messages that arrived are done; ones that didn't are sent again, once. */
   #settleUnconfirmed() {
     const unconfirmed = this.#unconfirmed.splice(0);
+    this.unsent = this.unsent.filter((message) => !unconfirmed.some((settled) => settled.id === message.id));
     for (const message of unconfirmed) {
       if (this.received(message.id)) {
         this.#doneSending(message.id);

@@ -23,12 +23,13 @@
   let steeringId = $state<string | null>(null);
 
   const blockedReason = $derived.by(() => {
-    if (view.connection !== 'open') return 'Reconnecting…';
     if (phase === 'stopped') return 'This session has stopped.';
     return null;
   });
   const queuedHint = $derived(
-    phase === 'starting'
+    view.connection !== 'open'
+      ? "Reconnecting… messages send once it's back."
+      : phase === 'starting'
       ? 'The agent is starting; messages are queued.'
       : phase === 'disconnected'
         ? 'The agent is reconnecting; messages are queued.'
@@ -66,6 +67,11 @@
     if (!message || blockedReason) return;
     text = '';
     const id = crypto.randomUUID();
+    if (view.connection !== 'open') {
+      view.sendWhenConnected(message, id);
+      textarea?.focus();
+      return;
+    }
     view.prompt(message, id).then(
       (stopReason) => {
         if (stopReason && stopReason in unusualStops) {
@@ -124,6 +130,19 @@
           <Button size="tiny" shape="round" variant="ghost" color="secondary" onclick={() => dismiss(message.id)}>
             Dismiss
           </Button>
+        </li>
+      {/each}
+    </ul>
+  </div>
+{/if}
+
+{#if view.unsent.length > 0}
+  <div class="border-light-200 shrink-0 border-t px-3 pt-2" data-testid="unsent-messages">
+    <ul class="mx-auto flex w-full max-w-3xl flex-col gap-1">
+      {#each view.unsent as message (message.id)}
+        <li class="bg-light-100 flex items-center gap-2 rounded-xl px-3 py-1.5 text-sm" data-testid="unsent-message">
+          <span class="text-muted shrink-0 text-xs">Waiting for the connection</span>
+          <span class="min-w-0 grow truncate" title={message.text}>{message.text}</span>
         </li>
       {/each}
     </ul>
