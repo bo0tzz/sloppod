@@ -49,11 +49,28 @@ pub async fn carried_over(
     child: &str,
     subject: &ReviewSubject,
 ) -> Result<Option<CarriedOver>, String> {
+    let reviewed_again = |kind: &str| {
+        state
+            .proposals
+            .get(kind)
+            .is_some_and(|kind| kind.reviewed_again())
+    };
+    carried_over_in(&state.db, parent, child, subject, reviewed_again).await
+}
+
+/// [`carried_over`], with which proposal kinds carry their review over given.
+pub(crate) async fn carried_over_in(
+    db: &sqlx::PgPool,
+    parent: &db::SessionRow,
+    child: &str,
+    subject: &ReviewSubject,
+    reviewed_again: impl Fn(&str) -> bool,
+) -> Result<Option<CarriedOver>, String> {
     let child = child
         .parse::<Uuid>()
         .ok()
         .ok_or("`from_sub_session` is the id of one of your sub-sessions")?;
-    let ours = db::get_session(&state.db, child)
+    let ours = db::get_session(db, child)
         .await
         .map_err(|e| e.to_string())?
         .is_some_and(|row| row.parent_id == Some(parent.id));
@@ -61,7 +78,7 @@ pub async fn carried_over(
         return Err("`from_sub_session` isn't one of your sub-sessions".into());
     }
     let reports = db::list_proposals(
-        &state.db,
+        db,
         &parent.owner,
         Some(child),
         Some(ProposalStatus::Executed),
@@ -69,11 +86,7 @@ pub async fn carried_over(
     .await
     .map_err(|e| e.to_string())?;
     let passed = reports.iter().rev().find(|report| {
-        state
-            .proposals
-            .get(&report.kind)
-            .is_some_and(|kind| kind.reviewed_again())
-            && report.payload["review"]["verdict"] == "pass"
+        reviewed_again(&report.kind) && report.payload["review"]["verdict"] == "pass"
     });
     let Some(report) = passed else {
         return Ok(None);
@@ -88,7 +101,7 @@ pub async fn carried_over(
     let same_repo = report.payload["repo"]
         .as_str()
         .is_some_and(|repo| sloppod_contracts::same_repo(repo, &subject.repo));
-    let kept = db::get_session(&state.db, reviewer)
+    let kept = db::get_session(db, reviewer)
         .await
         .map_err(|e| e.to_string())?
         .is_some_and(|row| row.deleted_at.is_none());
@@ -1016,6 +1029,30 @@ mod tests {
             f[k] = v.clone();
         }
         f
+    }
+
+    #[test]
+    fn a_carried_over_review_looks_at_what_changed_since_it_passed() {
+        let subject = ReviewSubject {
+            repo: "o/r".into(),
+            base: "main".into(),
+            head: "sloppod/p".into(),
+            head_sha: "beef".into(),
+            title: "Fix the build".into(),
+            body: "It was broken.".into(),
+            describes_change: true,
+        };
+        let carried = CarriedOver {
+            reviewer: Uuid::nil(),
+            sha: "c0ffee".into(),
+            head: "sloppod/p-child".into(),
+        };
+        let prompt = carried_over_prompt(&subject, &carried);
+        assert!(prompt.starts_with("sloppod: the work you passed, `sloppod/p-child` at c0ffee"));
+        assert!(prompt.contains("git diff c0ffee..beef"));
+        assert!(prompt.contains("git diff origin/main...beef"));
+        assert!(prompt.contains("It was broken."));
+        assert!(prompt.contains("submit_review"));
     }
 
     #[test]

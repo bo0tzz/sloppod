@@ -1449,3 +1449,102 @@ async fn an_agent_asks_to_act_as_the_owner_and_the_owner_picks_the_token(db: PgP
         .unwrap_err();
     assert!(again.0.contains("already acts as dev"), "{}", again.0);
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_proposal_carries_over_the_review_its_sub_session_s_report_passed(db: PgPool) {
+    use sloppod_contracts::ReviewSubject;
+
+    let parent = session(&db, "dev").await;
+    let child = session(&db, "dev").await;
+    let stranger = session(&db, "dev").await;
+    db::set_parent(&db, child, parent).await.unwrap();
+    let reviewer = session_of_kind(&db, "dev", SessionKind::Review).await;
+    let report = db::insert_proposal(
+        &db,
+        child,
+        "sloppod.session.report",
+        ProposalStatus::Executed,
+        &json!({"repo": "o/r", "head": "sloppod/p-child", "head_sha": "c0ffee", "review": {"verdict": "pass"}}),
+    )
+    .await
+    .unwrap();
+    db::set_review_session(&db, report.id, reviewer)
+        .await
+        .unwrap();
+
+    let subject = ReviewSubject {
+        repo: "O/R".into(),
+        base: "main".into(),
+        head: "sloppod/p".into(),
+        head_sha: "beef".into(),
+        title: "Fix".into(),
+        body: String::new(),
+        describes_change: true,
+    };
+    let parent_row = db::get_session(&db, parent).await.unwrap().unwrap();
+    let reports = |kind: &str| kind == "sloppod.session.report";
+    let carried =
+        crate::reviews::carried_over_in(&db, &parent_row, &child.to_string(), &subject, reports)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        (carried.reviewer, carried.sha.as_str()),
+        (reviewer, "c0ffee")
+    );
+    assert_eq!(carried.head, "sloppod/p-child");
+
+    // Only a sub-session of the proposer's, and only a review that passed, of the same repository.
+    assert!(
+        crate::reviews::carried_over_in(&db, &parent_row, &stranger.to_string(), &subject, reports)
+            .await
+            .is_err()
+    );
+    let elsewhere = ReviewSubject {
+        repo: "o/other".into(),
+        ..subject.clone()
+    };
+    assert!(
+        crate::reviews::carried_over_in(&db, &parent_row, &child.to_string(), &elsewhere, reports)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        crate::reviews::carried_over_in(&db, &parent_row, &child.to_string(), &subject, |_| false)
+            .await
+            .unwrap()
+            .is_none(),
+        "a kind that doesn't carry its review over"
+    );
+
+    // Kept for a day after the report was decided, unless a proposal is in review with it.
+    sqlx::query("update proposals set decided_at = now() - interval '2 days' where id = $1")
+        .bind(report.id)
+        .execute(&db)
+        .await
+        .unwrap();
+    let day_ago = Utc::now() - Duration::hours(24);
+    assert!(
+        db::idle_review_sessions(&db, day_ago)
+            .await
+            .unwrap()
+            .contains(&reviewer)
+    );
+    let pr = db::insert_proposal(
+        &db,
+        parent,
+        "github.pr.create",
+        ProposalStatus::InReview,
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    db::set_review_session(&db, pr.id, reviewer).await.unwrap();
+    assert!(
+        !db::idle_review_sessions(&db, day_ago)
+            .await
+            .unwrap()
+            .contains(&reviewer)
+    );
+}
