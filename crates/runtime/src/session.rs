@@ -70,13 +70,6 @@ fn notice_queued(text: &str) -> Queued {
 /// How long the agent has to have been quiet before a prompt tells it the time.
 const TIME_AFTER: chrono::Duration = chrono::Duration::minutes(30);
 
-/// How long to wait before checking again whether a restart's queued messages were taken back.
-const RESTORE_RETRY: std::time::Duration = if cfg!(test) {
-    std::time::Duration::from_millis(20)
-} else {
-    std::time::Duration::from_secs(10)
-};
-
 /// The line telling the agent the time (#105): its agent only knows the date it started on. Sent after a gap, or
 /// once the date has changed, since the agent was last heard from (`heard_at`), and with every notice.
 fn time_line(now: DateTime<Utc>, heard_at: Option<DateTime<Utc>>, notice: bool) -> Option<String> {
@@ -167,8 +160,6 @@ struct LiveState {
     permissions: HashMap<u64, Permission>,
     next_permission: u64,
     queue: Vec<Queued>,
-    /// Stored queue entries a restart left whose removal couldn't be checked yet: still stored, not yet queued.
-    unrestored: Vec<Value>,
     /// Prompts taken from the queue, and notices, on their way to the agent: kept in the stored queue until the
     /// request carrying them is answered, so a restart before then doesn't lose them (#237).
     in_flight: Vec<Held>,
@@ -744,7 +735,6 @@ impl Hub {
                     q
                 })
             })
-            .chain(state.unrestored.iter().cloned())
             .chain(state.queue.iter().map(stored))
             .collect();
         match self.store.save_queue(id, &stored).await {
@@ -900,19 +890,14 @@ impl Hub {
 
     /// Puts back the queues a restart left in the store: ahead of anything queued since, and run once each session's
     /// agent is up, waking a parked session for them as a new message would. Their callers are gone, so nobody
-    /// waits on the outcome; the transcript shows it.
-    pub async fn restore_queues(self: &Arc<Self>) {
-        let queues = match self.store.queues().await {
-            Ok(queues) => queues,
-            Err(e) => {
-                tracing::error!(error = %e, "loading queued messages");
-                return;
-            }
-        };
-        for (id, stored) in queues {
+    /// waits on the outcome; the transcript shows it. Reads everything it needs before changing anything, so on an
+    /// error nothing is restored and the stored queues stay as they were, for the caller to try again.
+    pub async fn restore_queues(self: &Arc<Self>) -> sqlx::Result<()> {
+        let mut restoring = Vec::new();
+        for (id, stored) in self.store.queues().await? {
             // What was on its way to the agent waits, held, until its agent says what it has.
             let mut held: Vec<Held> = Vec::new();
-            let mut waiting: Vec<Value> = Vec::new();
+            let mut restored: Vec<Queued> = Vec::new();
             for q in stored {
                 if q["held"].is_object() {
                     let key = q["held"]["batch"]
@@ -933,92 +918,37 @@ impl Hub {
                         }),
                     }
                 } else {
-                    waiting.push(q);
+                    let queued = unstored(&q);
+                    // Taken back before a restart that came before its queue was saved without it.
+                    if let Some(qid) = queued.id
+                        && self.store.message_removed(id, qid).await?
+                    {
+                        continue;
+                    }
+                    restored.push(queued);
                 }
             }
-            let restored = match self.not_taken_back(id, &waiting).await {
-                Ok(restored) => restored,
-                Err(e) => {
-                    // Whether the user took any of them back is unknown: they stay stored, and out of the queue,
-                    // until that can be read.
-                    tracing::warn!(session = %id, error = %e, "checking whether queued messages were taken back");
-                    {
-                        let live = self.live(id);
-                        let mut state = live.state.lock().await;
-                        state.in_flight.extend(held);
-                        state.unrestored = waiting;
-                        self.save_queue(id, &state).await;
-                    }
-                    tokio::spawn(self.clone().finish_restoring(id));
-                    continue;
-                }
-            };
-            self.put_back(id, restored, held).await;
+            restoring.push((id, restored, held));
         }
-    }
-
-    /// The stored queue entries `waiting` as queued messages, leaving out those the user took back before a restart
-    /// that came before their queue was saved without them.
-    async fn not_taken_back(&self, id: Uuid, waiting: &[Value]) -> sqlx::Result<Vec<Queued>> {
-        let mut kept = Vec::new();
-        for q in waiting {
-            let queued = unstored(q);
-            if let Some(qid) = queued.id
-                && self.store.message_removed(id, qid).await?
+        for (id, restored, held) in restoring {
+            let nothing = restored.is_empty() && held.is_empty();
             {
+                let live = self.live(id);
+                let mut state = live.state.lock().await;
+                let since = std::mem::take(&mut state.queue);
+                state.queue = restored.into_iter().chain(since).collect();
+                state.in_flight.extend(held);
+                self.save_queue(id, &state).await;
+            }
+            if nothing {
                 continue;
             }
-            kept.push(queued);
-        }
-        Ok(kept)
-    }
-
-    /// Restores what a restart left queued ahead of anything queued since, and runs it once the agent is up.
-    async fn put_back(self: &Arc<Self>, id: Uuid, restored: Vec<Queued>, held: Vec<Held>) {
-        let nothing = restored.is_empty() && held.is_empty();
-        {
-            let live = self.live(id);
-            let mut state = live.state.lock().await;
-            let since = std::mem::take(&mut state.queue);
-            state.queue = restored.into_iter().chain(since).collect();
-            state.in_flight.extend(held);
-            self.save_queue(id, &state).await;
-        }
-        if nothing {
-            return;
-        }
-        self.broadcast_queue(id).await;
-        if let Err(e) = self.wake_for_message(id).await {
-            tracing::warn!(session = %id, error = %e.message, "waking a session for its queued messages");
-        }
-    }
-
-    /// Tries again to restore the queue entries whose removal couldn't be checked, until it can.
-    async fn finish_restoring(self: Arc<Self>, id: Uuid) {
-        loop {
-            tokio::time::sleep(RESTORE_RETRY).await;
-            let waiting = {
-                let live = self.live(id);
-                let state = live.state.lock().await;
-                if state.stopped {
-                    return;
-                }
-                state.unrestored.clone()
-            };
-            if waiting.is_empty() {
-                return;
-            }
-            match self.not_taken_back(id, &waiting).await {
-                Ok(restored) => {
-                    self.live(id).state.lock().await.unrestored.clear();
-                    self.put_back(id, restored, Vec::new()).await;
-                    return;
-                }
-                Err(e) => {
-                    tracing::warn!(session = %id, error = %e, "checking whether queued messages were taken back");
-                }
+            self.broadcast_queue(id).await;
+            if let Err(e) = self.wake_for_message(id).await {
+                tracing::warn!(session = %id, error = %e.message, "waking a session for its queued messages");
             }
         }
+        Ok(())
     }
 
     /// The `_sloppod/queue` notification for the messages waiting behind the running turn.
@@ -1282,14 +1212,7 @@ impl Hub {
             {
                 return Ok(json!({"stopReason": "cancelled"}));
             }
-            let waiting = |m: Uuid| {
-                state.queue.iter().any(|q| q.id == Some(m))
-                    || state
-                        .unrestored
-                        .iter()
-                        .any(|q| q["id"] == m.to_string().as_str())
-            };
-            if received || message_id.is_some_and(waiting) {
+            if received || message_id.is_some_and(|m| state.queue.iter().any(|q| q.id == Some(m))) {
                 return Ok(
                     json!({"stopReason": "end_turn", "_meta": {"sloppod": {"alreadyReceived": true}}}),
                 );
@@ -2005,7 +1928,6 @@ impl Hub {
             live.end_compaction(&mut state);
             let queued = std::mem::take(&mut state.queue);
             state.in_flight.clear();
-            state.unrestored.clear();
             self.save_queue(id, &state).await;
             (state.agent.take(), queued)
         };
