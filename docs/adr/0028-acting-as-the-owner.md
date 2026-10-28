@@ -48,3 +48,5 @@ Considered and not chosen:
 To decide during implementation: whether `propose` as the owner also covers merging, and whether a session may hold `as-owner` on a repository while its proposals there still open as the App.
 
 2026-10-28: the grant controls this relies on are built (ADR 2's dated note): grants have an expiry, and the owner grants, narrows, extends and revokes them while the session runs. The `as-owner` grant itself is still to come.
+
+2026-10-28: [ADR 29](0029-grants-name-their-credential.md) (proposed) generalises this: every grant names the credential it acts with, so acting as the owner is a `repo` grant whose credential is a `github-user` token, not an `as-owner` capability. The rules above apply to every grant held with a person's credential. The two questions left open here are answered there: an identity does all of what it's granted, merging included, and splitting operations between identities is the direction, through separate grants for now.

@@ -31,3 +31,5 @@ Chosen option: **rows in the database, encrypted with a master key**.
 ## More Information
 
 2026-10-28: a fourth kind, `chatgpt`, holds a Codex login (the `auth.json` of a `codex login`) for review sessions ([ADR 24](0024-automated-review-before-human-review.md)). The runtime refreshes its tokens itself and stores them sealed again. A memini credential's URL may not carry a username or password: the config is returned by the API, and only the secret is write-only.
+
+2026-10-28: [ADR 29](0029-grants-name-their-credential.md) (proposed) is the "grants can name another later" above: every grant names its credential, filled in from the default when the grant is made, so the default only decides what new grants get.
