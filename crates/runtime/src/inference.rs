@@ -194,11 +194,14 @@ pub async fn check_turn_end(state: &AppState, id: Uuid) {
     if session.kind != SessionKind::Work || state.hub.commands(id).await != Some(0) {
         return;
     }
-    if state.inference.nudged.lock().unwrap().remove(&id) || state.hub.turn_running(id).await {
+    if state.inference.nudged.lock().unwrap().remove(&id) {
         return;
     }
     // The turn being checked; a judgement that comes back after the session moved on is about the past.
-    let checked = (state.hub.turns_ended(id).await.0, false);
+    let (checked, running) = state.hub.turn_state(id).await;
+    if running {
+        return;
+    }
     let Some(message) = last_agent_message(state, id).await else {
         return;
     };
@@ -213,19 +216,18 @@ pub async fn check_turn_end(state: &AppState, id: Uuid) {
     if verdict["ok"] != false {
         return;
     }
-    let now = (
-        state.hub.turns_ended(id).await.0,
-        state.hub.turn_running(id).await,
-    );
-    if now != checked {
-        return;
-    }
     let reason = verdict["reason"].as_str().unwrap_or(
         "Your last message says you're starting something, but nothing of yours is running.",
     );
-    // The turn that ends next is the answer to this notice.
+    // Marked first, so the notice's own turn can't end unmarked; unmarked if the session moved on and it isn't sent.
     state.inference.nudged.lock().unwrap().insert(id);
-    state.hub.notify(id, format!("sloppod: {reason}")).await;
+    let sent = state
+        .hub
+        .notify_when_idle(id, Some(checked), format!("sloppod: {reason}"))
+        .await;
+    if !sent {
+        state.inference.nudged.lock().unwrap().remove(&id);
+    }
 }
 
 /// The text of the session's last agent message, from its log.
