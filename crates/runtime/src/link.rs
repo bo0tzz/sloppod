@@ -87,6 +87,9 @@ pub struct AgentConn {
     tx: mpsc::UnboundedSender<ToSupervisor>,
     pending: Mutex<HashMap<i64, oneshot::Sender<Result<Value, RpcError>>>>,
     next_id: AtomicI64,
+    /// Commands run in the pod (`ToSupervisor::Run`) waiting for their result.
+    runs: Mutex<HashMap<u64, oneshot::Sender<Result<String, String>>>>,
+    next_run: std::sync::atomic::AtomicU64,
     closed: std::sync::atomic::AtomicBool,
 }
 
@@ -96,6 +99,8 @@ impl AgentConn {
             tx,
             pending: Mutex::default(),
             next_id: AtomicI64::new(1),
+            runs: Mutex::default(),
+            next_run: std::sync::atomic::AtomicU64::new(1),
             closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -160,15 +165,56 @@ impl AgentConn {
         let _ = tx.send(result);
     }
 
-    /// Fails every outstanding request; the link is gone.
+    /// Runs a command in the pod, apart from the agent; its output, or why it failed.
+    pub async fn run(
+        &self,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        input: String,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        const GONE: &str = "the session's pod disconnected";
+        let id = self.next_run.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        {
+            // Under the lock `close` clears runs with, so a run is either refused here or failed there.
+            let mut runs = self.runs.lock().expect("runs lock");
+            if self.is_closed() {
+                return Err(GONE.to_owned());
+            }
+            runs.insert(id, tx);
+        }
+        let sent = self.tx.send(ToSupervisor::Run {
+            id,
+            command,
+            env,
+            input,
+            timeout_secs: timeout.as_secs(),
+        });
+        if sent.is_err() {
+            self.runs.lock().expect("runs lock").remove(&id);
+            return Err(GONE.to_owned());
+        }
+        rx.await.unwrap_or_else(|_| Err(GONE.to_owned()))
+    }
+
+    pub(crate) fn run_result(&self, id: u64, output: Option<String>, error: Option<String>) {
+        if let Some(tx) = self.runs.lock().expect("runs lock").remove(&id) {
+            let _ = tx.send(output.ok_or_else(|| error.unwrap_or_default()));
+        }
+    }
+
     /// Whether the link this connection was on has gone.
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
 
+    /// Fails every outstanding request and run; the link is gone.
     pub fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
         self.pending.lock().expect("pending lock").clear();
+        let mut runs = self.runs.lock().expect("runs lock");
+        runs.clear();
     }
 }
 
@@ -671,6 +717,9 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
                     &message,
                 )
                 .await;
+            }
+            FromSupervisor::RunResult { id, output, error } => {
+                agent.run_result(id, output, error);
             }
             FromSupervisor::ShutdownReport { running } => {
                 tracing::info!(session = %session_id, commands = running.len(), "pod stopping with commands running");
