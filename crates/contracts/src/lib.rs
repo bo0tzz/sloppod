@@ -62,30 +62,45 @@ impl Grant {
     }
 }
 
-/// Whether a session can call `request_repository`, which decides what a refusal tells it to do about a repository it
-/// can't push to.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RepoRequests {
-    /// A work session of its own: it asks the user itself.
+/// What a session is for: what its agent is told, and which tools and next steps it has.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionRole {
+    /// The owner's own session, working on what they asked.
     #[default]
-    Itself,
-    /// A sub-session works where its parent can push, so it has to ask its parent through its report (ADR 27).
-    ViaParent,
-    /// A review session has no such tool.
-    Never,
+    Work,
+    /// A session another one spawned for part of its work (ADR 27), with its parent's id.
+    SubSession { parent: String },
+    /// A reviewer of a proposal (ADR 24), with a read-only checkout.
+    Review,
+    /// The runtime's own small model calls (ADR 26), with no tools.
+    Utility,
 }
 
-impl RepoRequests {
-    /// What to do about a repository the session can't push to, to follow a semicolon; none if there's nothing.
-    pub fn advice(self) -> Option<&'static str> {
+impl SessionRole {
+    /// Whether it acts outside its pod (proposals, questions to the user, sub-sessions): work sessions and
+    /// sub-sessions do, reviewers and utility sessions don't.
+    pub fn acts(&self) -> bool {
+        matches!(self, Self::Work | Self::SubSession { .. })
+    }
+
+    /// What to do about a repository the session can't push to, to follow a semicolon; none if there's nothing. Only
+    /// a work session of its own can call `request_repository`; a sub-session works where its parent can push, so it
+    /// asks through its report (ADR 27).
+    pub fn repo_advice(&self) -> Option<&'static str> {
         match self {
-            Self::Itself => Some("ask for write access with the request_repository tool"),
-            Self::ViaParent => {
+            Self::Work => Some("ask for write access with the request_repository tool"),
+            Self::SubSession { .. } => {
                 Some("say in your report that you need it, and your parent session can request it")
             }
-            Self::Never => None,
+            Self::Review | Self::Utility => None,
         }
+    }
+
+    /// The end of a refusal for a repository the session can't push to: `; ` and [`Self::repo_advice`], or nothing.
+    pub fn repo_next_step(&self) -> String {
+        self.repo_advice()
+            .map(|advice| format!("; {advice}"))
+            .unwrap_or_default()
     }
 }
 
@@ -97,7 +112,7 @@ pub struct SessionContext {
     pub owner: String,
     pub grants: Vec<Grant>,
     #[serde(default)]
-    pub repo_requests: RepoRequests,
+    pub role: SessionRole,
 }
 
 /// A writable repository grant: the repository and the session branch, the only ref it may push.
@@ -424,9 +439,6 @@ pub struct AgentFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentContext {
     pub session: SessionContext,
-    /// What the session is for, which decides what its agent is told.
-    #[serde(default)]
-    pub role: SessionRole,
     pub workdir: String,
     /// The repository the session is about, checked out at `repo_dir`.
     pub repo: Option<String>,
@@ -439,20 +451,6 @@ pub struct AgentContext {
     pub instructions: Option<String>,
     pub model: Option<String>,
     pub memory: Option<MemoryContext>,
-}
-
-/// What a session is for, as its agent needs to know it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SessionRole {
-    /// The owner's own session, working on what they asked.
-    #[default]
-    Work,
-    /// A session another one spawned for part of its work (ADR 27), with its parent's id.
-    SubSession { parent: String },
-    /// A reviewer of a proposal (ADR 24), with a read-only checkout.
-    Review,
-    /// The runtime's own small model calls (ADR 26), with no tools.
-    Utility,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -594,7 +592,7 @@ mod repo_tests {
         let session = SessionContext {
             session_id: "s".into(),
             owner: "o".into(),
-            repo_requests: RepoRequests::default(),
+            role: SessionRole::default(),
             grants: vec![
                 Grant::new(
                     capability::REPO,
@@ -625,21 +623,25 @@ mod repo_tests {
 }
 
 #[cfg(test)]
-mod repo_requests_tests {
+mod role_tests {
     use super::*;
 
     #[test]
     fn a_refusal_only_names_tools_the_session_has() {
         assert!(
-            RepoRequests::Itself
-                .advice()
-                .unwrap()
+            SessionRole::Work
+                .repo_next_step()
                 .contains("request_repository")
         );
-        let via_parent = RepoRequests::ViaParent.advice().unwrap();
-        assert!(!via_parent.contains("request_repository"));
-        assert!(via_parent.contains("your report"));
-        assert_eq!(RepoRequests::Never.advice(), None);
+        let sub = SessionRole::SubSession { parent: "p".into() }.repo_next_step();
+        assert!(
+            sub.starts_with("; ")
+                && sub.contains("your report")
+                && !sub.contains("request_repository")
+        );
+        assert_eq!(SessionRole::Review.repo_next_step(), "");
+        assert!(!SessionRole::Review.acts() && !SessionRole::Utility.acts());
+        assert!(SessionRole::Work.acts() && SessionRole::SubSession { parent: "p".into() }.acts());
     }
 }
 

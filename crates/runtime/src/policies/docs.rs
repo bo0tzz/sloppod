@@ -64,7 +64,7 @@ mod tests {
             session_id: "s".into(),
             owner: "dev".into(),
             grants,
-            repo_requests: Default::default(),
+            role: Default::default(),
         }
     }
 

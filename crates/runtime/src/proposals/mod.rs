@@ -169,11 +169,7 @@ fn same_identity(session: &SessionContext, target: Option<&str>, payload: &Value
 
 /// How a refusal for a repository the session can't push to ends: what to do about it, if anything.
 fn next_step(session: &SessionContext) -> String {
-    session
-        .repo_requests
-        .advice()
-        .map(|advice| format!("; {advice}"))
-        .unwrap_or_default()
+    session.role.repo_next_step()
 }
 
 fn target_repo<'a>(session: &'a SessionContext, named: Option<&str>) -> Result<RepoGrant<'a>> {
@@ -744,7 +740,7 @@ mod tests {
         SessionContext {
             session_id: Uuid::nil().to_string(),
             owner: "dev".into(),
-            repo_requests: Default::default(),
+            role: Default::default(),
             grants: repos
                 .iter()
                 .map(|r| {
