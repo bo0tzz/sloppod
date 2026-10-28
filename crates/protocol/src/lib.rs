@@ -286,6 +286,15 @@ pub mod api {
 pub mod link {
     use super::*;
 
+    /// Whether `name` can be a transcript file: a plain `.jsonl` file name, nothing that reaches outside the
+    /// transcript directory. Checked when the runtime stores a file and again when a supervisor restores it.
+    pub fn is_transcript_file_name(name: &str) -> bool {
+        name.ends_with(".jsonl")
+            && name.len() > ".jsonl".len()
+            && !name.starts_with('.')
+            && !name.contains(['/', '\\', '\0'])
+    }
+
     /// Path of the supervisor link WebSocket on the runtime.
     pub const PATH: &str = "/link/v1";
     /// Where in the session's workdir the supervisor keeps `{"build": ...}` for the runtime it's connected to.
@@ -405,5 +414,26 @@ pub mod link {
         Error {
             message: String,
         },
+    }
+}
+
+#[cfg(test)]
+mod transcript_name_tests {
+    use super::link::is_transcript_file_name;
+
+    #[test]
+    fn transcript_files_stay_in_their_directory() {
+        assert!(is_transcript_file_name("0b6a1c.jsonl"));
+        for refused in [
+            "../x.jsonl",
+            "a/b.jsonl",
+            "a\\b.jsonl",
+            ".jsonl",
+            ".hidden.jsonl",
+            "x.txt",
+            "",
+        ] {
+            assert!(!is_transcript_file_name(refused), "{refused}");
+        }
     }
 }

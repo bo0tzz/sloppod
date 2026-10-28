@@ -605,6 +605,10 @@ async fn prepare(
         std::fs::create_dir_all(&launch.cwd)?;
     }
     for file in &launch.transcript {
+        if !sloppod_protocol::link::is_transcript_file_name(&file.name) {
+            tracing::warn!(file = %file.name, "not restoring a transcript file with that name");
+            continue;
+        }
         let path = Path::new(&launch.transcript_dir).join(&file.name);
         if !path.exists() {
             let content = base64::engine::general_purpose::STANDARD.decode(&file.content_b64)?;
