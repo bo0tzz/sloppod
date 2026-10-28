@@ -2,6 +2,7 @@
 //! agent's ACP stdio over the link.
 
 mod proxy;
+mod shutdown;
 
 /// Whether the runtime's endpoints are served locally to the agent.
 static LOCAL_PROXY_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -390,6 +391,11 @@ async fn run(
         Event::Terminate => {
             tracing::info!("terminating");
             let mut a = agent.take().expect("an agent is running");
+            // Before the agent is stopped, which ends what it started.
+            let running = a.child.id().map(shutdown::running).unwrap_or_default();
+            if !running.is_empty() {
+                let _ = send(&mut sink, &FromSupervisor::ShutdownReport { running }).await;
+            }
             stop(&mut a.child).await;
             sync_transcript(&a.transcript_dir, &mut a.synced, &mut sink).await;
             Ending::Terminate

@@ -672,6 +672,14 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
                 )
                 .await;
             }
+            FromSupervisor::ShutdownReport { running } => {
+                tracing::info!(session = %session_id, commands = running.len(), "pod stopping with commands running");
+                // Waits for the agent to be up again, so it hears what to start again.
+                state
+                    .hub
+                    .notify(session_id, shutdown_notice(&running))
+                    .await;
+            }
         }
     }
     tracing::info!(session = %session_id, "supervisor disconnected");
@@ -735,6 +743,20 @@ async fn agent_failed(state: &AppState, session: Uuid, title: &str, error: &str)
         Ok(false) => state.hub.broadcast_session(session).await,
         Err(e) => tracing::warn!(%session, error = %e, "storing the agent's error"),
     }
+}
+
+/// Tells the agent which of its commands its pod's ending cut off.
+fn shutdown_notice(running: &[sloppod_protocol::link::RunningProcess]) -> String {
+    let mut notice = "sloppod: your session's pod was stopped (to be replaced, parked, or moved) while these of your \
+                      commands were still running. They were ended; start again whichever you still need:"
+        .to_owned();
+    for process in running {
+        notice.push_str(&format!("\n- `{}`", process.command));
+        if let Some(tail) = &process.output_tail {
+            notice.push_str(&format!(", which last wrote:\n```\n{tail}\n```"));
+        }
+    }
+    notice
 }
 
 /// A transcript file name the session's pod can be given back; one that isn't is dropped and logged.
@@ -894,5 +916,31 @@ async fn hello(
             Message::Close(_) => return None,
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use sloppod_protocol::link::RunningProcess;
+
+    use super::*;
+
+    #[test]
+    fn the_agent_hears_what_its_pod_cut_off() {
+        let notice = shutdown_notice(&[
+            RunningProcess {
+                command: "bash -c cargo test".into(),
+                output_tail: Some("test a ... ok".into()),
+            },
+            RunningProcess {
+                command: "bash -c npm run dev".into(),
+                output_tail: None,
+            },
+        ]);
+        assert!(notice.starts_with("sloppod: your session's pod was stopped"));
+        assert!(
+            notice.contains("\n- `bash -c cargo test`, which last wrote:\n```\ntest a ... ok\n```")
+        );
+        assert!(notice.ends_with("\n- `bash -c npm run dev`"));
     }
 }
