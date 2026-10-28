@@ -658,3 +658,47 @@ async fn a_session_log_has_a_last_event(db: PgPool) {
         .unwrap();
     assert_eq!(db::last_event(&db, s).await.unwrap(), seq);
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_pull_requests_fingerprint_is_found_by_repository_and_number(db: PgPool) {
+    let s = session(&db, "dev").await;
+    for (repo, number, fingerprint) in [("O/R", 7, Some("abc")), ("o/r", 8, None)] {
+        let id = db::insert_proposal(
+            &db,
+            s,
+            "github.pr.create",
+            ProposalStatus::Pending,
+            &json!({"repo": repo}),
+        )
+        .await
+        .unwrap()
+        .id;
+        db::decide_proposal(
+            &db,
+            id,
+            ProposalStatus::Approved,
+            &json!({"repo": repo}),
+            None,
+            "dev",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut result = json!({"number": number, "auto_merge": true});
+        if let Some(fingerprint) = fingerprint {
+            result["fingerprint"] = json!(fingerprint);
+        }
+        db::finish_proposal(&db, id, ProposalStatus::Executed, Some(&result), None)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        db::pull_fingerprint(&db, "o/r", 7)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("abc")
+    );
+    assert_eq!(db::pull_fingerprint(&db, "o/r", 8).await.unwrap(), None);
+    assert_eq!(db::pull_fingerprint(&db, "o/other", 7).await.unwrap(), None);
+}

@@ -732,6 +732,23 @@ pub async fn approved_proposals(db: &PgPool) -> sqlx::Result<Vec<ProposalRow>> {
 }
 
 /// Stacks that were set to merge themselves; the watch on each ends at its first check once it has merged.
+/// The fingerprint of the change a pull request made when it was proposed and set to merge itself, if it was.
+pub async fn pull_fingerprint(
+    db: &PgPool,
+    repo: &str,
+    number: u64,
+) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar(
+        "select result->>'fingerprint' from proposals where kind = 'github.pr.create' and status = 'executed' \
+         and lower(payload->>'repo') = lower($1) and (result->>'number')::bigint = $2 \
+         and result ? 'fingerprint' order by created_at desc limit 1",
+    )
+    .bind(repo)
+    .bind(number as i64)
+    .fetch_optional(db)
+    .await
+}
+
 pub async fn merging_stacks(db: &PgPool) -> sqlx::Result<Vec<ProposalRow>> {
     sqlx::query_as(AssertSqlSafe(format!(
         "select {PROPOSAL_COLUMNS} from proposals where kind = 'github.stack.create' and status = 'executed' \
