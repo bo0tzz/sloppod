@@ -160,7 +160,36 @@ pub struct HttpRequest {
     pub body_truncated: bool,
 }
 
+/// A request path that can't be read one way only.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct BadPath(pub String);
+
+/// A path's segments, percent-decoded: the one way a path is read wherever it decides anything. Empty segments are
+/// dropped, as the egress listener merges repeated slashes. A `.` or `..` segment, written plainly or encoded, makes
+/// the path refused rather than resolved, so nothing downstream can read it differently. A segment that decodes to
+/// something with a `/` in it stays one segment (memini's namespaces are written so); a policy whose upstream might
+/// split it refuses it itself.
+pub fn path_segments(path: &str) -> std::result::Result<Vec<String>, BadPath> {
+    let mut segments = Vec::new();
+    for raw in path.split('/').filter(|s| !s.is_empty()) {
+        let segment = percent_encoding::percent_decode_str(raw)
+            .decode_utf8()
+            .map_err(|_| BadPath(format!("{path} isn't valid UTF-8")))?;
+        if segment == "." || segment == ".." {
+            return Err(BadPath(format!("{path} has a dot segment")));
+        }
+        segments.push(segment.into_owned());
+    }
+    Ok(segments)
+}
+
 impl HttpRequest {
+    /// The path's decoded segments; see [`path_segments`].
+    pub fn segments(&self) -> std::result::Result<Vec<String>, BadPath> {
+        path_segments(self.path_only())
+    }
+
     pub fn path_only(&self) -> &str {
         self.path.split('?').next().unwrap_or_default()
     }
@@ -380,4 +409,28 @@ pub trait ProposalKind: Send + Sync {
     }
     /// Runs the approved action with the runtime's credentials.
     async fn execute(&self, session: &SessionContext, payload: &Value) -> Result<Value>;
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn a_path_reads_one_way() {
+        assert_eq!(path_segments("/v1//keys/").unwrap(), ["v1", "keys"]);
+        assert_eq!(path_segments("/v1/%6Beys").unwrap(), ["v1", "keys"]);
+        assert_eq!(
+            path_segments("/v1/namespaces/a%2Fb").unwrap(),
+            ["v1", "namespaces", "a/b"]
+        );
+        for refused in [
+            "/v1/../keys",
+            "/v1/%2e%2e/keys",
+            "/v1/%2E./keys",
+            "/./x",
+            "/v1/%ff",
+        ] {
+            assert!(path_segments(refused).is_err(), "{refused}");
+        }
+    }
 }
