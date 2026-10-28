@@ -15,7 +15,42 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Decides which of the other jobs a change needs. Skipping per job, not with a top-level `paths` filter, keeps the
+  # required checks reporting: a skipped job counts as passing, a workflow that never starts waits forever. Pushes to
+  # main run everything. The patterns list what each job depends on, so a path a job starts reading has to be added.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.scope.outputs.rust }}
+      ui: ${{ steps.scope.outputs.ui }}
+      images: ${{ steps.scope.outputs.images }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+      - id: scope
+        run: |
+          # On a pull request HEAD is its merge into the base, so the first parent is the base.
+          files=
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            files=$(git diff --name-only HEAD^1 HEAD)
+          fi
+          scope() {
+            if [ -z "$files" ] || printf '%s\n' "$files" | grep -Eq "$2"; then
+              echo "$1=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "$1=false" >> "$GITHUB_OUTPUT"
+            fi
+          }
+          common='mise\.(toml|lock)|\.github/workflows/ci\.yml'
+          rust='crates/|Cargo\.(toml|lock)|rust-toolchain\.toml'
+          scope rust "^($rust|dev/with-db\.sh|$common)"
+          scope ui "^(ui/|$common)"
+          scope images "^($rust|ui/|charts/|Containerfile|\.dockerignore|\.github/workflows/(ci|publish)\.yml)"
+
   check:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -23,7 +58,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: mise run check
 
-  ui:
+  ui-check:
+    needs: changes
+    if: needs.changes.outputs.ui == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -35,14 +72,44 @@ jobs:
           install_args: node
       - run: npm ci
       - run: npm run check
+
+  # The end-to-end tests are most of CI's wall-clock time, so they run in shards, each with its own mock runtime.
+  e2e:
+    needs: changes
+    if: needs.changes.outputs.ui == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: jdx/mise-action@82a612c5ab8bcda7cc5db6b7e81a8e7584c3dc6e # v5.2.3
+        with:
+          install_args: node
+      - run: npm ci
       - run: npx playwright install --with-deps chromium
-      - run: npm run test:e2e
+      - run: npx vite build
+      - run: npx playwright test --project=e2e --shard=${{ matrix.shard }}/3
+
+  # The one check to require for the UI: it keeps the name `ui`, and passes when the jobs above were skipped.
+  ui:
+    needs: [ui-check, e2e]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = false ]
 
   # Catches a broken Containerfile before merge instead of in the publish after it. Both images in one job, as in
   # publish.yml, from its cache. Nothing is written back: a pull request's cache entries are only visible to that pull
   # request, and would crowd main's out of the cache.
   images:
-    if: github.event_name == 'pull_request'
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.images == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
