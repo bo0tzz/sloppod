@@ -301,6 +301,9 @@ pub mod link {
 
     /// Path of the supervisor link WebSocket on the runtime.
     pub const PATH: &str = "/link/v1";
+    /// Where a supervisor fetches a transcript file the runtime has: `GET {TRANSCRIPT_PATH}/{name}`, with the pod's
+    /// token, streamed.
+    pub const TRANSCRIPT_PATH: &str = "/link/v1/transcript";
     /// Where in the session's workdir the supervisor keeps `{"build": ...}` for the runtime it's connected to.
     pub const RUNTIME_INFO: &str = ".sloppod/runtime.json";
 
@@ -328,12 +331,25 @@ pub mod link {
         pub commit: Option<String>,
     }
 
+    /// A transcript file the runtime has, and how many bytes of it.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct TranscriptRef {
+        pub name: String,
+        pub len: u64,
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct Launch {
         pub session_id: Uuid,
         pub files: Vec<File>,
         pub transcript_dir: String,
+        /// Transcript files inline, for a supervisor that doesn't fetch them.
+        #[serde(default)]
         pub transcript: Vec<TranscriptFile>,
+        /// The transcript files the runtime has, for the supervisor to fetch any it's missing from
+        /// [`TRANSCRIPT_PATH`], and to sync only what's appended to them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub transcript_files: Vec<TranscriptRef>,
         /// The runtime's CA, which every client in the pod must trust (ADR 11).
         pub ca_pem: Option<String>,
         pub repo: Option<Repo>,
@@ -397,6 +413,10 @@ pub mod link {
             /// The supervisor serves the runtime's session endpoints at [`LOCAL_PROXY`]; older ones don't.
             #[serde(default)]
             local_proxy: bool,
+            /// The supervisor fetches transcript files it's missing rather than having them inline in `Launch`, which
+            /// for a long session is one message tens of megabytes long (#211); older ones don't.
+            #[serde(default)]
+            fetch_transcript: bool,
         },
         Status {
             message: String,

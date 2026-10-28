@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use axum::extract::State;
+use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
@@ -22,6 +23,7 @@ use sloppod_contracts::{AgentContext, MemoryContext};
 use sloppod_protocol::api::SessionKind;
 use sloppod_protocol::link::{
     AgentReady, FromSupervisor, Launch, Repo, RunningAgent, ToSupervisor, TranscriptFile,
+    TranscriptRef,
 };
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -162,25 +164,32 @@ impl AgentConn {
     }
 }
 
+/// The session of the pod whose token a request carries, or the response refusing it.
+async fn calling_session(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Uuid, (StatusCode, String)> {
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let Some(token) = token else {
+        return Err((StatusCode::UNAUTHORIZED, "missing bearer token".to_owned()));
+    };
+    authenticate(state, token).await.map_err(|e| {
+        tracing::warn!(error = %e, "supervisor authentication failed");
+        (StatusCode::FORBIDDEN, e.to_string())
+    })
+}
+
 pub async fn handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::to_owned);
-    let Some(token) = token else {
-        return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
-    };
-    let session = match authenticate(&state, &token).await {
+    let session = match calling_session(&state, &headers).await {
         Ok(session) => session,
-        Err(e) => {
-            tracing::warn!(error = %e, "supervisor authentication failed");
-            return (StatusCode::FORBIDDEN, e.to_string()).into_response();
-        }
+        Err(refused) => return refused.into_response(),
     };
     // A transcript sync is one message, whole and base64-encoded; axum's default 16 MiB frame limit silently broke
     // the link once a session's transcript passed about 12 MB.
@@ -236,6 +245,50 @@ pub(crate) async fn authenticate(state: &AppState, token: &str) -> anyhow::Resul
         .context("pod is not a session pod")
 }
 
+/// How much of a transcript file the runtime reads at once while sending it.
+const TRANSCRIPT_CHUNK: i64 = 1 << 20;
+
+/// Sends a pod one of its session's transcript files, a chunk at a time, so a long session's transcript is never
+/// all in memory here.
+pub async fn transcript(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    let session = match calling_session(&state, &headers).await {
+        Ok(session) => session,
+        Err(refused) => return refused.into_response(),
+    };
+    if !sloppod_protocol::link::is_transcript_file_name(&name) {
+        return (StatusCode::BAD_REQUEST, "not a transcript file name").into_response();
+    }
+    let len = match db::transcript_len(&state.db, session, &name).await {
+        Ok(Some(len)) => len,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let chunks = futures::stream::try_unfold(0, move |offset| {
+        let (state, name) = (state.clone(), name.clone());
+        async move {
+            if offset >= len {
+                return Ok(None);
+            }
+            let chunk =
+                db::transcript_chunk(&state.db, session, &name, offset, TRANSCRIPT_CHUNK).await?;
+            if chunk.is_empty() {
+                return Ok(None);
+            }
+            let next = offset + chunk.len() as i64;
+            Ok::<_, sqlx::Error>(Some((bytes::Bytes::from(chunk), next)))
+        }
+    });
+    (
+        [(axum::http::header::CONTENT_LENGTH, len.to_string())],
+        Body::from_stream(chunks),
+    )
+        .into_response()
+}
+
 /// Commits are by whoever pushes them: the owner's GitHub App.
 async fn git_identity(state: &AppState, owner: &str) -> GitIdentity {
     let identity = match state.credentials.github(owner).await {
@@ -255,20 +308,34 @@ async fn launch_for(
     state: &AppState,
     session: &db::SessionRow,
     context: &AgentContext,
+    fetch_transcript: bool,
 ) -> anyhow::Result<(Launch, sloppod_contracts::AgentLaunch)> {
     let agent = state
         .agents
         .get(&session.agent)
         .with_context(|| format!("no agent called {}", session.agent))?
         .launch(context);
-    let transcript = db::transcripts(&state.db, session.id)
-        .await?
-        .into_iter()
-        .map(|(name, content)| TranscriptFile {
-            name,
-            content_b64: base64::engine::general_purpose::STANDARD.encode(content),
-        })
-        .collect();
+    let (transcript, transcript_files) = if fetch_transcript {
+        let files = db::transcript_lens(&state.db, session.id)
+            .await?
+            .into_iter()
+            .map(|(name, len)| TranscriptRef {
+                name,
+                len: len as u64,
+            })
+            .collect();
+        (Vec::new(), files)
+    } else {
+        let files = db::transcripts(&state.db, session.id)
+            .await?
+            .into_iter()
+            .map(|(name, content)| TranscriptFile {
+                name,
+                content_b64: base64::engine::general_purpose::STANDARD.encode(content),
+            })
+            .collect();
+        (files, Vec::new())
+    };
     let identity = git_identity(state, &session.owner).await;
     let mut env = agent.env.clone();
     env.extend([
@@ -292,6 +359,7 @@ async fn launch_for(
             .collect(),
         transcript_dir: agent.transcript_dir.clone(),
         transcript,
+        transcript_files,
         ca_pem: Some(state.ca.cert_pem.clone()),
         repo: session
             .repo
@@ -398,7 +466,7 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
             }
         }
     });
-    let Some((version, running, local_proxy)) = hello(&mut stream).await else {
+    let Some((version, running, local_proxy, fetch_transcript)) = hello(&mut stream).await else {
         tracing::warn!(session = %session_id, "supervisor connected without a hello");
         writer.abort();
         return;
@@ -425,7 +493,7 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
                 state.hub.notify(session_id, notice).await;
             }
             let context = agent_context(&state, &session, local_proxy).await;
-            match launch_for(&state, &session, &context).await {
+            match launch_for(&state, &session, &context, fetch_transcript).await {
                 Ok((launch, agent_launch)) => {
                     let _ = tx.send(ToSupervisor::Launch(Box::new(launch)));
                     Some(agent_launch)
@@ -682,7 +750,7 @@ const LINK_TIMEOUT: Duration = Duration::from_secs(60);
 /// The supervisor's first message: its version, and the agent it kept running if there is one.
 async fn hello(
     stream: &mut futures::stream::SplitStream<WebSocket>,
-) -> Option<(String, Option<RunningAgent>, bool)> {
+) -> Option<(String, Option<RunningAgent>, bool, bool)> {
     loop {
         let message = tokio::time::timeout(LINK_TIMEOUT, stream.next())
             .await
@@ -695,7 +763,8 @@ async fn hello(
                         version,
                         agent,
                         local_proxy,
-                    } => Some((version, agent, local_proxy)),
+                        fetch_transcript,
+                    } => Some((version, agent, local_proxy, fetch_transcript)),
                     _ => None,
                 };
             }

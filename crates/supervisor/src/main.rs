@@ -19,6 +19,7 @@ use futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use sloppod_protocol::link::{
     AgentReady, FromSupervisor, Launch, PATH, RUNTIME_INFO, RunningAgent, ToSupervisor,
+    TranscriptRef,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::TcpStream;
@@ -241,6 +242,7 @@ async fn run(
             version: env!("CARGO_PKG_VERSION").to_owned(),
             agent: agent.as_ref().and_then(Agent::running),
             local_proxy: LOCAL_PROXY_UP.load(std::sync::atomic::Ordering::SeqCst),
+            fetch_transcript: true,
         },
     )
     .await?;
@@ -449,7 +451,12 @@ async fn launch_agent(
         open: HashMap::new(),
         waiting: HashMap::new(),
         unsent: None,
-        synced: HashMap::new(),
+        // The runtime has these already: what's synced from them is what's appended.
+        synced: launch
+            .transcript_files
+            .iter()
+            .map(|f| (f.name.clone(), f.len))
+            .collect(),
     })
 }
 
@@ -470,6 +477,33 @@ async fn stop(child: &mut Child) {
     let _ = child.kill().await;
 }
 
+/// Fetches a transcript file from the runtime into `path`, through a partial file so a fetch cut off midway isn't
+/// taken for the whole file next time.
+async fn fetch_transcript(args: &Args, name: &str, path: &Path) -> anyhow::Result<()> {
+    let token = std::fs::read_to_string(&args.token_file).context("reading the pod's token")?;
+    let url = format!(
+        "{}{}/{name}",
+        args.url.trim_end_matches('/'),
+        sloppod_protocol::link::TRANSCRIPT_PATH
+    );
+    let mut response = reqwest::Client::new()
+        .get(&url)
+        .bearer_auth(token.trim())
+        .send()
+        .await?
+        .error_for_status()
+        .with_context(|| format!("fetching the transcript file {name}"))?;
+    let partial = path.with_extension("jsonl.partial");
+    let mut file = tokio::fs::File::create(&partial).await?;
+    while let Some(chunk) = response.chunk().await? {
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    drop(file);
+    tokio::fs::rename(&partial, path).await?;
+    Ok(())
+}
+
 /// Where to sync a transcript file of `len` bytes from, given how much the runtime has; `None` when it's up to date.
 /// A file that shrank (or one the runtime has none of) is sent whole.
 fn sync_from(len: u64, synced: Option<u64>) -> Option<u64> {
@@ -482,6 +516,9 @@ fn sync_from(len: u64, synced: Option<u64>) -> Option<u64> {
 
 /// Sends the runtime what was appended to each transcript file since the last sync (ADR 1). It stops at the first
 /// send that fails, since the link is gone then.
+/// The most of a transcript file one sync message carries.
+const SYNC_CHUNK: usize = 4 << 20;
+
 async fn sync_transcript(dir: &str, synced: &mut HashMap<String, u64>, sink: &mut Sink) {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return;
@@ -498,16 +535,21 @@ async fn sync_transcript(dir: &str, synced: &mut HashMap<String, u64>, sink: &mu
         let Some((offset, content)) = appended else {
             continue;
         };
-        let message = FromSupervisor::TranscriptAppend {
-            name: name.clone(),
-            offset,
-            content_b64: base64::engine::general_purpose::STANDARD.encode(&content),
-        };
-        if let Err(e) = send(sink, &message).await {
-            tracing::warn!(error = %e, file = %name, "syncing the transcript failed");
-            return;
+        // In pieces, so a file sent whole isn't one message the size of the file.
+        let mut sent = offset;
+        for piece in content.chunks(SYNC_CHUNK) {
+            let message = FromSupervisor::TranscriptAppend {
+                name: name.clone(),
+                offset: sent,
+                content_b64: base64::engine::general_purpose::STANDARD.encode(piece),
+            };
+            if let Err(e) = send(sink, &message).await {
+                tracing::warn!(error = %e, file = %name, "syncing the transcript failed");
+                return;
+            }
+            sent += piece.len() as u64;
+            synced.insert(name.clone(), sent);
         }
-        synced.insert(name, offset + content.len() as u64);
     }
 }
 
@@ -636,6 +678,18 @@ async fn prepare(
             let content = base64::engine::general_purpose::STANDARD.decode(&file.content_b64)?;
             write_file(&path, &content)?;
             tracing::info!(file = %file.name, "restored transcript");
+        }
+    }
+
+    for TranscriptRef { name, .. } in &launch.transcript_files {
+        if !sloppod_protocol::link::is_transcript_file_name(name) {
+            tracing::warn!(file = %name, "not restoring a transcript file with that name");
+            continue;
+        }
+        let path = Path::new(&launch.transcript_dir).join(name);
+        if !path.exists() {
+            fetch_transcript(args, name, &path).await?;
+            tracing::info!(file = %name, "restored transcript");
         }
     }
 

@@ -510,3 +510,36 @@ async fn finds_stacks_set_to_merge(db: PgPool) {
         .collect();
     assert_eq!(found, [ids[0]]);
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_transcript_reads_a_chunk_at_a_time(db: PgPool) {
+    let s = session(&db, "dev").await;
+    db::upsert_transcript(&db, s, "b.jsonl", b"0123456789")
+        .await
+        .unwrap();
+    db::upsert_transcript(&db, s, "a.jsonl", b"x")
+        .await
+        .unwrap();
+    assert_eq!(
+        db::transcript_lens(&db, s).await.unwrap(),
+        [("a.jsonl".to_owned(), 1), ("b.jsonl".to_owned(), 10)]
+    );
+    assert_eq!(
+        db::transcript_len(&db, s, "b.jsonl").await.unwrap(),
+        Some(10)
+    );
+    assert_eq!(db::transcript_len(&db, s, "c.jsonl").await.unwrap(), None);
+    let mut read = Vec::new();
+    let mut offset = 0;
+    loop {
+        let chunk = db::transcript_chunk(&db, s, "b.jsonl", offset, 4)
+            .await
+            .unwrap();
+        if chunk.is_empty() {
+            break;
+        }
+        offset += chunk.len() as i64;
+        read.extend(chunk);
+    }
+    assert_eq!(read, b"0123456789");
+}
