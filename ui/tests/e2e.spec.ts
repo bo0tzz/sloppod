@@ -894,8 +894,11 @@ test('approves a repository access request', async ({ page }) => {
 test('approves a request to act as the user, with the token they pick', async ({ page }) => {
   const add = async (name: string) =>
     (await (
-      await page.request.post('/api/v1/credentials', { data: { kind: 'github-user', name, secret: 'github_pat_x', config: {} } })
+      await page.request.post('/api/v1/credentials', {
+        data: { kind: 'github-user', name, secret: `github_pat_${name}`, config: {} },
+      })
     ).json()) as { id: string };
+  // The mock's "work" token is bo0tzz-work's; the other is bo0tzz's.
   const work = await add('work');
   const personal = await add('personal');
   try {
@@ -903,15 +906,21 @@ test('approves a request to act as the user, with the token they pick', async ({
     const card = page.getByTestId('proposal-card');
     await expect(card).toHaveAttribute('data-kind', 'sloppod.repo.act_as_owner');
     await expect(card).toContainText("sloppod's GitHub App isn't installed there.");
-    await expect(card).toContainText('act on bo0tzz/dotfiles as bo0tzz, with your own GitHub token');
-
-    // The agent's suggestion is the first token that reaches it; the user picks the other.
+    // The agent's suggestion is the first token that reaches it; the user picks the other, and the card follows.
+    await expect(card.getByTestId('proposal-card-title')).toHaveText('Act as bo0tzz-work on bo0tzz/dotfiles');
+    await expect(card).toContainText('act on bo0tzz/dotfiles as bo0tzz-work, with your own GitHub token');
     await card.getByTestId('proposal-token').getByRole('combobox').click();
     await page.getByRole('option', { name: 'bo0tzz (personal)' }).click();
+    await expect(card.getByTestId('proposal-card-title')).toHaveText('Act as bo0tzz on bo0tzz/dotfiles');
+    await expect(card).toContainText('act on bo0tzz/dotfiles as bo0tzz, with your own GitHub token');
     const approving = page.waitForRequest((request) => request.url().endsWith('/approve'));
     await card.getByRole('button', { name: 'Approve' }).click();
     expect((await approving).postDataJSON()).toEqual({ credential: personal.id });
     await expect(card).toBeHidden();
+    // Who it acted as stays on the proposal once it's carried out.
+    await page.getByRole('button', { name: 'Proposals' }).click();
+    await expect(page.getByRole('dialog').getByTestId('proposal-card-title')).toHaveText('Act as bo0tzz on bo0tzz/dotfiles');
+    await page.keyboard.press('Escape');
     await expect(page.getByTestId('system-notice')).toContainText('On bo0tzz/dotfiles you now act as bo0tzz.');
 
     await page.getByRole('button', { name: 'Session actions' }).click();

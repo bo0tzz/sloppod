@@ -1587,6 +1587,7 @@ function approve(proposal, body, decidedBy) {
       ack = 'I see.';
     } else {
       proposal.status = 'executed';
+      proposal.result = { login: token.config.login };
       if (session) {
         grantRepo(session, repo);
         const grant = session.data.grants.find((g) => g.capability === 'repo' && g.params.repo === repo);
@@ -1661,7 +1662,7 @@ function inspectUserToken(secret) {
   const days = secret.includes('soon') ? 3 : 60;
   return {
     config: {
-      login: 'bo0tzz',
+      login: secret.includes('work') ? 'bo0tzz-work' : 'bo0tzz',
       expires_at: new Date(Date.now() + days * 24 * 3600_000).toISOString(),
       repositories: ['bo0tzz/sloppod', 'bo0tzz/dotfiles'],
       more_repositories: false,

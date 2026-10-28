@@ -106,6 +106,8 @@ export type Proposal = {
     pull_requests?: { url: string; number: number }[];
     message?: string;
     failed?: { title: string; error: string }[];
+    /** `sloppod.repo.act_as_owner`: whose token it ended up acting with. */
+    login?: string;
   };
   error?: string;
   reason?: string;

@@ -140,7 +140,8 @@ export function proposalSummary(proposal: Proposal): { label: string; title: str
     case 'sloppod.repo.act_as_owner':
       return {
         label: 'Acting as you',
-        title: `Act as ${payloadText(payload.login) || 'you'} on ${payloadText(payload.repo)}`,
+        // The token picked when approving, once it's carried out.
+        title: `Act as ${payloadText(proposal.result?.login ?? payload.login) || 'you'} on ${payloadText(payload.repo)}`,
         detail: payloadText(payload.reason) || undefined,
         icon: mdiSourceRepository,
       };

@@ -776,8 +776,14 @@ async fn create_standing_approval(
     User(user): User,
     Json(new): Json<NewStandingApproval>,
 ) -> ApiResult<impl IntoResponse> {
-    if state.proposals.get(&new.kind).is_none() {
+    let Some(kind) = state.proposals.get(&new.kind) else {
         return Err(bad_request(format!("unknown proposal kind {}", new.kind)));
+    };
+    if !kind.standing_approvable() {
+        return Err(bad_request(format!(
+            "{} proposals always wait for a person to decide them",
+            new.kind
+        )));
     }
     let target = new
         .target

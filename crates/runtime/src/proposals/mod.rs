@@ -334,6 +334,9 @@ async fn apply_standing_approval(
     kind: &dyn ProposalKind,
     proposal: Proposal,
 ) -> anyhow::Result<Proposal> {
+    if !kind.standing_approvable() {
+        return Ok(proposal);
+    }
     let standing = db::matching_standing_approval(
         &state.db,
         &session.owner,

@@ -56,6 +56,11 @@ impl ProposalKind for ActAsOwner {
         payload["repo"].as_str().map(str::to_owned)
     }
 
+    /// Approving picks which of the user's identities the session acts as (ADR 28, ADR 29), so a person always does.
+    fn standing_approvable(&self) -> bool {
+        false
+    }
+
     fn summary(&self, payload: &Value) -> String {
         format!(
             "acting as {} on {}",
@@ -173,6 +178,10 @@ impl ProposalKind for ActAsOwner {
             .await
             .map_err(err)?;
         let session_id: Uuid = session.session_id.parse().map_err(err)?;
-        Ok(json!({"message": repo_granted_as(&repo, &token, session_id)}))
+        // Who it ended up acting as, which an edit picking another token changed.
+        Ok(json!({
+            "message": repo_granted_as(&repo, &token, session_id),
+            "login": token.config("login").unwrap_or_default(),
+        }))
     }
 }

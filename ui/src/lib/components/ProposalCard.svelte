@@ -25,6 +25,7 @@
   // svelte-ignore state_referenced_locally
   let credential = $state(payload.credential);
   const picked = $derived(tokens.find((token) => token.id === credential));
+  const title = $derived(actAsOwner && picked ? `Act as ${picked.login} on ${payload.repo}` : summary.title);
 
   onMount(async () => {
     if (!actAsOwner || !pending) return;
@@ -72,7 +73,7 @@
           <Badge size="tiny" shape="round" color="warning" class="shrink-0 whitespace-nowrap" data-testid="proposal-acts-as">as {as}</Badge>
         {/if}
       </div>
-      <span class="truncate text-sm font-medium" title={summary.title}>{summary.title}</span>
+      <span class="truncate text-sm font-medium" {title} data-testid="proposal-card-title">{title}</span>
       {#if summary.detail && !inline}
         <span class="text-muted truncate text-xs {proposal.kind === 'github.pr.create' ? 'font-mono' : ''}" title={summary.detail}>
           {summary.detail}

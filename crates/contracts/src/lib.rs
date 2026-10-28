@@ -500,6 +500,11 @@ pub trait ProposalKind: Send + Sync {
     fn outward(&self) -> bool {
         true
     }
+    /// Whether a standing approval may approve it. A kind whose approval picks something only a person should, like
+    /// which of their credentials a session acts as, says no: its proposals always wait for one.
+    fn standing_approvable(&self) -> bool {
+        true
+    }
     /// Whether it asks for a review and nothing else, like a session's request for a second opinion on a branch: it's
     /// always reviewed, and once the review is over there's nothing to carry out. Only for kinds that aren't outward.
     fn is_review(&self) -> bool {
