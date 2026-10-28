@@ -53,7 +53,7 @@ jobs:
           rust='crates/|Cargo\.(toml|lock)|rust-toolchain\.toml'
           scope rust "^($rust|dev/with-db\.sh|$common)"
           scope ui "^(ui/|$common)"
-          scope images "^($rust|ui/|charts/|Containerfile|\.dockerignore|\.github/workflows/(ci|publish)\.yml)"
+          scope images "^($rust|ui/|charts/|Containerfile|\.dockerignore|\.github/workflows/publish\.yml|$common)"
 
   check:
     needs: changes
