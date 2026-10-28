@@ -16,6 +16,7 @@ mod link;
 mod mcp;
 mod memini;
 mod memory;
+mod origin;
 mod placement;
 mod pods;
 mod policies;
@@ -238,6 +239,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/acp", get(acp::handler))
         .route("/healthz", get(|| async { "ok" }))
         .fallback_service(ui)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            origin::same_origin,
+        ))
         .with_state(state.clone());
     let sessions = Router::new()
         .route(sloppod_protocol::link::PATH, get(link::handler))

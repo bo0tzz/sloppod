@@ -5,8 +5,7 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -21,46 +20,10 @@ use crate::{AppState, db};
 pub async fn handler(
     State(state): State<AppState>,
     User(user): User,
-    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if !origin_allowed(&headers, &state.config.allowed_origins) {
-        return (
-            StatusCode::FORBIDDEN,
-            "sloppod: /acp can only be opened from sloppod's own pages",
-        )
-            .into_response();
-    }
     ws.max_message_size(64 << 20)
         .on_upgrade(move |socket| run(state, user, socket))
-}
-
-/// Whether a browser may open `/acp` from where this request comes from. A browser always says which page opens a
-/// WebSocket (`Origin`), and the proxy in front authenticates it with whatever it sends along, such as a cookie, so a
-/// page on another site must not get a connection as the user. A request without `Origin` doesn't come from a page,
-/// e.g. `sloppodctl`.
-fn origin_allowed(headers: &HeaderMap, allowed: &[String]) -> bool {
-    let Some(origin) = headers.get(header::ORIGIN) else {
-        return true;
-    };
-    let Ok(origin) = origin.to_str() else {
-        return false;
-    };
-    if allowed
-        .iter()
-        .any(|a| a.trim_end_matches('/').eq_ignore_ascii_case(origin))
-    {
-        return true;
-    }
-    // The host the page was served from: what the browser asked for, as the proxy saw it.
-    let Some((_, host)) = origin.split_once("://") else {
-        return false;
-    };
-    ["x-forwarded-host", "host"]
-        .iter()
-        .filter_map(|name| headers.get(*name)?.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .any(|served| served.trim().eq_ignore_ascii_case(host))
 }
 
 /// One UI connection.
@@ -364,77 +327,4 @@ async fn run(state: AppState, user: String, socket: WebSocket) {
         task.abort();
     }
     writer.abort();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        for (name, value) in pairs {
-            headers.append(*name, value.parse().unwrap());
-        }
-        headers
-    }
-
-    #[test]
-    fn only_sloppods_own_pages_open_acp() {
-        let none: &[String] = &[];
-        // Its own pages, directly or through a proxy.
-        assert!(origin_allowed(
-            &headers(&[
-                ("origin", "https://sloppod.example.com"),
-                ("host", "sloppod.example.com")
-            ]),
-            none
-        ));
-        assert!(origin_allowed(
-            &headers(&[
-                ("origin", "https://sloppod.example.com"),
-                ("host", "sloppod.slop.svc:8080"),
-                ("x-forwarded-host", "sloppod.example.com"),
-            ]),
-            none
-        ));
-        assert!(origin_allowed(
-            &headers(&[
-                ("origin", "http://localhost:18080"),
-                ("host", "localhost:18080")
-            ]),
-            none
-        ));
-        // Not from a page at all.
-        assert!(origin_allowed(
-            &headers(&[("host", "sloppod.example.com")]),
-            none
-        ));
-        // Another site's page.
-        assert!(!origin_allowed(
-            &headers(&[
-                ("origin", "https://evil.example"),
-                ("host", "sloppod.example.com")
-            ]),
-            none
-        ));
-        assert!(!origin_allowed(
-            &headers(&[
-                ("origin", "https://sloppod.example.com.evil.example"),
-                ("host", "sloppod.example.com")
-            ]),
-            none
-        ));
-        assert!(!origin_allowed(
-            &headers(&[("origin", "null"), ("host", "sloppod.example.com")]),
-            none
-        ));
-        // Unless it's allowed.
-        assert!(origin_allowed(
-            &headers(&[
-                ("origin", "https://ui.example.com"),
-                ("host", "sloppod.example.com")
-            ]),
-            &["https://ui.example.com/".to_owned()]
-        ));
-    }
 }
