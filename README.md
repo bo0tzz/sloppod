@@ -25,6 +25,7 @@ Concepts:
 - [7. Extension points have plugin-shaped boundaries](docs/adr/0007-extension-points.md)
 - [23. Users and ownership](docs/adr/0023-users-and-ownership.md)
 - [28. Sessions act as their owner only through grants the owner controls](docs/adr/0028-acting-as-the-owner.md)
+- [29. Every grant names the credential it acts with](docs/adr/0029-grants-name-their-credential.md)
 
 Approach:
 
