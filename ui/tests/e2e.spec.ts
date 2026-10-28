@@ -59,6 +59,47 @@ test('creates a session and streams the agent output', async ({ page }) => {
   await expect(page.getByTestId('session-row').filter({ hasText: prompt })).toBeVisible();
 });
 
+test("copies an agent message's Markdown", async ({ page, context }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  await createSession(page, 'Add backoff to the reconnect logic in sloppod');
+  await finishTurn(page);
+
+  const message = agentMessages(page).filter({ hasText: FINAL });
+  const copy = message.getByRole('button', { name: 'Copy message' });
+  const actions = message.getByTestId('message-actions');
+  await page.mouse.move(0, 0);
+  await expect(actions).toHaveCSS('opacity', '0');
+  await message.hover();
+  await expect(actions).toHaveCSS('opacity', '1');
+
+  await copy.click();
+  await expect(message.getByRole('button', { name: 'Copied' })).toBeVisible();
+  const copied = await page.evaluate(() => navigator.clipboard.readText());
+  expect(copied).toMatch(/^Done\. The tests pass and I've proposed a pull request, \*\*.+\*\*, from `sloppod\/.+`\./);
+  await expect(message.getByRole('button', { name: 'Copy message' })).toBeVisible();
+
+  await expect(userMessages(page).getByRole('button', { name: 'Copy message' })).toHaveCount(0);
+
+  // A denied clipboard says so on the button.
+  await page.evaluate(() => {
+    navigator.clipboard.writeText = () => Promise.reject(new DOMException('Denied', 'NotAllowedError'));
+  });
+  await message.getByRole('button', { name: 'Copy message' }).click();
+  await expect(message.getByRole('button', { name: "Couldn't copy" })).toBeVisible();
+  await expect(message.getByRole('status')).toHaveText("Couldn't copy the message");
+});
+
+test('touch screens always show the copy button', async ({ page, browser }) => {
+  await createSession(page, 'Add backoff to the reconnect logic in sloppod');
+  await finishTurn(page);
+
+  const touch = await browser.newContext({ hasTouch: true, isMobile: true, viewport: { width: 412, height: 915 } });
+  const phone = await touch.newPage();
+  await phone.goto(page.url());
+  await expect(agentMessages(phone).filter({ hasText: FINAL }).getByTestId('message-actions')).toHaveCSS('opacity', '1');
+  await touch.close();
+});
+
 test('answers a permission request', async ({ page }) => {
   await createSession(page, 'Answer my permission request in sloppod');
 
@@ -120,6 +161,65 @@ test('steers a queued message into the running turn', async ({ page }) => {
   await expect(agentMessages(page).filter({ hasText: FINAL })).toBeVisible();
 
   await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+});
+
+test('takes queued messages back to edit or remove', async ({ page }) => {
+  await createSession(page, 'Edit my queue in sloppod');
+  await expect(permissionCard(page)).toBeVisible();
+
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  for (const message of ['Drop this one', 'Fix this one']) {
+    await box.fill(message);
+    await page.getByRole('button', { name: 'Send' }).click();
+    await expect(page.getByTestId('queued-message').filter({ hasText: message })).toBeVisible();
+  }
+
+  // Up arrow in the empty box takes the last one back for editing.
+  await box.press('ArrowUp');
+  await expect(box).toHaveValue('Fix this one');
+  await expect(page.getByTestId('queued-message')).toHaveCount(1);
+  await page.getByTestId('queued-message').getByRole('button', { name: 'Remove' }).click();
+  await expect(page.getByTestId('queued-messages')).toBeHidden();
+
+  await box.fill('Fixed this one');
+  await page.getByRole('button', { name: 'Send' }).click();
+  await permissionCard(page).getByRole('button', { name: 'Allow', exact: true }).click();
+  await expect(userMessages(page).filter({ hasText: 'Fixed this one' })).toHaveCount(1);
+  await expect(userMessages(page).filter({ hasText: /Drop this one|Fix this one$/ })).toHaveCount(0);
+});
+
+test('a message taken back is not sent again when the connection drops before the answer', async ({ page }) => {
+  await createSession(page, 'Edit my queue in sloppod');
+  await expect(permissionCard(page)).toBeVisible();
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Take me back');
+  await page.getByRole('button', { name: 'Send' }).click();
+  const queued = page.getByTestId('queued-message').filter({ hasText: 'Take me back' });
+  await expect(queued).toBeVisible();
+
+  await page.request.post('/_mock/drop-next-remove');
+  await queued.getByRole('button', { name: 'Edit' }).click();
+  await expect(box).toHaveValue('Take me back');
+  await expect(page.getByTestId('reconnecting')).toBeHidden();
+  await expect(page.getByTestId('queued-messages')).toBeHidden();
+
+  await permissionCard(page).getByRole('button', { name: 'Allow', exact: true }).click();
+  await expect(agentMessages(page).filter({ hasText: FINAL })).toBeVisible();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+  await expect(userMessages(page).filter({ hasText: 'Take me back' })).toHaveCount(0);
+});
+
+test('a queued message with more than text can be removed but not edited', async ({ page }) => {
+  const sessionId = await createSession(page, 'Edit my queue in sloppod');
+  await expect(permissionCard(page)).toBeVisible();
+  await page.request.post(`/_mock/queue-image?session=${sessionId}`);
+  const queued = page.getByTestId('queued-message');
+  await expect(queued).toHaveCount(1);
+  await expect(queued.getByRole('button', { name: 'Edit' })).toHaveCount(0);
+  await page.getByRole('textbox', { name: 'Prompt' }).press('ArrowUp');
+  await expect(queued).toHaveCount(1);
+  await queued.getByRole('button', { name: 'Remove' }).click();
+  await expect(page.getByTestId('queued-messages')).toBeHidden();
 });
 
 test('runs a queued message as the next turn', async ({ page }) => {
@@ -380,6 +480,56 @@ test('reconnects after the socket drops without duplicating history', async ({ p
   await box.press('Enter');
   await expect(userMessages(page).filter({ hasText: 'And once more' })).toHaveCount(1);
   await expect(permissionCard(page)).toBeVisible();
+});
+
+test('the sidebar shows a redeployed runtime once the connection is back', async ({ page }) => {
+  await createSession(page, 'Reconnect me in sloppod');
+  await finishTurn(page);
+  const build = page.getByTestId('runtime-build');
+  await expect(build).toHaveText('sloppod 0.0.1-main.1');
+
+  try {
+    await page.request.post('/_mock/build?version=0.0.1-main.2&build=v0.0.2');
+    await page.request.post('/_mock/drop');
+    await expect(build).toHaveText('sloppod 0.0.1-main.2');
+    await expect(build).toHaveAttribute('href', 'https://github.com/bo0tzz/sloppod/releases/tag/v0.0.2');
+  } finally {
+    await page.request.post('/_mock/build');
+  }
+});
+
+test('a message written while reconnecting is sent once the connection is back', async ({ page }) => {
+  await createSession(page, 'Reconnect me in sloppod');
+  await finishTurn(page);
+
+  await page.request.post('/_mock/drop?for=3000');
+  await expect(page.getByTestId('composer-hint')).toHaveText("Reconnecting… messages send once it's back.");
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Written offline');
+  await box.press('Enter');
+  await expect(box).toHaveValue('');
+  await expect(page.getByTestId('unsent-message')).toContainText('Written offline');
+
+  await expect(userMessages(page).filter({ hasText: 'Written offline' })).toHaveCount(1, { timeout: 15_000 });
+  await expect(page.getByTestId('unsent-messages')).toBeHidden();
+});
+
+test('a message written while the reconnect finishes loading is sent too', async ({ page }) => {
+  await createSession(page, 'Reconnect me in sloppod');
+  await finishTurn(page);
+
+  // The socket comes back at once, but reading the session takes 3 s: the session loads and the view stays
+  // reconnecting meanwhile.
+  await page.request.post('/_mock/drop?slow=3000');
+  await expect(page.getByTestId('composer-hint')).toHaveText("Reconnecting… messages send once it's back.");
+  await page.waitForTimeout(500);
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Written while loading');
+  await box.press('Enter');
+  await expect(page.getByTestId('unsent-message')).toContainText('Written while loading');
+
+  await expect(userMessages(page).filter({ hasText: 'Written while loading' })).toHaveCount(1, { timeout: 15_000 });
+  await expect(page.getByTestId('unsent-messages')).toBeHidden();
 });
 
 test('switches the model of a session', async ({ page, context }) => {
@@ -689,12 +839,26 @@ test('answers questions from the agent, in every tab', async ({ page, context })
   await expect(phase(page)).toHaveAttribute('data-phase', 'waiting');
   await expect(page.getByTestId('activity')).toHaveText('Waiting for your answer');
 
+  // One question at a time: the second one, and its option descriptions, wait for Next.
+  await expect(questionCard(page).getByTestId('question-step')).toHaveText('Question 1 of 2');
+  await expect(questionField(page, 'question_1')).toHaveCount(0);
+  await expect(questionCard(page).getByRole('button', { name: 'Answer' })).toHaveCount(0);
+
   const backoff = questionField(page, 'question_0');
   await expect(backoff).toContainText('Backoff');
   await expect(backoff).toContainText('Which backoff strategy should reconnects use?');
   await expect(backoff).toContainText('Double the delay after each failure');
   await backoff.getByRole('radio', { name: /Exponential/ }).check();
   await expect(backoff.getByTestId('option-preview')).toContainText('Math.min(500 * 2 ** attempt');
+  await questionCard(page).getByRole('button', { name: 'Next' }).click();
+  await expect(questionCard(page).getByTestId('question-step')).toHaveText('Question 2 of 2');
+  await expect(questionField(page, 'question_0')).toHaveCount(0);
+  await expect(questionCard(page)).not.toContainText('Double the delay after each failure');
+
+  // Back keeps what was picked.
+  await questionCard(page).getByRole('button', { name: 'Back' }).click();
+  await expect(questionField(page, 'question_0').getByRole('radio', { name: /Exponential/ })).toBeChecked();
+  await questionCard(page).getByRole('button', { name: 'Next' }).click();
 
   const tests = questionField(page, 'question_1');
   await tests.getByRole('checkbox', { name: /Unit/ }).check();
@@ -714,8 +878,10 @@ test('answers questions from the agent, in every tab', async ({ page, context })
   });
 });
 
-test('Enter in the "Other" field submits the answer', async ({ page }) => {
+test('Enter in the "Other" field moves on, and on the last question submits the answers', async ({ page }) => {
   await createSession(page, 'Ask me before you start');
+  await questionField(page, 'question_0_custom').getByRole('textbox').press('Enter');
+  await expect(questionCard(page).getByTestId('question-step')).toHaveText('Question 2 of 2');
   const other = questionField(page, 'question_1_custom').getByRole('textbox');
   await other.fill('Load tests');
   await other.press('Enter');
@@ -754,12 +920,33 @@ test('a question asked with ask_user outlives the turn and a stop', async ({ pag
   await expect(agentMessages(page).filter({ hasText: 'Thanks, going with that. Backoff: Exponential, capped.' })).toBeVisible();
 });
 
+test('questions asked in separate requests show one after another', async ({ page }) => {
+  await createSession(page, 'Use ask_user twice');
+  await expect(questionCard(page)).toHaveCount(1);
+  await expect(questionCard(page)).toContainText('Which backoff strategy should reconnects use?');
+  await expect(questionCard(page).getByTestId('questions-queued')).toHaveText('One more request after this');
+  // A request with one question has no steps.
+  await expect(questionCard(page).getByTestId('question-step')).toHaveCount(0);
+
+  await questionField(page, 'question_0').getByRole('radio', { name: /Fixed/ }).check();
+  await questionCard(page).getByRole('button', { name: 'Answer' }).click();
+  await expect(questionCard(page)).toContainText('Which tests should I add?');
+  await expect(questionCard(page).getByTestId('questions-queued')).toHaveCount(0);
+  await expect(questionField(page, 'question_0').getByRole('checkbox', { name: /Unit/ })).not.toBeChecked();
+  await questionField(page, 'question_0').getByRole('checkbox', { name: /Unit/ }).check();
+  await questionCard(page).getByRole('button', { name: 'Answer' }).click();
+  await expect(questionCard(page)).toHaveCount(0);
+  await expect(agentMessages(page).filter({ hasText: 'Thanks, going with that. Backoff: Fixed.' })).toBeVisible();
+  await expect(agentMessages(page).filter({ hasText: 'Thanks, going with that. Tests: Unit.' })).toBeVisible();
+});
+
 test('shows an open question again after a reload', async ({ page }) => {
   await createSession(page, 'Ask me something, then reload');
   await expect(questionCard(page)).toBeVisible();
   await page.reload();
   await expect(questionCard(page)).toBeVisible();
   await questionField(page, 'question_0_custom').getByRole('textbox').fill('Whatever you think is best');
+  await questionCard(page).getByRole('button', { name: 'Next' }).click();
   await questionCard(page).getByRole('button', { name: 'Answer' }).click();
   await expect(agentMessages(page).filter({ hasText: 'Backoff: Whatever you think is best.' })).toBeVisible();
 });
@@ -785,7 +972,10 @@ test('manages credentials and nudges when they are missing', async ({ page }) =>
   await page.goto('/settings');
   await expect(page.getByTestId('session-subtitle')).toHaveText('Signed in as bo0tzz');
   await expect(page.getByTestId('current-user')).toHaveText('Signed in as bo0tzz');
-  await expect(page.getByTestId('runtime-build')).toHaveText('sloppod v0.0.0-mock');
+  const build = page.getByTestId('runtime-build');
+  await expect(build).toHaveText('sloppod 0.0.1-main.1');
+  await expect(build).toHaveAttribute('title', 'Built from 11396d515413b2bec5e7c052b06d5df78cc68052');
+  await expect(build).toHaveAttribute('href', 'https://github.com/bo0tzz/sloppod/commit/11396d515413b2bec5e7c052b06d5df78cc68052');
   await expect(row('claude', 'Personal').getByTestId('default-badge')).toBeVisible();
   await expect(row('github-app', 'sloppod-dev')).toContainText('App ID: 1234567');
 
@@ -1192,7 +1382,16 @@ test('reviews and approves updates to existing issues', async ({ page }) => {
   await expect(updates.nth(0)).toContainText('close as completed');
   await expect(updates.nth(0)).toContainText('Remove labels: priority');
   await expect(updates.nth(1)).toContainText('close as a duplicate');
-  await expect(updates.nth(2)).toContainText('New title: Startup failures show in the UI');
+  // A rewrite shows against what the issue says now.
+  await expect(updates.nth(2).getByTestId('issue-update-title')).toHaveText(
+    'Title: Startup failures are only in the logs → Startup failures show in the UI',
+  );
+  const bodyDiff = updates.nth(2).getByTestId('diff');
+  await expect(bodyDiff).toContainText('Body of #59');
+  await expect(bodyDiff).toContainText('+1');
+  await expect(bodyDiff).toContainText('−1');
+  await expect(bodyDiff.getByText('A pod that fails to start says nothing.')).toBeVisible();
+  await expect(bodyDiff.getByText('A pod that fails to start says why in the UI.')).toBeVisible();
 
   // Drop the duplicate close, and reword the first comment.
   await updates.nth(1).getByRole('checkbox', { name: 'Make this update' }).click();
@@ -1254,4 +1453,134 @@ test('a browser whose storage is full still sends', async ({ page }) => {
   await box.press('Enter');
   await expect(userMessages(page).filter({ hasText: 'Sent anyway' })).toHaveCount(1);
   await finishTurn(page);
+});
+
+test('the sidebar shows how much of each usage limit is left', async ({ page }) => {
+  const inTwoHours = new Date(Date.now() + 2 * 3600_000).toISOString();
+  const quota = (kind: string, name: string, limited: boolean, windows: [string, number, string][]) => ({
+    credential_id: `${kind}-${name}`,
+    kind,
+    name,
+    limited,
+    resets_at: limited ? inTwoHours : null,
+    windows: windows.map(([window, utilization, status]) => ({ window, utilization, resets_at: inTwoHours, status })),
+    observed_at: new Date().toISOString(),
+  });
+  await page.request.post('/_mock/quotas', {
+    data: [
+      quota('claude', 'work', false, [
+        ['five_hour', 0.2, 'allowed'],
+        ['seven_day', 0.95, 'warning'],
+      ]),
+      quota('chatgpt', 'reviews', true, [['five_hour', 1, 'rejected']]),
+    ],
+  });
+  try {
+    await page.goto('/settings');
+    const meters = page.getByTestId('sidebar').getByTestId('quota');
+    await expect(meters).toHaveCount(2);
+    const claude = meters.filter({ hasText: 'Claude' });
+    await expect(claude).toContainText('95% of week');
+    await expect(claude).toHaveAttribute('data-level', 'warning');
+    await expect(claude).toHaveAttribute('title', /session: 20% used, resets in 2 hours/);
+    const chatgpt = meters.filter({ hasText: 'ChatGPT' });
+    await expect(chatgpt).toContainText('limit reached');
+    await expect(chatgpt).toHaveAttribute('data-level', 'danger');
+  } finally {
+    await page.request.post('/_mock/quotas', { data: [] });
+  }
+});
+
+test('only the transcript scrolls, not the page around it', async ({ page }) => {
+  await page.setViewportSize({ width: 1000, height: 500 });
+  await createSession(page, 'Give me a long answer in sloppod');
+  await expect(page.getByText('The end.')).toBeInViewport({ timeout: 20_000 });
+  const transcript = page.getByTestId('transcript-scroller');
+  // Anything in the transcript laid out outside its scroller would stretch what's around it, most with the transcript
+  // scrolled to the top.
+  await transcript.evaluate((element) => element.scrollTo({ top: 0 }));
+  const overflowing = await transcript.evaluate((element) => {
+    const found = [];
+    for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+      if (ancestor.scrollHeight > ancestor.clientHeight) found.push(ancestor.className);
+    }
+    return { transcript: element.scrollHeight > element.clientHeight, found };
+  });
+  expect(overflowing).toEqual({ transcript: true, found: [] });
+  await expect(page.getByRole('textbox', { name: 'Prompt' })).toBeInViewport({ ratio: 1 });
+});
+
+test('a GitHub account is checked when added, and shows whose it is, what it reaches and when it expires', async ({ page }) => {
+  await page.goto('/settings');
+  const section = page.getByTestId('credentials-github-user');
+  const row = (name: string) => section.getByTestId('credential').filter({ hasText: name });
+  const add = async (name: string, token: string) => {
+    await section.getByRole('button', { name: 'Add GitHub account' }).click();
+    await section.getByLabel('Name', { exact: true }).fill(name);
+    await section.getByLabel('Fine-grained personal access token', { exact: true }).fill(token);
+    await section.getByRole('button', { name: 'Save' }).click();
+  };
+  await expect(section).toContainText('No GitHub account yet');
+
+  await add('Classic', 'ghp_classic');
+  await expect(section.getByText("that's a classic token")).toBeVisible();
+  await section.getByRole('button', { name: 'Cancel' }).click();
+
+  await add('Mine', 'github_pat_mine');
+  await expect(row('Mine')).toContainText('Account: bo0tzz');
+  await expect(row('Mine').getByTestId('token-repositories')).toHaveText('Reaches 2 repositories');
+  await expect(row('Mine').getByTestId('token-repositories')).toHaveAttribute('title', 'bo0tzz/sloppod\nbo0tzz/dotfiles');
+  await expect(row('Mine').getByTestId('token-expiry')).toHaveAttribute('data-level', 'ok');
+  await expect(page.getByText('github_pat_mine')).toHaveCount(0);
+
+  await add('Expiring', 'github_pat_soon');
+  const expiry = row('Expiring').getByTestId('token-expiry');
+  await expect(expiry).toHaveAttribute('data-level', 'soon');
+  await expect(expiry).toContainText('Expires in 3 days; make a new token and replace this one');
+
+  for (const name of ['Mine', 'Expiring']) {
+    await row(name).getByRole('button', { name: `Delete ${name}` }).click();
+    await page.getByRole('button', { name: 'Delete', exact: true }).click();
+    await expect(row(name)).toHaveCount(0);
+  }
+});
+
+test.describe('in Amsterdam', () => {
+  test.use({ timezoneId: 'Europe/Amsterdam' });
+
+  test('a user without a timezone gets the browser’s, and can choose another', async ({ page }) => {
+    await page.request.post('/_mock/forget-timezone');
+    await page.goto('/settings');
+    const setting = page.getByTestId('timezone-setting').getByRole('combobox', { name: 'Timezone' });
+    await expect(setting).toContainText('Europe/Amsterdam');
+    await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Europe/Amsterdam');
+
+    await setting.click();
+    await page.getByRole('option', { name: 'Asia/Tokyo', exact: true }).click();
+    await expect(setting).toContainText('Asia/Tokyo');
+    await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Asia/Tokyo');
+
+    // Once set, it's kept, whatever the browser's.
+    await page.reload();
+    await expect(setting).toContainText('Asia/Tokyo');
+  });
+});
+
+test.describe('in UTC', () => {
+  test.use({ timezoneId: 'UTC' });
+
+  test('a browser in UTC gets UTC, which can be chosen again after another', async ({ page }) => {
+    await page.request.post('/_mock/forget-timezone');
+    await page.goto('/settings');
+    const setting = page.getByTestId('timezone-setting').getByRole('combobox', { name: 'Timezone' });
+    await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('UTC');
+    await expect(setting).toContainText('UTC');
+
+    await setting.click();
+    await page.getByRole('option', { name: 'Asia/Tokyo', exact: true }).click();
+    await expect(setting).toContainText('Asia/Tokyo');
+    await setting.click();
+    await page.getByRole('option', { name: 'UTC', exact: true }).click();
+    await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('UTC');
+  });
 });

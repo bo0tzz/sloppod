@@ -20,7 +20,9 @@ pub const GITHUB_APP: &str = "github-app";
 pub const MEMINI: &str = "memini";
 /// A ChatGPT subscription's Codex login, for review sessions (ADR 24).
 pub const CHATGPT: &str = "chatgpt";
-const KINDS: &[&str] = &[CLAUDE, GITHUB_APP, MEMINI, CHATGPT];
+/// A user's fine-grained GitHub token, for acting as them where they grant it (ADR 28). Nothing uses it yet.
+pub const GITHUB_USER: &str = "github-user";
+const KINDS: &[&str] = &[CLAUDE, GITHUB_APP, MEMINI, CHATGPT, GITHUB_USER];
 
 /// Codex's OAuth client and token endpoint, which refresh a ChatGPT login.
 const CHATGPT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -143,6 +145,20 @@ fn host_of(url: &str) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
+/// Whether a token is one a `github-user` credential can hold: a fine-grained one, which can be narrowed to
+/// repositories, and not a classic one, which reaches everything its user can.
+fn user_token_shape(token: &str) -> Result<(), &'static str> {
+    if token.starts_with("ghp_") {
+        Err(
+            "that's a classic token, which can't be narrowed to repositories; make a fine-grained one instead",
+        )
+    } else if !token.starts_with("github_pat_") {
+        Err("expected a fine-grained personal access token, which starts with github_pat_")
+    } else {
+        Ok(())
+    }
+}
+
 /// Serialises changes to which of an owner's credentials of a kind is the default, until the transaction ends.
 async fn lock_kind(tx: &mut sqlx::PgConnection, owner: &str, kind: &str) -> sqlx::Result<()> {
     sqlx::query("select pg_advisory_xact_lock(hashtext($1 || '/' || $2))")
@@ -240,6 +256,27 @@ impl Credentials {
                 };
                 secret = serde_json::to_string(&tokens)?;
                 serde_json::json!({"account_id": tokens.account_id})
+            }
+            GITHUB_USER => {
+                if let Err(why) = user_token_shape(&secret) {
+                    return Ok(Err(Invalid(why.into())));
+                }
+                let token = match crate::github::inspect_user_token(
+                    &self.http,
+                    crate::github::API,
+                    &secret,
+                )
+                .await?
+                {
+                    Ok(token) => token,
+                    Err(why) => return Ok(Err(Invalid(why))),
+                };
+                serde_json::json!({
+                    "login": token.login,
+                    "expires_at": token.expires_at.map(|at| at.to_rfc3339()),
+                    "repositories": token.repositories,
+                    "more_repositories": token.more_repositories,
+                })
             }
             _ => serde_json::json!({}),
         };
@@ -344,6 +381,16 @@ impl Credentials {
         Ok(self.default_row(owner, kind).await?.is_some())
     }
 
+    /// The owners who have a default credential of a kind.
+    pub async fn owners_with_default(&self, kind: &str) -> sqlx::Result<Vec<String>> {
+        sqlx::query_scalar(
+            "select owner from credentials where kind = $1 and is_default order by owner",
+        )
+        .bind(kind)
+        .fetch_all(&self.db)
+        .await
+    }
+
     /// The owner's default credential of a kind, still sealed.
     pub async fn default_row(
         &self,
@@ -374,16 +421,21 @@ impl Credentials {
 
     /// The owner's ChatGPT access token and account id, refreshed first when it's about to expire.
     pub async fn chatgpt(&self, owner: &str) -> anyhow::Result<Option<ChatGptTokens>> {
-        let Some((_, secret)) = self.secret(owner, CHATGPT).await? else {
+        Ok(self.chatgpt_login(owner).await?.map(|(_, tokens)| tokens))
+    }
+
+    /// The same, with the id of the login they're from: the default when it was read, which may change meanwhile.
+    pub async fn chatgpt_login(
+        &self,
+        owner: &str,
+    ) -> anyhow::Result<Option<(Uuid, ChatGptTokens)>> {
+        let Some((login, secret)) = self.secret(owner, CHATGPT).await? else {
             return Ok(None);
         };
         let tokens: ChatGptTokens = serde_json::from_str(&secret)?;
         if !tokens.expires_soon() {
-            return Ok(Some(tokens));
+            return Ok(Some((login.id, tokens)));
         }
-        let Some(login) = self.default_row(owner, CHATGPT).await? else {
-            return Ok(None);
-        };
         let lock = self
             .chatgpt_refresh
             .lock()
@@ -406,7 +458,7 @@ impl Credentials {
         let secret = self.vault.decrypt_string(&row.secret)?;
         let mut tokens: ChatGptTokens = serde_json::from_str(&secret)?;
         if !tokens.expires_soon() {
-            return Ok(Some(tokens));
+            return Ok(Some((row.id, tokens)));
         }
         let response = self
             .http
@@ -448,7 +500,7 @@ impl Credentials {
             tracing::error!(%owner, credential = %row.id, error = %e, "storing a refreshed ChatGPT login; it will need signing in again");
             return Err(e.into());
         }
-        Ok(Some(tokens))
+        Ok(Some((row.id, tokens)))
     }
 
     pub async fn github(&self, owner: &str) -> anyhow::Result<Arc<GitHubApp>> {
@@ -552,6 +604,26 @@ mod tests {
             .filter(|r| r.is_default)
             .map(|r| r.name)
             .collect()
+    }
+
+    #[sqlx::test]
+    async fn a_github_user_token_has_to_be_fine_grained(db: PgPool) {
+        let credentials = credentials(db).await;
+        for (secret, why) in [
+            ("ghp_0123456789abcdef", "classic token"),
+            ("gho_0123456789abcdef", "starts with github_pat_"),
+        ] {
+            let new = NewCredential {
+                kind: GITHUB_USER.into(),
+                name: "me".into(),
+                config: Default::default(),
+                secret: secret.into(),
+            };
+            let refused = credentials.create("dev", new).await.unwrap().unwrap_err();
+            assert!(refused.0.contains(why), "{secret}: {}", refused.0);
+        }
+        assert!(credentials.list("dev").await.unwrap().is_empty());
+        assert_eq!(user_token_shape("github_pat_11ABC"), Ok(()));
     }
 
     #[sqlx::test]

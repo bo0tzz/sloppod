@@ -237,8 +237,13 @@
 </svelte:head>
 
 {#snippet waitingItems()}
-      {#each view.questions as question (question.rpcId)}
-        <QuestionCard request={question} onRespond={(response) => view.answerQuestion(question, response)} />
+      <!-- One request at a time; the rest wait their turn behind it. -->
+      {#each view.questions.slice(0, 1) as question (question.rpcId)}
+        <QuestionCard
+          request={question}
+          queued={view.questions.length - 1}
+          onRespond={(response) => view.answerQuestion(question, response)}
+        />
       {/each}
       {#each view.permissions as request (request.rpcId)}
         <PermissionCard
@@ -367,7 +372,7 @@
           <div
             bind:this={scroller}
             onscroll={onScroll}
-            class="immich-scrollbar h-full overflow-y-auto"
+            class="immich-scrollbar relative h-full overflow-y-auto"
             data-testid="transcript-scroller"
           >
             <div bind:this={content} class="mx-auto flex w-full max-w-3xl flex-col gap-3 px-3 py-4 md:px-4">

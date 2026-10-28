@@ -412,6 +412,11 @@ async fn launch_for(
         ("GIT_COMMITTER_NAME".to_owned(), identity.name),
         ("GIT_COMMITTER_EMAIL".to_owned(), identity.email),
     ]);
+    // The owner's clock for the agent and its commands, and so for the date Claude Code puts in its prompt (#253).
+    match db::user_zone(&state.db, &session.owner).await {
+        Ok(zone) => env.push(("TZ".to_owned(), zone.name().to_owned())),
+        Err(e) => tracing::warn!(session = %session.id, error = %e, "reading the owner's timezone"),
+    }
     let launch = Launch {
         session_id: session.id,
         files: agent

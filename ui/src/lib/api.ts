@@ -144,12 +144,14 @@ export type Review = {
   finished_at?: string;
 };
 
-/** Pull requests add their diff and commits; other kinds add nothing. */
+/** Pull requests add their diff and commits, issue updates the current text of the issues they rewrite. */
 export type ProposalDetail = Proposal & {
   diff?: string;
   commits?: { sha: string; message: string }[];
   /** Stacks: each pull request's diff and commits, bottom first. */
   layers?: { diff: string; commits: { sha: string; message: string }[] }[];
+  /** Issue updates: each issue whose title or body they replace, as it is now. */
+  current?: { number: number; title: string; body: string }[];
 };
 
 /** Pull requests that build on each other, bottom first; each merges into the one below it. */
@@ -160,15 +162,25 @@ export type StackPayload = {
   auto_merge?: boolean;
 };
 
-export type CredentialKind = 'claude' | 'github-app' | 'memini' | 'chatgpt';
+export type CredentialKind = 'claude' | 'github-app' | 'memini' | 'chatgpt' | 'github-user';
 
 export type Credential = {
   id: string;
   kind: CredentialKind;
   name: string;
-  config: Record<string, string>;
+  /** Strings, except a `github-user`'s, which is a {@link GitHubUserConfig}. */
+  config: Record<string, unknown>;
   default: boolean;
   created_at: string;
+};
+
+/** What the runtime learned of a GitHub token when it was added. */
+export type GitHubUserConfig = {
+  login: string;
+  expires_at: string | null;
+  repositories: string[];
+  /** The list stops short: the token reaches more. */
+  more_repositories: boolean;
 };
 
 export type NewCredential = {
@@ -178,11 +190,35 @@ export type NewCredential = {
   secret: string;
 };
 
+/** What's left of an inference credential's usage limits, as last reported. `utilization` is a fraction, usually 0 to 1. */
+export type Quota = {
+  credential_id: string;
+  kind: CredentialKind;
+  name: string;
+  /** The provider refuses its requests now, until `resets_at`. */
+  limited: boolean;
+  resets_at: string | null;
+  windows: QuotaWindow[];
+  observed_at: string;
+};
+
+export type QuotaStatus = 'allowed' | 'warning' | 'rejected';
+
+export type QuotaWindow = {
+  /** `five_hour` and `seven_day` for the session and weekly limits. */
+  window: string;
+  utilization: number | null;
+  resets_at: string | null;
+  status: QuotaStatus;
+};
+
 /** Defaults for new sessions. `models` is what the agent offered most recently; empty before the first session. */
 export type Settings = {
   model: string | null;
   models: { value: string; name: string }[];
   review: ReviewPolicy;
+  /** The user's timezone, e.g. `Europe/Amsterdam`, for the times agents are told and their pods' clocks. */
+  timezone: string | null;
 };
 
 /** Whether proposals are reviewed by another model before a human sees them. */
@@ -233,13 +269,15 @@ export const api = {
   addSessionRepo: (id: string, repo: string) =>
     call<Session>('POST', `/sessions/${encodeURIComponent(id)}/repos`, { repo }),
   listRepos: () => call<string[]>('GET', '/repos'),
-  /** Who we are, and the runtime's build (`SLOPPOD_BUILD`) if it has one. */
-  me: () => call<{ user: string; build: string | null }>('GET', '/me'),
+  /** Who we are, and the runtime's version and the commit or tag it was built from, if it knows them. */
+  me: () => call<{ user: string; version: string | null; build: string | null }>('GET', '/me'),
   getSettings: () => call<Settings>('GET', '/settings'),
-  updateSettings: (body: { model?: string | null; review?: ReviewPolicy }) => call<Settings>('PUT', '/settings', body),
+  updateSettings: (body: { model?: string | null; review?: ReviewPolicy; timezone?: string }) =>
+    call<Settings>('PUT', '/settings', body),
   setSessionReview: (id: string, review: ReviewPolicy) =>
     call<Session>('PUT', `/sessions/${encodeURIComponent(id)}/review`, { review }),
   listCredentials: () => call<Credential[]>('GET', '/credentials'),
+  listQuotas: () => call<Quota[]>('GET', '/quotas'),
   listStandingApprovals: () => call<StandingApproval[]>('GET', '/standing-approvals'),
   createStandingApproval: (approval: NewStandingApproval) =>
     call<StandingApproval>('POST', '/standing-approvals', approval),

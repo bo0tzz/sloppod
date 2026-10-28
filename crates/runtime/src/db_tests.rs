@@ -494,6 +494,17 @@ async fn a_purge_claim_wins_over_restoring_and_is_retried_until_done(db: PgPool)
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_question_is_kept_until_forgotten(db: PgPool) {
+    let s = session(&db, "dev").await;
+    let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+    let questions = json!([{"question": "Which?"}]);
+    db::save_question(&db, s, first, &questions).await.unwrap();
+    db::save_question(&db, s, second, &questions).await.unwrap();
+    db::forget_question(&db, first).await.unwrap();
+    assert_eq!(db::questions(&db).await.unwrap(), [(s, second, questions)]);
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
 async fn a_queue_is_kept_until_emptied(db: PgPool) {
     let s = session(&db, "dev").await;
     let queue = [json!({"id": null, "blocks": [{"type": "text", "text": "hi"}]})];
@@ -501,6 +512,17 @@ async fn a_queue_is_kept_until_emptied(db: PgPool) {
     assert_eq!(db::queues(&db).await.unwrap(), [(s, queue.to_vec())]);
     db::save_queue(&db, s, &[]).await.unwrap();
     assert!(db::queues(&db).await.unwrap().is_empty());
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn remembers_messages_taken_back_per_session(db: PgPool) {
+    let (s, other) = (session(&db, "dev").await, session(&db, "dev").await);
+    let message = Uuid::new_v4();
+    assert!(!db::message_removed(&db, s, message).await.unwrap());
+    db::remove_message(&db, s, message).await.unwrap();
+    db::remove_message(&db, s, message).await.unwrap();
+    assert!(db::message_removed(&db, s, message).await.unwrap());
+    assert!(!db::message_removed(&db, other, message).await.unwrap());
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
@@ -897,4 +919,130 @@ async fn a_session_below_a_deleted_one_is_in_a_deleted_line(db: PgPool) {
     for member in [a, b, c] {
         assert!(db::deleted_in_line(&db, member).await.unwrap());
     }
+}
+
+async fn credential(db: &PgPool, owner: &str, kind: &str) -> Uuid {
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "insert into credentials (id, owner, kind, name, secret, is_default) values ($1, $2, $3, $3, '\\x00', true)",
+    )
+    .bind(id)
+    .bind(owner)
+    .bind(kind)
+    .execute(db)
+    .await
+    .unwrap();
+    id
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_quota_keeps_the_windows_a_report_leaves_out(db: PgPool) {
+    use crate::quota::{self, Observation, Window};
+    use sloppod_protocol::api::QuotaStatus;
+    let claude = credential(&db, "dev", "claude").await;
+    credential(&db, "someone", "claude").await;
+    let window = |utilization: f64, status| Window {
+        utilization: Some(utilization),
+        resets_at: Some(Utc::now() + Duration::hours(3)),
+        status,
+    };
+    let first = Utc::now() - Duration::minutes(10);
+    let both = Observation {
+        observed_at: first,
+        limited: false,
+        resets_at: None,
+        windows: [
+            ("five_hour".to_owned(), window(0.5, QuotaStatus::Allowed)),
+            ("seven_day".to_owned(), window(0.8, QuotaStatus::Warning)),
+        ]
+        .into(),
+    };
+    quota::store(&db, claude, &both).await.unwrap();
+    let reset_at = Utc::now() + Duration::hours(1);
+    let refused = Observation {
+        observed_at: first + Duration::minutes(5),
+        limited: true,
+        resets_at: Some(reset_at),
+        windows: [("five_hour".to_owned(), window(1.0, QuotaStatus::Rejected))].into(),
+    };
+    quota::store(&db, claude, &refused).await.unwrap();
+    // A report from between the two that arrives late changes nothing they both had.
+    let late = Observation {
+        observed_at: first + Duration::minutes(1),
+        limited: false,
+        resets_at: None,
+        windows: [("five_hour".to_owned(), window(0.6, QuotaStatus::Allowed))].into(),
+    };
+    quota::store(&db, claude, &late).await.unwrap();
+
+    let quotas = quota::list(&db, "dev", Utc::now()).await.unwrap();
+    assert_eq!(quotas.len(), 1);
+    let quota = &quotas[0];
+    assert_eq!(
+        (quota.credential_id, quota.kind.as_str()),
+        (claude, "claude")
+    );
+    assert!(quota.limited);
+    let windows: Vec<_> = quota
+        .windows
+        .iter()
+        .map(|w| (w.window.as_str(), w.utilization, w.status))
+        .collect();
+    assert_eq!(
+        windows,
+        [
+            ("five_hour", Some(1.0), QuotaStatus::Rejected),
+            ("seven_day", Some(0.8), QuotaStatus::Warning)
+        ]
+    );
+    // Once the reset has passed, it's over.
+    let later = quota::for_credential(&db, claude, reset_at + Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!later.limited);
+    // Only the owner's own credentials, and only those with a report.
+    assert!(
+        quota::list(&db, "someone", Utc::now())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    sqlx::query("delete from credentials where id = $1")
+        .bind(claude)
+        .execute(&db)
+        .await
+        .unwrap();
+    assert!(
+        quota::list(&db, "dev", Utc::now())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_users_timezone_is_kept_and_utc_without_one(db: PgPool) {
+    assert_eq!(db::user_timezone(&db, "dev").await.unwrap(), None);
+    assert_eq!(db::user_zone(&db, "dev").await.unwrap(), chrono_tz::UTC);
+    db::set_user_review(&db, "dev", ReviewPolicy::Required)
+        .await
+        .unwrap();
+    db::set_user_timezone(&db, "dev", "Europe/Amsterdam")
+        .await
+        .unwrap();
+    assert_eq!(
+        db::user_timezone(&db, "dev").await.unwrap().as_deref(),
+        Some("Europe/Amsterdam")
+    );
+    assert_eq!(
+        db::user_zone(&db, "dev").await.unwrap(),
+        chrono_tz::Europe::Amsterdam
+    );
+    // Setting it leaves the user's other settings alone.
+    assert_eq!(
+        db::user_review(&db, "dev").await.unwrap(),
+        ReviewPolicy::Required
+    );
 }

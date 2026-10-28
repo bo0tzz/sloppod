@@ -2,6 +2,7 @@
 //! agent and record in the session's log.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -16,6 +17,9 @@ use crate::session::Hub;
 use crate::store::SessionStore;
 use crate::store::memory::MemoryStore;
 
+/// What the harness's clock says, and when its session was last active.
+const START: &str = "2026-10-27T15:40:00Z";
+
 struct Harness {
     hub: Arc<Hub>,
     store: Arc<MemoryStore>,
@@ -29,8 +33,11 @@ impl Harness {
     async fn starting() -> Self {
         let store = Arc::new(MemoryStore::default());
         let id = Uuid::new_v4();
-        store.add_session(SessionRow::for_test(id, "dev"));
+        let mut row = SessionRow::for_test(id, "dev");
+        row.active_at = START.parse().unwrap();
+        store.add_session(row);
         let hub = Arc::new(Hub::new(store.clone()));
+        hub.set_now(START.parse().unwrap());
         let (tx, to_agent) = mpsc::unbounded_channel();
         let agent = Arc::new(AgentConn::new(tx));
         hub.attach_agent(id, agent.clone()).await;
@@ -144,13 +151,30 @@ impl Harness {
     }
 }
 
+/// The text of what a request sent the agent, without the line telling it the time.
 fn prompt_text(request: &Value) -> Vec<String> {
+    let mut text = all_text(request);
+    if time_line(request).is_some() {
+        text.remove(0);
+    }
+    text
+}
+
+fn all_text(request: &Value) -> Vec<String> {
     request["params"]["prompt"]
         .as_array()
         .into_iter()
         .flatten()
         .map(|block| block["text"].as_str().unwrap_or_default().to_owned())
         .collect()
+}
+
+/// The line telling the agent the time that a request leads with, if it does.
+fn time_line(request: &Value) -> Option<String> {
+    all_text(request)
+        .into_iter()
+        .next()
+        .filter(|text| text.starts_with("[sloppod: it's "))
 }
 
 /// Waits until the hub has queued `n` messages; prompting happens on another task.
@@ -246,6 +270,64 @@ async fn a_queued_message_can_be_steered_into_the_turn() {
 }
 
 #[tokio::test]
+async fn a_queued_message_can_be_taken_back() {
+    let mut h = Harness::ready().await;
+    let first = h.prompt("First");
+    let first_request = h.next().await;
+    let kept = h.prompt("Kept");
+    wait_for_queue(&h, 1).await;
+    let taken = h.prompt("Taken back");
+    let queued = wait_for_queue(&h, 2).await;
+
+    let removed = h
+        .hub
+        .remove_queued(h.id, json!({"id": queued[1]}))
+        .await
+        .unwrap();
+    assert_eq!(removed["prompt"][0]["text"], "Taken back");
+    assert_eq!(taken.await.unwrap().unwrap()["stopReason"], "cancelled");
+    assert_eq!(h.queued().await, [queued[0].clone()]);
+    let stored = h.store.queues().await.unwrap();
+    let texts: Vec<&str> = stored[0]
+        .1
+        .iter()
+        .filter_map(|m| m["blocks"][0]["text"].as_str())
+        .collect();
+    assert_eq!(texts, ["Kept"]);
+    assert!(
+        h.hub
+            .remove_queued(h.id, json!({"id": queued[1]}))
+            .await
+            .is_err()
+    );
+    // A UI that didn't hear it was taken back sends it again; it doesn't run.
+    let resent = h
+        .hub
+        .prompt(
+            h.id,
+            json!({"sessionId": h.id, "prompt": [{"type": "text", "text": "Taken back"}],
+                "_meta": {"sloppod": {"messageId": queued[1]}}}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resent["stopReason"], "cancelled");
+    assert_eq!(h.queued().await, [queued[0].clone()]);
+
+    // It never runs; the rest of the queue still does.
+    h.respond(&first_request, json!({"stopReason": "end_turn"}))
+        .await;
+    first.await.unwrap().unwrap();
+    let next = h.next().await;
+    assert_eq!(prompt_text(&next), ["Kept"]);
+    h.respond(&next, json!({"stopReason": "end_turn"})).await;
+    kept.await.unwrap().unwrap();
+    assert_eq!(
+        h.user_messages(),
+        [("First".to_owned(), false), ("Kept".to_owned(), false)]
+    );
+}
+
+#[tokio::test]
 async fn a_notice_starts_a_turn_when_the_agent_is_idle() {
     let mut h = Harness::ready().await;
     h.hub
@@ -297,6 +379,152 @@ async fn a_notice_waits_for_a_compaction_to_end() {
     h.respond(&turn_request, json!({"stopReason": "end_turn"}))
         .await;
     turn.await.unwrap().unwrap();
+}
+
+fn tool_update(kind: &str, status: &str) -> Value {
+    json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "agent-session", "update": {
+        "sessionUpdate": kind, "toolCallId": "t1", "title": "cargo test", "status": status,
+    }}})
+}
+
+#[tokio::test]
+async fn a_notice_waits_for_a_tool_call_to_end() {
+    let mut h = Harness::ready().await;
+    let turn = h.prompt("First");
+    let turn_request = h.next().await;
+    from_agent(&h.hub, h.id, &h.agent, tool_update("tool_call", "pending")).await;
+    from_agent(
+        &h.hub,
+        h.id,
+        &h.agent,
+        tool_update("tool_call_update", "in_progress"),
+    )
+    .await;
+
+    h.hub
+        .notify(h.id, "sloppod: your proposal was approved.".into())
+        .await;
+    // Steering it in now would cancel the tool call, which the agent reads as the user telling it to stop.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(h.to_agent.try_recv().is_err());
+    assert_eq!(
+        kept_texts(&h).await,
+        ["sloppod: your proposal was approved."],
+        "kept while it waits"
+    );
+
+    from_agent(
+        &h.hub,
+        h.id,
+        &h.agent,
+        tool_update("tool_call_update", "completed"),
+    )
+    .await;
+    let steering = h.next().await;
+    assert_eq!(steering["method"], "_session/steering");
+    assert_eq!(
+        prompt_text(&steering),
+        ["sloppod: your proposal was approved."]
+    );
+    h.respond(&steering, json!({"outcome": "injected"})).await;
+    h.respond(&turn_request, json!({"stopReason": "end_turn"}))
+        .await;
+    turn.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_notice_waits_for_a_permission_request_to_be_answered() {
+    let mut h = Harness::ready().await;
+    let turn = h.prompt("First");
+    let turn_request = h.next().await;
+    let request = json!({"jsonrpc": "2.0", "id": "p-1", "method": "session/request_permission", "params": {
+        "sessionId": "agent-session", "toolCall": {"toolCallId": "t1"},
+        "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}],
+    }});
+    from_agent(&h.hub, h.id, &h.agent, request).await;
+
+    h.hub
+        .notify(h.id, "sloppod: your proposal was approved.".into())
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(h.to_agent.try_recv().is_err());
+
+    let (pid, _, _) = h.hub.replay(h.id).await.unwrap().permissions[0].clone();
+    let allow = json!({"outcome": {"outcome": "selected", "optionId": "allow"}});
+    h.hub
+        .answer_permission(h.id, pid, Ok(allow), "a test")
+        .await;
+    assert_eq!(h.next().await["id"], "p-1");
+    let steering = h.next().await;
+    assert_eq!(steering["method"], "_session/steering");
+    h.respond(&steering, json!({"outcome": "injected"})).await;
+    h.respond(&turn_request, json!({"stopReason": "end_turn"}))
+        .await;
+    turn.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_relinked_agents_permission_request_holds_a_notice_only_until_it_is_answered() {
+    let mut h = Harness::ready().await;
+    let _turn = h.prompt("First");
+    let turn_request = h.next().await;
+    let request = json!({"jsonrpc": "2.0", "id": "p-1", "method": "session/request_permission", "params": {
+        "sessionId": "agent-session", "toolCall": {"toolCallId": "t1"},
+        "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}],
+    }});
+    from_agent(&h.hub, h.id, &h.agent, request.clone()).await;
+    h.hub
+        .notify(h.id, "sloppod: your proposal was approved.".into())
+        .await;
+
+    // The supervisor links again before the runtime noticed the old link was gone, and reports the request still
+    // open; the old link is never detached.
+    let (tx, to_agent) = mpsc::unbounded_channel();
+    h.agent = Arc::new(AgentConn::new(tx));
+    h.to_agent = to_agent;
+    h.hub.attach_agent(h.id, h.agent.clone()).await;
+    let mut relinked = running(vec![turn_request]);
+    relinked.waiting = vec![request];
+    h.hub.adopt_agent(h.id, &h.agent, relinked).await;
+
+    let permissions = h.hub.replay(h.id).await.unwrap().permissions;
+    assert_eq!(permissions.len(), 1, "asked once, under the new link");
+    let allow = json!({"outcome": {"outcome": "selected", "optionId": "allow"}});
+    h.hub
+        .answer_permission(h.id, permissions[0].0, Ok(allow), "a test")
+        .await;
+    assert_eq!(h.next().await["id"], "p-1");
+    let steering = h.next().await;
+    assert_eq!(steering["method"], "_session/steering");
+    assert_eq!(
+        prompt_text(&steering),
+        ["sloppod: your proposal was approved."]
+    );
+}
+
+#[tokio::test]
+async fn the_users_steer_goes_in_during_a_tool_call() {
+    let mut h = Harness::ready().await;
+    let _turn = h.prompt("First");
+    h.next().await;
+    from_agent(
+        &h.hub,
+        h.id,
+        &h.agent,
+        tool_update("tool_call", "in_progress"),
+    )
+    .await;
+    let (hub, id) = (h.hub.clone(), h.id);
+    tokio::spawn(async move {
+        hub.steer(
+            id,
+            json!({"sessionId": id, "prompt": [{"type": "text", "text": "Also this"}]}),
+        )
+        .await
+    });
+    let steering = h.next().await;
+    assert_eq!(steering["method"], "_session/steering");
+    assert_eq!(prompt_text(&steering), ["Also this"]);
 }
 
 #[tokio::test]
@@ -724,6 +952,7 @@ async fn an_adopted_question_is_shown_again_and_answered() {
             h.id,
             replay.permissions[0].0,
             Ok(json!({"action": "accept"})),
+            "a test",
         )
         .await;
     let answer = h.next().await;
@@ -1008,6 +1237,7 @@ fn batch(
     let queued = crate::session::Queued {
         id: None,
         blocks: vec![json!({"type": "text", "text": text})],
+        notice: false,
         reply: Some(reply),
     };
     (vec![queued], receiver)
@@ -1220,14 +1450,16 @@ async fn a_question_from_ask_user_waits_for_its_answer_without_the_agent() {
     h.hub.ask(h.id, questions).await.unwrap();
     // The agent isn't blocked on it, and cancelling a turn leaves it.
     assert_eq!(h.phase().await, "idle");
-    h.hub.cancel(h.id).await;
+    h.hub.cancel(h.id, "a test").await;
     let replay = h.hub.replay(h.id).await.unwrap();
     let (pid, method, _) = replay.permissions.first().cloned().expect("the question");
     assert_eq!(method, "elicitation/create");
 
     // Answered, it reaches the agent as a notice.
     let answer = json!({"action": "accept", "content": {"question_0": "Fixed"}});
-    h.hub.answer_permission(h.id, pid, Ok(answer)).await;
+    h.hub
+        .answer_permission(h.id, pid, Ok(answer), "a test")
+        .await;
     // Past the cancel the agent was sent.
     let request = loop {
         let message = h.next().await;
@@ -1240,6 +1472,73 @@ async fn a_question_from_ask_user_waits_for_its_answer_without_the_agent() {
         ["sloppod: the user answered your question:\n- Which backoff?: Fixed"]
     );
     assert!(h.hub.replay(h.id).await.unwrap().permissions.is_empty());
+}
+
+#[tokio::test]
+async fn a_question_whose_answer_could_not_be_stored_comes_back_after_a_restart() {
+    // The agent isn't up, so the answer would wait in the stored queue, which can't be written.
+    let h = Harness::starting().await;
+    let questions = json!([{"question": "Which backoff?", "options": [{"label": "Exponential"}, {"label": "Fixed"}]}]);
+    h.hub.ask(h.id, questions).await.unwrap();
+    let (pid, _, _) = h.hub.replay(h.id).await.unwrap().permissions[0].clone();
+    h.store.fail_saving_queues.store(true, Ordering::SeqCst);
+    let answer = json!({"action": "accept", "content": {"question_0": "Fixed"}});
+    h.hub
+        .answer_permission(h.id, pid, Ok(answer), "a test")
+        .await;
+    assert_eq!(h.store.questions().await.unwrap().len(), 1);
+
+    h.store.fail_saving_queues.store(false, Ordering::SeqCst);
+    let (hub, _agent, _to_agent) = restarted(&h).await;
+    hub.restore_questions().await.unwrap();
+    let replay = hub.replay(h.id).await.unwrap();
+    assert_eq!(replay.permissions.len(), 1);
+    assert_eq!(replay.permissions[0].2["message"], "Which backoff?");
+}
+
+#[tokio::test]
+async fn questions_a_restart_could_not_read_are_shown_once_it_can() {
+    let h = Harness::ready().await;
+    let questions = json!([{"question": "Which backoff?", "options": [{"label": "Exponential"}, {"label": "Fixed"}]}]);
+    h.hub.ask(h.id, questions).await.unwrap();
+
+    let (hub, _agent, _to_agent) = restarted(&h).await;
+    h.store.fail_reading_questions.store(true, Ordering::SeqCst);
+    assert!(hub.restore_questions().await.is_err());
+    assert!(hub.replay(h.id).await.unwrap().permissions.is_empty());
+    h.store
+        .fail_reading_questions
+        .store(false, Ordering::SeqCst);
+    hub.restore_questions().await.unwrap();
+    let replay = hub.replay(h.id).await.unwrap();
+    assert_eq!(replay.permissions.len(), 1);
+    assert_eq!(replay.permissions[0].2["message"], "Which backoff?");
+}
+
+#[tokio::test]
+async fn a_question_from_ask_user_outlives_a_restart() {
+    let h = Harness::ready().await;
+    let questions = json!([{"question": "Which backoff?", "options": [{"label": "Exponential"}, {"label": "Fixed"}]}]);
+    h.hub.ask(h.id, questions).await.unwrap();
+
+    let (hub, agent, mut to_agent) = restarted(&h).await;
+    hub.restore_questions().await.unwrap();
+    let replay = hub.replay(h.id).await.unwrap();
+    let (pid, method, params) = replay.permissions.first().cloned().expect("the question");
+    assert_eq!(method, "elicitation/create");
+    assert_eq!(params["message"], "Which backoff?");
+
+    // Answered after the restart, it reaches the agent and is kept no longer.
+    hub.agent_ready(h.id, &agent, "agent-session".into(), json!({}), None)
+        .await;
+    let answer = json!({"action": "accept", "content": {"question_0": "Fixed"}});
+    hub.answer_permission(h.id, pid, Ok(answer), "a test").await;
+    assert_eq!(
+        prompt_text(&next_prompt(&mut to_agent).await),
+        ["sloppod: the user answered your question:\n- Which backoff?: Fixed"]
+    );
+    assert!(hub.replay(h.id).await.unwrap().permissions.is_empty());
+    assert!(h.store.questions().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1273,13 +1572,111 @@ async fn a_queue_kept_before_a_restart_runs_once_the_agent_is_up() {
         )
         .await
         .unwrap();
-    h.hub.restore_queues().await;
+    h.hub.restore_queues().await.unwrap();
     h.agent_ready().await;
     let restored = next_prompt(&mut h.to_agent).await;
     assert_eq!(prompt_text(&restored), ["Sent before the restart"]);
     h.respond(&restored, json!({"stopReason": "end_turn"}))
         .await;
     wait_until_nothing_kept(&h).await;
+}
+
+#[tokio::test]
+async fn a_message_taken_back_before_a_restart_does_not_run_from_the_kept_queue() {
+    // Taken back, but the restart came before the queue was saved without it.
+    let mut h = Harness::starting().await;
+    let (taken, kept) = (Uuid::new_v4(), Uuid::new_v4());
+    h.store
+        .save_queue(
+            h.id,
+            &[
+                json!({"id": taken, "blocks": [{"type": "text", "text": "Taken back"}]}),
+                json!({"id": kept, "blocks": [{"type": "text", "text": "Kept"}]}),
+            ],
+        )
+        .await
+        .unwrap();
+    h.store.remove_message(h.id, taken).await.unwrap();
+    h.hub.restore_queues().await.unwrap();
+    assert_eq!(h.queued().await, [kept.to_string()]);
+    h.agent_ready().await;
+    let restored = next_prompt(&mut h.to_agent).await;
+    assert_eq!(prompt_text(&restored), ["Kept"]);
+}
+
+#[tokio::test]
+async fn a_message_sent_again_while_it_is_taken_back_does_not_run() {
+    let mut h = Harness::ready().await;
+    let _first = h.prompt("First");
+    h.next().await;
+    let _taken = h.prompt("Taken back");
+    let qid = wait_for_queue(&h, 1).await.remove(0);
+
+    // The removal holds the session while it notes the message was taken back; the resend comes in meanwhile.
+    h.store.gate_removals.store(true, Ordering::SeqCst);
+    let (hub, id, removed_id) = (h.hub.clone(), h.id, qid.clone());
+    let removal =
+        tokio::spawn(async move { hub.remove_queued(id, json!({"id": removed_id})).await });
+    h.store.removal_started.notified().await;
+    let (hub, id) = (h.hub.clone(), h.id);
+    let resend = tokio::spawn(async move {
+        hub.prompt(
+            id,
+            json!({"sessionId": id, "prompt": [{"type": "text", "text": "Taken back"}],
+                "_meta": {"sloppod": {"messageId": qid}}}),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    h.store.removals_released.notify_one();
+    removal.await.unwrap().unwrap();
+    let resent = tokio::time::timeout(Duration::from_secs(2), resend)
+        .await
+        .expect("the resend is answered")
+        .unwrap()
+        .unwrap();
+    assert_eq!(resent["stopReason"], "cancelled");
+    assert!(h.queued().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_restore_that_cannot_read_removals_changes_nothing_until_it_can() {
+    let mut h = Harness::starting().await;
+    let (taken, kept) = (Uuid::new_v4(), Uuid::new_v4());
+    let queue = [
+        json!({"id": taken, "blocks": [{"type": "text", "text": "Taken back"}]}),
+        json!({"id": kept, "blocks": [{"type": "text", "text": "Kept"}]}),
+    ];
+    h.store.save_queue(h.id, &queue).await.unwrap();
+    h.store.remove_message(h.id, taken).await.unwrap();
+    h.store.fail_removal_lookups.store(true, Ordering::SeqCst);
+    assert!(h.hub.restore_queues().await.is_err());
+    assert!(h.queued().await.is_empty());
+    assert_eq!(h.store.queues().await.unwrap(), [(h.id, queue.to_vec())]);
+
+    // Tried again once it can be read: the one taken back is dropped and the other runs.
+    h.store.fail_removal_lookups.store(false, Ordering::SeqCst);
+    h.hub.restore_queues().await.unwrap();
+    assert_eq!(h.queued().await, [kept.to_string()]);
+    h.agent_ready().await;
+    assert_eq!(prompt_text(&next_prompt(&mut h.to_agent).await), ["Kept"]);
+}
+
+#[tokio::test]
+async fn a_message_taken_back_before_a_restart_leaves_nothing_kept() {
+    let h = Harness::starting().await;
+    let taken = Uuid::new_v4();
+    h.store
+        .save_queue(
+            h.id,
+            &[json!({"id": taken, "blocks": [{"type": "text", "text": "Taken back"}]})],
+        )
+        .await
+        .unwrap();
+    h.store.remove_message(h.id, taken).await.unwrap();
+    h.hub.restore_queues().await.unwrap();
+    assert!(h.queued().await.is_empty());
+    assert!(h.store.queues().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1315,7 +1712,7 @@ async fn a_notice_after_a_restore_joins_the_kept_queue() {
         )
         .await
         .unwrap();
-    h.hub.restore_queues().await;
+    h.hub.restore_queues().await.unwrap();
     h.hub.clone().notify(h.id, "A notice".into()).await;
     let kept = h.store.queues().await.unwrap();
     let texts: Vec<&str> = kept[0]
@@ -1387,10 +1784,11 @@ async fn restarted(
     mpsc::UnboundedReceiver<ToSupervisor>,
 ) {
     let hub = Arc::new(Hub::new(h.store.clone()));
+    hub.set_now(START.parse().unwrap());
     let (tx, to_agent) = mpsc::unbounded_channel();
     let agent = Arc::new(AgentConn::new(tx));
     hub.attach_agent(h.id, agent.clone()).await;
-    hub.restore_queues().await;
+    hub.restore_queues().await.unwrap();
     (hub, agent, to_agent)
 }
 
@@ -1404,6 +1802,32 @@ fn running(open: Vec<Value>) -> RunningAgent {
         open,
         waiting: Vec::new(),
     }
+}
+
+#[tokio::test]
+async fn a_message_taken_back_does_not_run_when_sent_again_after_a_restart() {
+    let mut h = Harness::ready().await;
+    let _first = h.prompt("First");
+    h.next().await;
+    let _taken = h.prompt("Taken back");
+    let queued = wait_for_queue(&h, 1).await;
+    h.hub
+        .remove_queued(h.id, json!({"id": queued[0]}))
+        .await
+        .unwrap();
+
+    // The UI never heard, and sends it again to the restarted runtime.
+    let (hub, _agent, _to_agent) = restarted(&h).await;
+    let resent = hub
+        .prompt(
+            h.id,
+            json!({"sessionId": h.id, "prompt": [{"type": "text", "text": "Taken back"}],
+                "_meta": {"sloppod": {"messageId": queued[0]}}}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resent["stopReason"], "cancelled");
+    assert!(h.store.queues().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1566,5 +1990,226 @@ async fn a_steer_a_restart_left_open_and_the_agent_then_refuses_still_delivers_i
     assert_eq!(
         prompt_text(&next_prompt(&mut to_agent).await),
         ["sloppod: approved."]
+    );
+}
+
+/// `START`, moved on by `minutes`.
+fn later(minutes: i64) -> chrono::DateTime<chrono::Utc> {
+    START.parse::<chrono::DateTime<chrono::Utc>>().unwrap() + chrono::Duration::minutes(minutes)
+}
+
+/// Runs a prompt as a turn that ends at once, and returns what the agent was sent.
+async fn prompt_and_answer(h: &mut Harness, text: &str) -> Value {
+    let turn = h.prompt(text);
+    let request = h.next().await;
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+    request
+}
+
+#[tokio::test]
+async fn a_prompt_after_a_gap_tells_the_agent_the_time() {
+    let mut h = Harness::ready().await;
+    let first = prompt_and_answer(&mut h, "First").await;
+    assert_eq!(time_line(&first), None);
+
+    h.hub.set_now(later(20));
+    let soon = prompt_and_answer(&mut h, "Soon after").await;
+    assert_eq!(time_line(&soon), None, "20 minutes isn't a gap");
+
+    h.hub.set_now(later(20 + 3 * 60 + 5));
+    let after_gap = prompt_and_answer(&mut h, "Is CI done?").await;
+    assert_eq!(
+        all_text(&after_gap),
+        [
+            "[sloppod: it's 2026-10-27 19:05 UTC, 3 hours since the last message]",
+            "Is CI done?"
+        ]
+    );
+    // Only the agent gets the line; the log has the message as it was sent.
+    assert_eq!(
+        h.user_messages().last().unwrap(),
+        &("Is CI done?".to_owned(), false)
+    );
+}
+
+#[tokio::test]
+async fn a_prompt_on_a_new_day_tells_the_agent_the_time() {
+    let mut h = Harness::ready().await;
+    h.hub.set_now("2026-10-27T23:55:00Z".parse().unwrap());
+    prompt_and_answer(&mut h, "Late").await;
+    h.hub.set_now("2026-10-28T00:05:00Z".parse().unwrap());
+    let request = prompt_and_answer(&mut h, "Early").await;
+    assert_eq!(
+        time_line(&request).as_deref(),
+        Some("[sloppod: it's 2026-10-28 00:05 UTC, 10 minutes since the last message]")
+    );
+}
+
+#[tokio::test]
+async fn a_gap_counts_from_the_agents_last_output_not_the_turns_start() {
+    let mut h = Harness::ready().await;
+    let turn = h.prompt("Long job");
+    let request = h.next().await;
+    h.hub.set_now(later(2 * 60));
+    let chunk = json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "agent-session", "update": {
+        "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Done."},
+    }}});
+    from_agent(&h.hub, h.id, &h.agent, chunk).await;
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+
+    h.hub.set_now(later(2 * 60 + 10));
+    let next = prompt_and_answer(&mut h, "Thanks").await;
+    assert_eq!(time_line(&next), None);
+}
+
+#[tokio::test]
+async fn a_notice_always_carries_the_time() {
+    let mut h = Harness::ready().await;
+    h.hub.notify(h.id, "sloppod: approved.".into()).await;
+    let request = h.next().await;
+    assert_eq!(
+        all_text(&request),
+        ["[sloppod: it's 2026-10-27 15:40 UTC]", "sloppod: approved."]
+    );
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+
+    // Steered into a running turn, too.
+    let turn = h.prompt("First");
+    let turn_request = h.next().await;
+    h.hub.notify(h.id, "sloppod: merged.".into()).await;
+    let steering = h.next().await;
+    assert_eq!(steering["method"], "_session/steering");
+    assert_eq!(
+        time_line(&steering).as_deref(),
+        Some("[sloppod: it's 2026-10-27 15:40 UTC]")
+    );
+    let recorded: Vec<Value> = h
+        .store
+        .updates(h.id)
+        .into_iter()
+        .filter(|u| u["_meta"]["sloppod"]["notice"] == true)
+        .map(|u| u["content"]["text"].clone())
+        .collect();
+    assert_eq!(recorded, ["sloppod: approved.", "sloppod: merged."]);
+    h.respond(&steering, json!({"outcome": "injected"})).await;
+    h.respond(&turn_request, json!({"stopReason": "end_turn"}))
+        .await;
+    turn.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn after_a_restart_a_gap_counts_from_the_sessions_last_activity() {
+    let h = Harness::ready().await;
+    let (hub, agent, mut to_agent) = restarted(&h).await;
+    hub.set_now(later(2 * 24 * 60 + 30));
+    hub.agent_ready(h.id, &agent, "agent-session".into(), json!({}), None)
+        .await;
+    let (id, prompting) = (h.id, hub.clone());
+    tokio::spawn(async move {
+        let params = json!({"sessionId": id, "prompt": [{"type": "text", "text": "Back"}]});
+        prompting.prompt(id, params).await
+    });
+    let request = next_prompt(&mut to_agent).await;
+    assert_eq!(
+        time_line(&request).as_deref(),
+        Some("[sloppod: it's 2026-10-29 16:10 UTC, 2 days since the last message]")
+    );
+}
+
+#[tokio::test]
+async fn an_adopted_turn_that_ends_counts_as_hearing_from_the_agent() {
+    let turn = json!({"jsonrpc": "2.0", "id": 7, "method": "session/prompt", "params": {"sessionId": "agent-session", "prompt": []}});
+    let mut h = Harness::adopted(vec![turn.clone()], Vec::new()).await;
+    let chunk = json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "agent-session", "update": {
+        "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Working on it."},
+    }}});
+    from_agent(&h.hub, h.id, &h.agent, chunk).await;
+    h.hub.set_now(later(3 * 60));
+    let next = h.prompt("Next");
+    wait_for_queue(&h, 1).await;
+    h.respond(&turn, json!({"stopReason": "end_turn"})).await;
+    let request = h.next().await;
+    assert_eq!(time_line(&request), None);
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    next.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_message_kept_across_a_restart_tells_the_agent_how_long_it_waited() {
+    let h = Harness::starting().await;
+    let (id, hub) = (h.id, h.hub.clone());
+    tokio::spawn(async move {
+        let params = json!({"sessionId": id, "prompt": [{"type": "text", "text": "Sent while it was down"}]});
+        hub.prompt(id, params).await
+    });
+    for _ in 0..100 {
+        if kept_texts(&h).await == ["Sent while it was down"] {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The restarted runtime records nothing before the kept message runs.
+    let (hub, agent, mut to_agent) = restarted(&h).await;
+    hub.set_now(later(3 * 60));
+    hub.agent_ready(h.id, &agent, "agent-session".into(), json!({}), None)
+        .await;
+    let request = next_prompt(&mut to_agent).await;
+    assert_eq!(
+        all_text(&request),
+        [
+            "[sloppod: it's 2026-10-27 18:40 UTC, 3 hours since the last message]",
+            "Sent while it was down"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn usage_updates_are_handed_on_but_not_when_replayed() {
+    let h = Harness::ready().await;
+    let (tx, mut seen) = mpsc::unbounded_channel();
+    h.hub.set_usage_seen(Arc::new(move |id, update| {
+        let tx = tx.clone();
+        Box::pin(async move {
+            let _ = tx.send((id, update));
+        })
+    }));
+    let usage = |used: u64| {
+        json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "agent-session", "update": {
+            "sessionUpdate": "usage_update", "used": used, "size": 200_000,
+            "_meta": {"_claude/rateLimit": {"status": "allowed"}},
+        }}})
+    };
+    h.hub.set_loading(h.id, true).await;
+    from_agent(&h.hub, h.id, &h.agent, usage(1)).await;
+    h.hub.set_loading(h.id, false).await;
+    from_agent(&h.hub, h.id, &h.agent, usage(2)).await;
+    let (id, update) = tokio::time::timeout(Duration::from_secs(5), seen.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(id, h.id);
+    assert_eq!(update["used"], 2);
+    assert!(seen.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn the_time_is_in_the_owners_timezone() {
+    let mut h = Harness::ready().await;
+    h.store
+        .zones
+        .lock()
+        .unwrap()
+        .insert("dev".into(), chrono_tz::Europe::Amsterdam);
+    h.hub.set_now("2026-10-27T22:50:00Z".parse().unwrap());
+    prompt_and_answer(&mut h, "Late").await;
+    // Still the 27th in UTC, but the 28th in Amsterdam: a new day there.
+    h.hub.set_now("2026-10-27T23:05:00Z".parse().unwrap());
+    let request = prompt_and_answer(&mut h, "Early").await;
+    assert_eq!(
+        time_line(&request).as_deref(),
+        Some("[sloppod: it's 2026-10-28 00:05 CET, 15 minutes since the last message]")
     );
 }

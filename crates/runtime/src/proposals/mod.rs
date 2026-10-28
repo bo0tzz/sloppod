@@ -1,5 +1,6 @@
 //! Proposals (ADR 3): the kinds an agent can propose, and proposing, deciding and carrying them out.
 
+mod code_review;
 mod issue_updates;
 mod issues;
 mod pull_request;
@@ -14,9 +15,10 @@ use sloppod_contracts::{Error, ProposalKind, RepoGrant, Result, SessionContext, 
 use sloppod_protocol::api::{Proposal, ProposalStatus, ReviewPolicy};
 use uuid::Uuid;
 
-use crate::github::StackWatch;
+use crate::github::{GitHubApp, StackWatch};
 use crate::{AppState, db, lifecycle, reviews};
 
+pub use code_review::CodeReview;
 pub use issue_updates::IssueUpdates;
 pub use issues::Issues;
 use pull_request::stack_layers;
@@ -75,6 +77,42 @@ pub fn is_session_branch(session_branch: &str, branch: &str) -> bool {
             })
 }
 
+/// The branch a pull request or report is from: the session branch unless one named after it is named.
+pub(crate) fn head_branch<'a>(session_branch: &'a str, named: Option<&'a str>) -> Result<&'a str> {
+    let Some(head) = named.map(str::trim).filter(|h| !h.is_empty()) else {
+        return Ok(session_branch);
+    };
+    let head = head.strip_prefix("refs/heads/").unwrap_or(head);
+    if is_session_branch(session_branch, head) {
+        Ok(head)
+    } else {
+        Err(Error::new(format!(
+            "the branch has to be your session branch `{session_branch}` or one named after it, like \
+             `{session_branch}-<name>`, where the name has only letters, digits, `.`, `_` and `-`"
+        )))
+    }
+}
+
+/// What a reviewer of a branch sees: the diff and commits from the base to the commit that was proposed, not
+/// wherever the branch is now. Nothing for a payload without one.
+async fn branch_detail(app: &GitHubApp, payload: &Value) -> Result<Value> {
+    let Some(head) = payload["head_sha"].as_str() else {
+        return Ok(json!({}));
+    };
+    let comparison = app
+        .compare(
+            payload["repo"].as_str().unwrap_or_default(),
+            payload["base"].as_str().unwrap_or_default(),
+            head,
+        )
+        .await
+        .map_err(err)?;
+    Ok(json!({
+        "diff": comparison.diff,
+        "commits": comparison.commits.iter().map(|(sha, message)| json!({"sha": sha, "message": message})).collect::<Vec<_>>(),
+    }))
+}
+
 /// The repository a pull request or issue is for: the one named, or the only one the session can push to.
 fn target_repo<'a>(session: &'a SessionContext, named: Option<&str>) -> Result<RepoGrant<'a>> {
     if let Some(repo) = named {
@@ -119,7 +157,7 @@ pub async fn propose(
         .ok_or("unknown session")?;
     // The session's policy covers every kind that can be reviewed; asking for a review of one that can't is an
     // error, as is asking when the owner has no login for the reviewer. Under the policy those just skip review.
-    let asked = arguments["review"].as_bool() == Some(true);
+    let asked = arguments["review"].as_bool() == Some(true) || kind.is_review();
     let required = session.review == ReviewPolicy::Required;
     let context = session.context();
     let payload = kind.prepare(&context, arguments).await.map_err(|e| e.0)?;
@@ -132,6 +170,12 @@ pub async fn propose(
             .await
             .map_err(|e| e.to_string())?
     {
+        if kind.is_review() {
+            return Err(
+                "reviews need a ChatGPT login in sloppod's settings, which the user hasn't added"
+                    .into(),
+            );
+        }
         if asked {
             return Err(
                 "reviews need a ChatGPT login in sloppod's settings, which the user hasn't added; \
@@ -179,6 +223,9 @@ pub async fn propose(
             )
             .await
             .map_err(|e| e.to_string())?;
+            if kind.is_review() {
+                return Err(format!("the review couldn't start ({e}); try again later"));
+            }
             return Err(format!(
                 "the review couldn't start ({e}), so proposal {} is being carried out without one",
                 row.id
@@ -440,6 +487,10 @@ async fn carry_out(
         }
     }
     state.hub.broadcast_session(session_id).await;
+    // The session heard how its review ended already, and there was nothing else to do.
+    if kind.is_review() && proposal.error.is_none() {
+        return Ok(());
+    }
     let outcome = match (&proposal.result, &proposal.error) {
         (Some(result), _) => match (result["message"].as_str(), result["url"].as_str()) {
             (Some(message), _) => format!("approved and done. {message}"),
@@ -604,5 +655,32 @@ mod tests {
                 .contains("a/one, a/two")
         );
         assert_eq!(target_repo(&two, Some("a/two")).unwrap().repo, "a/two");
+    }
+
+    #[test]
+    fn picks_the_head_branch() {
+        let branch = "sloppod/00000000";
+        assert_eq!(head_branch(branch, None).unwrap(), branch);
+        assert_eq!(head_branch(branch, Some(" ")).unwrap(), branch);
+        assert_eq!(head_branch(branch, Some(branch)).unwrap(), branch);
+        assert_eq!(
+            head_branch(branch, Some("sloppod/00000000-issues")).unwrap(),
+            "sloppod/00000000-issues"
+        );
+        assert_eq!(
+            head_branch(branch, Some("refs/heads/sloppod/00000000-issues")).unwrap(),
+            "sloppod/00000000-issues"
+        );
+        assert!(head_branch(branch, Some("sloppod/00000000-")).is_err());
+        assert!(head_branch(branch, Some("sloppod/00000000/issues")).is_err());
+        assert!(head_branch(branch, Some("sloppod/000000001")).is_err());
+        assert!(head_branch(branch, Some("main")).is_err());
+        assert!(head_branch(branch, Some("sloppod/00000000-fix+1")).is_err());
+        assert!(head_branch(branch, Some("sloppod/00000000-a#b")).is_err());
+        assert!(head_branch(branch, Some("sloppod/00000000-a b")).is_err());
+        assert_eq!(
+            head_branch(branch, Some("sloppod/00000000-v1.2_x")).unwrap(),
+            "sloppod/00000000-v1.2_x"
+        );
     }
 }

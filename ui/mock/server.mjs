@@ -36,7 +36,7 @@ const MODELS = [
   { value: 'haiku', name: 'Haiku' },
 ];
 /** The user's defaults for new sessions. `models` fills in once a session has offered them. */
-const settings = { model: null, models: [], review: 'off' };
+const settings = { model: null, models: [], review: 'off', timezone: null };
 const CANCELLED = Symbol('cancelled');
 
 /** @type {Map<string, MockSession>} */
@@ -46,6 +46,8 @@ const proposals = new Map();
 const reviews = new Map();
 const connections = new Set();
 const credentials = [];
+/** Set by `/_mock/quotas`: what `GET /api/v1/quotas` answers. */
+let quotas = [];
 
 const now = () => new Date().toISOString();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -428,21 +430,24 @@ async function agentScript(session, turn, prompt) {
 
   if (/ask_user/i.test(prompt)) {
     await step(1);
-    const askId = randomUUID();
-    tool({ toolCallId: askId, title: 'mcp__sloppod__ask_user', kind: 'other', status: 'pending', rawInput: { questions: [QUESTIONS[0]] } });
-    void requestFromUser(session, {
-      method: 'elicitation/create',
-      params: questionsToElicitation([QUESTIONS[0]], session.data.id),
-      cancelled: { action: 'cancel' },
-      blocking: false,
-    }).then((response) => {
-      const answers = response.action === 'accept' ? summariseAnswers([QUESTIONS[0]], response.content ?? {}) : [];
-      const notice = answers.length
-        ? `sloppod: the user answered your question:\n- ${QUESTIONS[0].question}: ${answers.join(' ')}`
-        : `sloppod: the user dismissed your question without answering it:\n- ${QUESTIONS[0].question}`;
-      void notifyAgent(session, notice, answers.length ? `Thanks, going with that. ${answers.join(' ')}` : "I'll use my own judgement then.");
-    });
-    update(askId, { status: 'completed' });
+    // "twice" asks each question with a call of its own, so the second request waits behind the first.
+    for (const question of /twice/i.test(prompt) ? QUESTIONS : [QUESTIONS[0]]) {
+      const askId = randomUUID();
+      tool({ toolCallId: askId, title: 'mcp__sloppod__ask_user', kind: 'other', status: 'pending', rawInput: { questions: [question] } });
+      void requestFromUser(session, {
+        method: 'elicitation/create',
+        params: questionsToElicitation([question], session.data.id),
+        cancelled: { action: 'cancel' },
+        blocking: false,
+      }).then((response) => {
+        const answers = response.action === 'accept' ? summariseAnswers([question], response.content ?? {}) : [];
+        const notice = answers.length
+          ? `sloppod: the user answered your question:\n- ${question.question}: ${answers.join(' ')}`
+          : `sloppod: the user dismissed your question without answering it:\n- ${question.question}`;
+        void notifyAgent(session, notice, answers.length ? `Thanks, going with that. ${answers.join(' ')}` : "I'll use my own judgement then.");
+      });
+      update(askId, { status: 'completed' });
+    }
     await say("I've asked you about the backoff; I'll carry on meanwhile.");
     await step(4);
     await say('Done with the parts that don\'t depend on your answer.');
@@ -834,9 +839,22 @@ function createIssueUpdates(session) {
       updates: [
         { number: 100, comment: 'Fixed by #148.', close: 'completed', remove_labels: ['priority'] },
         { number: 65, comment: 'Superseded by #196.', close: 'duplicate' },
-        { number: 59, add_labels: ['priority'], title: 'Startup failures show in the UI' },
+        {
+          number: 59,
+          add_labels: ['priority'],
+          title: 'Startup failures show in the UI',
+          body: 'A pod that fails to start says why in the UI.\n\nToday it only shows in the logs.',
+        },
       ],
     },
+    // Like the runtime's detail: what the rewritten issue says now.
+    current: [
+      {
+        number: 59,
+        title: 'Startup failures are only in the logs',
+        body: 'A pod that fails to start says nothing.\n\nToday it only shows in the logs.',
+      },
+    ],
     created_at: now(),
   };
   proposals.set(proposal.id, proposal);
@@ -877,7 +895,7 @@ function createStack(session) {
 }
 
 function publicProposal(proposal) {
-  const { diff: _diff, commits: _commits, layers: _layers, ...rest } = proposal;
+  const { diff: _diff, commits: _commits, layers: _layers, current: _current, ...rest } = proposal;
   return rest;
 }
 
@@ -945,8 +963,11 @@ function createSession({ prompt, repo, title, parent }) {
 /** Messages queued behind the running turn, `{ id, text, resolve, reject }`; UIs show them and can steer them in. */
 const waitingList = (session) => (session.waiting ??= []);
 
+/** What a waiting message holds: its text, unless a test queued more. */
+const waitingPrompt = ({ text, prompt }) => prompt ?? [{ type: 'text', text }];
+
 function broadcastQueue(session, conns = session.subscribers) {
-  const messages = waitingList(session).map(({ id, text }) => ({ id, prompt: [{ type: 'text', text }] }));
+  const messages = waitingList(session).map((message) => ({ id: message.id, prompt: waitingPrompt(message) }));
   for (const conn of conns ?? []) conn.notify('_sloppod/queue', { sessionId: session.data.id, messages });
 }
 
@@ -1023,6 +1044,19 @@ function handleCall(conn, message) {
     return true;
   };
 
+  /** Takes a message out of the queue behind the running turn, answering with an error if it isn't there. */
+  const takeWaiting = () => {
+    const waiting = waitingList(session);
+    const index = waiting.findIndex((message) => message.id === params.id);
+    if (index < 0) {
+      conn.error(id, -32002, "that message isn't queued any more");
+      return undefined;
+    }
+    const [message] = waiting.splice(index, 1);
+    broadcastQueue(session);
+    return message;
+  };
+
   switch (method) {
     case 'initialize':
       conn.respond(id, {
@@ -1069,6 +1103,11 @@ function handleCall(conn, message) {
     case 'session/prompt': {
       if (!needLoaded()) return;
       const messageId = params._meta?.sloppod?.messageId ?? randomUUID();
+      // Like the runtime: a message taken back out of the queue doesn't run when it's sent again.
+      if (session.removed?.has(messageId)) {
+        conn.respond(id, { stopReason: 'cancelled' });
+        return;
+      }
       // Like the runtime: a message sent again isn't run twice.
       const received = session.log.some(
         (entry) => entry.update.sessionUpdate === 'user_message_chunk' && entry.update.messageId === messageId,
@@ -1128,16 +1167,25 @@ function handleCall(conn, message) {
       if (session) cancelTurn(session);
       return;
 
+    case '_sloppod/remove_queued': {
+      if (!needLoaded()) return;
+      const message = takeWaiting();
+      if (!message) return;
+      (session.removed ??= new Set()).add(message.id);
+      // Tests drop the connection before either answer reaches the UI.
+      if (dropNextRemove) {
+        dropNextRemove = false;
+        conn.ws.terminate();
+      }
+      conn.respond(id, { prompt: waitingPrompt(message) });
+      message.resolve('cancelled');
+      return;
+    }
+
     case '_sloppod/steer_queued': {
       if (!needLoaded()) return;
-      const waiting = waitingList(session);
-      const index = waiting.findIndex((message) => message.id === params.id);
-      if (index < 0) {
-        conn.error(id, -32002, "that message isn't queued any more");
-        return;
-      }
-      const [message] = waiting.splice(index, 1);
-      broadcastQueue(session);
+      const message = takeWaiting();
+      if (!message) return;
       if (session.turn) {
         echoUser(session, message.text, { steering: true });
         session.turn.steers.push({ text: message.text });
@@ -1226,10 +1274,11 @@ async function handleApi(req, res, url) {
 
   if (parts[0] === 'repos' && parts.length === 1 && method === 'GET') return json(res, 200, availableRepos());
   if (parts[0] === 'me' && parts.length === 1 && method === 'GET') {
-    return json(res, 200, { user: req.headers['x-forwarded-user'] ?? 'bo0tzz', build: 'v0.0.0-mock' });
+    return json(res, 200, { user: req.headers['x-forwarded-user'] ?? 'bo0tzz', ...runtimeBuild });
   }
 
   if (parts[0] === 'credentials') return handleCredentials(req, res, parts);
+  if (parts[0] === 'quotas' && parts.length === 1 && method === 'GET') return json(res, 200, quotas);
   if (parts[0] === 'standing-approvals') return handleStandingApprovals(req, res, parts);
 
   if (parts[0] === 'settings' && parts.length === 1) {
@@ -1243,6 +1292,12 @@ async function handleApi(req, res, url) {
       if ('review' in body) {
         if (!['off', 'required'].includes(body.review)) return json(res, 400, { error: 'review must be one of off, required' });
         settings.review = body.review;
+      }
+      if ('timezone' in body) {
+        if (body.timezone !== 'UTC' && !Intl.supportedValuesOf('timeZone').includes(body.timezone)) {
+          return json(res, 400, { error: `${body.timezone} isn't a timezone, e.g. Europe/Amsterdam` });
+        }
+        settings.timezone = body.timezone;
       }
       return json(res, 200, settings);
     }
@@ -1269,7 +1324,10 @@ async function handleApi(req, res, url) {
     }
     const session = sessions.get(parts[1]);
     if (!session) return json(res, 404, { error: 'session not found' });
-    if (parts.length === 2 && method === 'GET') return json(res, 200, session.data);
+    if (parts.length === 2 && method === 'GET') {
+      if (Date.now() < slowSessionsUntil) await sleep(slowSessionsUntil - Date.now());
+      return json(res, 200, session.data);
+    }
     if (parts.length === 3 && parts[2] === 'review' && method === 'PUT') {
       const body = await readBody(req);
       if (!['off', 'required'].includes(body.review)) return json(res, 400, { error: 'review must be one of off, required' });
@@ -1467,7 +1525,22 @@ function handleStandingApprovals(req, res, parts) {
   return json(res, 404, { error: 'not found' });
 }
 
-const CREDENTIAL_CONFIG = { claude: [], 'github-app': ['app_id'], memini: ['url'], chatgpt: [] };
+const CREDENTIAL_CONFIG = { claude: [], 'github-app': ['app_id'], memini: ['url'], chatgpt: [], 'github-user': [] };
+
+/** What the runtime learns of a GitHub token from GitHub; a token with "soon" in it expires in three days. */
+function inspectUserToken(secret) {
+  if (secret.startsWith('ghp_')) return { error: "that's a classic token, which can't be narrowed to repositories; make a fine-grained one instead" };
+  if (!secret.startsWith('github_pat_')) return { error: 'expected a fine-grained personal access token, which starts with github_pat_' };
+  const days = secret.includes('soon') ? 3 : 60;
+  return {
+    config: {
+      login: 'bo0tzz',
+      expires_at: new Date(Date.now() + days * 24 * 3600_000).toISOString(),
+      repositories: ['bo0tzz/sloppod', 'bo0tzz/dotfiles'],
+      more_repositories: false,
+    },
+  };
+}
 
 function addCredential({ kind, name, config }) {
   const credential = {
@@ -1492,7 +1565,12 @@ async function handleCredentials(req, res, parts) {
     if (!body.name?.trim() || !body.secret?.trim()) return json(res, 400, { error: 'name and secret are required' });
     const missing = keys.filter((key) => !body.config?.[key]);
     if (missing.length) return json(res, 400, { error: `missing config: ${missing.join(', ')}` });
-    const config = Object.fromEntries(keys.map((key) => [key, String(body.config[key])]));
+    let config = Object.fromEntries(keys.map((key) => [key, String(body.config[key])]));
+    if (body.kind === 'github-user') {
+      const inspected = inspectUserToken(body.secret.trim());
+      if (inspected.error) return json(res, 400, { error: inspected.error });
+      config = inspected.config;
+    }
     return json(res, 201, addCredential({ kind: body.kind, name: body.name.trim(), config }));
   }
   const credential = credentials.find((c) => c.id === parts[1]);
@@ -1619,8 +1697,14 @@ async function seed() {
 
 // --- server ---------------------------------------------------------------------------------
 
+const DEFAULT_BUILD = { version: '0.0.1-main.1', build: '11396d515413b2bec5e7c052b06d5df78cc68052' };
+/** What `/me` says the runtime is; `/_mock/build` changes it, as a deploy would. */
+let runtimeBuild = DEFAULT_BUILD;
+
 /** Set by `/_mock/drop-next-prompt`: drop the connection the next prompt arrives on, before or after taking it. */
 let dropNextPrompt = null;
+/** Set by `/_mock/drop-next-remove`: drop the connection right after the next queued message is taken back. */
+let dropNextRemove = false;
 /** Set by `/_mock/fail-next-prompt`: refuse the next prompt that isn't dropped, without taking it. */
 let failNextPrompt = false;
 
@@ -1628,13 +1712,37 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   try {
     if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
+    if (url.pathname === '/_mock/quotas' && req.method === 'POST') {
+      quotas = await readBody(req);
+      return json(res, 200, {});
+    }
+    if (url.pathname === '/_mock/forget-timezone' && req.method === 'POST') {
+      settings.timezone = null;
+      return json(res, 200, {});
+    }
     if (url.pathname === '/_mock/fail-next-prompt' && req.method === 'POST') {
       failNextPrompt = true;
       return json(res, 200, { failNextPrompt });
     }
+    if (url.pathname === '/_mock/drop-next-remove' && req.method === 'POST') {
+      dropNextRemove = true;
+      return json(res, 200, { dropNextRemove });
+    }
     if (url.pathname === '/_mock/drop-next-prompt' && req.method === 'POST') {
       dropNextPrompt = url.searchParams.get('when') === 'after' ? 'after' : 'before';
       return json(res, 200, { dropNextPrompt });
+    }
+    if (url.pathname === '/_mock/queue-image' && req.method === 'POST') {
+      // A message with an image waiting behind the running turn, as another client could send.
+      const session = sessions.get(url.searchParams.get('session') ?? '');
+      if (!session) return json(res, 404, { error: 'no such session' });
+      const prompt = [
+        { type: 'text', text: 'Look at this' },
+        { type: 'image', mimeType: 'image/png', data: 'iVBORw0KGgo=' },
+      ];
+      waitingList(session).push({ id: randomUUID(), text: 'Look at this', prompt, resolve: () => {}, reject: () => {} });
+      broadcastQueue(session);
+      return json(res, 200, {});
     }
     if (url.pathname === '/_mock/say' && req.method === 'POST') {
       // More output in every session, as if its agent carried on.
@@ -1659,7 +1767,17 @@ const server = http.createServer(async (req, res) => {
       for (const session of sessions.values()) echoUser(session, text, { notice: true, summary });
       return json(res, 200, {});
     }
+    if (url.pathname === '/_mock/build' && req.method === 'POST') {
+      // `?version=…&build=…`; without either, back to the default.
+      const version = url.searchParams.get('version');
+      const build = url.searchParams.get('build');
+      runtimeBuild = version || build ? { version, build } : DEFAULT_BUILD;
+      return json(res, 200, runtimeBuild);
+    }
     if (url.pathname === '/_mock/drop' && req.method === 'POST') {
+      // With `?for=<ms>`, new connections are refused that long, so a UI stays disconnected for a while.
+      refuseConnectionsUntil = Date.now() + Number(url.searchParams.get('for') ?? 0);
+      slowSessionsUntil = Date.now() + Number(url.searchParams.get('slow') ?? 0);
       for (const conn of connections) conn.ws.terminate();
       return json(res, 200, { dropped: connections.size });
     }
@@ -1671,9 +1789,14 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+/** Set by `/_mock/drop?for=<ms>`: until then, UIs can't connect. */
+let refuseConnectionsUntil = 0;
+/** Set by `/_mock/drop?slow=<ms>`: until then, reading a session waits, as a slow runtime's REST does. */
+let slowSessionsUntil = 0;
+
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
-  if (new URL(req.url ?? '/', 'http://localhost').pathname !== '/acp') {
+  if (new URL(req.url ?? '/', 'http://localhost').pathname !== '/acp' || Date.now() < refuseConnectionsUntil) {
     socket.destroy();
     return;
   }

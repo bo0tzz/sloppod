@@ -1,10 +1,11 @@
 //! Live session state between the agent (over the supervisor link) and any number of UIs (over `/acp`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use sloppod_protocol::api::{Phase, Proposal};
 use sloppod_protocol::link::RunningAgent;
@@ -37,12 +38,13 @@ pub(crate) struct Queued {
     /// recorded when they run.
     pub(crate) id: Option<Uuid>,
     pub(crate) blocks: Vec<Value>,
+    pub(crate) notice: bool,
     pub(crate) reply: Option<oneshot::Sender<Result<Value, RpcError>>>,
 }
 
 /// How a queued prompt is kept in the store.
 fn stored(q: &Queued) -> Value {
-    json!({"id": q.id, "blocks": q.blocks})
+    json!({"id": q.id, "blocks": q.blocks, "notice": q.notice})
 }
 
 /// A queued prompt from how it's kept in the store.
@@ -50,6 +52,7 @@ fn unstored(q: &Value) -> Queued {
     Queued {
         id: q["id"].as_str().and_then(|s| s.parse().ok()),
         blocks: q["blocks"].as_array().cloned().unwrap_or_default(),
+        notice: q["notice"] == true,
         reply: None,
     }
 }
@@ -59,8 +62,52 @@ fn notice_queued(text: &str) -> Queued {
     Queued {
         id: None,
         blocks: vec![json!({"type": "text", "text": text})],
+        notice: true,
         reply: None,
     }
+}
+
+/// How long the agent has to have been quiet before a prompt tells it the time.
+const TIME_AFTER: chrono::Duration = chrono::Duration::minutes(30);
+
+/// The line telling the agent the time (#105), in its owner's timezone (#253): its agent only knows the date it
+/// started on. Sent after a gap, or once the owner's date has changed, since the agent was last heard from
+/// (`heard_at`), and with every notice.
+fn time_line(
+    now: DateTime<Utc>,
+    heard_at: Option<DateTime<Utc>>,
+    notice: bool,
+    zone: chrono_tz::Tz,
+) -> Option<String> {
+    let date = |at: DateTime<Utc>| at.with_timezone(&zone).date_naive();
+    let gap = heard_at
+        .filter(|h| now - *h >= TIME_AFTER || date(*h) != date(now))
+        .map(|h| now - h);
+    if gap.is_none() && !notice {
+        return None;
+    }
+    let time = now.with_timezone(&zone).format("%Y-%m-%d %H:%M %Z");
+    Some(match gap {
+        Some(gap) => format!(
+            "[sloppod: it's {time}, {} since the last message]",
+            how_long(gap)
+        ),
+        None => format!("[sloppod: it's {time}]"),
+    })
+}
+
+/// A gap in the largest whole unit that fits it.
+fn how_long(gap: chrono::Duration) -> String {
+    let (n, unit) = if gap.num_hours() >= 48 {
+        (gap.num_days(), "day")
+    } else if gap.num_minutes() >= 60 {
+        (gap.num_hours(), "hour")
+    } else if gap.num_minutes() >= 1 {
+        (gap.num_minutes(), "minute")
+    } else {
+        return "under a minute".to_owned();
+    };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
 }
 
 /// A batch of prompts on its way to the agent.
@@ -94,8 +141,9 @@ enum Asker {
         request_id: Value,
         agent: Arc<AgentConn>,
     },
-    /// The agent's `ask_user` tool, which returned at once: the answer goes to the agent as a notice.
-    Tool { questions: Value },
+    /// The agent's `ask_user` tool, which returned at once: the answer goes to the agent as a notice. Kept in the
+    /// store under `key` until then.
+    Tool { key: Uuid, questions: Value },
 }
 
 #[derive(Default)]
@@ -112,6 +160,9 @@ struct LiveState {
     /// The agent is compacting its context; steers wait for it to end. A turn's end ends it too, in case the
     /// compaction's own end never came.
     compacting: bool,
+    /// The agent's tool calls that have started and not yet completed or failed, by id; notices wait for them. A
+    /// turn's end ends them too.
+    tools: HashSet<String>,
     /// How many turns the hub sent have ended, and why the last one failed, if it did. A watcher compares the count
     /// with the one it saw, so no turn's end is missed between its looks.
     turns_ended: u64,
@@ -129,9 +180,11 @@ struct LiveState {
 }
 
 impl Live {
-    fn end_compaction(&self, state: &mut LiveState) {
+    /// Nothing of the agent's work is under way any more: its turn ended, or it was replaced, parked or stopped.
+    fn end_work(&self, state: &mut LiveState) {
         state.compacting = false;
-        self.compaction_ended.notify_waiters();
+        state.tools.clear();
+        self.boundary.notify_waiters();
     }
 }
 
@@ -141,7 +194,10 @@ pub struct Live {
     state: Mutex<LiveState>,
     /// Held while the session is parked or woken, so the two never overlap.
     transition: Mutex<()>,
-    compaction_ended: Notify,
+    /// Notified when something a steer waits for ends: a compaction, a tool call, a permission request, the turn.
+    boundary: Notify,
+    /// When the agent was last heard from, for telling it the time after a gap; `None` until this runtime knows.
+    heard_at: StdMutex<Option<DateTime<Utc>>>,
 }
 
 /// What `run_queued` does with its batch.
@@ -175,12 +231,19 @@ pub type Waker =
 /// Called when a turn the hub sent ends well, e.g. to check what it ended on (ADR 26).
 pub type TurnEnded = Arc<dyn Fn(Uuid) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+/// Called with each `usage_update` an agent sends, e.g. to keep the rate limits it reports (#140).
+pub type UsageSeen =
+    Arc<dyn Fn(Uuid, Value) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 pub struct Hub {
     store: Arc<dyn SessionStore>,
     waker: StdMutex<Option<Waker>>,
     turn_ended: StdMutex<Option<TurnEnded>>,
+    usage_seen: StdMutex<Option<UsageSeen>>,
     sessions: StdMutex<HashMap<Uuid, Arc<Live>>>,
     agent_capabilities: StdMutex<Option<Value>>,
+    /// The time the tests say it is, instead of the clock's.
+    now: StdMutex<Option<DateTime<Utc>>>,
 }
 
 fn notification(method: &str, params: Value) -> Value {
@@ -208,8 +271,43 @@ impl Hub {
             store,
             waker: StdMutex::default(),
             turn_ended: StdMutex::default(),
+            usage_seen: StdMutex::default(),
             sessions: StdMutex::default(),
             agent_capabilities: StdMutex::default(),
+            now: StdMutex::default(),
+        }
+    }
+
+    fn now(&self) -> DateTime<Utc> {
+        self.now.lock().expect("hub lock").unwrap_or_else(Utc::now)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_now(&self, now: DateTime<Utc>) {
+        *self.now.lock().expect("hub lock") = Some(now);
+    }
+
+    fn heard_from_agent(&self, id: Uuid) {
+        *self.live(id).heard_at.lock().expect("hub lock") = Some(self.now());
+    }
+
+    /// `blocks` as the agent gets them: after a gap, and always for a notice, led by a line with the time.
+    async fn with_time(&self, id: Uuid, blocks: Vec<Value>, notice: bool) -> Vec<Value> {
+        let heard_at = self.heard_at(id).await;
+        let zone = match self.store.get_session(id).await {
+            Ok(Some(row)) => self.store.owner_zone(&row.owner).await,
+            Ok(None) => Ok(chrono_tz::UTC),
+            Err(e) => Err(e),
+        }
+        .unwrap_or_else(|e| {
+            tracing::warn!(session = %id, error = %e, "reading the owner's timezone");
+            chrono_tz::UTC
+        });
+        match time_line(self.now(), heard_at, notice, zone) {
+            Some(line) => std::iter::once(json!({"type": "text", "text": line}))
+                .chain(blocks)
+                .collect(),
+            None => blocks,
         }
     }
 
@@ -219,6 +317,10 @@ impl Hub {
 
     pub fn set_turn_ended(&self, turn_ended: TurnEnded) {
         *self.turn_ended.lock().unwrap() = Some(turn_ended);
+    }
+
+    pub fn set_usage_seen(&self, usage_seen: UsageSeen) {
+        *self.usage_seen.lock().unwrap() = Some(usage_seen);
     }
 
     /// The session's agent, if it's up.
@@ -251,7 +353,8 @@ impl Hub {
                     events: broadcast::channel(4096).0,
                     state: Mutex::default(),
                     transition: Mutex::default(),
-                    compaction_ended: Notify::new(),
+                    boundary: Notify::new(),
+                    heard_at: StdMutex::default(),
                 })
             })
             .clone()
@@ -309,8 +412,33 @@ impl Hub {
         );
     }
 
+    /// When the agent was last heard from. Until this runtime has heard from it, that's the session's last activity,
+    /// read before this runtime records or sends anything for the session.
+    async fn heard_at(&self, id: Uuid) -> Option<DateTime<Utc>> {
+        let live = self.live(id);
+        let known = *live.heard_at.lock().expect("hub lock");
+        if known.is_some() {
+            return known;
+        }
+        let active_at = match self.store.get_session(id).await {
+            Ok(row) => row?.active_at,
+            Err(e) => {
+                tracing::warn!(session = %id, error = %e, "reading the session's last activity");
+                return None;
+            }
+        };
+        Some(
+            *live
+                .heard_at
+                .lock()
+                .expect("hub lock")
+                .get_or_insert(active_at),
+        )
+    }
+
     /// Appends an update to the event log and sends it to every UI.
     pub async fn record(&self, id: Uuid, update: Value) {
+        self.heard_at(id).await;
         match self.store.append_event(id, &update).await {
             Ok(seq) => self.broadcast(
                 id,
@@ -324,15 +452,33 @@ impl Hub {
     }
 
     pub async fn attach_agent(&self, id: Uuid, agent: Arc<AgentConn>) {
-        let live = self.live(id);
-        let mut state = live.state.lock().await;
-        if let Some(old) = state.agent.replace(agent) {
-            old.close();
+        let resolved = {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            if let Some(old) = state.agent.replace(agent) {
+                old.close();
+            }
+            state.agent_session_id = None;
+            state.turn_running = false;
+            state.commands = None;
+            live.end_work(&mut state);
+            // The new link reports the requests the agent still has open, and they're asked again under it.
+            take_agent_permissions(&mut state)
+        };
+        self.resolve_permissions(id, resolved);
+    }
+
+    /// Tells the UIs that these permission requests are no longer open.
+    fn resolve_permissions(&self, id: Uuid, resolved: Vec<(u64, Option<String>)>) {
+        for (pid, tool_call_id) in resolved {
+            self.broadcast(
+                id,
+                UiEvent::PermissionResolved {
+                    id: pid,
+                    tool_call_id,
+                },
+            );
         }
-        state.agent_session_id = None;
-        state.turn_running = false;
-        state.commands = None;
-        live.end_compaction(&mut state);
     }
 
     /// What the supervisor of `agent`, the session's current one, says about the agent's running commands.
@@ -528,6 +674,7 @@ impl Hub {
                 .map(|text| json!({"type": "text", "text": text}))
                 .collect();
             blocks.extend(queued.iter().flat_map(|q| q.blocks.iter().cloned()));
+            let notice = queued.iter().any(|q| q.notice);
             // One decision under the lock, so no other agent's readiness or turn can slip in between.
             let started = {
                 let live = self.live(id);
@@ -614,7 +761,7 @@ impl Hub {
             };
             let agent = taken_for;
             let result = self
-                .turn_on(id, &agent, &agent_session_id, blocks, held)
+                .turn_on(id, &agent, &agent_session_id, blocks, notice, held)
                 .await;
             if let Err(e) = &result {
                 tracing::warn!(session = %id, error = %e, "queued prompt failed");
@@ -626,8 +773,8 @@ impl Hub {
     }
 
     /// Keeps the session's queue in the store as it is now, so a restart doesn't lose it (#39). Called under the
-    /// session's state lock, right after the queue changes.
-    async fn save_queue(&self, id: Uuid, state: &LiveState) {
+    /// session's state lock, right after the queue changes. Says whether it was kept.
+    async fn save_queue(&self, id: Uuid, state: &LiveState) -> bool {
         let stored: Vec<Value> = state
             .in_flight
             .iter()
@@ -640,15 +787,29 @@ impl Hub {
             })
             .chain(state.queue.iter().map(stored))
             .collect();
-        if let Err(e) = self.store.save_queue(id, &stored).await {
-            tracing::warn!(session = %id, error = %e, "keeping the session's queue");
+        match self.store.save_queue(id, &stored).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(session = %id, error = %e, "keeping the session's queue");
+                false
+            }
         }
     }
 
     /// Keeps `batch` in the stored queue while it's on its way to the agent; under the state lock.
     async fn hold(&self, id: Uuid, state: &mut LiveState, batch: &[Queued]) -> Option<Uuid> {
+        self.hold_kept(id, state, batch).await.0
+    }
+
+    /// Like `hold`, and says whether the stored queue was kept.
+    async fn hold_kept(
+        &self,
+        id: Uuid,
+        state: &mut LiveState,
+        batch: &[Queued],
+    ) -> (Option<Uuid>, bool) {
         if batch.is_empty() {
-            return None;
+            return (None, true);
         }
         let key = Uuid::new_v4();
         state.in_flight.push(Held {
@@ -657,8 +818,8 @@ impl Hub {
             restored: false,
             stored: batch.iter().map(stored).collect(),
         });
-        self.save_queue(id, state).await;
-        Some(key)
+        let kept = self.save_queue(id, state).await;
+        (Some(key), kept)
     }
 
     /// A held batch was sent as `request`.
@@ -779,16 +940,11 @@ impl Hub {
 
     /// Puts back the queues a restart left in the store: ahead of anything queued since, and run once each session's
     /// agent is up, waking a parked session for them as a new message would. Their callers are gone, so nobody
-    /// waits on the outcome; the transcript shows it.
-    pub async fn restore_queues(self: &Arc<Self>) {
-        let queues = match self.store.queues().await {
-            Ok(queues) => queues,
-            Err(e) => {
-                tracing::error!(error = %e, "loading queued messages");
-                return;
-            }
-        };
-        for (id, stored) in queues {
+    /// waits on the outcome; the transcript shows it. Reads everything it needs before changing anything, so on an
+    /// error nothing is restored and the stored queues stay as they were, for the caller to try again.
+    pub async fn restore_queues(self: &Arc<Self>) -> sqlx::Result<()> {
+        let mut restoring = Vec::new();
+        for (id, stored) in self.store.queues().await? {
             // What was on its way to the agent waits, held, until its agent says what it has.
             let mut held: Vec<Held> = Vec::new();
             let mut restored: Vec<Queued> = Vec::new();
@@ -812,12 +968,20 @@ impl Hub {
                         }),
                     }
                 } else {
-                    restored.push(unstored(&q));
+                    let queued = unstored(&q);
+                    // Taken back before a restart that came before its queue was saved without it.
+                    if let Some(qid) = queued.id
+                        && self.store.message_removed(id, qid).await?
+                    {
+                        continue;
+                    }
+                    restored.push(queued);
                 }
             }
-            if restored.is_empty() && held.is_empty() {
-                continue;
-            }
+            restoring.push((id, restored, held));
+        }
+        for (id, restored, held) in restoring {
+            let nothing = restored.is_empty() && held.is_empty();
             {
                 let live = self.live(id);
                 let mut state = live.state.lock().await;
@@ -826,11 +990,15 @@ impl Hub {
                 state.in_flight.extend(held);
                 self.save_queue(id, &state).await;
             }
+            if nothing {
+                continue;
+            }
             self.broadcast_queue(id).await;
             if let Err(e) = self.wake_for_message(id).await {
                 tracing::warn!(session = %id, error = %e.message, "waking a session for its queued messages");
             }
         }
+        Ok(())
     }
 
     /// The `_sloppod/queue` notification for the messages waiting behind the running turn.
@@ -869,23 +1037,11 @@ impl Hub {
             state.agent_session_id = None;
             state.turn_running = false;
             state.commands = None;
-            live.end_compaction(&mut state);
+            live.end_work(&mut state);
             self.set_phase(id, Phase::Disconnected).await;
-            state
-                .permissions
-                .extract_if(|_, p| matches!(p.asker, Asker::Agent { .. }))
-                .map(|(pid, p)| (pid, tool_call_id(&p.params)))
-                .collect()
+            take_agent_permissions(&mut state)
         };
-        for (pid, tool_call_id) in resolved {
-            self.broadcast(
-                id,
-                UiEvent::PermissionResolved {
-                    id: pid,
-                    tool_call_id,
-                },
-            );
-        }
+        self.resolve_permissions(id, resolved);
     }
 
     pub async fn on_agent_notification(&self, id: Uuid, message: Value) {
@@ -900,6 +1056,12 @@ impl Hub {
             if state.loading {
                 return;
             }
+            self.heard_from_agent(id);
+            if update["sessionUpdate"] == "usage_update"
+                && let Some(usage_seen) = self.usage_seen.lock().unwrap().clone()
+            {
+                tokio::spawn(usage_seen(id, update.clone()));
+            }
             if update["sessionUpdate"] == "current_mode_update"
                 && let Some(mode) = update.get("currentModeId")
             {
@@ -909,7 +1071,24 @@ impl Hub {
                 if update["status"] == "in_progress" {
                     state.compacting = true;
                 } else {
-                    live.end_compaction(&mut state);
+                    state.compacting = false;
+                    live.boundary.notify_waiters();
+                }
+            }
+            if let Some(tool) = update["toolCallId"].as_str() {
+                match update["status"].as_str() {
+                    Some("completed" | "failed") => {
+                        if state.tools.remove(tool) {
+                            live.boundary.notify_waiters();
+                        }
+                    }
+                    Some("pending" | "in_progress") => {
+                        state.tools.insert(tool.to_owned());
+                    }
+                    _ if update["sessionUpdate"] == "tool_call" => {
+                        state.tools.insert(tool.to_owned());
+                    }
+                    _ => {}
                 }
             }
         }
@@ -980,22 +1159,24 @@ impl Hub {
         );
     }
 
-    /// The first answer to a permission request wins; later ones are ignored.
+    /// The first answer to a permission request wins; later ones are ignored. `by` says who answered, for the log.
     pub async fn answer_permission(
         self: &Arc<Self>,
         id: Uuid,
         pid: u64,
         result: Result<Value, RpcError>,
+        by: &str,
     ) {
         let permission = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
             let permission = state.permissions.remove(&pid);
             let blocked = |p: &Permission| matches!(p.asker, Asker::Agent { .. });
-            if permission.as_ref().is_some_and(blocked)
-                && !state.permissions.values().any(blocked)
-                && state.agent.is_some()
-            {
+            let agent_asked = permission.as_ref().is_some_and(blocked);
+            if agent_asked {
+                live.boundary.notify_waiters();
+            }
+            if agent_asked && !state.permissions.values().any(blocked) && state.agent.is_some() {
                 let phase = if state.turn_running {
                     Phase::Working
                 } else {
@@ -1005,14 +1186,34 @@ impl Hub {
             }
             permission
         };
-        let Some(permission) = permission else { return };
+        let Some(permission) = permission else {
+            tracing::debug!(session = %id, permission = pid, by, "ignoring an answer to a settled permission request");
+            return;
+        };
         let tool_call_id = tool_call_id(&permission.params);
+        tracing::info!(
+            session = %id,
+            permission = pid,
+            method = %permission.method,
+            tool_call = tool_call_id.as_deref().unwrap_or_default(),
+            outcome = %answer_outcome(&result),
+            by,
+            "permission request answered"
+        );
         match permission.asker {
             Asker::Agent { request_id, agent } => agent.respond(request_id, result),
-            Asker::Tool { questions } => {
+            Asker::Tool { key, questions } => {
                 let answer = result.unwrap_or_else(|_| json!({"action": "cancel"}));
-                self.notify(id, crate::questions::answer_text(&questions, &answer))
+                // The notice is kept until it reaches the agent, so the question can go once that's stored. If it
+                // couldn't be, the question stays stored and comes back after a restart rather than both being lost.
+                let kept = self
+                    .notify(id, crate::questions::answer_text(&questions, &answer))
                     .await;
+                if !kept {
+                    tracing::warn!(session = %id, "keeping an answered question, as its answer couldn't be stored");
+                } else if let Err(e) = self.store.forget_question(key).await {
+                    tracing::warn!(session = %id, error = %e, "forgetting an answered question");
+                }
             }
         }
         self.broadcast(
@@ -1062,17 +1263,29 @@ impl Hub {
         let message_id = client_message_id(&params);
         // A UI sends a message again when it can't tell whether the first send arrived, e.g. after a reload; it
         // doesn't run twice. A UI can't always tell: it only has the latest of a long session's history.
+        let failed = |e: sqlx::Error| RpcError::new(-32603, e.to_string());
         let received = match message_id {
             Some(message_id) => self
                 .store
                 .has_message(id, message_id)
                 .await
-                .map_err(|e| RpcError::new(-32603, e.to_string()))?,
+                .map_err(failed)?,
             None => false,
         };
         let (queued, behind_turn) = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
+            // Nor does one the user took back out of the queue, sent again by a UI that didn't hear so. Read under
+            // the lock taking it back holds, so a resend can't miss a removal that's under way.
+            if let Some(message_id) = message_id
+                && self
+                    .store
+                    .message_removed(id, message_id)
+                    .await
+                    .map_err(failed)?
+            {
+                return Ok(json!({"stopReason": "cancelled"}));
+            }
             if received || message_id.is_some_and(|m| state.queue.iter().any(|q| q.id == Some(m))) {
                 return Ok(
                     json!({"stopReason": "end_turn", "_meta": {"sloppod": {"alreadyReceived": true}}}),
@@ -1087,6 +1300,7 @@ impl Hub {
                 state.queue.push(Queued {
                     id: agent_up.then(|| message_id.unwrap_or_else(Uuid::new_v4)),
                     blocks: blocks.clone(),
+                    notice: false,
                     reply: Some(reply),
                 });
                 self.save_queue(id, &state).await;
@@ -1122,7 +1336,7 @@ impl Hub {
                 "the session's agent isn't running yet; try again shortly",
             ));
         };
-        self.turn_on(id, &agent, &agent_session_id, blocks, None)
+        self.turn_on(id, &agent, &agent_session_id, blocks, false, None)
             .await
     }
 
@@ -1149,11 +1363,13 @@ impl Hub {
         agent: &Arc<AgentConn>,
         agent_session_id: &str,
         blocks: Vec<Value>,
+        notice: bool,
         held: Option<Uuid>,
     ) -> Result<Value, RpcError> {
+        let prompt = self.with_time(id, blocks, notice).await;
         let (request, answer) = agent.send_request(
             "session/prompt",
-            json!({"sessionId": agent_session_id, "prompt": blocks}),
+            json!({"sessionId": agent_session_id, "prompt": prompt}),
         );
         self.sent(id, held, request).await;
         let result = answer.await;
@@ -1177,7 +1393,7 @@ impl Hub {
             if !state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
                 return;
             }
-            live.end_compaction(&mut state);
+            live.end_work(&mut state);
             let agent_up = state.agent_session_id.is_some();
             state.turn_running = agent_up && !state.queue.is_empty();
             let next = state.turn_running.then(|| std::mem::take(&mut state.queue));
@@ -1206,6 +1422,33 @@ impl Hub {
         id: Uuid,
         params: Value,
     ) -> Result<Value, RpcError> {
+        let queued = self.take_queued(id, &params, false).await?;
+        self.record_user_message(id, &json!(queued.blocks), true, queued.id)
+            .await;
+        let result = self.steer_in(id, queued.blocks, false, None).await;
+        if let Some(reply) = queued.reply {
+            let _ = reply.send(result.clone());
+        }
+        result
+    }
+
+    /// Takes a message waiting behind the running turn out of the queue, e.g. for the user to edit, and returns it.
+    pub async fn remove_queued(&self, id: Uuid, params: Value) -> Result<Value, RpcError> {
+        let queued = self.take_queued(id, &params, true).await?;
+        if let Some(reply) = queued.reply {
+            let _ = reply.send(Ok(json!({"stopReason": "cancelled"})));
+        }
+        Ok(json!({"prompt": queued.blocks}))
+    }
+
+    /// Takes the waiting message `params.id` names out of the queue; with `discard`, the store remembers it was
+    /// taken back rather than run.
+    async fn take_queued(
+        &self,
+        id: Uuid,
+        params: &Value,
+        discard: bool,
+    ) -> Result<Queued, RpcError> {
         let qid = params["id"]
             .as_str()
             .and_then(|q| q.parse::<Uuid>().ok())
@@ -1218,18 +1461,18 @@ impl Hub {
                 .iter()
                 .position(|q| q.id == Some(qid))
                 .ok_or_else(|| RpcError::new(-32002, "that message isn't queued any more"))?;
+            if discard {
+                self.store
+                    .remove_message(id, qid)
+                    .await
+                    .map_err(|e| RpcError::new(-32603, e.to_string()))?;
+            }
             let queued = state.queue.remove(index);
             self.save_queue(id, &state).await;
             queued
         };
         self.broadcast_queue(id).await;
-        self.record_user_message(id, &json!(queued.blocks), true, queued.id)
-            .await;
-        let result = self.steer_in(id, queued.blocks, None).await;
-        if let Some(reply) = queued.reply {
-            let _ = reply.send(result.clone());
-        }
-        result
+        Ok(queued)
     }
 
     /// Tells the agent something happened outside its turns, e.g. a proposal was decided: a new turn when it's
@@ -1282,9 +1525,10 @@ impl Hub {
     }
 
     /// Tells the agent something: a new turn when it's idle, steered into the running one, or queued until it's
-    /// up. Kept in the stored queue until it reaches the agent, so a restart doesn't lose it (#237).
-    pub async fn notify(self: &Arc<Self>, id: Uuid, text: String) {
-        self.notify_summarised(id, text, None).await;
+    /// up. Kept in the stored queue until it reaches the agent, so a restart doesn't lose it (#237); says whether
+    /// it was kept.
+    pub async fn notify(self: &Arc<Self>, id: Uuid, text: String) -> bool {
+        self.notify_summarised(id, text, None).await
     }
 
     /// A notice the UI shows folded as `summary`, e.g. a message from another session; the agent gets all of it.
@@ -1293,27 +1537,27 @@ impl Hub {
         id: Uuid,
         text: String,
         summary: Option<String>,
-    ) {
+    ) -> bool {
         let notice = notice_queued(&text);
         let blocks = notice.blocks.clone();
-        let delivery = {
+        let (delivery, kept) = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
             if state.agent.is_none() || state.agent_session_id.is_none() {
                 state.queue.push(notice);
-                self.save_queue(id, &state).await;
-                Delivery::Queued
+                let kept = self.save_queue(id, &state).await;
+                (Delivery::Queued, kept)
             } else if state.turn_running {
-                let held = self
-                    .hold(id, &mut state, std::slice::from_ref(&notice))
+                let (held, kept) = self
+                    .hold_kept(id, &mut state, std::slice::from_ref(&notice))
                     .await;
-                Delivery::Steer(held)
+                (Delivery::Steer(held), kept)
             } else {
                 state.turn_running = true;
-                let held = self
-                    .hold(id, &mut state, std::slice::from_ref(&notice))
+                let (held, kept) = self
+                    .hold_kept(id, &mut state, std::slice::from_ref(&notice))
                     .await;
-                Delivery::Turn(state.agent.clone(), notice, held)
+                (Delivery::Turn(state.agent.clone(), notice, held), kept)
             }
         };
         self.record_notice(id, &blocks[0], summary.as_deref()).await;
@@ -1327,7 +1571,7 @@ impl Hub {
             Delivery::Steer(held) => {
                 let hub = self.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = hub.steer_in(id, blocks.clone(), held).await {
+                    if let Err(e) = hub.steer_in(id, blocks.clone(), true, held).await {
                         tracing::warn!(session = %id, error = %e, "steering a notice in");
                         if let Some(key) = held {
                             hub.requeue_held(id, key).await;
@@ -1336,6 +1580,7 @@ impl Hub {
                 });
             }
         }
+        kept
     }
 
     /// Shows a notice in the session's log as a message to the agent.
@@ -1358,21 +1603,23 @@ impl Hub {
 
     /// Steers blocks into the running turn. If that turn has just ended they start a new one here, so the turn
     /// is tracked like any other rather than run detached by the adapter. `held` is released once they reach the
-    /// agent.
+    /// agent. A `notice` waits for a moment between the agent's tool calls (see `before_steer`).
     async fn steer_in(
         self: &Arc<Self>,
         id: Uuid,
         blocks: Vec<Value>,
+        notice: bool,
         held: Option<Uuid>,
     ) -> Result<Value, RpcError> {
         for _ in 0..10 {
-            self.after_compaction(id).await;
+            self.before_steer(id, notice).await;
             let (agent, agent_session_id) = self.agent_for(id).await?;
+            let prompt = self.with_time(id, blocks.clone(), notice).await;
             let (request, answer) = agent.send_request(
                 "_session/steering",
                 json!({
                     "sessionId": agent_session_id,
-                    "prompt": blocks,
+                    "prompt": prompt,
                     "_meta": {"steering": {"idleBehavior": "promptRequired"}},
                 }),
             );
@@ -1393,6 +1640,7 @@ impl Hub {
                 let queued = vec![Queued {
                     id: None,
                     blocks,
+                    notice,
                     reply: None,
                 }];
                 tokio::spawn(self.clone().run_queued(id, agent, None, queued, held));
@@ -1407,16 +1655,27 @@ impl Hub {
         ))
     }
 
-    /// A steer pre-empts whatever the agent is generating, and a compaction it pre-empts is cancelled rather than
-    /// resumed. So steers wait for one to end, however long it takes.
-    async fn after_compaction(&self, id: Uuid) {
+    /// A steer pre-empts whatever the agent is doing (the adapter doesn't let us ask it to wait), and a compaction it
+    /// pre-empts is cancelled rather than resumed. So steers wait for one to end, however long it takes. A notice
+    /// also waits for the agent's tool calls and permission requests to end, or its turn: one it pre-empts is
+    /// cancelled, which the agent reads as the user telling it to stop. The user's own steers go in at once.
+    async fn before_steer(&self, id: Uuid, notice: bool) {
         let live = self.live(id);
         loop {
-            let ended = live.compaction_ended.notified();
-            if !live.state.lock().await.compacting {
-                return;
+            let changed = live.boundary.notified();
+            {
+                let state = live.state.lock().await;
+                let busy = notice
+                    && (!state.tools.is_empty()
+                        || state
+                            .permissions
+                            .values()
+                            .any(|p| matches!(p.asker, Asker::Agent { .. })));
+                if !state.compacting && !busy {
+                    return;
+                }
             }
-            ended.await;
+            changed.await;
         }
     }
 
@@ -1431,6 +1690,7 @@ impl Hub {
                 state.queue.push(Queued {
                     id: None,
                     blocks,
+                    notice: false,
                     reply: None,
                 });
                 self.save_queue(id, &state).await;
@@ -1442,10 +1702,12 @@ impl Hub {
         }
         self.record_user_message(id, &params["prompt"], true, message_id)
             .await;
-        self.steer_in(id, blocks, None).await
+        self.steer_in(id, blocks, false, None).await
     }
 
-    pub async fn cancel(self: &Arc<Self>, id: Uuid) {
+    /// Cancels the running turn; `by` says who did, for the log.
+    pub async fn cancel(self: &Arc<Self>, id: Uuid, by: &str) {
+        tracing::info!(session = %id, by, "cancelling the turn");
         if let Ok((agent, agent_session_id)) = self.agent_for(id).await {
             agent.notify("session/cancel", json!({"sessionId": agent_session_id}));
         }
@@ -1467,7 +1729,8 @@ impl Hub {
             } else {
                 json!({"outcome": {"outcome": "cancelled"}})
             };
-            self.answer_permission(id, pid, Ok(answer)).await;
+            self.answer_permission(id, pid, Ok(answer), &format!("the cancel by {by}"))
+                .await;
         }
     }
 
@@ -1539,6 +1802,28 @@ impl Hub {
     /// as a notice.
     pub async fn ask(&self, id: Uuid, questions: Value) -> Result<(), String> {
         let params = crate::questions::elicitation(&questions, &id.to_string())?;
+        let key = Uuid::new_v4();
+        self.store
+            .save_question(id, key, &questions)
+            .await
+            .map_err(|e| format!("couldn't keep the question: {e}"))?;
+        self.show_question(id, key, questions, params).await;
+        Ok(())
+    }
+
+    /// Shows the questions a restart left unanswered again (#39). On an error reading them it shows none, for the
+    /// caller to try again.
+    pub async fn restore_questions(&self) -> sqlx::Result<()> {
+        for (id, key, questions) in self.store.questions().await? {
+            match crate::questions::elicitation(&questions, &id.to_string()) {
+                Ok(params) => self.show_question(id, key, questions, params).await,
+                Err(e) => tracing::warn!(session = %id, error = %e, "restoring a question"),
+            }
+        }
+        Ok(())
+    }
+
+    async fn show_question(&self, id: Uuid, key: Uuid, questions: Value, params: Value) {
         let pid = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
@@ -1549,7 +1834,7 @@ impl Hub {
                 Permission {
                     method: "elicitation/create".into(),
                     params: params.clone(),
-                    asker: Asker::Tool { questions },
+                    asker: Asker::Tool { key, questions },
                 },
             );
             pid
@@ -1562,7 +1847,6 @@ impl Hub {
                 params,
             },
         );
-        Ok(())
     }
 
     pub async fn turn_running(&self, id: Uuid) -> bool {
@@ -1571,6 +1855,7 @@ impl Hub {
 
     /// Counts a turn the hub sent as ended, failed with `error` or not.
     async fn turn_finished(&self, id: Uuid, error: Option<String>) {
+        self.heard_from_agent(id);
         let ok = error.is_none();
         {
             let live = self.live(id);
@@ -1616,7 +1901,7 @@ impl Hub {
             if state.turn_running {
                 return Err(ParkError::InTurn);
             }
-            live.end_compaction(&mut state);
+            live.end_work(&mut state);
             (state.agent.take(), state.agent_session_id.take())
         };
         // Parked before the pod ends, so its supervisor's attempts to reconnect meanwhile are turned away.
@@ -1723,7 +2008,7 @@ impl Hub {
             let live = self.live(id);
             let mut state = live.state.lock().await;
             state.stopped = true;
-            live.end_compaction(&mut state);
+            live.end_work(&mut state);
             let queued = std::mem::take(&mut state.queue);
             state.in_flight.clear();
             self.save_queue(id, &state).await;
@@ -1744,6 +2029,30 @@ fn client_message_id(params: &Value) -> Option<Uuid> {
     params["_meta"]["sloppod"]["messageId"]
         .as_str()
         .and_then(|s| s.parse().ok())
+}
+
+/// What a permission request or question was answered with, for the log.
+fn answer_outcome(result: &Result<Value, RpcError>) -> String {
+    match result {
+        Ok(answer) => match (
+            answer["outcome"]["outcome"].as_str(),
+            answer["action"].as_str(),
+        ) {
+            (Some("selected"), _) => format!("selected {}", answer["outcome"]["optionId"]),
+            (Some(outcome), _) | (None, Some(outcome)) => outcome.to_owned(),
+            (None, None) => answer.to_string(),
+        },
+        Err(e) => format!("error {}: {}", e.code, e.message),
+    }
+}
+
+/// Removes the agent's permission requests, whose agent connection is gone: their ids and tool calls.
+fn take_agent_permissions(state: &mut LiveState) -> Vec<(u64, Option<String>)> {
+    state
+        .permissions
+        .extract_if(|_, p| matches!(p.asker, Asker::Agent { .. }))
+        .map(|(pid, p)| (pid, tool_call_id(&p.params)))
+        .collect()
 }
 
 fn tool_call_id(params: &Value) -> Option<String> {

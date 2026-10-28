@@ -430,6 +430,9 @@ pub struct ReviewSubject {
     pub head_sha: String,
     pub title: String,
     pub body: String,
+    /// Whether someone decides from the title and body, so they have to describe the change and are reviewed with
+    /// it. A code review's only say what the author wants looked at.
+    pub describes_change: bool,
 }
 
 /// An outward action the agent can propose and a human approves (ADR 3).
@@ -456,6 +459,11 @@ pub trait ProposalKind: Send + Sync {
     /// carried out by the runtime once its review is over, without waiting for a person (ADR 27).
     fn outward(&self) -> bool {
         true
+    }
+    /// Whether it asks for a review and nothing else, like a session's request for a second opinion on a branch: it's
+    /// always reviewed, and once the review is over there's nothing to carry out. Only for kinds that aren't outward.
+    fn is_review(&self) -> bool {
+        false
     }
     /// Applies the reviewer's edits, sent along with the approval, to the payload.
     fn edit(&self, payload: &Value, edits: &Value) -> Result<Value> {

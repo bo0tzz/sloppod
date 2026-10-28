@@ -24,6 +24,7 @@ mod policies;
 mod proposals;
 mod pulls;
 mod questions;
+mod quota;
 mod rebases;
 mod reviews;
 mod session;
@@ -82,6 +83,8 @@ pub struct Inner {
     pub image_nudges: lifecycle::ImageNudges,
     /// Pushes to heads of pull requests set to merge themselves, waiting to be rechecked (#106).
     pub rechecks: Arc<rebases::Rechecks>,
+    /// What's left of each inference credential's usage limits (#140).
+    pub quotas: quota::Quotas,
 }
 
 #[derive(Clone)]
@@ -160,6 +163,7 @@ async fn main() -> anyhow::Result<()> {
     proposals.register(Arc::new(proposals::Stack::new(credentials.clone(), pushes)));
     proposals.register(Arc::new(proposals::Issues::new(credentials.clone())));
     proposals.register(Arc::new(proposals::IssueUpdates::new(credentials.clone())));
+    proposals.register(Arc::new(proposals::CodeReview::new(credentials.clone())));
     proposals.register(Arc::new(proposals::Report::new(
         db.clone(),
         credentials.clone(),
@@ -222,6 +226,7 @@ async fn main() -> anyhow::Result<()> {
         inference: inference::Inference::default(),
         image_nudges: lifecycle::ImageNudges::default(),
         rechecks,
+        quotas: quota::Quotas::new()?,
     }));
     // A message queued for a parked session's absent agent wakes the session.
     let waker = state.clone();
@@ -233,6 +238,11 @@ async fn main() -> anyhow::Result<()> {
                 None => Ok(()),
             }
         })
+    }));
+    let usage = state.clone();
+    state.hub.set_usage_seen(Arc::new(move |id, update| {
+        let (state, at) = (usage.clone(), chrono::Utc::now());
+        Box::pin(async move { quota::seen(&state, id, update, at).await })
     }));
     let checker = state.clone();
     state.hub.set_turn_ended(Arc::new(move |id| {
@@ -268,6 +278,16 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::spawn(rebases::run(state.clone(), pushes_to_recheck));
     tokio::spawn(pulls::run(state.clone()));
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                every.tick().await;
+                quota::read_chatgpt(&state).await;
+            }
+        });
+    }
     {
         let state = state.clone();
         tokio::spawn(async move {
@@ -367,7 +387,12 @@ async fn reconcile(state: &AppState) {
     }
     // After the pods are placed, so a queue for a running session waits for its agent and a parked one wakes for it;
     // before anything that can queue a notice, which would otherwise replace the kept queue before it's read.
-    state.hub.restore_queues().await;
+    // Nothing is listening yet, so nothing can queue a message or answer a question until this is done.
+    until_done("restoring queued messages", || state.hub.restore_queues()).await;
+    until_done("restoring unanswered questions", || {
+        state.hub.restore_questions()
+    })
+    .await;
     proposals::resume_approved(state).await;
     reviews::resume_round_watches(state).await;
     proposals::resume_stack_watches(state).await;
@@ -383,6 +408,18 @@ fn restart_notice(build: Option<&str>) -> String {
          was running, any background tasks you started and any question you were waiting on are gone; your working \
          tree and files are intact. Check what had finished, then carry on where you left off."
     )
+}
+
+/// Retries a startup step that reads the database until it succeeds, e.g. through a brief database outage.
+async fn until_done<F, Fut>(what: &str, step: F)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = sqlx::Result<()>>,
+{
+    while let Err(e) = step().await {
+        tracing::error!(error = %e, "{what}; trying again");
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
 }
 
 #[cfg(test)]

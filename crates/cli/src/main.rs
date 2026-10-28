@@ -74,7 +74,7 @@ enum Cmd {
     Credentials,
     /// Add a credential; the secret is read from a file, or stdin with `-`.
     AddCredential {
-        /// claude, github-app or memini
+        /// claude, github-app, memini, chatgpt or github-user
         #[arg(long)]
         kind: String,
         #[arg(long)]

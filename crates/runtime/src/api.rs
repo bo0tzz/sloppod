@@ -19,7 +19,7 @@ use crate::credentials::CHATGPT;
 use crate::proposals::{self, DecideError, Verdict};
 use crate::session::ParkError;
 use crate::users::User;
-use crate::{AppState, db, lifecycle, reviews, subsessions};
+use crate::{AppState, db, lifecycle, quota, reviews, subsessions};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -40,6 +40,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/default", post(default_credential))
+        .route("/quotas", get(list_quotas))
         .route(
             "/standing-approvals",
             get(list_standing_approvals).post(create_standing_approval),
@@ -95,7 +96,7 @@ fn bad_request(message: impl Into<String>) -> ApiError {
 type ApiResult<T> = Result<T, ApiError>;
 
 async fn me(State(state): State<AppState>, User(user): User) -> impl IntoResponse {
-    Json(json!({"user": user, "build": state.config.build}))
+    Json(json!({"user": user, "version": state.config.version, "build": state.config.build}))
 }
 
 /// The models the agent offered, from a `configOptions` list; options may be grouped.
@@ -127,7 +128,8 @@ async fn settings(state: &AppState, user: &str) -> ApiResult<serde_json::Value> 
         .map(|s| offered_models(&s))
         .unwrap_or_default();
     let review = db::user_review(&state.db, user).await?;
-    Ok(json!({"model": model, "models": models, "review": review}))
+    let timezone = db::user_timezone(&state.db, user).await?;
+    Ok(json!({"model": model, "models": models, "review": review, "timezone": timezone}))
 }
 
 /// Deserializes a field that's present, so `Option<Option<T>>` tells an absent field from a null one.
@@ -157,6 +159,7 @@ struct SettingsUpdate {
     #[serde(default, deserialize_with = "present")]
     model: Option<Option<String>>,
     review: Option<String>,
+    timezone: Option<String>,
 }
 
 async fn put_settings(
@@ -166,12 +169,24 @@ async fn put_settings(
 ) -> ApiResult<impl IntoResponse> {
     // Checked before anything is written, so a bad field doesn't leave the others half applied.
     let review = update.review.as_deref().map(review_policy).transpose()?;
+    let timezone = update
+        .timezone
+        .as_deref()
+        .map(|name| {
+            name.trim()
+                .parse::<chrono_tz::Tz>()
+                .map_err(|_| bad_request(format!("{name} isn't a timezone, e.g. Europe/Amsterdam")))
+        })
+        .transpose()?;
     if let Some(model) = &update.model {
         let model = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
         db::set_user_model(&state.db, &user, model).await?;
     }
     if let Some(review) = review {
         db::set_user_review(&state.db, &user, review).await?;
+    }
+    if let Some(timezone) = timezone {
+        db::set_user_timezone(&state.db, &user, timezone.name()).await?;
     }
     Ok(Json(settings(&state, &user).await?))
 }
@@ -472,7 +487,7 @@ async fn park_ending_turn(state: &AppState, session: &db::SessionRow) -> ApiResu
             Ok(()) | Err(ParkError::Stopped) => return Ok(()),
             Err(ParkError::InTurn) => {
                 if attempt == 0 {
-                    state.hub.cancel(session.id).await;
+                    state.hub.cancel(session.id, "deleting the session").await;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
@@ -546,6 +561,15 @@ async fn create_credential(
         Ok(row) => Ok((StatusCode::CREATED, Json(row.to_api()))),
         Err(invalid) => Err(bad_request(invalid.0)),
     }
+}
+
+async fn list_quotas(
+    State(state): State<AppState>,
+    User(user): User,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(
+        quota::list(&state.db, &user, chrono::Utc::now()).await?,
+    ))
 }
 
 async fn list_standing_approvals(
