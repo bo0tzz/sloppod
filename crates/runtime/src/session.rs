@@ -90,6 +90,9 @@ enum Start {
     Stopped(Vec<Queued>),
     /// Back in the queue, and run on a newer agent that was up and idle.
     Requeued(Option<(Arc<AgentConn>, Vec<Queued>)>),
+    /// The first message couldn't be marked as taken, so running it could run it twice: nothing runs, its callers
+    /// get an error, and the first message stays stored for the agent's next start.
+    Failed(Vec<Queued>),
 }
 
 /// Why a session couldn't be parked.
@@ -291,9 +294,23 @@ impl Hub {
         }
         .unwrap_or_else(|| json!({}));
         match turn {
+            // An agent that came up but never got its first message (the link dropped before it ran) gets it now.
             None => {
-                self.agent_ready(id, agent, running.ready.agent_session_id, agent_state, None)
-                    .await
+                let pending = match self.store.pending_prompt(id).await {
+                    Ok(pending) => pending,
+                    Err(e) => {
+                        tracing::warn!(session = %id, error = %e, "reading the first message");
+                        None
+                    }
+                };
+                self.agent_ready(
+                    id,
+                    agent,
+                    running.ready.agent_session_id,
+                    agent_state,
+                    pending,
+                )
+                .await
             }
             Some(turn) => {
                 {
@@ -384,23 +401,37 @@ impl Hub {
                 match (&state.agent_session_id, current) {
                     (Some(agent_session_id), true) => {
                         let agent_session_id = agent_session_id.clone();
-                        self.set_phase(id, Phase::Working).await;
-                        Start::Run(agent_session_id, queued)
+                        // The first message is kept until now, so an agent that went before it ran leaves it for
+                        // the next; from here this turn has it.
+                        let cleared = match pending {
+                            Some(_) => self.store.clear_pending_prompt(id).await,
+                            None => Ok(()),
+                        };
+                        match cleared {
+                            Ok(()) => {
+                                self.set_phase(id, Phase::Working).await;
+                                Start::Run(agent_session_id, queued)
+                            }
+                            Err(e) => {
+                                tracing::error!(session = %id, error = %e, "clearing the first message");
+                                state.turn_running = false;
+                                self.set_phase(id, Phase::Idle).await;
+                                Start::Failed(queued)
+                            }
+                        }
                     }
                     _ if state.stopped => Start::Stopped(queued),
                     _ => {
                         // Taken for an agent that's gone: everything goes back, ahead of what's queued since,
                         // recorded already so not shown as waiting behind a turn. A newer agent that's up and idle
-                        // runs it now.
+                        // runs it now. The first message isn't requeued: it's still stored, and the next agent to
+                        // be ready reads it from there.
                         let requeued = queued.into_iter().map(|q| Queued { id: None, ..q });
-                        let pending = pending.map(|text| Queued {
-                            id: None,
-                            blocks: vec![json!({"type": "text", "text": text})],
-                            reply: None,
-                        });
                         let rest = std::mem::take(&mut state.queue);
-                        state.queue = pending.into_iter().chain(requeued).chain(rest).collect();
-                        let idle = state.agent_session_id.is_some() && !state.turn_running;
+                        state.queue = requeued.chain(rest).collect();
+                        let idle = state.agent_session_id.is_some()
+                            && !state.turn_running
+                            && !state.queue.is_empty();
                         match (state.agent.clone(), idle) {
                             (Some(agent), true) => {
                                 state.turn_running = true;
@@ -416,6 +447,15 @@ impl Hub {
                 Start::Stopped(queued) => {
                     for reply in queued.into_iter().filter_map(|q| q.reply) {
                         let _ = reply.send(Err(RpcError::new(-32002, "the session was stopped")));
+                    }
+                    return;
+                }
+                Start::Failed(queued) => {
+                    for reply in queued.into_iter().filter_map(|q| q.reply) {
+                        let _ = reply.send(Err(RpcError::new(
+                            -32603,
+                            "the session's store failed; try again",
+                        )));
                     }
                     return;
                 }

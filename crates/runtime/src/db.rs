@@ -297,16 +297,22 @@ pub async fn set_agent_session(
         .map(|_| ())
 }
 
-pub async fn take_pending_prompt(db: &PgPool, id: Uuid) -> sqlx::Result<Option<String>> {
-    // `old` reads the row from the statement's snapshot, so it still holds the prompt being cleared.
-    let row = sqlx::query(
-        "update sessions s set pending_prompt = null from sessions old \
-         where s.id = $1 and old.id = s.id and old.pending_prompt is not null returning old.pending_prompt",
-    )
-    .bind(id)
-    .fetch_optional(db)
-    .await?;
-    Ok(row.and_then(|r| r.get::<Option<String>, _>(0)))
+/// The session's first message, until a turn has started with it.
+pub async fn pending_prompt(db: &PgPool, id: Uuid) -> sqlx::Result<Option<String>> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("select pending_prompt from sessions where id = $1")
+            .bind(id)
+            .fetch_optional(db)
+            .await?;
+    Ok(row.and_then(|(prompt,)| prompt))
+}
+
+pub async fn clear_pending_prompt(db: &PgPool, id: Uuid) -> sqlx::Result<()> {
+    sqlx::query("update sessions set pending_prompt = null where id = $1")
+        .bind(id)
+        .execute(db)
+        .await
+        .map(|_| ())
 }
 
 pub async fn append_event(db: &PgPool, id: Uuid, payload: &Value) -> sqlx::Result<i64> {
