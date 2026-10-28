@@ -461,6 +461,10 @@ pub mod link {
         Error {
             message: String,
         },
+        /// How many of the agent's commands are running, foreground or in the background; sent when it changes.
+        Commands {
+            running: usize,
+        },
         /// What a `Run` printed, or why it failed (it couldn't start, timed out, or exited unsuccessfully).
         RunResult {
             id: u64,

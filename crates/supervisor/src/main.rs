@@ -101,6 +101,8 @@ struct Agent {
     unsent: Option<Value>,
     /// How much of each transcript file the runtime has, so syncs send only what was appended.
     synced: HashMap<String, u64>,
+    /// What ran under the agent when its session came up, before any turn: its helpers, not commands.
+    helpers: Option<shutdown::Helpers>,
     /// The agent's environment and working directory, for commands the runtime runs beside it.
     env: Vec<(String, String)>,
     cwd: String,
@@ -311,6 +313,8 @@ async fn run(
         Terminate,
     }
     let mut ping = tokio::time::interval(Duration::from_secs(20));
+    // What the runtime was last told about the agent's commands; a new link starts out telling it.
+    let mut commands_told = None;
     // Results of commands the runtime asked to run, sent back on this link.
     let (results_tx, mut results) =
         tokio::sync::mpsc::unbounded_channel::<(u64, Result<String, String>)>();
@@ -347,7 +351,13 @@ async fn run(
                             }
                             track(&mut a.open, &mut a.waiting, &message);
                         }
-                        Ok(ToSupervisor::AgentReady(ready)) => a.ready = Some(ready),
+                        Ok(ToSupervisor::AgentReady(ready)) => {
+                            // Before any turn: what runs under the agent now are its own helpers, not commands.
+                            if a.helpers.is_none() {
+                                a.helpers = a.child.id().map(shutdown::helpers);
+                            }
+                            a.ready = Some(ready);
+                        }
                         Ok(ToSupervisor::SyncTranscript) => sync_transcript(&a.transcript_dir, &mut a.synced, &mut sink).await,
                         Ok(ToSupervisor::ResyncTranscript { name }) => {
                             a.synced.remove(&name);
@@ -387,6 +397,17 @@ async fn run(
                 if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
                     break Event::LinkEnded;
                 }
+                let running = match (a.child.id(), &a.helpers) {
+                    (Some(pid), Some(helpers)) => shutdown::count(pid, helpers),
+                    // Not up yet, so nothing it runs is a command.
+                    _ => 0,
+                };
+                if commands_told != Some(running) {
+                    if send(&mut sink, &FromSupervisor::Commands { running }).await.is_err() {
+                        break Event::LinkEnded;
+                    }
+                    commands_told = Some(running);
+                }
             }
             _ = &mut deadline => {
                 tracing::warn!("no word from the runtime; dropping the link");
@@ -421,7 +442,10 @@ async fn run(
             tracing::info!("terminating");
             let mut a = agent.take().expect("an agent is running");
             // Before the agent is stopped, which ends what it started.
-            let running = a.child.id().map(shutdown::running).unwrap_or_default();
+            let running = match (a.child.id(), &a.helpers) {
+                (Some(pid), Some(helpers)) => shutdown::running(pid, helpers),
+                _ => Vec::new(),
+            };
             if !running.is_empty() {
                 let _ = send(&mut sink, &FromSupervisor::ShutdownReport { running }).await;
             }
@@ -494,6 +518,7 @@ async fn launch_agent(
             .iter()
             .map(|f| (f.name.clone(), f.len))
             .collect(),
+        helpers: None,
         env: agent_env,
         cwd: launch.cwd.clone(),
     })

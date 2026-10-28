@@ -1,41 +1,64 @@
 //! What was still running when the pod was told to stop (ADR 10, 17): the agent's tool commands, foreground or in
 //! the background, which ending the pod cuts off. The runtime tells the agent, so it can start them again.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use sloppod_protocol::link::RunningProcess;
 
-/// Shells the agent runs its commands in.
-const SHELLS: &[&str] = &["bash", "sh", "zsh", "dash"];
-
 /// How much of a command's output to report.
 const TAIL_LINES: usize = 20;
 const TAIL_BYTES: u64 = 4096;
 
-/// A process as `/proc` has it: its parent and its name.
+/// A process as `/proc` has it: its parent, and when it started, in clock ticks since boot.
 struct Proc {
     ppid: u32,
-    comm: String,
+    start: u64,
 }
 
-/// The commands running under `agent`: each shell below it with no other shell between it and the agent, so a
-/// command and everything it starts count once.
-fn commands(procs: &HashMap<u32, Proc>, agent: u32) -> Vec<u32> {
-    let is_shell = |pid: u32| {
+/// The agent's own processes (its CLI, MCP servers), by pid and start time, so a reused pid isn't taken for one.
+pub type Helpers = HashSet<(u32, u64)>;
+
+/// What runs under `agent` now. Taken when its session is up, before any turn, these are its helpers: everything
+/// started later is a command, whatever it runs (a command's shell may have `exec`ed its program, leaving no shell to
+/// recognize), and a helper started later counts as one too, which errs on the side of the session being busy.
+pub fn helpers(agent: u32) -> Helpers {
+    let procs = read_procs(Path::new("/proc"));
+    procs
+        .iter()
+        .filter(|(pid, _)| **pid != agent && under(&procs, **pid, agent))
+        .map(|(pid, proc)| (*pid, proc.start))
+        .collect()
+}
+
+fn under(procs: &HashMap<u32, Proc>, pid: u32, agent: u32) -> bool {
+    let mut parent = procs.get(&pid).map(|p| p.ppid);
+    while let Some(ppid) = parent {
+        if ppid == agent {
+            return true;
+        }
+        parent = procs.get(&ppid).map(|p| p.ppid);
+    }
+    false
+}
+
+/// The commands running under `agent`: each process below it that isn't one of its `helpers`, with no other such
+/// process between it and the agent, so a command and everything it starts count once.
+fn commands(procs: &HashMap<u32, Proc>, agent: u32, helpers: &Helpers) -> Vec<u32> {
+    let is_command = |pid: u32| {
         procs
             .get(&pid)
-            .is_some_and(|p| SHELLS.contains(&p.comm.as_str()))
+            .is_some_and(|p| pid != agent && !helpers.contains(&(pid, p.start)))
     };
-    // Whether `pid` is under the agent with no shell above it on the way.
+    // Whether `pid` is under the agent with no other command above it on the way.
     let outermost = |pid: u32| {
         let mut parent = procs.get(&pid).map(|p| p.ppid);
         while let Some(ppid) = parent {
             if ppid == agent {
                 return true;
             }
-            if is_shell(ppid) {
+            if is_command(ppid) {
                 return false;
             }
             parent = procs.get(&ppid).map(|p| p.ppid);
@@ -45,7 +68,7 @@ fn commands(procs: &HashMap<u32, Proc>, agent: u32) -> Vec<u32> {
     let mut commands: Vec<u32> = procs
         .keys()
         .copied()
-        .filter(|pid| is_shell(*pid) && outermost(*pid))
+        .filter(|pid| is_command(*pid) && outermost(*pid))
         .collect();
     commands.sort_unstable();
     commands
@@ -60,11 +83,12 @@ fn read_procs(root: &Path) -> HashMap<u32, Proc> {
         .filter_map(|entry| {
             let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
             let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
-            // `pid (comm) state ppid ...`; comm can contain spaces and parentheses, so read around the last `)`.
-            let (head, rest) = stat.rsplit_once(')')?;
-            let comm = head.split_once('(')?.1.to_owned();
-            let ppid = rest.split_whitespace().nth(1)?.parse().ok()?;
-            Some((pid, Proc { ppid, comm }))
+            // `pid (comm) state ppid ... starttime ...`; comm can contain spaces and parentheses, so read after the
+            // last `)`, where the state is field 3 of proc(5)'s numbering and the start time field 22.
+            let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+            let ppid = fields.get(1)?.parse().ok()?;
+            let start = fields.get(19)?.parse().ok()?;
+            Some((pid, Proc { ppid, start }))
         })
         .collect()
 }
@@ -88,14 +112,19 @@ fn output_tail(root: &Path, pid: u32) -> Option<String> {
     (!tail.trim().is_empty()).then_some(tail)
 }
 
-/// The commands still running under the agent, read from `/proc`.
-pub fn running(agent: u32) -> Vec<RunningProcess> {
-    running_in(Path::new("/proc"), agent)
+/// How many commands are running under the agent.
+pub fn count(agent: u32, helpers: &Helpers) -> usize {
+    commands(&read_procs(Path::new("/proc")), agent, helpers).len()
 }
 
-fn running_in(root: &Path, agent: u32) -> Vec<RunningProcess> {
+/// The commands still running under the agent, read from `/proc`.
+pub fn running(agent: u32, helpers: &Helpers) -> Vec<RunningProcess> {
+    running_in(Path::new("/proc"), agent, helpers)
+}
+
+fn running_in(root: &Path, agent: u32, helpers: &Helpers) -> Vec<RunningProcess> {
     let procs = read_procs(root);
-    commands(&procs, agent)
+    commands(&procs, agent, helpers)
         .into_iter()
         .filter_map(|pid| {
             let cmdline = std::fs::read(root.join(pid.to_string()).join("cmdline")).ok()?;
@@ -119,15 +148,22 @@ mod tests {
 
     use super::*;
 
-    fn procs(table: &[(u32, u32, &str)]) -> HashMap<u32, Proc> {
+    /// A stat line for a process started `start` ticks after boot.
+    fn stat(pid: u32, comm: &str, ppid: u32, start: u64) -> String {
+        format!(
+            "{pid} ({comm}) S {ppid} {pid} {pid} 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {start} 0 0"
+        )
+    }
+
+    fn procs(table: &[(u32, u32, u64)]) -> HashMap<u32, Proc> {
         table
             .iter()
-            .map(|(pid, ppid, comm)| {
+            .map(|(pid, ppid, start)| {
                 (
                     *pid,
                     Proc {
                         ppid: *ppid,
-                        comm: (*comm).to_owned(),
+                        start: *start,
                     },
                 )
             })
@@ -135,25 +171,31 @@ mod tests {
     }
 
     #[test]
-    fn each_command_under_the_agent_counts_once() {
-        // supervisor 1 > agent 10 > claude 11 > bash 20 (a background build) > cargo 21 > bash 22 (a build script)
-        //                                     > bash 30 (a dev server) > node 31
-        //                         > mcp server 40, not a command.
+    fn everything_but_the_helpers_under_the_agent_is_a_command_counted_once() {
+        // supervisor 1 > agent 10 > claude 11 and an MCP server 40, its helpers when its session came up
+        //   claude 11 > bash 20 (a background build) > cargo 21 > bash 22 (a build script)
+        //             > sleep 30, a command whose shell exec'd it, started moments after the agent
         // bash 50 elsewhere in the pod isn't the agent's.
         let table = procs(&[
-            (1, 0, "sloppod-supervi"),
-            (10, 1, "node"),
-            (11, 10, "claude"),
-            (20, 11, "bash"),
-            (21, 20, "cargo"),
-            (22, 21, "bash"),
-            (30, 11, "bash"),
-            (31, 30, "node"),
-            (40, 10, "node"),
-            (50, 1, "bash"),
+            (1, 0, 10),
+            (10, 1, 100),
+            (11, 10, 150),
+            (40, 10, 300),
+            (20, 11, 5_000),
+            (21, 20, 5_001),
+            (22, 21, 5_002),
+            (30, 11, 160),
+            (50, 1, 9_000),
         ]);
-        assert_eq!(commands(&table, 10), [20, 30]);
-        assert!(commands(&procs(&[(10, 1, "node"), (11, 10, "claude")]), 10).is_empty());
+        let helpers: Helpers = [(11, 150), (40, 300)].into();
+        assert_eq!(commands(&table, 10, &helpers), [20, 30]);
+        assert!(
+            commands(&table, 999, &helpers).is_empty(),
+            "no agent, no commands"
+        );
+        // A helper's pid reused by a command later is a command.
+        let reused = procs(&[(10, 1, 100), (11, 10, 150), (40, 10, 7_000)]);
+        assert_eq!(commands(&reused, 10, &helpers), [40]);
     }
 
     #[test]
@@ -166,14 +208,18 @@ mod tests {
             std::fs::write(dir.join("stat"), stat).unwrap();
             std::fs::write(dir.join("cmdline"), cmdline).unwrap();
         };
-        proc(10, "10 (node) S 1 10", b"node\0agent\0");
-        proc(20, "20 (bash) S 10 20", b"/bin/bash\0-c\0cargo test 2>&1\0");
+        proc(10, &stat(10, "node", 1, 100), b"node\0agent\0");
+        proc(
+            20,
+            &stat(20, "bash (a) b)", 10, 5_000),
+            b"/bin/bash\0-c\0cargo test 2>&1\0",
+        );
         let output = root.join("task.output");
         let lines: Vec<String> = (1..=30).map(|n| format!("line {n}")).collect();
         std::fs::write(&output, lines.join("\n")).unwrap();
         std::os::unix::fs::symlink(&output, root.join("20/fd/1")).unwrap();
 
-        let running = running_in(&root, 10);
+        let running = running_in(&root, 10, &Helpers::new());
         assert_eq!(running.len(), 1);
         // A huge output file is only read at its end.
         let huge = root.join("huge.output");
@@ -194,7 +240,7 @@ mod tests {
         );
         std::fs::remove_file(root.join("20/fd/1")).unwrap();
         std::os::unix::fs::symlink(&output, root.join("20/fd/1")).unwrap();
-        let running = running_in(&root, 10);
+        let running = running_in(&root, 10, &Helpers::new());
         assert_eq!(running[0].command, "/bin/bash -c cargo test 2>&1");
         let tail = running[0].output_tail.as_deref().unwrap();
         assert!(tail.starts_with("line 11\n") && tail.ends_with("line 30"));
