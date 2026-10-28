@@ -95,7 +95,7 @@ fn bad_request(message: impl Into<String>) -> ApiError {
 type ApiResult<T> = Result<T, ApiError>;
 
 async fn me(State(state): State<AppState>, User(user): User) -> impl IntoResponse {
-    Json(json!({"user": user, "build": state.config.build}))
+    Json(json!({"user": user, "version": state.config.version, "build": state.config.build}))
 }
 
 /// The models the agent offered, from a `configOptions` list; options may be grouped.
