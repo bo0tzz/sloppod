@@ -523,6 +523,61 @@ async fn a_busy_session_keeps_its_pod() {
 }
 
 #[tokio::test]
+async fn a_command_run_in_the_pod_gets_its_own_result() {
+    let mut h = Harness::ready().await;
+    let run = |input: &str| {
+        let (agent, input) = (h.agent.clone(), input.to_owned());
+        tokio::spawn(async move {
+            agent
+                .run(
+                    vec!["judge".into()],
+                    Vec::new(),
+                    input,
+                    Duration::from_secs(5),
+                )
+                .await
+        })
+    };
+    let (first, second) = (run("one"), run("two"));
+    let mut ids = Vec::new();
+    while ids.len() < 2 {
+        if let ToSupervisor::Run { id, input, .. } = h.to_agent.recv().await.unwrap() {
+            ids.push((id, input));
+        }
+    }
+    ids.sort_by_key(|(_, input)| input.clone());
+    // Answered out of order, each gets its own.
+    h.agent.run_result(ids[1].0, None, Some("failed".into()));
+    h.agent.run_result(ids[0].0, Some("ok".into()), None);
+    assert_eq!(first.await.unwrap(), Ok("ok".into()));
+    assert_eq!(second.await.unwrap(), Err("failed".into()));
+
+    // A link that goes fails what's still waiting, and what's run after it.
+    let pending = run("three");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    h.agent.close();
+    assert!(pending.await.unwrap().is_err());
+    assert!(run("four").await.unwrap().is_err());
+
+    // So does a run whose request can't be sent.
+    let (tx, rx) = mpsc::unbounded_channel();
+    drop(rx);
+    let unsent = AgentConn::new(tx);
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        unsent.run(
+            vec!["judge".into()],
+            Vec::new(),
+            String::new(),
+            Duration::from_secs(5),
+        ),
+    )
+    .await
+    .expect("a run whose request couldn't be sent waited");
+    assert!(result.is_err());
+}
+
+#[tokio::test]
 async fn a_notice_waits_for_the_agent_to_be_up() {
     let mut h = Harness::starting().await;
     h.hub

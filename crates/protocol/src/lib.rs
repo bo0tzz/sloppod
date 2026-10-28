@@ -402,6 +402,16 @@ pub mod link {
             message: Value,
         },
         SyncTranscript,
+        /// Runs a command in the pod apart from the agent, in its working directory and environment with `env`
+        /// changed, with `input` on its standard input: e.g. a judgement (ADR 26). Answered with `RunResult`.
+        Run {
+            id: u64,
+            command: Vec<String>,
+            #[serde(default)]
+            env: Vec<(String, String)>,
+            input: String,
+            timeout_secs: u64,
+        },
         /// The runtime's copy of a transcript file doesn't match; send all of it.
         ResyncTranscript {
             name: String,
@@ -454,6 +464,14 @@ pub mod link {
         /// How many of the agent's commands are running, foreground or in the background; sent when it changes.
         Commands {
             running: usize,
+        },
+        /// What a `Run` printed, or why it failed (it couldn't start, timed out, or exited unsuccessfully).
+        RunResult {
+            id: u64,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            output: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            error: Option<String>,
         },
         /// The pod is being terminated, and these of the agent's commands were still running; ending the pod ends
         /// them (ADR 10, 17).
