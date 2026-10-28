@@ -40,6 +40,47 @@ pub(crate) struct Queued {
     pub(crate) reply: Option<oneshot::Sender<Result<Value, RpcError>>>,
 }
 
+/// How a queued prompt is kept in the store.
+fn stored(q: &Queued) -> Value {
+    json!({"id": q.id, "blocks": q.blocks})
+}
+
+/// A queued prompt from how it's kept in the store.
+fn unstored(q: &Value) -> Queued {
+    Queued {
+        id: q["id"].as_str().and_then(|s| s.parse().ok()),
+        blocks: q["blocks"].as_array().cloned().unwrap_or_default(),
+        reply: None,
+    }
+}
+
+/// A notice, as a prompt of its own.
+fn notice_queued(text: &str) -> Queued {
+    Queued {
+        id: None,
+        blocks: vec![json!({"type": "text", "text": text})],
+        reply: None,
+    }
+}
+
+/// A batch of prompts on its way to the agent.
+struct Held {
+    key: Uuid,
+    /// The request carrying it, once sent. After a restart, a held batch whose request the supervisor still has open
+    /// reached the agent; any other is sent again.
+    request: Option<i64>,
+    /// Left by the runtime before a restart, waiting to learn whether it reached the agent.
+    restored: bool,
+    stored: Vec<Value>,
+}
+
+/// How a notice gets to the agent.
+enum Delivery {
+    Queued,
+    Turn(Option<Arc<AgentConn>>, Queued, Option<Uuid>),
+    Steer(Option<Uuid>),
+}
+
 struct Permission {
     method: String,
     params: Value,
@@ -78,6 +119,9 @@ struct LiveState {
     permissions: HashMap<u64, Permission>,
     next_permission: u64,
     queue: Vec<Queued>,
+    /// Prompts taken from the queue, and notices, on their way to the agent: kept in the stored queue until the
+    /// request carrying them is answered, so a restart before then doesn't lose them (#237).
+    in_flight: Vec<Held>,
     /// For an agent a runtime restart cut off, if it has to be launched again rather than attached to.
     restart_notice: Option<String>,
     /// The session was stopped: nothing queued for it runs any more.
@@ -107,7 +151,7 @@ enum Start {
     /// The session was stopped: its callers get an error.
     Stopped(Vec<Queued>),
     /// Back in the queue, and run on a newer agent that was up and idle.
-    Requeued(Option<(Arc<AgentConn>, Vec<Queued>)>),
+    Requeued(Option<(Arc<AgentConn>, Vec<Queued>, Option<Uuid>)>),
     /// The first message couldn't be marked as taken, so running it could run it twice: nothing runs, its callers
     /// get an error, and the first message stays stored for the agent's next start.
     Failed(Vec<Queued>),
@@ -338,12 +382,32 @@ impl Hub {
         if self.agent_capabilities().is_none() {
             self.set_agent_capabilities(running.ready.capabilities);
         }
+        // What a restart left on its way to the agent: a turn the agent has open has it, a steer it has open waits
+        // for its answer, and the rest is sent again.
+        let open: Vec<(i64, bool)> = running
+            .open
+            .iter()
+            .filter_map(|r| Some((r["id"].as_i64()?, r["method"] == "_session/steering")))
+            .collect();
+        {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            self.settle_restored(id, &mut state, &open).await;
+        }
         let mut turn = None;
         for request in &running.open {
             if let Some(request_id) = request["id"].as_i64() {
                 let reply = agent.adopt(request_id);
                 if request["method"] == "session/prompt" {
                     turn = Some(reply);
+                } else if request["method"] == "_session/steering" {
+                    let hub = self.clone();
+                    tokio::spawn(async move {
+                        let answer = reply.await.unwrap_or_else(|_| {
+                            Err(RpcError::new(-32002, "the session's agent disconnected"))
+                        });
+                        hub.steer_answered(id, request_id, answer).await;
+                    });
                 }
             }
         }
@@ -424,19 +488,24 @@ impl Hub {
             state.agent_session_id = Some(agent_session_id);
             state.agent_state = agent_state;
             state.loading = false;
+            self.settle_restored(id, &mut state, &[]).await;
             let queued = std::mem::take(&mut state.queue);
-            self.save_queue(id, &state.queue).await;
+            let held = self.hold(id, &mut state, &queued).await;
             if pending.is_some() || !queued.is_empty() {
                 state.turn_running = true;
             } else {
                 self.set_phase(id, Phase::Idle).await;
             }
-            queued
+            (queued, held)
         };
+        let (queued, held) = queued;
         if pending.is_none() && queued.is_empty() {
             return;
         }
-        tokio::spawn(self.clone().run_queued(id, agent.clone(), pending, queued));
+        tokio::spawn(
+            self.clone()
+                .run_queued(id, agent.clone(), pending, queued, held),
+        );
     }
 
     /// Runs queued prompts (and a prompt the agent was holding, if any) as one turn, and answers each prompt
@@ -447,6 +516,7 @@ impl Hub {
         taken_for: Arc<AgentConn>,
         pending: Option<String>,
         queued: Vec<Queued>,
+        held: Option<Uuid>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         Box::pin(async move {
             for q in queued.iter().filter(|q| q.id.is_some()) {
@@ -482,13 +552,17 @@ impl Hub {
                             }
                             Err(e) => {
                                 tracing::error!(session = %id, error = %e, "clearing the first message");
+                                self.release(id, &mut state, held).await;
                                 state.turn_running = false;
                                 self.set_phase(id, Phase::Idle).await;
                                 Start::Failed(queued)
                             }
                         }
                     }
-                    _ if state.stopped => Start::Stopped(queued),
+                    _ if state.stopped => {
+                        self.release(id, &mut state, held).await;
+                        Start::Stopped(queued)
+                    }
                     _ => {
                         // Taken for an agent that's gone: everything goes back, ahead of what's queued since,
                         // recorded already so not shown as waiting behind a turn. A newer agent that's up and idle
@@ -497,7 +571,8 @@ impl Hub {
                         let requeued = queued.into_iter().map(|q| Queued { id: None, ..q });
                         let rest = std::mem::take(&mut state.queue);
                         state.queue = requeued.chain(rest).collect();
-                        self.save_queue(id, &state.queue).await;
+                        self.release(id, &mut state, held).await;
+                        self.save_queue(id, &state).await;
                         let idle = state.agent_session_id.is_some()
                             && !state.turn_running
                             && !state.queue.is_empty();
@@ -505,8 +580,8 @@ impl Hub {
                             (Some(agent), true) => {
                                 state.turn_running = true;
                                 let taken = std::mem::take(&mut state.queue);
-                                self.save_queue(id, &state.queue).await;
-                                Start::Requeued(Some((agent, taken)))
+                                let held = self.hold(id, &mut state, &taken).await;
+                                Start::Requeued(Some((agent, taken, held)))
                             }
                             _ => Start::Requeued(None),
                         }
@@ -531,14 +606,16 @@ impl Hub {
                     return;
                 }
                 Start::Requeued(next) => {
-                    if let Some((agent, queued)) = next {
-                        tokio::spawn(self.clone().run_queued(id, agent, None, queued));
+                    if let Some((agent, queued, held)) = next {
+                        tokio::spawn(self.clone().run_queued(id, agent, None, queued, held));
                     }
                     return;
                 }
             };
             let agent = taken_for;
-            let result = self.turn_on(id, &agent, &agent_session_id, blocks).await;
+            let result = self
+                .turn_on(id, &agent, &agent_session_id, blocks, held)
+                .await;
             if let Err(e) = &result {
                 tracing::warn!(session = %id, error = %e, "queued prompt failed");
             }
@@ -550,13 +627,153 @@ impl Hub {
 
     /// Keeps the session's queue in the store as it is now, so a restart doesn't lose it (#39). Called under the
     /// session's state lock, right after the queue changes.
-    async fn save_queue(&self, id: Uuid, queue: &[Queued]) {
-        let stored: Vec<Value> = queue
+    async fn save_queue(&self, id: Uuid, state: &LiveState) {
+        let stored: Vec<Value> = state
+            .in_flight
             .iter()
-            .map(|q| json!({"id": q.id, "blocks": q.blocks}))
+            .flat_map(|held| {
+                held.stored.iter().map(|q| {
+                    let mut q = q.clone();
+                    q["held"] = json!({"batch": held.key, "request": held.request});
+                    q
+                })
+            })
+            .chain(state.queue.iter().map(stored))
             .collect();
         if let Err(e) = self.store.save_queue(id, &stored).await {
             tracing::warn!(session = %id, error = %e, "keeping the session's queue");
+        }
+    }
+
+    /// Keeps `batch` in the stored queue while it's on its way to the agent; under the state lock.
+    async fn hold(&self, id: Uuid, state: &mut LiveState, batch: &[Queued]) -> Option<Uuid> {
+        if batch.is_empty() {
+            return None;
+        }
+        let key = Uuid::new_v4();
+        state.in_flight.push(Held {
+            key,
+            request: None,
+            restored: false,
+            stored: batch.iter().map(stored).collect(),
+        });
+        self.save_queue(id, state).await;
+        Some(key)
+    }
+
+    /// A held batch was sent as `request`.
+    async fn sent(&self, id: Uuid, key: Option<Uuid>, request: i64) {
+        let Some(key) = key else {
+            return;
+        };
+        let live = self.live(id);
+        let mut state = live.state.lock().await;
+        if let Some(held) = state.in_flight.iter_mut().find(|h| h.key == key) {
+            held.request = Some(request);
+            self.save_queue(id, &state).await;
+        }
+    }
+
+    /// Held batches a restart left, once the agent's open requests are known (`(id, whether it's a steer)`): a turn
+    /// the agent has open has its batch; a steer it has open stays held until it's answered, as it may yet be
+    /// refused; the rest go back to the front of the queue. Under the state lock.
+    async fn settle_restored(&self, id: Uuid, state: &mut LiveState, open: &[(i64, bool)]) {
+        if !state.in_flight.iter().any(|h| h.restored) {
+            return;
+        }
+        let (restored, current): (Vec<Held>, Vec<Held>) = std::mem::take(&mut state.in_flight)
+            .into_iter()
+            .partition(|h| h.restored);
+        state.in_flight = current;
+        let open_as = |held: &Held| {
+            held.request
+                .and_then(|r| open.iter().find(|(o, _)| *o == r).map(|(_, steer)| *steer))
+        };
+        let (open_steers, rest): (Vec<Held>, Vec<Held>) =
+            restored.into_iter().partition(|h| open_as(h) == Some(true));
+        state
+            .in_flight
+            .extend(open_steers.into_iter().map(|h| Held {
+                restored: false,
+                ..h
+            }));
+        let resent = rest
+            .into_iter()
+            .filter(|h| open_as(h).is_none())
+            .flat_map(|h| h.stored)
+            .map(|q| unstored(&q));
+        let since = std::mem::take(&mut state.queue);
+        state.queue = resent.chain(since).collect();
+        self.save_queue(id, state).await;
+    }
+
+    /// A held batch reached the agent, or went back to the queue; under the state lock.
+    async fn release(&self, id: Uuid, state: &mut LiveState, key: Option<Uuid>) {
+        let Some(key) = key else {
+            return;
+        };
+        let before = state.in_flight.len();
+        state.in_flight.retain(|h| h.key != key);
+        if state.in_flight.len() != before {
+            self.save_queue(id, state).await;
+        }
+    }
+
+    /// A held notice that couldn't be delivered goes back to the queue, and runs now if the agent is idle, e.g.
+    /// because the turn it was steered into ended meanwhile.
+    async fn requeue_held(self: &Arc<Self>, id: Uuid, key: Uuid) {
+        let next = {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            let Some(held) = state.in_flight.iter().find(|h| h.key == key) else {
+                return;
+            };
+            let back: Vec<Queued> = held.stored.iter().map(unstored).collect();
+            state.queue.extend(back);
+            self.release(id, &mut state, Some(key)).await;
+            let idle = state.agent_session_id.is_some() && !state.turn_running && !state.stopped;
+            match (state.agent.clone(), idle) {
+                (Some(agent), true) => {
+                    state.turn_running = true;
+                    let queued = std::mem::take(&mut state.queue);
+                    let held = self.hold(id, &mut state, &queued).await;
+                    Some((agent, queued, held))
+                }
+                _ => None,
+            }
+        };
+        if let Some((agent, queued, held)) = next {
+            tokio::spawn(self.clone().run_queued(id, agent, None, queued, held));
+        }
+    }
+
+    /// The answer to a steer a restart left open: taken, it's let go; refused or failed, it goes back to the queue,
+    /// as a live steer's would.
+    async fn steer_answered(
+        self: &Arc<Self>,
+        id: Uuid,
+        request: i64,
+        answer: Result<Value, RpcError>,
+    ) {
+        let key = {
+            let live = self.live(id);
+            let state = live.state.lock().await;
+            state
+                .in_flight
+                .iter()
+                .find(|h| h.request == Some(request))
+                .map(|h| h.key)
+        };
+        let Some(key) = key else {
+            return;
+        };
+        match answer {
+            Ok(result) if result["outcome"] != "promptRequired" => {
+                let live = self.live(id);
+                let mut state = live.state.lock().await;
+                self.release(id, &mut state, Some(key)).await;
+            }
+            _ => self.requeue_held(id, key).await,
         }
     }
 
@@ -572,15 +789,33 @@ impl Hub {
             }
         };
         for (id, stored) in queues {
-            let restored: Vec<Queued> = stored
-                .into_iter()
-                .map(|q| Queued {
-                    id: q["id"].as_str().and_then(|s| s.parse().ok()),
-                    blocks: q["blocks"].as_array().cloned().unwrap_or_default(),
-                    reply: None,
-                })
-                .collect();
-            if restored.is_empty() {
+            // What was on its way to the agent waits, held, until its agent says what it has.
+            let mut held: Vec<Held> = Vec::new();
+            let mut restored: Vec<Queued> = Vec::new();
+            for q in stored {
+                if q["held"].is_object() {
+                    let key = q["held"]["batch"]
+                        .as_str()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or_default();
+                    let mut entry = q.clone();
+                    if let Some(entry) = entry.as_object_mut() {
+                        entry.remove("held");
+                    }
+                    match held.iter_mut().find(|h| h.key == key) {
+                        Some(batch) => batch.stored.push(entry),
+                        None => held.push(Held {
+                            key,
+                            request: q["held"]["request"].as_i64(),
+                            restored: true,
+                            stored: vec![entry],
+                        }),
+                    }
+                } else {
+                    restored.push(unstored(&q));
+                }
+            }
+            if restored.is_empty() && held.is_empty() {
                 continue;
             }
             {
@@ -588,7 +823,8 @@ impl Hub {
                 let mut state = live.state.lock().await;
                 let since = std::mem::take(&mut state.queue);
                 state.queue = restored.into_iter().chain(since).collect();
-                self.save_queue(id, &state.queue).await;
+                state.in_flight.extend(held);
+                self.save_queue(id, &state).await;
             }
             self.broadcast_queue(id).await;
             if let Err(e) = self.wake_for_message(id).await {
@@ -853,7 +1089,7 @@ impl Hub {
                     blocks: blocks.clone(),
                     reply: Some(reply),
                 });
-                self.save_queue(id, &state.queue).await;
+                self.save_queue(id, &state).await;
                 (Some(receiver), agent_up)
             }
         };
@@ -886,7 +1122,8 @@ impl Hub {
                 "the session's agent isn't running yet; try again shortly",
             ));
         };
-        self.turn_on(id, &agent, &agent_session_id, blocks).await
+        self.turn_on(id, &agent, &agent_session_id, blocks, None)
+            .await
     }
 
     /// Marks a turn working on the session's current agent, which it returns; `None` if there isn't one up.
@@ -905,19 +1142,26 @@ impl Hub {
         Some(started)
     }
 
+    /// Runs a turn on `agent`; `held`, what it carries, stays kept until the agent answers.
     async fn turn_on(
         self: &Arc<Self>,
         id: Uuid,
         agent: &Arc<AgentConn>,
         agent_session_id: &str,
         blocks: Vec<Value>,
+        held: Option<Uuid>,
     ) -> Result<Value, RpcError> {
-        let result = agent
-            .request(
-                "session/prompt",
-                json!({"sessionId": agent_session_id, "prompt": blocks}),
-            )
-            .await;
+        let (request, answer) = agent.send_request(
+            "session/prompt",
+            json!({"sessionId": agent_session_id, "prompt": blocks}),
+        );
+        self.sent(id, held, request).await;
+        let result = answer.await;
+        {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            self.release(id, &mut state, held).await;
+        }
         self.turn_finished(id, result.as_ref().err().map(|e| e.message.clone()))
             .await;
         self.end_turn(id, agent).await;
@@ -937,18 +1181,22 @@ impl Hub {
             let agent_up = state.agent_session_id.is_some();
             state.turn_running = agent_up && !state.queue.is_empty();
             let next = state.turn_running.then(|| std::mem::take(&mut state.queue));
-            if next.is_some() {
-                self.save_queue(id, &state.queue).await;
-            }
+            let held = match &next {
+                Some(queued) => self.hold(id, &mut state, queued).await,
+                None => None,
+            };
             if next.is_none() && agent_up {
                 self.set_phase(id, Phase::Idle).await;
             }
-            next
+            next.map(|queued| (queued, held))
         };
         agent.sync_transcript();
-        if let Some(queued) = next {
+        if let Some((queued, held)) = next {
             self.broadcast_queue(id).await;
-            tokio::spawn(self.clone().run_queued(id, agent.clone(), None, queued));
+            tokio::spawn(
+                self.clone()
+                    .run_queued(id, agent.clone(), None, queued, held),
+            );
         }
     }
 
@@ -971,13 +1219,13 @@ impl Hub {
                 .position(|q| q.id == Some(qid))
                 .ok_or_else(|| RpcError::new(-32002, "that message isn't queued any more"))?;
             let queued = state.queue.remove(index);
-            self.save_queue(id, &state.queue).await;
+            self.save_queue(id, &state).await;
             queued
         };
         self.broadcast_queue(id).await;
         self.record_user_message(id, &json!(queued.blocks), true, queued.id)
             .await;
-        let result = self.steer_in(id, queued.blocks).await;
+        let result = self.steer_in(id, queued.blocks, None).await;
         if let Some(reply) = queued.reply {
             let _ = reply.send(result.clone());
         }
@@ -1012,8 +1260,8 @@ impl Hub {
         turns_ended: Option<u64>,
         text: String,
     ) -> bool {
-        let blocks = vec![json!({"type": "text", "text": text})];
-        {
+        let notice = notice_queued(&text);
+        let (agent, held) = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
             let up = state.agent.is_some() && state.agent_session_id.is_some();
@@ -1021,94 +1269,105 @@ impl Hub {
                 return false;
             }
             state.turn_running = true;
+            let held = self
+                .hold(id, &mut state, std::slice::from_ref(&notice))
+                .await;
+            (state.agent.clone(), held)
+        };
+        self.record_notice(id, &notice.blocks[0]).await;
+        if let Some(agent) = agent {
+            tokio::spawn(self.clone().run_queued(id, agent, None, vec![notice], held));
         }
-        self.record(
-            id,
-            json!({
-                "sessionUpdate": "user_message_chunk",
-                "messageId": Uuid::new_v4(),
-                "content": blocks[0],
-                "_meta": {"sloppod": {"notice": true}},
-            }),
-        )
-        .await;
-        let hub = self.clone();
-        tokio::spawn(async move {
-            if let Err(e) = hub.run_turn(id, blocks).await {
-                tracing::warn!(session = %id, error = %e, "notice turn failed");
-            }
-        });
         true
     }
 
+    /// Tells the agent something: a new turn when it's idle, steered into the running one, or queued until it's
+    /// up. Kept in the stored queue until it reaches the agent, so a restart doesn't lose it (#237).
     pub async fn notify(self: &Arc<Self>, id: Uuid, text: String) {
-        let blocks = vec![json!({"type": "text", "text": text})];
+        let notice = notice_queued(&text);
+        let blocks = notice.blocks.clone();
         let delivery = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
             if state.agent.is_none() || state.agent_session_id.is_none() {
-                state.queue.push(Queued {
-                    id: None,
-                    blocks: blocks.clone(),
-                    reply: None,
-                });
-                self.save_queue(id, &state.queue).await;
-                None
+                state.queue.push(notice);
+                self.save_queue(id, &state).await;
+                Delivery::Queued
             } else if state.turn_running {
-                Some(false)
+                let held = self
+                    .hold(id, &mut state, std::slice::from_ref(&notice))
+                    .await;
+                Delivery::Steer(held)
             } else {
                 state.turn_running = true;
-                Some(true)
+                let held = self
+                    .hold(id, &mut state, std::slice::from_ref(&notice))
+                    .await;
+                Delivery::Turn(state.agent.clone(), notice, held)
             }
         };
-        self.record(
-            id,
-            json!({
-                "sessionUpdate": "user_message_chunk",
-                "messageId": Uuid::new_v4(),
-                "content": blocks[0],
-                "_meta": {"sloppod": {"notice": true}},
-            }),
-        )
-        .await;
+        self.record_notice(id, &blocks[0]).await;
         match delivery {
-            None => {}
-            Some(true) => {
-                let hub = self.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = hub.run_turn(id, blocks).await {
-                        tracing::warn!(session = %id, error = %e, "notice turn failed");
-                    }
-                });
+            Delivery::Queued => {}
+            Delivery::Turn(agent, notice, held) => {
+                if let Some(agent) = agent {
+                    tokio::spawn(self.clone().run_queued(id, agent, None, vec![notice], held));
+                }
             }
-            Some(false) => {
+            Delivery::Steer(held) => {
                 let hub = self.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = hub.steer_in(id, blocks).await {
+                    if let Err(e) = hub.steer_in(id, blocks.clone(), held).await {
                         tracing::warn!(session = %id, error = %e, "steering a notice in");
+                        if let Some(key) = held {
+                            hub.requeue_held(id, key).await;
+                        }
                     }
                 });
             }
         }
     }
 
+    /// Shows a notice in the session's log as a message to the agent.
+    async fn record_notice(&self, id: Uuid, block: &Value) {
+        self.record(
+            id,
+            json!({
+                "sessionUpdate": "user_message_chunk",
+                "messageId": Uuid::new_v4(),
+                "content": block,
+                "_meta": {"sloppod": {"notice": true}},
+            }),
+        )
+        .await;
+    }
+
     /// Steers blocks into the running turn. If that turn has just ended they start a new one here, so the turn
-    /// is tracked like any other rather than run detached by the adapter.
-    async fn steer_in(self: &Arc<Self>, id: Uuid, blocks: Vec<Value>) -> Result<Value, RpcError> {
+    /// is tracked like any other rather than run detached by the adapter. `held` is released once they reach the
+    /// agent.
+    async fn steer_in(
+        self: &Arc<Self>,
+        id: Uuid,
+        blocks: Vec<Value>,
+        held: Option<Uuid>,
+    ) -> Result<Value, RpcError> {
         for _ in 0..10 {
             self.after_compaction(id).await;
             let (agent, agent_session_id) = self.agent_for(id).await?;
-            let result = agent
-                .request(
-                    "_session/steering",
-                    json!({
-                        "sessionId": agent_session_id,
-                        "prompt": blocks,
-                        "_meta": {"steering": {"idleBehavior": "promptRequired"}},
-                    }),
-                )
-                .await?;
+            let (request, answer) = agent.send_request(
+                "_session/steering",
+                json!({
+                    "sessionId": agent_session_id,
+                    "prompt": blocks,
+                    "_meta": {"steering": {"idleBehavior": "promptRequired"}},
+                }),
+            );
+            self.sent(id, held, request).await;
+            let result = answer.await?;
             if result["outcome"] != "promptRequired" {
+                let live = self.live(id);
+                let mut state = live.state.lock().await;
+                self.release(id, &mut state, held).await;
                 return Ok(result);
             }
             let start = {
@@ -1117,12 +1376,12 @@ impl Hub {
                 !std::mem::replace(&mut state.turn_running, true)
             };
             if start {
-                let hub = self.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = hub.run_turn(id, blocks).await {
-                        tracing::warn!(session = %id, error = %e, "steered turn failed");
-                    }
-                });
+                let queued = vec![Queued {
+                    id: None,
+                    blocks,
+                    reply: None,
+                }];
+                tokio::spawn(self.clone().run_queued(id, agent, None, queued, held));
                 return Ok(json!({"outcome": "startedNewTurn"}));
             }
             // Our record of the turn hasn't caught up with the agent's yet.
@@ -1160,7 +1419,7 @@ impl Hub {
                     blocks,
                     reply: None,
                 });
-                self.save_queue(id, &state.queue).await;
+                self.save_queue(id, &state).await;
             }
             self.record_user_message(id, &params["prompt"], false, message_id)
                 .await;
@@ -1169,7 +1428,7 @@ impl Hub {
         }
         self.record_user_message(id, &params["prompt"], true, message_id)
             .await;
-        self.steer_in(id, blocks).await
+        self.steer_in(id, blocks, None).await
     }
 
     pub async fn cancel(self: &Arc<Self>, id: Uuid) {
@@ -1410,10 +1669,10 @@ impl Hub {
         match agent.filter(|_| up) {
             Some(agent) if !state.queue.is_empty() => {
                 let queued = std::mem::take(&mut state.queue);
-                self.save_queue(id, &state.queue).await;
+                let held = self.hold(id, &mut state, &queued).await;
                 state.turn_running = true;
                 self.set_phase(id, Phase::Working).await;
-                tokio::spawn(self.clone().run_queued(id, agent, None, queued));
+                tokio::spawn(self.clone().run_queued(id, agent, None, queued, held));
             }
             Some(_) => self.set_phase(id, Phase::Idle).await,
             None => self.set_phase(id, Phase::Disconnected).await,
@@ -1452,7 +1711,8 @@ impl Hub {
             state.stopped = true;
             live.end_compaction(&mut state);
             let queued = std::mem::take(&mut state.queue);
-            self.save_queue(id, &state.queue).await;
+            state.in_flight.clear();
+            self.save_queue(id, &state).await;
             (state.agent.take(), queued)
         };
         for reply in queued.into_iter().filter_map(|q| q.reply) {

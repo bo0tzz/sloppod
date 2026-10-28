@@ -1042,7 +1042,10 @@ async fn a_batch_taken_for_a_replaced_agent_runs_on_the_new_idle_one() {
     let old = h.agent.clone();
     let (new, mut to_new) = replace_agent(&h).await;
     let (queued, reply) = batch("Late");
-    h.hub.clone().run_queued(h.id, old, None, queued).await;
+    h.hub
+        .clone()
+        .run_queued(h.id, old, None, queued, None)
+        .await;
 
     let request = next_prompt(&mut to_new).await;
     assert_eq!(prompt_text(&request), ["Late"]);
@@ -1068,7 +1071,10 @@ async fn a_batch_for_a_replaced_agent_waits_behind_the_new_ones_turn() {
     let busy = next_prompt(&mut to_new).await;
 
     let (queued, reply) = batch("Late");
-    h.hub.clone().run_queued(h.id, old, None, queued).await;
+    h.hub
+        .clone()
+        .run_queued(h.id, old, None, queued, None)
+        .await;
     assert_eq!(h.phase().await, "working");
 
     // Only once the new agent's turn ends does the batch run on it.
@@ -1112,7 +1118,7 @@ async fn a_first_message_taken_for_a_replaced_agent_stays_stored_for_the_next() 
     let (_new, mut to_new) = replace_agent(&h).await;
     h.hub
         .clone()
-        .run_queued(h.id, old, Some("Hello".into()), Vec::new())
+        .run_queued(h.id, old, Some("Hello".into()), Vec::new(), None)
         .await;
     // Not run, not forgotten, and not queued in memory either: the next agent reads it from the store. With
     // nothing else to requeue, the new agent isn't sent an empty turn.
@@ -1200,7 +1206,10 @@ async fn a_batch_that_can_no_longer_start_in_a_stopped_session_fails() {
     let agent = h.agent.clone();
     h.hub.stop(h.id).await;
     let (queued, reply) = batch("Too late");
-    h.hub.clone().run_queued(h.id, agent, None, queued).await;
+    h.hub
+        .clone()
+        .run_queued(h.id, agent, None, queued, None)
+        .await;
     assert!(reply.await.unwrap().is_err());
 }
 
@@ -1247,7 +1256,10 @@ async fn a_queued_message_is_kept_until_its_turn_takes_it() {
     h.respond(&busy, json!({"stopReason": "end_turn"})).await;
     let later = next_prompt(&mut h.to_agent).await;
     assert_eq!(prompt_text(&later), ["Later"]);
-    assert!(h.store.queues().await.unwrap().is_empty());
+    // Kept until the agent answers the turn that took it.
+    assert_eq!(kept_texts(&h).await, ["Later"]);
+    h.respond(&later, json!({"stopReason": "end_turn"})).await;
+    wait_until_nothing_kept(&h).await;
 }
 
 #[tokio::test]
@@ -1265,7 +1277,9 @@ async fn a_queue_kept_before_a_restart_runs_once_the_agent_is_up() {
     h.agent_ready().await;
     let restored = next_prompt(&mut h.to_agent).await;
     assert_eq!(prompt_text(&restored), ["Sent before the restart"]);
-    assert!(h.store.queues().await.unwrap().is_empty());
+    h.respond(&restored, json!({"stopReason": "end_turn"}))
+        .await;
+    wait_until_nothing_kept(&h).await;
 }
 
 #[tokio::test]
@@ -1338,5 +1352,219 @@ async fn every_turn_that_ends_is_counted_with_its_error() {
     assert_eq!(
         h.hub.turns_ended(h.id).await,
         (2, Some("upstream 503".into()))
+    );
+}
+
+/// The texts the store keeps for the session's queue.
+async fn kept_texts(h: &Harness) -> Vec<String> {
+    h.store
+        .queues()
+        .await
+        .unwrap()
+        .into_iter()
+        .flat_map(|(_, messages)| messages)
+        .filter_map(|m| m["blocks"][0]["text"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Waits for the store to keep nothing for the session; a turn lets go of what it carried once its answer is in.
+async fn wait_until_nothing_kept(h: &Harness) {
+    for _ in 0..100 {
+        if h.store.queues().await.unwrap().is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("still kept: {:?}", kept_texts(h).await);
+}
+
+/// A runtime restart: a new hub on the same store, with what it restores.
+async fn restarted(
+    h: &Harness,
+) -> (
+    Arc<Hub>,
+    Arc<AgentConn>,
+    mpsc::UnboundedReceiver<ToSupervisor>,
+) {
+    let hub = Arc::new(Hub::new(h.store.clone()));
+    let (tx, to_agent) = mpsc::unbounded_channel();
+    let agent = Arc::new(AgentConn::new(tx));
+    hub.attach_agent(h.id, agent.clone()).await;
+    hub.restore_queues().await;
+    (hub, agent, to_agent)
+}
+
+/// The agent as it was before the restart, with `open` requests still unanswered.
+fn running(open: Vec<Value>) -> RunningAgent {
+    RunningAgent {
+        ready: AgentReady {
+            agent_session_id: "agent-session".into(),
+            capabilities: json!({}),
+        },
+        open,
+        waiting: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn a_notice_is_kept_until_the_agent_answers_its_turn() {
+    let mut h = Harness::ready().await;
+    h.hub
+        .clone()
+        .notify(h.id, "sloppod: approved.".into())
+        .await;
+    assert_eq!(kept_texts(&h).await, ["sloppod: approved."]);
+    let turn = next_prompt(&mut h.to_agent).await;
+    assert_eq!(prompt_text(&turn), ["sloppod: approved."]);
+    // Sent, but only in the runtime's hands until the agent answers.
+    assert_eq!(kept_texts(&h).await, ["sloppod: approved."]);
+    h.respond(&turn, json!({"stopReason": "end_turn"})).await;
+    wait_until_nothing_kept(&h).await;
+}
+
+#[tokio::test]
+async fn a_notice_a_restart_caught_before_it_was_sent_is_sent_again() {
+    let h = Harness::ready().await;
+    h.hub
+        .clone()
+        .notify(h.id, "sloppod: approved.".into())
+        .await;
+    // The runtime restarts before its turn sends it; the agent comes up anew.
+    let (hub, agent, mut to_agent) = restarted(&h).await;
+    hub.agent_ready(h.id, &agent, "agent-session".into(), json!({}), None)
+        .await;
+    assert_eq!(
+        prompt_text(&next_prompt(&mut to_agent).await),
+        ["sloppod: approved."]
+    );
+}
+
+#[tokio::test]
+async fn a_notice_the_agent_has_isnt_sent_again_after_a_restart() {
+    let mut h = Harness::ready().await;
+    h.hub
+        .clone()
+        .notify(h.id, "sloppod: approved.".into())
+        .await;
+    let turn = next_prompt(&mut h.to_agent).await;
+    // The runtime restarts mid-turn; the agent outlived it and still has the turn open.
+    let (hub, agent, mut to_agent) = restarted(&h).await;
+    hub.adopt_agent(h.id, &agent, running(vec![turn])).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(to_agent.try_recv().is_err(), "not sent twice");
+    assert!(h.store.queues().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_notice_sent_but_never_received_is_sent_again_after_a_restart() {
+    let mut h = Harness::ready().await;
+    h.hub
+        .clone()
+        .notify(h.id, "sloppod: approved.".into())
+        .await;
+    let _lost = next_prompt(&mut h.to_agent).await;
+    // The restart lost it on the way: the supervisor has nothing open.
+    let (hub, agent, mut to_agent) = restarted(&h).await;
+    hub.adopt_agent(h.id, &agent, running(Vec::new())).await;
+    assert_eq!(
+        prompt_text(&next_prompt(&mut to_agent).await),
+        ["sloppod: approved."]
+    );
+}
+
+#[tokio::test]
+async fn a_notice_steered_into_a_turn_is_kept_until_the_agent_takes_it() {
+    let mut h = Harness::ready().await;
+    let turn = h.prompt("Busy");
+    let turn_request = next_prompt(&mut h.to_agent).await;
+    h.hub
+        .clone()
+        .notify(h.id, "sloppod: approved.".into())
+        .await;
+    assert_eq!(kept_texts(&h).await, ["sloppod: approved."]);
+
+    let steering = h.next().await;
+    assert_eq!(steering["method"], "_session/steering");
+    assert_eq!(
+        kept_texts(&h).await,
+        ["sloppod: approved."],
+        "sent, not yet taken"
+    );
+    h.respond(&steering, json!({"outcome": "injected"})).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(h.store.queues().await.unwrap().is_empty());
+
+    h.respond(&turn_request, json!({"stopReason": "end_turn"}))
+        .await;
+    turn.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_notice_whose_steer_failed_after_the_turn_ended_starts_a_turn() {
+    let mut h = Harness::ready().await;
+    let turn = h.prompt("Busy");
+    let turn_request = next_prompt(&mut h.to_agent).await;
+    h.hub
+        .clone()
+        .notify(h.id, "sloppod: approved.".into())
+        .await;
+    let steering = h.next().await;
+    // The turn ends with the steer still open, and then the steer fails.
+    h.respond(&turn_request, json!({"stopReason": "end_turn"}))
+        .await;
+    turn.await.unwrap().unwrap();
+    let failed = json!({"jsonrpc": "2.0", "id": steering["id"], "error": {"code": -32603, "message": "boom"}});
+    from_agent(&h.hub, h.id, &h.agent, failed).await;
+    assert_eq!(
+        prompt_text(&next_prompt(&mut h.to_agent).await),
+        ["sloppod: approved."]
+    );
+}
+
+#[tokio::test]
+async fn a_steer_a_restart_left_open_and_the_agent_then_refuses_still_delivers_its_notice() {
+    let mut h = Harness::ready().await;
+    let _turn = h.prompt("Busy");
+    let turn_request = next_prompt(&mut h.to_agent).await;
+    h.hub
+        .clone()
+        .notify(h.id, "sloppod: approved.".into())
+        .await;
+    let steering = h.next().await;
+    assert_eq!(steering["method"], "_session/steering");
+
+    // The runtime restarts with both open on the agent.
+    let (hub, agent, mut to_agent) = restarted(&h).await;
+    hub.adopt_agent(
+        h.id,
+        &agent,
+        running(vec![turn_request.clone(), steering.clone()]),
+    )
+    .await;
+    assert_eq!(
+        kept_texts(&h).await,
+        ["sloppod: approved."],
+        "held until the steer's answer"
+    );
+
+    // The turn ends first, so the agent refuses the steer: the notice runs as a turn of its own.
+    let answer = |request: &Value, result: Value| json!({"jsonrpc": "2.0", "id": request["id"], "result": result});
+    from_agent(
+        &hub,
+        h.id,
+        &agent,
+        answer(&turn_request, json!({"stopReason": "end_turn"})),
+    )
+    .await;
+    from_agent(
+        &hub,
+        h.id,
+        &agent,
+        answer(&steering, json!({"outcome": "promptRequired"})),
+    )
+    .await;
+    assert_eq!(
+        prompt_text(&next_prompt(&mut to_agent).await),
+        ["sloppod: approved."]
     );
 }
