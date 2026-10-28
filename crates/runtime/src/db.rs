@@ -1130,6 +1130,36 @@ pub async fn set_user_review(db: &PgPool, owner: &str, review: ReviewPolicy) -> 
     .map(|_| ())
 }
 
+/// The user's timezone as an IANA name, e.g. `Europe/Amsterdam`; `None` until they've set one.
+pub async fn user_timezone(db: &PgPool, owner: &str) -> sqlx::Result<Option<String>> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("select timezone from user_settings where owner = $1")
+            .bind(owner)
+            .fetch_optional(db)
+            .await?;
+    Ok(row.and_then(|(timezone,)| timezone))
+}
+
+pub async fn set_user_timezone(db: &PgPool, owner: &str, timezone: &str) -> sqlx::Result<()> {
+    sqlx::query(
+        "insert into user_settings (owner, timezone) values ($1, $2) \
+         on conflict (owner) do update set timezone = excluded.timezone, updated_at = now()",
+    )
+    .bind(owner)
+    .bind(timezone)
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
+/// The user's timezone, or UTC when they have none or it's not one this build knows.
+pub async fn user_zone(db: &PgPool, owner: &str) -> sqlx::Result<chrono_tz::Tz> {
+    Ok(user_timezone(db, owner)
+        .await?
+        .and_then(|name| name.parse().ok())
+        .unwrap_or(chrono_tz::UTC))
+}
+
 pub async fn user_model(db: &PgPool, owner: &str) -> sqlx::Result<Option<String>> {
     let row: Option<(Option<String>,)> =
         sqlx::query_as("select model from user_settings where owner = $1")

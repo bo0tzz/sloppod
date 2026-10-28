@@ -128,7 +128,8 @@ async fn settings(state: &AppState, user: &str) -> ApiResult<serde_json::Value> 
         .map(|s| offered_models(&s))
         .unwrap_or_default();
     let review = db::user_review(&state.db, user).await?;
-    Ok(json!({"model": model, "models": models, "review": review}))
+    let timezone = db::user_timezone(&state.db, user).await?;
+    Ok(json!({"model": model, "models": models, "review": review, "timezone": timezone}))
 }
 
 /// Deserializes a field that's present, so `Option<Option<T>>` tells an absent field from a null one.
@@ -158,6 +159,7 @@ struct SettingsUpdate {
     #[serde(default, deserialize_with = "present")]
     model: Option<Option<String>>,
     review: Option<String>,
+    timezone: Option<String>,
 }
 
 async fn put_settings(
@@ -167,12 +169,24 @@ async fn put_settings(
 ) -> ApiResult<impl IntoResponse> {
     // Checked before anything is written, so a bad field doesn't leave the others half applied.
     let review = update.review.as_deref().map(review_policy).transpose()?;
+    let timezone = update
+        .timezone
+        .as_deref()
+        .map(|name| {
+            name.trim()
+                .parse::<chrono_tz::Tz>()
+                .map_err(|_| bad_request(format!("{name} isn't a timezone, e.g. Europe/Amsterdam")))
+        })
+        .transpose()?;
     if let Some(model) = &update.model {
         let model = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
         db::set_user_model(&state.db, &user, model).await?;
     }
     if let Some(review) = review {
         db::set_user_review(&state.db, &user, review).await?;
+    }
+    if let Some(timezone) = timezone {
+        db::set_user_timezone(&state.db, &user, timezone.name()).await?;
     }
     Ok(Json(settings(&state, &user).await?))
 }
