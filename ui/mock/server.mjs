@@ -945,8 +945,11 @@ function createSession({ prompt, repo, title, parent }) {
 /** Messages queued behind the running turn, `{ id, text, resolve, reject }`; UIs show them and can steer them in. */
 const waitingList = (session) => (session.waiting ??= []);
 
+/** What a waiting message holds: its text, unless a test queued more. */
+const waitingPrompt = ({ text, prompt }) => prompt ?? [{ type: 'text', text }];
+
 function broadcastQueue(session, conns = session.subscribers) {
-  const messages = waitingList(session).map(({ id, text }) => ({ id, prompt: [{ type: 'text', text }] }));
+  const messages = waitingList(session).map((message) => ({ id: message.id, prompt: waitingPrompt(message) }));
   for (const conn of conns ?? []) conn.notify('_sloppod/queue', { sessionId: session.data.id, messages });
 }
 
@@ -1023,6 +1026,19 @@ function handleCall(conn, message) {
     return true;
   };
 
+  /** Takes a message out of the queue behind the running turn, answering with an error if it isn't there. */
+  const takeWaiting = () => {
+    const waiting = waitingList(session);
+    const index = waiting.findIndex((message) => message.id === params.id);
+    if (index < 0) {
+      conn.error(id, -32002, "that message isn't queued any more");
+      return undefined;
+    }
+    const [message] = waiting.splice(index, 1);
+    broadcastQueue(session);
+    return message;
+  };
+
   switch (method) {
     case 'initialize':
       conn.respond(id, {
@@ -1069,6 +1085,11 @@ function handleCall(conn, message) {
     case 'session/prompt': {
       if (!needLoaded()) return;
       const messageId = params._meta?.sloppod?.messageId ?? randomUUID();
+      // Like the runtime: a message taken back out of the queue doesn't run when it's sent again.
+      if (session.removed?.has(messageId)) {
+        conn.respond(id, { stopReason: 'cancelled' });
+        return;
+      }
       // Like the runtime: a message sent again isn't run twice.
       const received = session.log.some(
         (entry) => entry.update.sessionUpdate === 'user_message_chunk' && entry.update.messageId === messageId,
@@ -1128,16 +1149,25 @@ function handleCall(conn, message) {
       if (session) cancelTurn(session);
       return;
 
+    case '_sloppod/remove_queued': {
+      if (!needLoaded()) return;
+      const message = takeWaiting();
+      if (!message) return;
+      (session.removed ??= new Set()).add(message.id);
+      // Tests drop the connection before either answer reaches the UI.
+      if (dropNextRemove) {
+        dropNextRemove = false;
+        conn.ws.terminate();
+      }
+      conn.respond(id, { prompt: waitingPrompt(message) });
+      message.resolve('cancelled');
+      return;
+    }
+
     case '_sloppod/steer_queued': {
       if (!needLoaded()) return;
-      const waiting = waitingList(session);
-      const index = waiting.findIndex((message) => message.id === params.id);
-      if (index < 0) {
-        conn.error(id, -32002, "that message isn't queued any more");
-        return;
-      }
-      const [message] = waiting.splice(index, 1);
-      broadcastQueue(session);
+      const message = takeWaiting();
+      if (!message) return;
       if (session.turn) {
         echoUser(session, message.text, { steering: true });
         session.turn.steers.push({ text: message.text });
@@ -1624,6 +1654,8 @@ async function seed() {
 
 /** Set by `/_mock/drop-next-prompt`: drop the connection the next prompt arrives on, before or after taking it. */
 let dropNextPrompt = null;
+/** Set by `/_mock/drop-next-remove`: drop the connection right after the next queued message is taken back. */
+let dropNextRemove = false;
 /** Set by `/_mock/fail-next-prompt`: refuse the next prompt that isn't dropped, without taking it. */
 let failNextPrompt = false;
 
@@ -1635,9 +1667,25 @@ const server = http.createServer(async (req, res) => {
       failNextPrompt = true;
       return json(res, 200, { failNextPrompt });
     }
+    if (url.pathname === '/_mock/drop-next-remove' && req.method === 'POST') {
+      dropNextRemove = true;
+      return json(res, 200, { dropNextRemove });
+    }
     if (url.pathname === '/_mock/drop-next-prompt' && req.method === 'POST') {
       dropNextPrompt = url.searchParams.get('when') === 'after' ? 'after' : 'before';
       return json(res, 200, { dropNextPrompt });
+    }
+    if (url.pathname === '/_mock/queue-image' && req.method === 'POST') {
+      // A message with an image waiting behind the running turn, as another client could send.
+      const session = sessions.get(url.searchParams.get('session') ?? '');
+      if (!session) return json(res, 404, { error: 'no such session' });
+      const prompt = [
+        { type: 'text', text: 'Look at this' },
+        { type: 'image', mimeType: 'image/png', data: 'iVBORw0KGgo=' },
+      ];
+      waitingList(session).push({ id: randomUUID(), text: 'Look at this', prompt, resolve: () => {}, reject: () => {} });
+      broadcastQueue(session);
+      return json(res, 200, {});
     }
     if (url.pathname === '/_mock/say' && req.method === 'POST') {
       // More output in every session, as if its agent carried on.

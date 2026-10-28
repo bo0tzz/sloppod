@@ -1,9 +1,9 @@
 <script lang="ts">
-  import { Button, Select, toastManager } from '@immich/ui';
-  import { mdiSend, mdiSteering, mdiStop } from '@mdi/js';
+  import { Button, IconButton, Select, toastManager } from '@immich/ui';
+  import { mdiClose, mdiPencilOutline, mdiSend, mdiSteering, mdiStop } from '@mdi/js';
   import { configSelectOptions } from '#lib/presentation.ts';
   import { ConnectionClosedError } from '#lib/acp/connection.ts';
-  import { queuedText, type SessionView } from '#lib/session.svelte.ts';
+  import { queuedText, type QueuedMessage, type SessionView } from '#lib/session.svelte.ts';
   import { loadDraft, saveDraft } from '#lib/drafts.ts';
   import Composer from './Composer.svelte';
 
@@ -18,9 +18,11 @@
   const phase = $derived(view.session?.phase);
   // While the agent is starting or coming back, the runtime queues prompts and runs them as one turn.
   const queued = $derived(phase === 'starting' || phase === 'disconnected');
-  // While a turn runs, sending queues the message for the next turn; each queued message can be steered in.
+  // While a turn runs, sending queues the message for the next turn; each queued message can be steered in,
+  // edited or removed.
   const working = $derived(!queued && view.turnRunning);
   let steeringId = $state<string | null>(null);
+  let removingId = $state<string | null>(null);
 
   const blockedReason = $derived.by(() => {
     if (phase === 'stopped') return 'This session has stopped.';
@@ -50,7 +52,7 @@
     return error instanceof Error ? error.message : String(error);
   }
 
-  /** Puts a message that didn't arrive back in the box, after any draft there. */
+  /** Puts a message back in the box, after any draft there, e.g. one that didn't arrive. */
   function putBack(message: { id: string; text: string }) {
     text = text.trim() ? `${text.trimEnd()}\n\n${message.text}` : message.text;
     dismiss(message.id);
@@ -97,6 +99,30 @@
     } finally {
       steeringId = null;
     }
+  }
+
+  // The box only holds text, so editing a message with anything else in it would lose that.
+  const editable = (message: QueuedMessage) => message.prompt.every((block) => block.type === 'text');
+
+  /** Takes a queued message out of the queue; with `edit`, into the box, after any draft there. */
+  async function unqueue(message: QueuedMessage, edit: boolean) {
+    removingId = message.id;
+    try {
+      const prompt = await view.removeQueued(message.id);
+      if (edit) putBack({ id: message.id, text: queuedText({ id: message.id, prompt }) });
+    } catch (error) {
+      // It may have been taken out before the connection dropped: rather than lose it, it's in the box, and if it
+      // wasn't taken out it shows in the queue again once the session reloads.
+      if (edit && error instanceof ConnectionClosedError) putBack({ id: message.id, text: queuedText(message) });
+      else toastManager.danger({ title: "Couldn't take the message back", description: errorMessage(error) });
+    } finally {
+      removingId = null;
+    }
+  }
+
+  function editLastQueued() {
+    const last = view.queue.at(-1);
+    if (last && editable(last) && removingId === null) unqueue(last, true);
   }
 
   // Esc stops the turn like the Stop button, unless an open dialog, menu or list is the one it should close.
@@ -170,6 +196,30 @@
               Steer
             </Button>
           {/if}
+          {#if editable(message)}
+            <Button
+              size="tiny"
+              shape="round"
+              variant="outline"
+              leadingIcon={mdiPencilOutline}
+              title="Edit (↑ in an empty box edits the last one)"
+              disabled={removingId !== null}
+              onclick={() => unqueue(message, true)}
+            >
+              Edit
+            </Button>
+          {/if}
+          <IconButton
+            size="tiny"
+            shape="round"
+            variant="ghost"
+            color="secondary"
+            icon={mdiClose}
+            aria-label="Remove"
+            loading={removingId === message.id}
+            disabled={removingId !== null}
+            onclick={() => unqueue(message, false)}
+          />
         </li>
       {/each}
     </ul>
@@ -186,6 +236,7 @@
   sendColor="primary"
   {canSend}
   onSend={send}
+  onRecall={editLastQueued}
   notice={blockedReason || queuedHint ? notice : undefined}
 >
   {#snippet leading()}

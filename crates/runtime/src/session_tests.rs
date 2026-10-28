@@ -246,6 +246,64 @@ async fn a_queued_message_can_be_steered_into_the_turn() {
 }
 
 #[tokio::test]
+async fn a_queued_message_can_be_taken_back() {
+    let mut h = Harness::ready().await;
+    let first = h.prompt("First");
+    let first_request = h.next().await;
+    let kept = h.prompt("Kept");
+    wait_for_queue(&h, 1).await;
+    let taken = h.prompt("Taken back");
+    let queued = wait_for_queue(&h, 2).await;
+
+    let removed = h
+        .hub
+        .remove_queued(h.id, json!({"id": queued[1]}))
+        .await
+        .unwrap();
+    assert_eq!(removed["prompt"][0]["text"], "Taken back");
+    assert_eq!(taken.await.unwrap().unwrap()["stopReason"], "cancelled");
+    assert_eq!(h.queued().await, [queued[0].clone()]);
+    let stored = h.store.queues().await.unwrap();
+    let texts: Vec<&str> = stored[0]
+        .1
+        .iter()
+        .filter_map(|m| m["blocks"][0]["text"].as_str())
+        .collect();
+    assert_eq!(texts, ["Kept"]);
+    assert!(
+        h.hub
+            .remove_queued(h.id, json!({"id": queued[1]}))
+            .await
+            .is_err()
+    );
+    // A UI that didn't hear it was taken back sends it again; it doesn't run.
+    let resent = h
+        .hub
+        .prompt(
+            h.id,
+            json!({"sessionId": h.id, "prompt": [{"type": "text", "text": "Taken back"}],
+                "_meta": {"sloppod": {"messageId": queued[1]}}}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resent["stopReason"], "cancelled");
+    assert_eq!(h.queued().await, [queued[0].clone()]);
+
+    // It never runs; the rest of the queue still does.
+    h.respond(&first_request, json!({"stopReason": "end_turn"}))
+        .await;
+    first.await.unwrap().unwrap();
+    let next = h.next().await;
+    assert_eq!(prompt_text(&next), ["Kept"]);
+    h.respond(&next, json!({"stopReason": "end_turn"})).await;
+    kept.await.unwrap().unwrap();
+    assert_eq!(
+        h.user_messages(),
+        [("First".to_owned(), false), ("Kept".to_owned(), false)]
+    );
+}
+
+#[tokio::test]
 async fn a_notice_starts_a_turn_when_the_agent_is_idle() {
     let mut h = Harness::ready().await;
     h.hub
@@ -1404,6 +1462,32 @@ fn running(open: Vec<Value>) -> RunningAgent {
         open,
         waiting: Vec::new(),
     }
+}
+
+#[tokio::test]
+async fn a_message_taken_back_does_not_run_when_sent_again_after_a_restart() {
+    let mut h = Harness::ready().await;
+    let _first = h.prompt("First");
+    h.next().await;
+    let _taken = h.prompt("Taken back");
+    let queued = wait_for_queue(&h, 1).await;
+    h.hub
+        .remove_queued(h.id, json!({"id": queued[0]}))
+        .await
+        .unwrap();
+
+    // The UI never heard, and sends it again to the restarted runtime.
+    let (hub, _agent, _to_agent) = restarted(&h).await;
+    let resent = hub
+        .prompt(
+            h.id,
+            json!({"sessionId": h.id, "prompt": [{"type": "text", "text": "Taken back"}],
+                "_meta": {"sloppod": {"messageId": queued[0]}}}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resent["stopReason"], "cancelled");
+    assert!(h.store.queues().await.unwrap().is_empty());
 }
 
 #[tokio::test]

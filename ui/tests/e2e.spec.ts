@@ -122,6 +122,65 @@ test('steers a queued message into the running turn', async ({ page }) => {
   await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
 });
 
+test('takes queued messages back to edit or remove', async ({ page }) => {
+  await createSession(page, 'Edit my queue in sloppod');
+  await expect(permissionCard(page)).toBeVisible();
+
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  for (const message of ['Drop this one', 'Fix this one']) {
+    await box.fill(message);
+    await page.getByRole('button', { name: 'Send' }).click();
+    await expect(page.getByTestId('queued-message').filter({ hasText: message })).toBeVisible();
+  }
+
+  // Up arrow in the empty box takes the last one back for editing.
+  await box.press('ArrowUp');
+  await expect(box).toHaveValue('Fix this one');
+  await expect(page.getByTestId('queued-message')).toHaveCount(1);
+  await page.getByTestId('queued-message').getByRole('button', { name: 'Remove' }).click();
+  await expect(page.getByTestId('queued-messages')).toBeHidden();
+
+  await box.fill('Fixed this one');
+  await page.getByRole('button', { name: 'Send' }).click();
+  await permissionCard(page).getByRole('button', { name: 'Allow', exact: true }).click();
+  await expect(userMessages(page).filter({ hasText: 'Fixed this one' })).toHaveCount(1);
+  await expect(userMessages(page).filter({ hasText: /Drop this one|Fix this one$/ })).toHaveCount(0);
+});
+
+test('a message taken back is not sent again when the connection drops before the answer', async ({ page }) => {
+  await createSession(page, 'Edit my queue in sloppod');
+  await expect(permissionCard(page)).toBeVisible();
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Take me back');
+  await page.getByRole('button', { name: 'Send' }).click();
+  const queued = page.getByTestId('queued-message').filter({ hasText: 'Take me back' });
+  await expect(queued).toBeVisible();
+
+  await page.request.post('/_mock/drop-next-remove');
+  await queued.getByRole('button', { name: 'Edit' }).click();
+  await expect(box).toHaveValue('Take me back');
+  await expect(page.getByTestId('reconnecting')).toBeHidden();
+  await expect(page.getByTestId('queued-messages')).toBeHidden();
+
+  await permissionCard(page).getByRole('button', { name: 'Allow', exact: true }).click();
+  await expect(agentMessages(page).filter({ hasText: FINAL })).toBeVisible();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+  await expect(userMessages(page).filter({ hasText: 'Take me back' })).toHaveCount(0);
+});
+
+test('a queued message with more than text can be removed but not edited', async ({ page }) => {
+  const sessionId = await createSession(page, 'Edit my queue in sloppod');
+  await expect(permissionCard(page)).toBeVisible();
+  await page.request.post(`/_mock/queue-image?session=${sessionId}`);
+  const queued = page.getByTestId('queued-message');
+  await expect(queued).toHaveCount(1);
+  await expect(queued.getByRole('button', { name: 'Edit' })).toHaveCount(0);
+  await page.getByRole('textbox', { name: 'Prompt' }).press('ArrowUp');
+  await expect(queued).toHaveCount(1);
+  await queued.getByRole('button', { name: 'Remove' }).click();
+  await expect(page.getByTestId('queued-messages')).toBeHidden();
+});
+
 test('runs a queued message as the next turn', async ({ page }) => {
   await createSession(page, 'Queue behind me in sloppod');
   await expect(permissionCard(page)).toBeVisible();

@@ -1062,14 +1062,26 @@ impl Hub {
         let message_id = client_message_id(&params);
         // A UI sends a message again when it can't tell whether the first send arrived, e.g. after a reload; it
         // doesn't run twice. A UI can't always tell: it only has the latest of a long session's history.
-        let received = match message_id {
-            Some(message_id) => self
-                .store
-                .has_message(id, message_id)
-                .await
-                .map_err(|e| RpcError::new(-32603, e.to_string()))?,
-            None => false,
+        // Nor does one the user took back out of the queue, sent again by a UI that didn't hear so.
+        let (received, removed) = match message_id {
+            Some(message_id) => {
+                let failed = |e: sqlx::Error| RpcError::new(-32603, e.to_string());
+                (
+                    self.store
+                        .has_message(id, message_id)
+                        .await
+                        .map_err(failed)?,
+                    self.store
+                        .message_removed(id, message_id)
+                        .await
+                        .map_err(failed)?,
+                )
+            }
+            None => (false, false),
         };
+        if removed {
+            return Ok(json!({"stopReason": "cancelled"}));
+        }
         let (queued, behind_turn) = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
@@ -1206,6 +1218,33 @@ impl Hub {
         id: Uuid,
         params: Value,
     ) -> Result<Value, RpcError> {
+        let queued = self.take_queued(id, &params, false).await?;
+        self.record_user_message(id, &json!(queued.blocks), true, queued.id)
+            .await;
+        let result = self.steer_in(id, queued.blocks, None).await;
+        if let Some(reply) = queued.reply {
+            let _ = reply.send(result.clone());
+        }
+        result
+    }
+
+    /// Takes a message waiting behind the running turn out of the queue, e.g. for the user to edit, and returns it.
+    pub async fn remove_queued(&self, id: Uuid, params: Value) -> Result<Value, RpcError> {
+        let queued = self.take_queued(id, &params, true).await?;
+        if let Some(reply) = queued.reply {
+            let _ = reply.send(Ok(json!({"stopReason": "cancelled"})));
+        }
+        Ok(json!({"prompt": queued.blocks}))
+    }
+
+    /// Takes the waiting message `params.id` names out of the queue; with `discard`, the store remembers it was
+    /// taken back rather than run.
+    async fn take_queued(
+        &self,
+        id: Uuid,
+        params: &Value,
+        discard: bool,
+    ) -> Result<Queued, RpcError> {
         let qid = params["id"]
             .as_str()
             .and_then(|q| q.parse::<Uuid>().ok())
@@ -1218,18 +1257,18 @@ impl Hub {
                 .iter()
                 .position(|q| q.id == Some(qid))
                 .ok_or_else(|| RpcError::new(-32002, "that message isn't queued any more"))?;
+            if discard {
+                self.store
+                    .remove_message(id, qid)
+                    .await
+                    .map_err(|e| RpcError::new(-32603, e.to_string()))?;
+            }
             let queued = state.queue.remove(index);
             self.save_queue(id, &state).await;
             queued
         };
         self.broadcast_queue(id).await;
-        self.record_user_message(id, &json!(queued.blocks), true, queued.id)
-            .await;
-        let result = self.steer_in(id, queued.blocks, None).await;
-        if let Some(reply) = queued.reply {
-            let _ = reply.send(result.clone());
-        }
-        result
+        Ok(queued)
     }
 
     /// Tells the agent something happened outside its turns, e.g. a proposal was decided: a new turn when it's

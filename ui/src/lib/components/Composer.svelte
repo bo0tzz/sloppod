@@ -14,6 +14,7 @@
     canSend,
     sending = false,
     onSend,
+    onRecall,
     notice,
     leading,
     trailing,
@@ -28,6 +29,8 @@
     canSend: boolean;
     sending?: boolean;
     onSend: () => void;
+    /** Up arrow in the empty box, if given. */
+    onRecall?: () => void;
     /** Shown on its own line above the controls, on every screen size. */
     notice?: Snippet;
     leading?: Snippet;
@@ -56,6 +59,9 @@
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && (!touch.current || event.ctrlKey || event.metaKey)) {
       event.preventDefault();
       if (canSend && !sending) onSend();
+    } else if (onRecall && event.key === 'ArrowUp' && !text && !event.isComposing && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) {
+      event.preventDefault();
+      onRecall();
     }
   }
 </script>
