@@ -333,10 +333,18 @@ impl Credentials {
             .or_default()
             .clone();
         let _refreshing = lock.lock().await;
-        // Someone may have refreshed it while this waited for the lock.
-        let Some((row, secret)) = self.secret(owner, CHATGPT).await? else {
+        // Someone may have refreshed it while this waited for the lock. Reloaded by id, not as the default: the default
+        // may have changed meanwhile, and this lock only covers this login.
+        let row: Option<CredentialRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "select {COLUMNS} from credentials where id = $1"
+        )))
+        .bind(login.id)
+        .fetch_optional(&self.db)
+        .await?;
+        let Some(row) = row else {
             return Ok(None);
         };
+        let secret = self.vault.decrypt_string(&row.secret)?;
         let mut tokens: ChatGptTokens = serde_json::from_str(&secret)?;
         if !tokens.expires_soon() {
             return Ok(Some(tokens));
