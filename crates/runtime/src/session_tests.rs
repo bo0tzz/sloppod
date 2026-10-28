@@ -1865,7 +1865,7 @@ async fn a_session_at_its_usage_limit_waits_then_carries_on_with_what_queued() {
 #[tokio::test]
 async fn a_limited_session_tries_again_later_when_the_reset_is_unknown() {
     let mut h = Harness::ready().await;
-    let before = chrono::Utc::now();
+    let before = START.parse::<chrono::DateTime<chrono::Utc>>().unwrap();
     let _turn = h.prompt("Work");
     let request = h.next().await;
     hit_the_limit(&h, &request).await;
@@ -1915,19 +1915,6 @@ async fn a_message_steered_in_while_limited_tries_now_and_ends_the_wait() {
 }
 
 #[tokio::test]
-async fn a_wait_for_the_usage_limit_survives_a_restart() {
-    let store = Arc::new(MemoryStore::default());
-    let id = Uuid::new_v4();
-    let mut row = SessionRow::for_test(id, "dev");
-    let until = chrono::Utc::now() + chrono::Duration::hours(1);
-    row.limited_until = Some(until);
-    store.add_session(row);
-    let hub = Arc::new(Hub::new(store.clone()));
-    hub.restore_limits().await;
-    assert_eq!(hub.limited_until(id).await, Some(until));
-}
-
-#[tokio::test]
 async fn a_wait_for_the_usage_limit_moves_with_the_quota() {
     let mut h = Harness::ready().await;
     let _turn = h.prompt("Work");
@@ -1945,8 +1932,119 @@ async fn a_wait_for_the_usage_limit_moves_with_the_quota() {
     h.agent_sent_nothing();
 
     // The credential isn't limited any more: the session carries on now.
-    h.hub.move_limit(h.id, chrono::Utc::now()).await;
+    h.hub.move_limit(h.id, START.parse().unwrap()).await;
     let request = h.next().await;
     assert!(prompt_text(&request)[0].contains("usage limit"));
     assert_eq!(h.hub.limited_until(h.id).await, None);
+}
+
+impl Harness {
+    /// A runtime that restarted while the session waited for its usage limit until `until`, with `kept` in its
+    /// stored queue; its agent is attached but not up yet. Restored in startup's order.
+    async fn restarted_limited(until: chrono::DateTime<chrono::Utc>, kept: &[&str]) -> Self {
+        let store = Arc::new(MemoryStore::default());
+        let id = Uuid::new_v4();
+        let mut row = SessionRow::for_test(id, "dev");
+        row.limited_until = Some(until);
+        store.add_session(row);
+        let stored: Vec<Value> = kept
+            .iter()
+            .map(|text| json!({"id": Uuid::new_v4(), "blocks": [{"type": "text", "text": text}]}))
+            .collect();
+        store.save_queue(id, &stored).await.unwrap();
+        let hub = Arc::new(Hub::new(store.clone()));
+        let (tx, to_agent) = mpsc::unbounded_channel();
+        let agent = Arc::new(AgentConn::new(tx));
+        hub.attach_agent(id, agent.clone()).await;
+        let limited = hub.restore_limits().await;
+        assert_eq!(limited, [(id, until)]);
+        hub.restore_queues().await;
+        hub.resume_limits(limited);
+        Self {
+            hub,
+            store,
+            id,
+            agent,
+            to_agent,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_wait_that_ended_during_a_restart_carries_on_with_the_kept_queue() {
+    let past = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let mut h = Harness::restarted_limited(past, &["Kept"]).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.hub.limited_until(h.id).await, None);
+    let kept = kept_texts(&h).await;
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    assert!(kept[0].contains("usage limit"));
+    assert_eq!(kept[1], "Kept");
+
+    h.agent_ready().await;
+    let request = h.next().await;
+    let text = prompt_text(&request);
+    assert!(text.iter().any(|t| t.contains("usage limit")), "{text:?}");
+    assert_eq!(text.last().map(String::as_str), Some("Kept"));
+}
+
+#[tokio::test]
+async fn an_agent_that_comes_back_during_the_wait_keeps_the_queue_until_it_ends() {
+    let until = chrono::Utc::now() + chrono::Duration::hours(1);
+    let mut h = Harness::restarted_limited(until, &["Kept"]).await;
+    assert_eq!(h.hub.limited_until(h.id).await, Some(until));
+
+    h.agent_ready().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    h.agent_sent_nothing();
+    assert_eq!(kept_texts(&h).await, ["Kept"]);
+    assert_eq!(h.phase().await, "idle");
+
+    h.hub.resume_after_limit(h.id, until).await;
+    let request = h.next().await;
+    let text = prompt_text(&request);
+    assert!(text.iter().any(|t| t.contains("usage limit")), "{text:?}");
+    assert_eq!(text.last().map(String::as_str), Some("Kept"));
+}
+
+#[tokio::test]
+async fn a_message_to_a_limited_session_without_its_agent_waits_and_steering_it_carries_on() {
+    let until = chrono::Utc::now() + chrono::Duration::hours(1);
+    let mut h = Harness::restarted_limited(until, &[]).await;
+    let woken = Arc::new(std::sync::Mutex::new(0));
+    {
+        let woken = woken.clone();
+        h.hub.set_waker(Arc::new(move |_| {
+            let woken = woken.clone();
+            Box::pin(async move {
+                *woken.lock().unwrap() += 1;
+                Ok(())
+            })
+        }));
+    }
+
+    // It waits, shown in the queue, and doesn't wake the session.
+    let message = h.prompt("Later");
+    let queued = wait_for_queue(&h, 1).await;
+    assert_eq!(*woken.lock().unwrap(), 0);
+
+    // Steering it in ends the wait: the session is woken to carry on with it.
+    let result = h
+        .hub
+        .steer_queued(h.id, json!({"id": queued[0]}))
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "queued");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.hub.limited_until(h.id).await, None);
+    assert_eq!(*woken.lock().unwrap(), 1);
+
+    h.agent_ready().await;
+    let request = h.next().await;
+    assert_eq!(
+        prompt_text(&request).last().map(String::as_str),
+        Some("Later")
+    );
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    message.await.unwrap().unwrap();
 }
