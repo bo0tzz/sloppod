@@ -32,8 +32,8 @@ pub struct Inference {
     owners: StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// When each utility session was last asked something.
     last_used: StdMutex<HashMap<Uuid, Instant>>,
-    /// Sessions sent a turn-end notice, with the turn count their answer to it ends at, so that turn isn't checked.
-    nudged: StdMutex<HashMap<Uuid, u64>>,
+    /// Sessions sent a turn-end notice: the next turn that ends there is the answer to it, and isn't checked.
+    nudged: StdMutex<std::collections::HashSet<Uuid>>,
 }
 
 impl Inference {
@@ -194,11 +194,11 @@ pub async fn check_turn_end(state: &AppState, id: Uuid) {
     if session.kind != SessionKind::Work || state.hub.commands(id).await != Some(0) {
         return;
     }
-    let (turns, _) = state.hub.turns_ended(id).await;
-    let answering = state.inference.nudged.lock().unwrap().remove(&id) == Some(turns);
-    if answering {
+    if state.inference.nudged.lock().unwrap().remove(&id) || state.hub.turn_running(id).await {
         return;
     }
+    // The turn being checked; a judgement that comes back after the session moved on is about the past.
+    let checked = (state.hub.turns_ended(id).await.0, false);
     let Some(message) = last_agent_message(state, id).await else {
         return;
     };
@@ -213,28 +213,53 @@ pub async fn check_turn_end(state: &AppState, id: Uuid) {
     if verdict["ok"] != false {
         return;
     }
+    let now = (
+        state.hub.turns_ended(id).await.0,
+        state.hub.turn_running(id).await,
+    );
+    if now != checked {
+        return;
+    }
     let reason = verdict["reason"].as_str().unwrap_or(
         "Your last message says you're starting something, but nothing of yours is running.",
     );
-    // The notice starts a turn; the check skips the one that ends with it.
-    state.inference.nudged.lock().unwrap().insert(id, turns + 1);
+    // The turn that ends next is the answer to this notice.
+    state.inference.nudged.lock().unwrap().insert(id);
     state.hub.notify(id, format!("sloppod: {reason}")).await;
 }
 
 /// The text of the session's last agent message, from its log.
 async fn last_agent_message(state: &AppState, id: Uuid) -> Option<String> {
     let events = state.hub.events_before(id, i64::MAX, 500).await.ok()?;
-    let chunks: Vec<&Value> = events.iter().map(|(_, update)| update).collect();
-    let last = chunks
-        .iter()
-        .rev()
-        .find(|u| u["sessionUpdate"] == "agent_message_chunk")?;
-    let message_id = &last["messageId"];
-    let text: String = chunks
-        .iter()
-        .filter(|u| u["sessionUpdate"] == "agent_message_chunk" && &u["messageId"] == message_id)
-        .filter_map(|u| u["content"]["text"].as_str())
-        .collect();
+    let updates: Vec<Value> = events.into_iter().map(|(_, update)| update).collect();
+    final_message(&updates)
+}
+
+/// The agent's last message: the last unbroken run of its message chunks. Thoughts between them don't break it;
+/// anything else does (a tool call, a user message), as does a chunk of another message when both say which.
+fn final_message(updates: &[Value]) -> Option<String> {
+    let mut chunks = Vec::new();
+    let mut id: Option<&Value> = None;
+    for update in updates.iter().rev() {
+        match update["sessionUpdate"].as_str() {
+            Some("agent_message_chunk") => {
+                let this = &update["messageId"];
+                if let Some(id) = id
+                    && !id.is_null()
+                    && !this.is_null()
+                    && id != this
+                {
+                    break;
+                }
+                id = Some(this);
+                chunks.push(update["content"]["text"].as_str().unwrap_or_default());
+            }
+            Some("agent_thought_chunk") => {}
+            _ if chunks.is_empty() => {}
+            _ => break,
+        }
+    }
+    let text: String = chunks.into_iter().rev().collect();
     (!text.trim().is_empty()).then_some(text)
 }
 
@@ -276,6 +301,42 @@ mod tests {
         assert!(reply("not json").is_err());
         let failed = json!({"is_error": true, "result": "rate limited"}).to_string();
         assert!(reply(&failed).is_err());
+    }
+
+    #[test]
+    fn the_final_message_is_only_the_last_run_of_its_chunks() {
+        let say = |text: &str| json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}});
+        let with_id = |text: &str, id: &str| {
+            let mut chunk = say(text);
+            chunk["messageId"] = json!(id);
+            chunk
+        };
+        // An earlier promise, the work, then the report, none with ids.
+        let updates = [
+            say("I'm starting the build "),
+            say("now."),
+            json!({"sessionUpdate": "tool_call", "toolCallId": "t1"}),
+            json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed"}),
+            say("The build "),
+            json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "hm"}}),
+            say("passed."),
+            json!({"sessionUpdate": "usage_update"}),
+        ];
+        assert_eq!(
+            final_message(&updates).as_deref(),
+            Some("The build passed.")
+        );
+        // Two messages back to back, told apart by their ids.
+        let updates = [
+            with_id("First.", "a"),
+            with_id("Second ", "b"),
+            with_id("part.", "b"),
+        ];
+        assert_eq!(final_message(&updates).as_deref(), Some("Second part."));
+        assert_eq!(
+            final_message(&[json!({"sessionUpdate": "tool_call"})]),
+            None
+        );
     }
 
     #[test]
