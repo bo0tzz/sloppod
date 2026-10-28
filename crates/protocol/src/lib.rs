@@ -451,6 +451,20 @@ pub mod link {
         Error {
             message: String,
         },
+        /// The pod is being terminated, and these of the agent's commands were still running; ending the pod ends
+        /// them (ADR 10, 17).
+        ShutdownReport {
+            running: Vec<RunningProcess>,
+        },
+    }
+
+    /// A command the agent started that was still running, foreground or in the background.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct RunningProcess {
+        pub command: String,
+        /// The last lines it wrote, when it writes to a file, as background commands do.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub output_tail: Option<String>,
     }
 }
 

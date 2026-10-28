@@ -939,6 +939,16 @@ impl Hub {
 
     /// Tells the agent something happened outside its turns, e.g. a proposal was decided: a new turn when it's
     /// idle, steered into the running one, or queued until it's up.
+    /// The agent's pod is going away: from now on the agent counts as not up, so new prompts and notices, and
+    /// whatever its running turn would hand on when it ends, wait for the agent that replaces it.
+    pub async fn retire_agent(&self, id: Uuid, agent: &Arc<AgentConn>) {
+        let live = self.live(id);
+        let mut state = live.state.lock().await;
+        if state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
+            state.agent_session_id = None;
+        }
+    }
+
     pub async fn notify(self: &Arc<Self>, id: Uuid, text: String) {
         let blocks = vec![json!({"type": "text", "text": text})];
         let delivery = {

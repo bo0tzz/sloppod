@@ -386,6 +386,65 @@ async fn a_message_sent_again_does_not_run_twice() {
     assert_eq!(h.user_messages(), [("Once".to_owned(), false)]);
 }
 
+impl Harness {
+    /// Nothing but non-ACP messages (transcript syncs) went to the agent.
+    fn agent_sent_nothing(&mut self) {
+        while let Ok(message) = self.to_agent.try_recv() {
+            assert!(
+                !matches!(message, ToSupervisor::Acp { .. }),
+                "the agent was sent {message:?}"
+            );
+        }
+    }
+
+    /// The agent's pod went away and a new one came up.
+    async fn replace_agent(&mut self) {
+        self.hub.detach_agent(self.id, &self.agent).await;
+        let (tx, to_agent) = mpsc::unbounded_channel();
+        self.agent = Arc::new(AgentConn::new(tx));
+        self.to_agent = to_agent;
+        self.hub.attach_agent(self.id, self.agent.clone()).await;
+        self.agent_ready().await;
+    }
+}
+
+const STOPPED: &str = "sloppod: your pod was stopped.";
+
+#[tokio::test]
+async fn a_retired_agent_gets_no_more_work_and_its_replacement_gets_the_notice() {
+    let mut h = Harness::ready().await;
+    // Its pod is going away with the agent idle.
+    h.hub.retire_agent(h.id, &h.agent).await;
+    h.hub.notify(h.id, STOPPED.into()).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    h.agent_sent_nothing();
+    assert_eq!(
+        h.store.queues().await.unwrap().len(),
+        1,
+        "kept through the restart"
+    );
+
+    h.replace_agent().await;
+    assert_eq!(prompt_text(&h.next().await), [STOPPED]);
+}
+
+#[tokio::test]
+async fn a_turn_that_ends_after_its_agent_retired_hands_nothing_on_to_it() {
+    let mut h = Harness::ready().await;
+    let turn = h.prompt("Busy");
+    let request = h.next().await;
+    // The report arrives during the turn, and the turn then ends before the link goes.
+    h.hub.retire_agent(h.id, &h.agent).await;
+    h.hub.notify(h.id, STOPPED.into()).await;
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    h.agent_sent_nothing();
+
+    h.replace_agent().await;
+    assert_eq!(prompt_text(&h.next().await), [STOPPED]);
+}
+
 #[tokio::test]
 async fn a_notice_waits_for_the_agent_to_be_up() {
     let mut h = Harness::starting().await;
