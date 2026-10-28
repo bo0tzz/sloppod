@@ -19,7 +19,7 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, PostParams};
 use serde_json::{Value, json};
 use sloppod_contracts::capability;
-use sloppod_contracts::{AgentContext, MemoryContext};
+use sloppod_contracts::{AgentContext, MemoryContext, SessionRole};
 use sloppod_protocol::api::SessionKind;
 use sloppod_protocol::link::{
     AgentReady, FromSupervisor, Launch, Repo, RunningAgent, ToSupervisor, TranscriptFile,
@@ -504,8 +504,17 @@ pub async fn agent_context(
         },
         None => None,
     };
+    let role = match (session.kind, session.parent_id) {
+        (SessionKind::Review, _) => SessionRole::Review,
+        (SessionKind::Utility, _) => SessionRole::Utility,
+        (SessionKind::Work, Some(parent)) => SessionRole::SubSession {
+            parent: parent.to_string(),
+        },
+        (SessionKind::Work, None) => SessionRole::Work,
+    };
     AgentContext {
         session: context,
+        role,
         workdir: WORKDIR.to_owned(),
         repo: session.repo.clone(),
         repo_dir: work_dir(session).to_owned(),

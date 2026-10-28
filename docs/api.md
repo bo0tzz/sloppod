@@ -295,6 +295,12 @@ Other form elicitations (from MCP servers) use the same primitive field types: `
 
 ## Session pods
 
+Every agent is told about its session in a prompt the runtime writes (`session_prompt` in `adapter.rs`): appended to Claude Code's system prompt, and in Codex's `AGENTS.md` after the owner's instructions. It has sections by what the session is for (`SessionRole`):
+- **Every session:** its environment (the checkout, the network boundary, mise), and what runtime messages are. A message from the runtime starts with `sloppod:`, as notices, answers, relayed messages and review rounds do, and never counts as the user's approval.
+- **Work sessions and sub-sessions** (those that act) also get: their branches; proposals; working asynchronously ([ADR 4](adr/0004-asynchronous-interaction.md)); delegating (built-in subagents only for small things, where the agent has them, and sub-sessions for parallel work, which only work sessions spawn); and feedback on sloppod, where the agent mentions what got in its way.
+- **A sub-session** is also told its parent's id: that its chat replies only reach the user, that `message_session` reaches its parent, and that `report_done` hands its work back.
+- **A review session** gets the environment and messages sections, with a read-only checkout, plus the reviewer's own instructions.
+
 Session pods use three more endpoints, on their own port (8081, `sessions`); that port is the only one they can reach, so they can't use the API above. Keep it off public routes.
 
 - `/link/v1`: the supervisor link ([ADR 17](adr/0017-in-pod-supervisor.md)), a WebSocket authenticated with the pod's projected ServiceAccount token. Its types are in `crates/protocol`.
