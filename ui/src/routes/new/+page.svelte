@@ -18,26 +18,31 @@
   // The starting set (#232): suggested while the message is written, shown as a card the user edits. A field they
   // changed keeps their value when a later suggestion arrives; the others follow it.
   const SUGGEST_AFTER = 800;
+  /** What can be chosen at all: the capabilities suggested for an empty draft, whichever draft is current. */
   let offered = $state<string[]>([]);
   let suggested = $state(false);
+  /** The suggestion shown was made for the draft as it is now. */
+  let fresh = $state(false);
   let pending = $state(false);
   let source = $state<StartingSet['source'] | null>(null);
   let title = $state('');
   let repo = $state<string | null>(null);
   let capabilities = $state<string[]>([]);
   const touched = { title: false, repo: false, capabilities: false };
-  let asked = 0;
+  /** Advances with every change to the draft, so an answer to an earlier one is dropped, debounce or not. */
+  let generation = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
-  function suggest(prompt: string) {
-    const mine = ++asked;
+  function suggest(prompt: string): Promise<void> {
+    const mine = generation;
     pending = true;
-    api.suggestSession(prompt).then(
+    return api.suggestSession(prompt).then(
       (set) => {
-        if (mine !== asked) return;
+        if (prompt === '') offered = set.capabilities;
+        else if (offered.length === 0) loadOffered();
+        if (mine !== generation) return;
         pending = false;
-        // The first answer, for an empty draft, says what can be chosen at all.
-        if (!suggested) offered = set.capabilities;
+        fresh = true;
         suggested = true;
         source = set.source;
         if (!touched.title) title = set.title;
@@ -45,8 +50,16 @@
         if (!touched.capabilities) capabilities = set.capabilities;
       },
       () => {
-        if (mine === asked) pending = false;
+        if (mine === generation) pending = false;
       },
+    );
+  }
+
+  /** Asks again what can be chosen, after the empty draft's answer didn't arrive. */
+  function loadOffered() {
+    api.suggestSession('').then(
+      (set) => (offered = set.capabilities),
+      () => {},
     );
   }
 
@@ -57,7 +70,7 @@
       () => {},
     );
     // Once with the empty draft, which also warms the runtime up for the first real one.
-    suggest('');
+    void suggest('');
     return () => clearTimeout(timer);
   });
 
@@ -66,8 +79,11 @@
     const prompt = text.trim();
     if (prompt === previous) return;
     previous = prompt;
+    generation++;
+    fresh = false;
+    pending = true;
     clearTimeout(timer);
-    timer = setTimeout(() => suggest(prompt), SUGGEST_AFTER);
+    timer = setTimeout(() => void suggest(prompt), SUGGEST_AFTER);
   });
 
   function toggle(capability: string, on: boolean) {
@@ -81,10 +97,19 @@
     sending = true;
     error = null;
     try {
-      // Without a suggestion yet, the session starts as it always did.
-      const session = await api.createSession(
-        suggested ? { prompt, title: title.trim() || undefined, repo, capabilities } : { prompt },
-      );
+      // A suggestion for an earlier draft isn't sent for this one: the suggestion for it is waited for, so what the
+      // user didn't change follows their message. If it doesn't come, only what they set themselves is sent, and
+      // the session starts as it always did for the rest.
+      if (!fresh) {
+        clearTimeout(timer);
+        await suggest(prompt);
+      }
+      const session = await api.createSession({
+        prompt,
+        title: touched.title || fresh ? title.trim() || undefined : undefined,
+        repo: touched.repo || fresh ? repo : undefined,
+        capabilities: touched.capabilities || fresh ? capabilities : undefined,
+      });
       sessions.upsert(session);
       await goto(`/sessions/${session.id}`);
     } catch (e) {
