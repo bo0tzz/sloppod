@@ -117,8 +117,9 @@ pub struct Credentials {
     db: PgPool,
     vault: Vault,
     github: Mutex<HashMap<Uuid, Arc<GitHubApp>>>,
-    /// Held while refreshing a ChatGPT login, so a single-use refresh token is only ever spent once.
-    chatgpt_refresh: Mutex<()>,
+    /// Held per login while refreshing it, so a single-use refresh token is only ever spent once, and a slow refresh
+    /// holds up only that login's requests.
+    chatgpt_refresh: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
     http: reqwest::Client,
 }
 
@@ -136,7 +137,10 @@ impl Credentials {
             vault,
             github: Mutex::default(),
             chatgpt_refresh: Mutex::default(),
-            http: reqwest::Client::new(),
+            // The refresh runs while a session's request waits on the authorizer, which Envoy gives 10 s.
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()?,
         })
     }
 
@@ -318,7 +322,17 @@ impl Credentials {
         if !tokens.expires_soon() {
             return Ok(Some(tokens));
         }
-        let _refreshing = self.chatgpt_refresh.lock().await;
+        let Some(login) = self.default_row(owner, CHATGPT).await? else {
+            return Ok(None);
+        };
+        let lock = self
+            .chatgpt_refresh
+            .lock()
+            .await
+            .entry(login.id)
+            .or_default()
+            .clone();
+        let _refreshing = lock.lock().await;
         // Someone may have refreshed it while this waited for the lock.
         let Some((row, secret)) = self.secret(owner, CHATGPT).await? else {
             return Ok(None);
@@ -357,11 +371,16 @@ impl Credentials {
         let sealed = self
             .vault
             .encrypt(serde_json::to_string(&tokens)?.as_bytes())?;
-        sqlx::query("update credentials set secret = $2 where id = $1")
+        // The old refresh token is spent now, so a login that isn't stored is lost until the user signs in again.
+        if let Err(e) = sqlx::query("update credentials set secret = $2 where id = $1")
             .bind(row.id)
             .bind(&sealed)
             .execute(&self.db)
-            .await?;
+            .await
+        {
+            tracing::error!(%owner, credential = %row.id, error = %e, "storing a refreshed ChatGPT login; it will need signing in again");
+            return Err(e.into());
+        }
         Ok(Some(tokens))
     }
 
