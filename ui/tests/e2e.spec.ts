@@ -1483,6 +1483,33 @@ test('grants, narrows, times and revokes the grants of a running session', async
   await expect(page.getByText("sloppod: the user revoked this session's grant packages.")).toBeVisible();
 });
 
+test('a grant gets a new expiry, and a refused change can be tried again', async ({ page }) => {
+  await createSession(page, 'Fix the build in bo0tzz/sloppod');
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await page.getByRole('menuitem', { name: 'Grants' }).click();
+  const model = page.getByTestId('grants').getByTestId('grant-model');
+
+  await model.getByRole('combobox').click();
+  await page.getByRole('option', { name: 'In a day' }).click();
+  await expect(model).toContainText('Runs out');
+
+  let refused = false;
+  await page.route('**/api/v1/sessions/*/grants/*', async (route) => {
+    if (refused) return route.fallback();
+    refused = true;
+    await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'try again' }) });
+  });
+  await model.getByRole('combobox').click();
+  await page.getByRole('option', { name: 'Never' }).click();
+  await expect(page.getByTestId('grants').getByText('try again')).toBeVisible();
+  await expect(model).toContainText('Runs out');
+  await expect(model.getByRole('combobox')).toContainText('Change when it runs out');
+
+  await model.getByRole('combobox').click();
+  await page.getByRole('option', { name: 'Never' }).click();
+  await expect(model).not.toContainText('Runs out');
+});
+
 test('reviews and approves updates to existing issues', async ({ page }) => {
   await createSession(page, 'Tidy the issues in sloppod');
   const card = page.getByTestId('proposal-card');

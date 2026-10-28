@@ -26,6 +26,8 @@
   let capability = $state<string>();
   let lasts = $state('never');
   let busy = $state(false);
+  /** Bumped after every change, so the expiry pickers, which only act, show no choice again. */
+  let settled = $state(0);
   let error = $state<string | null>(null);
 
   const narrowable = (grant: Grant) => grant.capability === 'repo' && grant.params.access === 'rw';
@@ -42,6 +44,7 @@
       return false;
     } finally {
       busy = false;
+      settled++;
     }
   }
 
@@ -70,13 +73,17 @@
             {#if changeable && grant.id}
               <div class="flex flex-wrap items-center gap-2">
                 <div class="w-52">
-                  <Select
-                    size="tiny"
-                    options={runsOut}
-                    placeholder="Change when it runs out"
-                    title="When {grant.capability} runs out"
-                    onChange={(value) => void change(grant, { expires_at: expiry(value as string) })}
-                  />
+                  {#key settled}
+                    <Field disabled={busy}>
+                      <Select
+                        size="tiny"
+                        options={runsOut}
+                        placeholder="Change when it runs out"
+                        title="When {grant.capability} runs out"
+                        onChange={(value) => void change(grant, { expires_at: expiry(value as string) })}
+                      />
+                    </Field>
+                  {/key}
                 </div>
                 {#if narrowable(grant)}
                   <Button size="tiny" variant="ghost" shape="round" disabled={busy} onclick={() => change(grant, { narrow: true })}>
