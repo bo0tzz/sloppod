@@ -83,7 +83,15 @@ impl Authorizer {
             return deny("sloppod: request through a listener that names no session.\n");
         };
         let session = match db::get_session(&self.state.db, session_id).await {
-            Ok(Some(session)) => session,
+            Ok(Some(session)) => match session.not_acting() {
+                None => session,
+                Some(why) => {
+                    tracing::warn!(session = %session_id, %host, why, "request from a session that can't act");
+                    return deny(&format!(
+                        "sloppod: this session is {why}, so nothing goes out in its name.\n"
+                    ));
+                }
+            },
             Ok(None) => return deny("sloppod: unknown session.\n"),
             // Ours, not the request's: say so, so the agent tries again rather than giving up.
             Err(e) => {

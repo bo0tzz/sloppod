@@ -244,13 +244,15 @@ Other form elicitations (from MCP servers) use the same primitive field types: `
 Session pods use three more endpoints, on their own port (8081, `sessions`); that port is the only one they can reach, so they can't use the API above. Keep it off public routes.
 
 - `/link/v1`: the supervisor link ([ADR 17](adr/0017-in-pod-supervisor.md)), a WebSocket authenticated with the pod's projected ServiceAccount token. Its types are in `crates/protocol`.
-- `/mcp`: an MCP server (streamable HTTP, JSON responses) registered with the agent at session start. It identifies the session by the pod's IP. Its tools:
+- `/mcp`: an MCP server (streamable HTTP, JSON responses) registered with the agent at session start. It identifies the session by the pod's own identity: the supervisor's local proxy attaches the pod's ServiceAccount token; pods from before that are identified by their IP. Its tools:
   - `propose_pull_request {title, body, repo?, base?, head?, draft?, auto_merge?}` creates a `github.pr.create` proposal from the session branch, or from `head`, a branch named after it (`<session branch>-<name>`, the name of letters, digits, `.`, `_` and `-`), so a session can have several open; `repo` is needed when the session can write to more than one.
   - `propose_issues {issues: {title, body?, labels?}[], repo?}` creates a `github.issue.create` proposal (up to 50 issues; `repo` as for pull requests).
   - `propose_issue_updates {updates: {number, comment?, close?, reopen?, title?, body?, add_labels?, remove_labels?}[], repo?}` creates a `github.issue.update` proposal (up to 50 updates), e.g. to close issues the session's work finished, or merge duplicates.
   - `request_repository {repo, reason}` creates a `sloppod.repo.grant` proposal.
   - `get_proposal {id}` returns a proposal's status and result. The agent is also told when its proposals are decided.
   - `withdraw_proposal {id, reason?}` withdraws one of the session's pending proposals: it becomes `withdrawn` (with the reason) and nothing is carried out.
-- `/memini/*`: memini, for sessions with a `memory` grant, identified by the pod's IP. The runtime forwards each request to the owner's memini with the session's own key and namespace, and refuses memini's administration endpoints. The memini plugin's `MEMINI_BASE_URL` points here.
+- `/memini/*`: memini, for sessions with a `memory` grant, identified like `/mcp`. The runtime forwards each request to the owner's memini with the session's own key and namespace, and refuses memini's administration endpoints. The memini plugin's `MEMINI_BASE_URL` points here.
+
+A session that's stopped, parked or deleted can't act, even if its pod is still up: the authorizer refuses its egress, `/mcp` gives it no tools, and `/memini/*` answers 403.
 
 In the pod, the repository is checked out at `/workspace/repo` on the session branch. `/workspace` is the session's own volume, kept across pod restarts.
