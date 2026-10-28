@@ -4,6 +4,7 @@
     Alert,
     Button,
     ContextMenuButton,
+    Icon,
     IconButton,
     LoadingSpinner,
     Text,
@@ -20,10 +21,12 @@
     mdiShieldKeyOutline,
     mdiSourcePull,
     mdiSourceRepository,
+    mdiTimerSandComplete,
     mdiTrashCanOutline,
   } from '@mdi/js';
   import { onMount } from 'svelte';
   import { api } from '#lib/api.ts';
+  import { absoluteTime, clockTime, countdown } from '#lib/format.ts';
   import { SessionView } from '#lib/session.svelte.ts';
   import { sessions } from '#lib/sessions.svelte.ts';
   import AddRepoModal from './AddRepoModal.svelte';
@@ -62,6 +65,13 @@
     view.proposals.filter((proposal) => proposal.status === 'pending' || proposal.status === 'approved'),
   );
   const showReconnecting = $derived(view.loaded && view.connection !== 'open');
+  let now = $state(Date.now());
+  $effect(() => {
+    if (!session?.limited_until) return;
+    now = Date.now();
+    const timer = setInterval(() => (now = Date.now()), 30_000);
+    return () => clearInterval(timer);
+  });
   const activity = $derived.by(() => {
     const status = session?.agent_status ? `${session.agent_status[0].toUpperCase()}${session.agent_status.slice(1)}…` : null;
     switch (session?.phase) {
@@ -358,6 +368,23 @@
       >
         <LoadingSpinner size="tiny" />
         Connection lost, reconnecting…
+      </div>
+    {/if}
+
+    {#if session?.limited_until}
+      <div
+        class="bg-warning-100 text-warning-800 flex shrink-0 items-center justify-center gap-2 px-3 py-1 text-center text-xs"
+        role="status"
+        data-testid="limited"
+      >
+        <Icon icon={mdiTimerSandComplete} size="1.2em" class="shrink-0" aria-hidden />
+        <span>
+          The account's usage limit is reached. The session carries on at
+          <time datetime={session.limited_until} title={absoluteTime(session.limited_until)}
+            >{clockTime(session.limited_until, now)}</time
+          >
+          ({countdown(session.limited_until, now)}). Messages wait until then; steer one in to try now.
+        </span>
       </div>
     {/if}
 
