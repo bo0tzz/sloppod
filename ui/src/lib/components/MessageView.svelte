@@ -1,6 +1,6 @@
 <script lang="ts">
   import { Icon, IconButton } from '@immich/ui';
-  import { mdiCheck, mdiContentCopy, mdiLinkVariant, mdiSteering } from '@mdi/js';
+  import { mdiAlertCircleOutline, mdiCheck, mdiContentCopy, mdiLinkVariant, mdiSteering } from '@mdi/js';
   import { messageMarkdown, type MessageItem } from '#lib/acp/transcript.svelte.ts';
   import Markdown from './Markdown.svelte';
 
@@ -8,17 +8,27 @@
 
   const user = $derived(message.type === 'user');
 
-  let copied = $state(false);
-  let copiedTimer: ReturnType<typeof setTimeout> | undefined;
+  let copyState = $state<'idle' | 'copied' | 'failed'>('idle');
+  let copyTimer: ReturnType<typeof setTimeout> | undefined;
+  const copyFeedback = {
+    idle: { icon: mdiContentCopy, label: 'Copy message', status: '' },
+    copied: { icon: mdiCheck, label: 'Copied', status: 'Copied the message' },
+    // The clipboard needs a secure context and the user's permission.
+    failed: { icon: mdiAlertCircleOutline, label: "Couldn't copy", status: "Couldn't copy the message" },
+  };
 
   async function copy() {
-    await navigator.clipboard.writeText(messageMarkdown(message));
-    copied = true;
-    clearTimeout(copiedTimer);
-    copiedTimer = setTimeout(() => (copied = false), 2000);
+    try {
+      await navigator.clipboard.writeText(messageMarkdown(message));
+      copyState = 'copied';
+    } catch {
+      copyState = 'failed';
+    }
+    clearTimeout(copyTimer);
+    copyTimer = setTimeout(() => (copyState = 'idle'), 2000);
   }
 
-  $effect(() => () => clearTimeout(copiedTimer));
+  $effect(() => () => clearTimeout(copyTimer));
 </script>
 
 <div class="flex {user ? 'justify-end' : ''}" data-testid="message-{message.type}" data-steering={message.steering || undefined}>
@@ -54,14 +64,15 @@
       <!-- Revealed on hover where there's a pointer to hover with, always shown on touch screens. -->
       <div data-testid="message-actions" class="pointer-fine:opacity-0 pointer-fine:group-hover:opacity-100 pointer-fine:focus-within:opacity-100 -ms-2 transition-opacity">
         <IconButton
-          icon={copied ? mdiCheck : mdiContentCopy}
-          aria-label={copied ? 'Copied' : 'Copy message'}
+          icon={copyFeedback[copyState].icon}
+          aria-label={copyFeedback[copyState].label}
           variant="ghost"
           shape="round"
-          color="secondary"
+          color={copyState === 'failed' ? 'danger' : 'secondary'}
           size="small"
           onclick={copy}
         />
+        <span class="sr-only" role="status">{copyFeedback[copyState].status}</span>
       </div>
     {/if}
   </div>
