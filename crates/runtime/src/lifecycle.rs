@@ -150,6 +150,84 @@ pub async fn start_session(
     Ok(row)
 }
 
+/// Applies the egress policy a session's grants call for: direct access to package hosts with `packages`. Run when
+/// its pod is placed, and again when its grants change.
+pub async fn apply_egress(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
+    let id = session.id.to_string();
+    state
+        .enforcer
+        .apply(&EgressSpec {
+            session_id: id.clone(),
+            pod_labels: pod_labels(&id),
+            intercepted_hosts: state.policies.hosts(),
+            direct_hosts: if session.context().has(capability::PACKAGES) {
+                state.config.direct_hosts.clone()
+            } else {
+                Vec::new()
+            },
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
+}
+
+/// After a session's grants changed (`what`, for the agent): its egress policy follows them, its agent and UIs are
+/// told. A session that isn't acting gets its egress at its next placement.
+pub async fn grants_changed(state: &AppState, id: Uuid, what: &str) {
+    reapply_egress(state, id);
+    state.hub.broadcast_session(id).await;
+    state
+        .hub
+        .notify(id, format!("sloppod: {what} See them with `list_grants`."))
+        .await;
+}
+
+/// Applies an acting session's egress again after its grants changed, retrying until it lands: a revoked `packages`
+/// must not keep its direct access because the control plane was briefly unreachable. A session that stops acting
+/// needs nothing more, and startup applies every acting session's egress again anyway.
+fn reapply_egress(state: &AppState, id: Uuid) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut wait = std::time::Duration::from_secs(5);
+        loop {
+            let session = match db::get_session(&state.db, id).await {
+                Ok(Some(session)) if session.not_acting().is_none() => session,
+                Ok(_) => return,
+                Err(e) => {
+                    tracing::warn!(session = %id, error = %e, "loading a session to apply its egress");
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+            };
+            match apply_egress(&state, &session).await {
+                Ok(()) => return,
+                Err(e) => {
+                    tracing::warn!(session = %id, error = %e, "applying egress after a grant change; trying again");
+                    tokio::time::sleep(wait).await;
+                    wait = (wait * 2).min(std::time::Duration::from_secs(60));
+                }
+            }
+        }
+    });
+}
+
+/// Removes the grants that have run out and tells their sessions; they already stopped counting when they ran out.
+pub async fn sweep_expired_grants(state: &AppState) {
+    let expired = match db::sweep_expired_grants(&state.db).await {
+        Ok(expired) => expired,
+        Err(e) => {
+            tracing::warn!(error = %e, "removing grants that ran out");
+            return;
+        }
+    };
+    for (session, grant) in expired {
+        let what = format!(
+            "this session's grant ran out: {}",
+            crate::grants::describe(&grant)
+        );
+        grants_changed(state, session, &what).await;
+    }
+}
+
 /// Makes sure a session's pod and egress policy exist.
 pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
     if let Err(e) = ensure_memini_key(state, session).await {
@@ -160,7 +238,6 @@ pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result
         .await?
         .ok_or_else(|| anyhow::anyhow!("session {} is gone", session.id))?;
     let id = session.id.to_string();
-    let context = session.context();
     let labels = BTreeMap::from([
         (SESSION_LABEL.to_owned(), id.clone()),
         ("app.kubernetes.io/part-of".to_owned(), "sloppod".to_owned()),
@@ -169,19 +246,7 @@ pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result
             "session".to_owned(),
         ),
     ]);
-    state
-        .enforcer
-        .apply(&EgressSpec {
-            session_id: id.clone(),
-            pod_labels: pod_labels(&id),
-            intercepted_hosts: state.policies.hosts(),
-            direct_hosts: if context.has(capability::PACKAGES) {
-                state.config.direct_hosts.clone()
-            } else {
-                Vec::new()
-            },
-        })
-        .await?;
+    apply_egress(state, session).await?;
     state
         .placement
         .ensure(&PlacementSpec {

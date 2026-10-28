@@ -180,6 +180,15 @@ pub mod api {
         /// What the grant lets the session do; set by the runtime, ignored on input.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub description: Option<String>,
+        /// The grant's id, for changing or revoking it; set by the runtime.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub id: Option<Uuid>,
+        /// When it was granted (RFC 3339); set by the runtime.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub created_at: Option<String>,
+        /// When it runs out (RFC 3339), if it does.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub expires_at: Option<String>,
     }
 
     #[derive(Clone, Serialize, Deserialize)]

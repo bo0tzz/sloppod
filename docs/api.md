@@ -20,6 +20,9 @@ POST   /api/v1/sessions/{id}/restore -> Session    brings a deleted session back
 POST   /api/v1/sessions/{id}/park   -> Session     ends its pod and keeps its volume, transcript, branch, grants and keys; 409 during a turn
 POST   /api/v1/sessions/{id}/wake   -> Session     brings a parked session back (no-op otherwise); a message sent to it does too
 POST   /api/v1/sessions/{id}/repos  -> Session     body: {repo: string}; grants write access to another repository and tells the agent (no-op if it has it)
+POST   /api/v1/sessions/{id}/grants -> Session (201) body: {capability, expires_at?}; grants model, github, packages, docs or codex; 409 if the session has it
+PATCH  /api/v1/sessions/{id}/grants/{grant} -> Session  body: {expires_at?: string | null, narrow?: true}; changes when it runs out (null: never), or narrows it (a repository it can push to becomes read only)
+DELETE /api/v1/sessions/{id}/grants/{grant} -> Session  revokes it
 PUT    /api/v1/sessions/{id}/review -> Session     body: {review: "off" | "required"}
 GET    /api/v1/repos                -> string[]    repositories sessions can be granted, e.g. ["bo0tzz/sloppod"]
 GET    /api/v1/me                   -> {user: string, version: string | null, build: string | null}   version: the release, e.g. 0.1.2-main.153 (SLOPPOD_VERSION, the chart's version); build: the commit or tag it was built from (SLOPPOD_BUILD, the chart's app version)
@@ -75,7 +78,14 @@ type Session = {
 // grants), "packages" (package registries), "codex" (Codex through the owner's ChatGPT login), "repo"
 // {repo, access: "rw", branch}, "memory" {namespace, access: "rw"}, "docs" (library documentation through Context7's MCP server, which agents get as `docs` tools; granted by default). `description` says what the grant allows in plain
 // terms, in the same words the agent's `list_grants` tool uses.
-type Grant = { capability: string; params: Record<string, unknown>; description?: string };
+type Grant = {
+  capability: string;
+  params: Record<string, unknown>;
+  description?: string;
+  id?: string;           // for changing or revoking it
+  created_at?: string;   // when it was granted
+  expires_at?: string;   // when it runs out, if it does
+};
 
 type Phase =
   | "starting"           // pod being created or agent not connected yet
@@ -87,7 +97,7 @@ type Phase =
   | "stopped";
 ```
 
-`POST /api/v1/sessions` derives the repository and grants before it returns. A session gains more repositories later through `POST /api/v1/sessions/{id}/repos`, or when the agent requests one and the user approves (`sloppod.repo.grant` proposals). `repo` is the repository the session was started for, which is checked out as its working directory, or else the first one it was given; `branch` is its session branch, the same in every repository. Until the agent names the session, its title is the first line of the first message. It returns `409` when the user has no credential for the agent's model (a Claude account for Claude Code, a ChatGPT login for Codex), and `400` with `{error}` when a given `repo` isn't accessible or `agent` isn't one the runtime has.
+`POST /api/v1/sessions` derives the repository and grants before it returns. The owner changes a session's grants while it runs ([ADR 2](adr/0002-capabilities.md)): grant a capability it lacks, change when one runs out, narrow it, or revoke it. A grant that has run out or been revoked stops counting at once, wherever the session's grants are read (the authorizer reads them on every request); egress that depends on grants (direct access to package hosts with `packages`) is applied again, and the agent is told what changed. A minute's sweep removes grants that have run out and tells their agents. Memory can't be granted mid-session, since its key is minted when the pod is placed, and the docs MCP server granted mid-session reaches the agent at its next start. A session gains more repositories later through `POST /api/v1/sessions/{id}/repos`, or when the agent requests one and the user approves (`sloppod.repo.grant` proposals). `repo` is the repository the session was started for, which is checked out as its working directory, or else the first one it was given; `branch` is its session branch, the same in every repository. Until the agent names the session, its title is the first line of the first message. It returns `409` when the user has no credential for the agent's model (a Claude account for Claude Code, a ChatGPT login for Codex), and `400` with `{error}` when a given `repo` isn't accessible or `agent` isn't one the runtime has.
 
 ### Credentials
 

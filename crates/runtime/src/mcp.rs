@@ -239,7 +239,7 @@ async fn ask_user(state: &AppState, session: Uuid, arguments: &Value) -> Result<
 
 async fn list_grants_text(state: &AppState, session: Uuid) -> Result<String, String> {
     match db::get_session(&state.db, session).await {
-        Ok(Some(row)) => Ok(grant_list(&row.context().grants)),
+        Ok(Some(row)) => Ok(grant_list(&row.to_api().grants)),
         _ => Err("couldn't load the session".into()),
     }
 }
@@ -318,10 +318,21 @@ async fn propose(
     })
 }
 
-fn grant_list(grants: &[sloppod_contracts::Grant]) -> String {
+fn grant_list(grants: &[sloppod_protocol::api::Grant]) -> String {
     let mut lines: Vec<String> = grants
         .iter()
-        .map(|g| format!("- {}: {}", g.capability, crate::grants::describe(g)))
+        .map(|g| {
+            let until = g
+                .expires_at
+                .as_ref()
+                .map(|at| format!(" (until {at})"))
+                .unwrap_or_default();
+            format!(
+                "- {}: {}{until}",
+                g.capability,
+                g.description.as_deref().unwrap_or_default()
+            )
+        })
         .collect();
     lines.push(
         "Anything else is refused. Ask for write access to another repository with request_repository.".into(),
