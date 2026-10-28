@@ -32,7 +32,7 @@ pub struct Seen {
 
 const STATUS: &str = "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { \
     pullRequest(number: $number) { state mergeable reviews { totalCount } comments { totalCount } \
-    reviewThreads { totalCount } commits(last: 1) { nodes { commit { statusCheckRollup { state \
+    reviewThreads(first: 100) { totalCount nodes { comments { totalCount } } } commits(last: 1) { nodes { commit { statusCheckRollup { state \
     contexts(first: 100) { nodes { __typename ... on CheckRun { name conclusion } \
     ... on StatusContext { context state } } } } } } } } } }";
 
@@ -77,7 +77,15 @@ fn observe(previous: Option<&Seen>, pull: &Value) -> Seen {
         mergeable,
         checks,
         failing,
-        feedback: count("reviews") + count("comments") + count("reviewThreads"),
+        // A reply in an existing thread adds a comment to it, not a thread.
+        feedback: count("reviews")
+            + count("comments")
+            + pull["reviewThreads"]["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|thread| thread["comments"]["totalCount"].as_u64().unwrap_or(0))
+                .sum::<u64>(),
     }
 }
 
@@ -172,6 +180,11 @@ async fn check(state: &AppState, pull: &db::WatchedPull) -> anyhow::Result<()> {
         &response["data"]["repository"]["pullRequest"],
     );
     let changes = changes(pull.number as u64, before.as_ref(), &now);
+    // Told before it's saved: a restart in between tells it again rather than never.
+    if !changes.is_empty() {
+        let text = format!("sloppod: {}", changes.join(" "));
+        state.hub.notify(pull.session_id, text).await;
+    }
     if before.as_ref() != Some(&now) {
         db::save_pull_watch(
             &state.db,
@@ -181,10 +194,6 @@ async fn check(state: &AppState, pull: &db::WatchedPull) -> anyhow::Result<()> {
             &serde_json::to_value(&now)?,
         )
         .await?;
-    }
-    if !changes.is_empty() {
-        let text = format!("sloppod: {}", changes.join(" "));
-        state.hub.notify(pull.session_id, text).await;
     }
     Ok(())
 }
@@ -209,7 +218,8 @@ mod tests {
     fn reads_what_github_says() {
         let pull = json!({
             "state": "OPEN", "mergeable": "UNKNOWN",
-            "reviews": {"totalCount": 1}, "comments": {"totalCount": 2}, "reviewThreads": {"totalCount": 0},
+            "reviews": {"totalCount": 1}, "comments": {"totalCount": 2},
+            "reviewThreads": {"totalCount": 1, "nodes": [{"comments": {"totalCount": 2}}]},
             "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "FAILURE", "contexts": {"nodes": [
                 {"__typename": "CheckRun", "name": "check", "conclusion": "FAILURE"},
                 {"__typename": "CheckRun", "name": "ui", "conclusion": "SUCCESS"},
@@ -221,7 +231,11 @@ mod tests {
         assert_eq!(now.checks, "FAILURE");
         assert_eq!(now.failing, ["check", "ci/legacy"]);
         assert_eq!(now.mergeable, "MERGEABLE", "UNKNOWN keeps what was known");
-        assert_eq!(now.feedback, 3);
+        assert_eq!(now.feedback, 5);
+        // A reply in an existing thread counts, though no review, comment or thread is new.
+        let mut replied = pull.clone();
+        replied["reviewThreads"]["nodes"][0]["comments"]["totalCount"] = json!(3);
+        assert_eq!(observe(Some(&now), &replied).feedback, 6);
 
         // Checks still running keep their last settled state.
         let mut running = pull.clone();
