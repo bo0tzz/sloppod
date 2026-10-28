@@ -55,5 +55,5 @@ The parent session manages, and sub-sessions ([ADR 27](adr/0027-sub-sessions.md)
 ## Environment
 
 - Put work in `/workspace` (e.g. git worktrees under `/workspace/wt/`), never `/tmp`, which a pod restart wipes.
-- "The user doesn't want to take this action right now. STOP…" as a tool result was Claude Code's cancel text, caused by notices steered into a running tool call ([#259](https://github.com/bo0tzz/sloppod/issues/259)), not the user. Fixed by #264; if it shows up again, treat it as that bug.
+- "The user doesn't want to take this action right now. STOP…" as a tool result is Claude Code's cancel text, not a rejection: something cancelled the running tool call. On 2026-10-28 that was usually a notice steered into the call ([#259](https://github.com/bo0tzz/sloppod/issues/259), fixed by #264, which makes notices wait). But a user's own steer still interrupts a tool call on purpose, and Esc or Stop cancel the turn. So before calling it the bug, check what came in at that moment: a steered message from the user, or a cancel in the runtime's log (cancels and permission answers are logged with who sent them). If it was the user, treat it as their instruction.
 - Sessions can push workflow files once the push token asks for `workflows: write` (in progress).
