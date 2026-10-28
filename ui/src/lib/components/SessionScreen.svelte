@@ -100,7 +100,7 @@
     if (!scroller) return;
     if (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80) {
       atBottom = true;
-    } else if (performance.now() - lastUserScroll < 1000) {
+    } else if (pointerHeld || performance.now() - lastUserScroll < 1000) {
       atBottom = false;
     }
   }
@@ -108,12 +108,24 @@
   // Only the reader stops the view following new output. The browser scrolls by itself too, e.g. to keep what's on
   // screen in place while something above it changes size, and that's no sign they've scrolled up.
   let lastUserScroll = -Infinity;
+  /** A pointer pressed on the transcript, e.g. dragging the scrollbar, counts as the reader scrolling until it lets go. */
+  let pointerHeld = false;
   $effect(() => {
     if (!scroller) return;
     const scrolling = () => (lastUserScroll = performance.now());
+    const press = () => (pointerHeld = true);
+    const release = () => (pointerHeld = false);
     const events = ['wheel', 'touchmove', 'keydown', 'pointerdown'] as const;
     for (const event of events) scroller.addEventListener(event, scrolling, { passive: true });
-    return () => events.forEach((event) => scroller?.removeEventListener(event, scrolling));
+    scroller.addEventListener('pointerdown', press);
+    window.addEventListener('pointerup', release);
+    window.addEventListener('pointercancel', release);
+    return () => {
+      events.forEach((event) => scroller?.removeEventListener(event, scrolling));
+      scroller?.removeEventListener('pointerdown', press);
+      window.removeEventListener('pointerup', release);
+      window.removeEventListener('pointercancel', release);
+    };
   });
 
   function scrollToBottom(behavior: ScrollBehavior = 'instant') {
@@ -332,7 +344,12 @@
     <div class="flex min-h-0 grow" bind:clientWidth={width}>
       <div class="flex min-w-0 grow flex-col">
         <div class="relative min-h-0 grow">
-          <div bind:this={scroller} onscroll={onScroll} class="immich-scrollbar h-full overflow-y-auto">
+          <div
+            bind:this={scroller}
+            onscroll={onScroll}
+            class="immich-scrollbar h-full overflow-y-auto"
+            data-testid="transcript-scroller"
+          >
             <div bind:this={content} class="mx-auto flex w-full max-w-3xl flex-col gap-3 px-3 py-4 md:px-4">
               {#if view.loadError}
                 <div data-testid="load-error">

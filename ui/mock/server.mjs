@@ -1526,6 +1526,14 @@ const server = http.createServer(async (req, res) => {
       dropNextPrompt = url.searchParams.get('when') === 'after' ? 'after' : 'before';
       return json(res, 200, { dropNextPrompt });
     }
+    if (url.pathname === '/_mock/say' && req.method === 'POST') {
+      // More output in every session, as if its agent carried on.
+      const text = url.searchParams.get('text') ?? '';
+      for (const session of sessions.values()) {
+        session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text }, messageId: randomUUID() });
+      }
+      return json(res, 200, {});
+    }
     if (url.pathname === '/_mock/drop' && req.method === 'POST') {
       for (const conn of connections) conn.ws.terminate();
       return json(res, 200, { dropped: connections.size });
