@@ -368,6 +368,7 @@ async fn reconcile(state: &AppState) {
     // After the pods are placed, so a queue for a running session waits for its agent and a parked one wakes for it;
     // before anything that can queue a notice, which would otherwise replace the kept queue before it's read.
     state.hub.restore_queues().await;
+    state.hub.restore_questions().await;
     proposals::resume_approved(state).await;
     reviews::resume_round_watches(state).await;
     proposals::resume_stack_watches(state).await;

@@ -31,6 +31,12 @@ pub trait SessionStore: Send + Sync {
     async fn save_queue(&self, id: Uuid, queue: &[Value]) -> sqlx::Result<()>;
     /// Every session's kept queue, for after a restart.
     async fn queues(&self) -> sqlx::Result<Vec<(Uuid, Vec<Value>)>>;
+    /// Keeps questions the session's agent asked with `ask_user`, until they're answered.
+    async fn save_question(&self, id: Uuid, question: Uuid, questions: &Value) -> sqlx::Result<()>;
+    /// Forgets an answered question.
+    async fn forget_question(&self, question: Uuid) -> sqlx::Result<()>;
+    /// Every kept question, `(session, question, questions)`, oldest first, for after a restart.
+    async fn questions(&self) -> sqlx::Result<Vec<(Uuid, Uuid, Value)>>;
     /// The session's first message, until a turn has started with it.
     async fn pending_prompt(&self, id: Uuid) -> sqlx::Result<Option<String>>;
     /// Forgets the session's first message, once a turn has started with it.
@@ -90,6 +96,18 @@ impl SessionStore for PgStore {
         db::queues(&self.0).await
     }
 
+    async fn save_question(&self, id: Uuid, question: Uuid, questions: &Value) -> sqlx::Result<()> {
+        db::save_question(&self.0, id, question, questions).await
+    }
+
+    async fn forget_question(&self, question: Uuid) -> sqlx::Result<()> {
+        db::forget_question(&self.0, question).await
+    }
+
+    async fn questions(&self) -> sqlx::Result<Vec<(Uuid, Uuid, Value)>> {
+        db::questions(&self.0).await
+    }
+
     async fn clear_pending_prompt(&self, id: Uuid) -> sqlx::Result<()> {
         db::clear_pending_prompt(&self.0, id).await
     }
@@ -109,6 +127,8 @@ pub mod memory {
         events: Mutex<Vec<(Uuid, i64, Value)>>,
         /// Sessions' kept queues.
         pub queues: Mutex<HashMap<Uuid, Vec<Value>>>,
+        /// Questions from `ask_user`, until they're answered.
+        pub questions: Mutex<Vec<(Uuid, Uuid, Value)>>,
         /// Sessions' first messages, until a turn starts with them.
         pub pending_prompts: Mutex<HashMap<Uuid, String>>,
         /// Sessions whose first message a turn has started with.
@@ -219,6 +239,31 @@ pub mod memory {
 
         async fn queues(&self) -> sqlx::Result<Vec<(Uuid, Vec<Value>)>> {
             Ok(self.queues.lock().unwrap().clone().into_iter().collect())
+        }
+
+        async fn save_question(
+            &self,
+            id: Uuid,
+            question: Uuid,
+            questions: &Value,
+        ) -> sqlx::Result<()> {
+            self.questions
+                .lock()
+                .unwrap()
+                .push((id, question, questions.clone()));
+            Ok(())
+        }
+
+        async fn forget_question(&self, question: Uuid) -> sqlx::Result<()> {
+            self.questions
+                .lock()
+                .unwrap()
+                .retain(|(_, q, _)| *q != question);
+            Ok(())
+        }
+
+        async fn questions(&self) -> sqlx::Result<Vec<(Uuid, Uuid, Value)>> {
+            Ok(self.questions.lock().unwrap().clone())
         }
 
         async fn pending_prompt(&self, id: Uuid) -> sqlx::Result<Option<String>> {

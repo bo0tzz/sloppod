@@ -94,8 +94,9 @@ enum Asker {
         request_id: Value,
         agent: Arc<AgentConn>,
     },
-    /// The agent's `ask_user` tool, which returned at once: the answer goes to the agent as a notice.
-    Tool { questions: Value },
+    /// The agent's `ask_user` tool, which returned at once: the answer goes to the agent as a notice. Kept in the
+    /// store under `key` until then.
+    Tool { key: Uuid, questions: Value },
 }
 
 #[derive(Default)]
@@ -1009,10 +1010,14 @@ impl Hub {
         let tool_call_id = tool_call_id(&permission.params);
         match permission.asker {
             Asker::Agent { request_id, agent } => agent.respond(request_id, result),
-            Asker::Tool { questions } => {
+            Asker::Tool { key, questions } => {
                 let answer = result.unwrap_or_else(|_| json!({"action": "cancel"}));
+                // The notice is kept until it reaches the agent, so the question can go once it's queued.
                 self.notify(id, crate::questions::answer_text(&questions, &answer))
                     .await;
+                if let Err(e) = self.store.forget_question(key).await {
+                    tracing::warn!(session = %id, error = %e, "forgetting an answered question");
+                }
             }
         }
         self.broadcast(
@@ -1539,6 +1544,33 @@ impl Hub {
     /// as a notice.
     pub async fn ask(&self, id: Uuid, questions: Value) -> Result<(), String> {
         let params = crate::questions::elicitation(&questions, &id.to_string())?;
+        let key = Uuid::new_v4();
+        self.store
+            .save_question(id, key, &questions)
+            .await
+            .map_err(|e| format!("couldn't keep the question: {e}"))?;
+        self.show_question(id, key, questions, params).await;
+        Ok(())
+    }
+
+    /// Shows the questions a restart left unanswered again (#39).
+    pub async fn restore_questions(&self) {
+        let questions = match self.store.questions().await {
+            Ok(questions) => questions,
+            Err(e) => {
+                tracing::error!(error = %e, "loading unanswered questions");
+                return;
+            }
+        };
+        for (id, key, questions) in questions {
+            match crate::questions::elicitation(&questions, &id.to_string()) {
+                Ok(params) => self.show_question(id, key, questions, params).await,
+                Err(e) => tracing::warn!(session = %id, error = %e, "restoring a question"),
+            }
+        }
+    }
+
+    async fn show_question(&self, id: Uuid, key: Uuid, questions: Value, params: Value) {
         let pid = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
@@ -1549,7 +1581,7 @@ impl Hub {
                 Permission {
                     method: "elicitation/create".into(),
                     params: params.clone(),
-                    asker: Asker::Tool { questions },
+                    asker: Asker::Tool { key, questions },
                 },
             );
             pid
@@ -1562,7 +1594,6 @@ impl Hub {
                 params,
             },
         );
-        Ok(())
     }
 
     pub async fn turn_running(&self, id: Uuid) -> bool {
