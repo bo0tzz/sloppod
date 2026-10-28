@@ -428,21 +428,24 @@ async function agentScript(session, turn, prompt) {
 
   if (/ask_user/i.test(prompt)) {
     await step(1);
-    const askId = randomUUID();
-    tool({ toolCallId: askId, title: 'mcp__sloppod__ask_user', kind: 'other', status: 'pending', rawInput: { questions: [QUESTIONS[0]] } });
-    void requestFromUser(session, {
-      method: 'elicitation/create',
-      params: questionsToElicitation([QUESTIONS[0]], session.data.id),
-      cancelled: { action: 'cancel' },
-      blocking: false,
-    }).then((response) => {
-      const answers = response.action === 'accept' ? summariseAnswers([QUESTIONS[0]], response.content ?? {}) : [];
-      const notice = answers.length
-        ? `sloppod: the user answered your question:\n- ${QUESTIONS[0].question}: ${answers.join(' ')}`
-        : `sloppod: the user dismissed your question without answering it:\n- ${QUESTIONS[0].question}`;
-      void notifyAgent(session, notice, answers.length ? `Thanks, going with that. ${answers.join(' ')}` : "I'll use my own judgement then.");
-    });
-    update(askId, { status: 'completed' });
+    // "twice" asks each question with a call of its own, so the second request waits behind the first.
+    for (const question of /twice/i.test(prompt) ? QUESTIONS : [QUESTIONS[0]]) {
+      const askId = randomUUID();
+      tool({ toolCallId: askId, title: 'mcp__sloppod__ask_user', kind: 'other', status: 'pending', rawInput: { questions: [question] } });
+      void requestFromUser(session, {
+        method: 'elicitation/create',
+        params: questionsToElicitation([question], session.data.id),
+        cancelled: { action: 'cancel' },
+        blocking: false,
+      }).then((response) => {
+        const answers = response.action === 'accept' ? summariseAnswers([question], response.content ?? {}) : [];
+        const notice = answers.length
+          ? `sloppod: the user answered your question:\n- ${question.question}: ${answers.join(' ')}`
+          : `sloppod: the user dismissed your question without answering it:\n- ${question.question}`;
+        void notifyAgent(session, notice, answers.length ? `Thanks, going with that. ${answers.join(' ')}` : "I'll use my own judgement then.");
+      });
+      update(askId, { status: 'completed' });
+    }
     await say("I've asked you about the backoff; I'll carry on meanwhile.");
     await step(4);
     await say('Done with the parts that don\'t depend on your answer.');
