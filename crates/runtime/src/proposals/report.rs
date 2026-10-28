@@ -118,6 +118,10 @@ impl ProposalKind for Report {
         false
     }
 
+    fn reviewed_again(&self) -> bool {
+        true
+    }
+
     fn review_subject(&self, payload: &Value) -> Option<ReviewSubject> {
         let field = |key: &str| payload[key].as_str().map(str::to_owned);
         Some(ReviewSubject {
@@ -217,11 +221,20 @@ impl ProposalKind for Report {
             payload["title"].as_str().unwrap_or_default(),
             session.session_id
         );
+        let mut text = report_text(&child, payload);
+        if payload["review"]["verdict"] == "pass" && payload["head_sha"].is_string() {
+            text.push_str(&format!(
+                "\n\nTo propose its work with this review carried over, so its reviewer looks at what changed since it \
+                 passed rather than the whole change, add `from_sub_session: \"{}\"` to propose_pull_request or \
+                 propose_stack.",
+                session.session_id
+            ));
+        }
         Ok(json!({
             "message": "Your parent session has your report.",
             "notify": [{
                 "session": payload["parent"],
-                "text": report_text(&child, payload),
+                "text": text,
                 "summary": format!("Sub-session \"{}\" reports it's done", payload["title"].as_str().unwrap_or_default()),
             }],
         }))

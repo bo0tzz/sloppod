@@ -1394,6 +1394,18 @@ pub async fn move_proposal(
     .await
 }
 
+/// Review sessions none of whose proposals is still being reviewed, or was decided after `since`.
+pub async fn idle_review_sessions(db: &PgPool, since: DateTime<Utc>) -> sqlx::Result<Vec<Uuid>> {
+    sqlx::query_scalar(
+        "select s.id from sessions s where s.kind = 'review' and s.deleted_at is null \
+         and not exists (select 1 from proposals p where p.review_session_id = s.id \
+           and (p.status in ('in_review', 'changes_requested') or coalesce(p.decided_at, p.created_at) > $1))",
+    )
+    .bind(since)
+    .fetch_all(db)
+    .await
+}
+
 pub async fn set_review_session(db: &PgPool, proposal: Uuid, session: Uuid) -> sqlx::Result<()> {
     sqlx::query("update proposals set review_session_id = $2 where id = $1")
         .bind(proposal)
@@ -1435,11 +1447,46 @@ pub async fn proposals_in_review(db: &PgPool, session: Uuid) -> sqlx::Result<Vec
 /// The proposal a review session reviews.
 pub async fn reviewed_proposal(db: &PgPool, session: Uuid) -> sqlx::Result<Option<ProposalRow>> {
     sqlx::query_as(AssertSqlSafe(format!(
-        "select {PROPOSAL_COLUMNS} from proposals where review_session_id = $1"
+        "select {PROPOSAL_COLUMNS} from proposals where review_session_id = $1 \
+         order by status in ('in_review', 'changes_requested') desc, created_at desc limit 1"
     )))
     .bind(session)
     .fetch_optional(db)
     .await
+}
+
+/// Whether a review session has a proposal it's reviewing now (in review, or waiting on its author for the next
+/// round). A reviewer kept after a report (#247) has none until a proposal carries its review over.
+pub async fn has_active_review(db: &PgPool, session: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "select exists (select 1 from proposals where review_session_id = $1 \
+         and status in ('in_review', 'changes_requested'))",
+    )
+    .bind(session)
+    .fetch_one(db)
+    .await
+}
+
+/// Makes `reviewer` the review session of `proposal` if it reviews nothing else now, atomically, so two proposals
+/// carrying the same review over can't share it. Says whether it did.
+pub async fn claim_reviewer(db: &PgPool, proposal: Uuid, reviewer: Uuid) -> sqlx::Result<bool> {
+    let mut tx = db.begin().await?;
+    sqlx::query("select pg_advisory_xact_lock(hashtext($1::text))")
+        .bind(reviewer)
+        .execute(&mut *tx)
+        .await?;
+    let claimed = sqlx::query(
+        "update proposals set review_session_id = $2 where id = $1 and not exists (select 1 from proposals \
+         where review_session_id = $2 and id <> $1 and status in ('in_review', 'changes_requested'))",
+    )
+    .bind(proposal)
+    .bind(reviewer)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        > 0;
+    tx.commit().await?;
+    Ok(claimed)
 }
 
 #[derive(Debug, Clone, FromRow)]

@@ -522,6 +522,11 @@ pub trait ProposalKind: Send + Sync {
     fn standing_approvable(&self) -> bool {
         true
     }
+    /// Whether a later proposal of the same change can carry its review over (#247), like a sub-session's report,
+    /// whose branch its parent then proposes: its reviewer is kept, parked, once it passes, instead of deleted.
+    fn reviewed_again(&self) -> bool {
+        false
+    }
     /// Whether it asks for a review and nothing else, like a session's request for a second opinion on a branch: it's
     /// always reviewed, and once the review is over there's nothing to carry out. Only for kinds that aren't outward.
     fn is_review(&self) -> bool {
