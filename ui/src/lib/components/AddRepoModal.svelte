@@ -2,7 +2,7 @@
   import { Alert, Button, Field, LoadingSpinner, Modal, ModalBody, ModalFooter, Select, Text } from '@immich/ui';
   import { mdiSourceRepository } from '@mdi/js';
   import { onMount } from 'svelte';
-  import { api, type Session } from '#lib/api.ts';
+  import { api, type GitHubUserConfig, type Session } from '#lib/api.ts';
 
   let {
     session,
@@ -10,17 +10,43 @@
     onClose,
   }: { session: Session; onAdded: (session: Session, repo: string) => void; onClose: () => void } = $props();
 
+  const APP = 'app';
+
   let repos = $state<string[] | null>(null);
+  let tokens = $state<{ id: string; label: string; repositories: string[] }[]>([]);
+  let actAs = $state(APP);
   let repo = $state<string>();
   let saving = $state(false);
   let error = $state<string | null>(null);
 
+  const token = $derived(tokens.find((candidate) => candidate.id === actAs));
+  const identities = $derived([
+    { value: APP, label: 'The GitHub App' },
+    ...tokens.map((entry) => ({ value: entry.id, label: entry.label })),
+  ]);
+  // The session can act on a repository as the App and as each token, so what it already has depends on who it acts as.
   const granted = $derived(
-    new Set(session.grants.filter((grant) => grant.capability === 'repo').map((grant) => String(grant.params.repo))),
+    new Set(
+      session.grants
+        .filter((grant) => grant.capability === 'repo' && (grant.params.credential ?? APP) === actAs)
+        .map((grant) => String(grant.params.repo)),
+    ),
   );
-  const available = $derived((repos ?? []).filter((candidate) => !granted.has(candidate)));
+  const available = $derived((token ? token.repositories : (repos ?? [])).filter((candidate) => !granted.has(candidate)));
 
   onMount(async () => {
+    // Without tokens, or if they can't be listed, the modal offers the App alone.
+    api
+      .listCredentials()
+      .then((credentials) => {
+        tokens = credentials
+          .filter((credential) => credential.kind === 'github-user')
+          .map((credential) => {
+            const config = credential.config as unknown as GitHubUserConfig;
+            return { id: credential.id, label: `${config.login} (${credential.name})`, repositories: config.repositories };
+          });
+      })
+      .catch(() => {});
     try {
       repos = await api.listRepos();
     } catch (e) {
@@ -34,7 +60,7 @@
     saving = true;
     error = null;
     try {
-      onAdded(await api.addSessionRepo(session.id, repo), repo);
+      onAdded(await api.addSessionRepo(session.id, repo, token?.id), repo);
       onClose();
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -47,11 +73,20 @@
   <ModalBody>
     <div class="flex flex-col gap-3 pb-4" data-testid="add-repo">
       <Text color="muted" size="small">The session gets write access to its own branch in the repository.</Text>
+      {#if tokens.length > 0}
+        <Field label="Act as">
+          <Select options={identities} bind:value={actAs} onChange={() => (repo = undefined)} />
+        </Field>
+        {#if token}
+          <Text color="muted" size="small">What the session pushes there is attributed to that person.</Text>
+        {/if}
+      {/if}
       {#if repos === null}
         <div class="flex justify-center py-4"><LoadingSpinner /></div>
       {:else if available.length === 0 && !error}
         <Text size="small">
-          No more repositories available. <a href="/settings" class="text-primary underline">Check your GitHub App in settings</a>.
+          No more repositories available.
+          <a href="/settings" class="text-primary underline">Check your {token ? 'GitHub account' : 'GitHub App'} in settings</a>.
         </Text>
       {:else if available.length > 0}
         <Field label="Repository">
