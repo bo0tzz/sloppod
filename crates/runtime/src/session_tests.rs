@@ -475,11 +475,29 @@ async fn a_command_run_in_the_pod_gets_its_own_result() {
     assert_eq!(first.await.unwrap(), Ok("ok".into()));
     assert_eq!(second.await.unwrap(), Err("failed".into()));
 
-    // A link that goes fails what's still waiting.
+    // A link that goes fails what's still waiting, and what's run after it.
     let pending = run("three");
     tokio::time::sleep(Duration::from_millis(20)).await;
     h.agent.close();
     assert!(pending.await.unwrap().is_err());
+    assert!(run("four").await.unwrap().is_err());
+
+    // So does a run whose request can't be sent.
+    let (tx, rx) = mpsc::unbounded_channel();
+    drop(rx);
+    let unsent = AgentConn::new(tx);
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        unsent.run(
+            vec!["judge".into()],
+            Vec::new(),
+            String::new(),
+            Duration::from_secs(5),
+        ),
+    )
+    .await
+    .expect("a run whose request couldn't be sent waited");
+    assert!(result.is_err());
 }
 
 #[tokio::test]

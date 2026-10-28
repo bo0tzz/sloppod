@@ -521,12 +521,13 @@ async fn run_command(
         .spawn()
         .map_err(|e| format!("starting {program}: {e}"))?;
     let mut stdin = child.stdin.take().ok_or("no stdin")?;
-    stdin
-        .write_all(input.as_bytes())
-        .await
-        .map_err(|e| format!("writing its input: {e}"))?;
-    drop(stdin);
-    let output = tokio::time::timeout(timeout, child.wait_with_output())
+    // The input is written while the output is read, so neither waits on the other, and the timeout covers both.
+    // A command that doesn't read all its input just leaves the rest unwritten.
+    let write = async move {
+        let _ = stdin.write_all(input.as_bytes()).await;
+    };
+    let io = async move { tokio::join!(write, child.wait_with_output()).1 };
+    let output = tokio::time::timeout(timeout, io)
         .await
         .map_err(|_| format!("it took longer than {}s", timeout.as_secs()))?
         .map_err(|e| e.to_string())?;
@@ -1104,5 +1105,34 @@ mod run_tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn input_larger_than_a_pipe_never_blocks() {
+        let big = "x".repeat(4 << 20);
+        // A command that doesn't read its input.
+        let out = run_command(&sh("echo done"), [], "/", &big, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(out, "done\n");
+        // One that writes more than a pipe holds before it reads.
+        let out = run_command(
+            &sh("head -c 1000000 /dev/zero | wc -c; wc -c"),
+            [],
+            "/",
+            &big,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.split_whitespace().collect::<Vec<_>>(),
+            ["1000000", "4194304"]
+        );
+        // And a timeout holds while input is still being written.
+        let slow = run_command(&sh("sleep 5"), [], "/", &big, Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(slow.contains("longer than"), "{slow}");
     }
 }
