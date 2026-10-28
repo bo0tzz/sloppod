@@ -19,28 +19,20 @@ use crate::{AppState, db};
 /// Where sessions find memini on the runtime's sessions port.
 pub const PREFIX: &str = "/memini";
 
-/// The memini path and query a request is for, in the one form the policy checks and memini receives: dot
-/// segments resolved and percent-encoding decoded by URL parsing, empty segments dropped, then encoded again.
+/// The memini path and query a request is for, in the one form the policy checks and memini receives: read by the
+/// shared path parser, then encoded again, so a `/` within a segment (as in a namespace) stays within it.
 fn canonical_path(path_and_query: &str) -> anyhow::Result<String> {
-    let parsed = reqwest::Url::parse("http://memini.invalid/")?.join(path_and_query)?;
-    let segments = parsed
-        .path_segments()
-        .into_iter()
-        .flatten()
-        .filter(|segment| !segment.is_empty())
-        .map(|segment| {
-            percent_encoding::percent_decode_str(segment)
-                .decode_utf8()
-                .map(|s| s.into_owned())
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .context("the path isn't valid UTF-8")?;
+    let (path, query) = match path_and_query.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (path_and_query, None),
+    };
+    let segments = sloppod_contracts::path_segments(path)?;
     let mut canonical = reqwest::Url::parse("http://memini.invalid/")?;
     canonical
         .path_segments_mut()
         .map_err(|()| anyhow::anyhow!("no path"))?
         .extend(&segments);
-    canonical.set_query(parsed.query());
+    canonical.set_query(query);
     Ok(match canonical.query() {
         Some(query) => format!("{}?{query}", canonical.path()),
         None => canonical.path().to_owned(),
@@ -210,16 +202,22 @@ mod tests {
     fn paths_are_canonical() {
         for (raw, canonical) in [
             ("/v1/memories", "/v1/memories"),
-            ("/v1/x/../pins", "/v1/pins"),
-            ("/v1/x/%2e%2e/keys", "/v1/keys"),
             ("/v1/%6Beys", "/v1/keys"),
             ("/v1//keys/", "/v1/keys"),
-            ("/v1/./memories?q=a%20b", "/v1/memories?q=a%20b"),
+            ("/v1/memories?q=a%20b", "/v1/memories?q=a%20b"),
             ("/v1/namespaces/a%2Fb", "/v1/namespaces/a%2Fb"),
-            ("/../../v1/keys", "/v1/keys"),
             ("/", "/"),
         ] {
             assert_eq!(canonical_path(raw).unwrap(), canonical, "{raw}");
+        }
+        // Dot segments are refused, not resolved: the policy and memini can't read them differently.
+        for raw in [
+            "/v1/x/../pins",
+            "/v1/x/%2e%2e/keys",
+            "/v1/./memories",
+            "/../../v1/keys",
+        ] {
+            assert!(canonical_path(raw).is_err(), "{raw}");
         }
     }
 }
