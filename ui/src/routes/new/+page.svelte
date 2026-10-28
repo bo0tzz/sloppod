@@ -33,24 +33,33 @@
   let generation = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
-  function suggest(prompt: string): Promise<void> {
+  /** The suggestion shown, for the draft it was made for. */
+  let shown: StartingSet | null = null;
+
+  /** Asks for the suggestion for `prompt`, and shows it if the draft hasn't changed since. Resolves with it either
+   * way, or null if it didn't come, so a caller keeps what it asked for whatever the card shows by then. */
+  function suggest(prompt: string): Promise<StartingSet | null> {
     const mine = generation;
     pending = true;
     return api.suggestSession(prompt).then(
       (set) => {
         if (prompt === '') offered = set.capabilities;
         else if (offered.length === 0) loadOffered();
-        if (mine !== generation) return;
-        pending = false;
-        fresh = true;
-        suggested = true;
-        source = set.source;
-        if (!touched.title) title = set.title;
-        if (!touched.repo) repo = set.repo;
-        if (!touched.capabilities) capabilities = set.capabilities;
+        if (mine === generation) {
+          pending = false;
+          fresh = true;
+          suggested = true;
+          shown = set;
+          source = set.source;
+          if (!touched.title) title = set.title;
+          if (!touched.repo) repo = set.repo;
+          if (!touched.capabilities) capabilities = set.capabilities;
+        }
+        return set;
       },
       () => {
         if (mine === generation) pending = false;
+        return null;
       },
     );
   }
@@ -100,15 +109,18 @@
       // A suggestion for an earlier draft isn't sent for this one: the suggestion for it is waited for, so what the
       // user didn't change follows their message. If it doesn't come, only what they set themselves is sent, and
       // the session starts as it always did for the rest.
+      // What's sent comes from the suggestion for this prompt, not from the card, which the user may have kept typing
+      // into meanwhile and which then shows the suggestion for a later one.
+      let set = fresh ? shown : null;
       if (!fresh) {
         clearTimeout(timer);
-        await suggest(prompt);
+        set = await suggest(prompt);
       }
       const session = await api.createSession({
         prompt,
-        title: touched.title || fresh ? title.trim() || undefined : undefined,
-        repo: touched.repo || fresh ? repo : undefined,
-        capabilities: touched.capabilities || fresh ? capabilities : undefined,
+        title: touched.title ? title.trim() || undefined : set?.title,
+        repo: touched.repo ? repo : set?.repo,
+        capabilities: touched.capabilities ? capabilities : set?.capabilities,
       });
       sessions.upsert(session);
       await goto(`/sessions/${session.id}`);

@@ -1031,6 +1031,21 @@ test('sending before the suggestion for the message is in uses that suggestion',
   await expect(page.getByTestId('session-title')).toHaveText('Fix the build in bo0tzz/sloppod');
 });
 
+test('a session starts with the suggestion for the message sent, though the draft changed while it waited', async ({ page }) => {
+  await delaySuggestion(page, 'Fix the build in bo0tzz/sloppod', 2000);
+  await openNewSession(page);
+  await expect(page.getByTestId('starting-card')).toBeVisible();
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Fix the build in bo0tzz/sloppod');
+  await box.press('Enter');
+  // The suggestion for that message is slow; typing another one meanwhile gets its own, which comes first.
+  await box.fill('question: how does the library behave?');
+  await expect(page.getByTestId('starting-source')).toHaveText('Suggested by the model');
+  await expect(page).toHaveURL(/\/sessions\/[0-9a-f-]+$/);
+  await expect(page.getByTestId('session-title')).toHaveText('Fix the build in bo0tzz/sloppod');
+  await expect(page.getByTestId('session-subtitle')).toHaveText('bo0tzz/sloppod');
+});
+
 test('choosing no repository sends none, though the message names one', async ({ page }) => {
   await openNewSession(page);
   const card = page.getByTestId('starting-card');
