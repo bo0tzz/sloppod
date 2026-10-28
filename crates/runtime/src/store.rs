@@ -56,6 +56,8 @@ pub trait SessionStore: Send + Sync {
     async fn end_limit(&self, id: Uuid, at: DateTime<Utc>) -> sqlx::Result<Option<SessionRow>>;
     /// The sessions waiting for their usage limit, for after a restart.
     async fn limited_sessions(&self) -> sqlx::Result<Vec<(Uuid, DateTime<Utc>)>>;
+    /// The timezone of a session's owner, for the times its agent is told.
+    async fn owner_zone(&self, owner: &str) -> sqlx::Result<chrono_tz::Tz>;
 }
 
 pub struct PgStore(pub PgPool);
@@ -64,6 +66,10 @@ pub struct PgStore(pub PgPool);
 impl SessionStore for PgStore {
     async fn get_session(&self, id: Uuid) -> sqlx::Result<Option<SessionRow>> {
         db::get_session(&self.0, id).await
+    }
+
+    async fn owner_zone(&self, owner: &str) -> sqlx::Result<chrono_tz::Tz> {
+        db::user_zone(&self.0, owner).await
     }
 
     async fn set_phase(&self, id: Uuid, phase: Phase) -> sqlx::Result<Option<SessionRow>> {
@@ -178,6 +184,8 @@ pub mod memory {
         pub cleared_prompts: Mutex<Vec<Uuid>>,
         /// Makes clearing a first message fail, as a lost database would.
         pub fail_clearing: std::sync::atomic::AtomicBool,
+        /// Owners' timezones; UTC for the rest.
+        pub zones: Mutex<HashMap<String, chrono_tz::Tz>>,
         /// Makes reading unanswered questions fail, as a lost database would.
         pub fail_reading_questions: std::sync::atomic::AtomicBool,
         /// Makes keeping a session's queue fail, as a lost database would.
@@ -211,6 +219,16 @@ pub mod memory {
     impl SessionStore for MemoryStore {
         async fn get_session(&self, id: Uuid) -> sqlx::Result<Option<SessionRow>> {
             Ok(self.sessions.lock().unwrap().get(&id).cloned())
+        }
+
+        async fn owner_zone(&self, owner: &str) -> sqlx::Result<chrono_tz::Tz> {
+            Ok(self
+                .zones
+                .lock()
+                .unwrap()
+                .get(owner)
+                .copied()
+                .unwrap_or(chrono_tz::UTC))
         }
 
         async fn set_phase(&self, id: Uuid, phase: Phase) -> sqlx::Result<Option<SessionRow>> {

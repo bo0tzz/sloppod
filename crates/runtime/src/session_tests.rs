@@ -2480,3 +2480,22 @@ async fn the_end_of_a_wait_is_kept_as_it_happens() {
     assert_eq!(ended.len(), 1);
     assert_eq!(ended[0].0, h.id);
 }
+
+#[tokio::test]
+async fn the_time_is_in_the_owners_timezone() {
+    let mut h = Harness::ready().await;
+    h.store
+        .zones
+        .lock()
+        .unwrap()
+        .insert("dev".into(), chrono_tz::Europe::Amsterdam);
+    h.hub.set_now("2026-10-27T22:50:00Z".parse().unwrap());
+    prompt_and_answer(&mut h, "Late").await;
+    // Still the 27th in UTC, but the 28th in Amsterdam: a new day there.
+    h.hub.set_now("2026-10-27T23:05:00Z".parse().unwrap());
+    let request = prompt_and_answer(&mut h, "Early").await;
+    assert_eq!(
+        time_line(&request).as_deref(),
+        Some("[sloppod: it's 2026-10-28 00:05 CET, 15 minutes since the last message]")
+    );
+}
