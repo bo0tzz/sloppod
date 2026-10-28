@@ -13,6 +13,9 @@ use sloppod_contracts::{
 use super::{branch_detail, err, head_branch, target_repo};
 use crate::credentials::Credentials;
 
+/// The kind of a code review's proposal, which the MCP tool answers differently from other proposals.
+pub const CODE_REVIEW: &str = "sloppod.code_review";
+
 pub struct CodeReview {
     credentials: Arc<Credentials>,
 }
@@ -62,7 +65,7 @@ impl ProposalKind for CodeReview {
     }
 
     fn kind(&self) -> String {
-        "sloppod.code_review".into()
+        CODE_REVIEW.into()
     }
 
     fn tool(&self) -> ToolSpec {

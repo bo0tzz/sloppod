@@ -42,8 +42,10 @@ impl ProposalKind for PullRequest {
             name: "propose_pull_request".into(),
             description: "Propose opening a pull request from your session branch, or from a branch named after it \
                           (`<session branch>-<name>`) so several pull requests can be open at once. Push your \
-                          commits first. A human reviews the title, body and diff; once approved, sloppod opens \
-                          the PR. Returns the proposal's id; check it with get_proposal."
+                          commits first, and don't push more to the branch before it's approved: new commits \
+                          make the approved proposal fail to open, and you'd propose it again. A human reviews \
+                          the title, body and diff; once approved, sloppod opens the PR. Returns the proposal's \
+                          id; check it with get_proposal."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -183,7 +185,8 @@ impl ProposalKind for PullRequest {
             Err(e) => {
                 result["auto_merge"] = json!(false);
                 format!(
-                    "{url} is open; auto-merge couldn't be turned on ({e}), so it needs merging by hand."
+                    "{url} is open; auto-merge couldn't be turned on ({e}), so it needs merging by hand. {}",
+                    crate::pulls::TELL_THE_USER
                 )
             }
         };
@@ -290,9 +293,11 @@ impl ProposalKind for Stack {
             name: "propose_stack".into(),
             description: "Propose a stack of pull requests that build on each other, e.g. branches managed with \
                           `gh stack`: each one merges into the branch below it, the bottom one into the base. \
-                          Push every branch first; they come from your session branch or branches named after it. \
-                          A human reviews them together; once approved, sloppod opens them and links them as a \
-                          stack on GitHub. Returns the proposal's id; check it with get_proposal."
+                          Push every branch first, and don't push more to any of them before it's approved: new \
+                          commits make the approved proposal fail to open, and you'd propose it again. They come \
+                          from your session branch or branches named after it. A human reviews them together; \
+                          once approved, sloppod opens them and links them as a stack on GitHub. Returns the \
+                          proposal's id; check it with get_proposal."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -502,7 +507,8 @@ impl ProposalKind for Stack {
                         " The stack merges once its required checks pass.".to_owned()
                     }
                     Err(e) => format!(
-                        " Auto-merge couldn't be turned on ({e}), so it needs merging by hand."
+                        " Auto-merge couldn't be turned on ({e}), so it needs merging by hand. {}",
+                        crate::pulls::TELL_THE_USER
                     ),
                 },
                 _ => " Without a linked stack, auto-merge stays off.".to_owned(),

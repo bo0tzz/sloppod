@@ -7,6 +7,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
+use sloppod_contracts::RepoRequests;
 use sloppod_protocol::api::{ProposalStatus, SessionKind};
 use uuid::Uuid;
 
@@ -123,7 +124,7 @@ fn tools(state: &AppState, kind: SessionKind) -> Vec<Value> {
     tools.push(list_grants());
     tools.push(json!({
         "name": "get_proposal",
-        "description": "Check the status of a proposal you made: in_review (another model is reviewing it), changes_requested (by that review), pending (waiting for a human), approved, rejected (with the reviewer's reason), executed (with the result, e.g. the PR URL) or failed.",
+        "description": "Check the status of a proposal you made: in_review (another model is reviewing it), changes_requested (by that review), pending (waiting for a human), approved, rejected (with the reviewer's reason), withdrawn, executed (with the result, e.g. the PR URL) or failed.",
         "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
     }));
     tools.push(json!({
@@ -140,7 +141,7 @@ fn tools(state: &AppState, kind: SessionKind) -> Vec<Value> {
     }));
     tools.push(json!({
         "name": "ask_user",
-        "description": "Ask the user one to four multiple-choice questions without waiting for them: the questions are shown in their client, this returns at once, and their answer arrives later as a message starting \"sloppod: the user answered your question\". Carry on with work that doesn't depend on it meanwhile.",
+        "description": "Ask the user one to four multiple-choice questions without waiting for them: the questions are shown in their client, this returns at once, and their answer arrives later as a message starting \"sloppod: the user answered your question\", or \"sloppod: the user dismissed your question without answering it\" if they close it. An open question survives a runtime restart. Carry on with work that doesn't depend on it meanwhile.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -177,12 +178,12 @@ fn tools(state: &AppState, kind: SessionKind) -> Vec<Value> {
     }));
     tools.push(json!({
         "name": "request_review",
-        "description": "After a review asked for changes to your proposal, ask for the next round once you've pushed fixes. The proposal is re-pinned to your branch's new head.",
+        "description": "After a review asked for changes to your proposal or to a branch you asked `request_code_review` for, ask for the next round once you've pushed fixes. The proposal is re-pinned to your branch's new head.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "id": {"type": "string"},
-                "update": {"type": "object", "description": "A new title or description when they no longer describe the change: {title?, body?} for a pull request, {pull_requests: [{title?, body?}]} by position for a stack, {title?, summary?} for a report. What's proposed (repository, branches) can't change; withdraw and propose again for that"},
+                "update": {"type": "object", "description": "A new title or description when they no longer describe the change: {title?, body?} for a pull request, {pull_requests: [{title?, body?}]} by position for a stack, {title?, summary?} for a report, {focus} for a code review. What's proposed (repository, branches) can't change; withdraw and propose again for that"},
                 "replies": {"type": "string", "description": "Your replies to findings you think don't apply, or that you addressed differently"},
             },
             "required": ["id"],
@@ -239,7 +240,7 @@ async fn ask_user(state: &AppState, session: Uuid, arguments: &Value) -> Result<
 
 async fn list_grants_text(state: &AppState, session: Uuid) -> Result<String, String> {
     match db::get_session(&state.db, session).await {
-        Ok(Some(row)) => Ok(grant_list(&row.to_api().grants)),
+        Ok(Some(row)) => Ok(grant_list(&row.to_api().grants, row.repo_requests())),
         _ => Err("couldn't load the session".into()),
     }
 }
@@ -299,6 +300,15 @@ async fn propose(
     let proposal = proposals::propose(state, session, tool, arguments)
         .await
         .map_err(|e| format!("Proposal refused: {e}"))?;
+    // A code review asks no human: it ends with its findings, and nothing is carried out.
+    if proposal.kind == proposals::CODE_REVIEW {
+        return Ok(format!(
+            "Code review {} started; another model is reviewing the branch. Its findings come back to you. No human \
+             is asked and nothing is carried out: push fixes and call request_review for the next round, or \
+             withdraw_proposal once you've heard enough.",
+            proposal.id
+        ));
+    }
     Ok(match proposal.status {
         ProposalStatus::InReview => format!(
             "Proposal {} created; another model is reviewing it before a human sees it. Its findings, if any, come \
@@ -318,7 +328,7 @@ async fn propose(
     })
 }
 
-fn grant_list(grants: &[sloppod_protocol::api::Grant]) -> String {
+fn grant_list(grants: &[sloppod_protocol::api::Grant], requests: RepoRequests) -> String {
     let mut lines: Vec<String> = grants
         .iter()
         .map(|g| {
@@ -334,8 +344,27 @@ fn grant_list(grants: &[sloppod_protocol::api::Grant]) -> String {
             )
         })
         .collect();
-    lines.push(
-        "Anything else is refused. Ask for write access to another repository with request_repository.".into(),
-    );
+    let next = requests
+        .advice()
+        .map(|advice| format!("; for another repository, {advice}"))
+        .unwrap_or_default();
+    lines.push(format!("Anything else is refused{next}."));
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_grant_list_points_to_request_repository_only_where_it_exists() {
+        assert!(grant_list(&[], RepoRequests::Itself).contains("request_repository"));
+        let sub = grant_list(&[], RepoRequests::ViaParent);
+        assert!(!sub.contains("request_repository"), "{sub}");
+        assert!(sub.contains("your report"), "{sub}");
+        assert_eq!(
+            grant_list(&[], RepoRequests::Never),
+            "Anything else is refused."
+        );
+    }
 }
