@@ -486,7 +486,7 @@ impl GitHubApp {
             let installation = self.installation_for(repo).await?;
             let mut covered = vec![repo];
             for other in granted {
-                if !other.eq_ignore_ascii_case(repo)
+                if !sloppod_contracts::same_repo(other, repo)
                     && self.installation_for(other).await.ok() == Some(installation)
                 {
                     covered.push(other);
