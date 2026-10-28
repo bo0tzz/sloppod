@@ -47,6 +47,53 @@ fn labels(update: &Value, field: &str, i: usize) -> Result<Vec<String>> {
     }
 }
 
+/// What an update can have; anything else is refused rather than dropped, so a proposal shows all it will do.
+const FIELDS: &[&str] = &[
+    "number",
+    "title",
+    "comment",
+    "body",
+    "close",
+    "reopen",
+    "add_labels",
+    "remove_labels",
+];
+
+/// Refuses an update with a field it can't have, or one of the wrong type, before its fields are read.
+fn check_fields(update: &Value, i: usize) -> Result<()> {
+    let Some(fields) = update.as_object() else {
+        return Err(Error::new(format!("update {} must be an object", i + 1)));
+    };
+    if let Some(unknown) = fields.keys().find(|k| !FIELDS.contains(&k.as_str())) {
+        return Err(Error::new(format!(
+            "update {} has `{unknown}`, which an update can't have; it can have {}",
+            i + 1,
+            FIELDS.join(", ")
+        )));
+    }
+    for field in ["title", "comment", "body", "close"] {
+        if !matches!(
+            fields.get(field),
+            None | Some(Value::Null | Value::String(_))
+        ) {
+            return Err(Error::new(format!(
+                "update {}'s {field} must be text",
+                i + 1
+            )));
+        }
+    }
+    if !matches!(
+        fields.get("reopen"),
+        None | Some(Value::Null | Value::Bool(_))
+    ) {
+        return Err(Error::new(format!(
+            "update {}'s reopen must be true or false",
+            i + 1
+        )));
+    }
+    Ok(())
+}
+
 /// Checks a list of updates from the agent or the reviewer, keeping only what GitHub gets. Each names an issue and
 /// changes at least one thing.
 fn update_list(updates: &Value) -> Result<Vec<Value>> {
@@ -62,6 +109,7 @@ fn update_list(updates: &Value) -> Result<Vec<Value>> {
         .iter()
         .enumerate()
         .map(|(i, update)| {
+            check_fields(update, i)?;
             let number = update["number"]
                 .as_u64()
                 .ok_or_else(|| Error::new(format!("update {} needs the issue's number", i + 1)))?;
@@ -364,6 +412,15 @@ mod tests {
         assert!(update_list(&json!([])).is_err());
         assert!(update_list(&json!([{"comment": "no number"}])).is_err());
         assert!(update_list(&json!([{"number": 1}])).is_err());
+        // Nothing is dropped unseen: a field it can't have, or of the wrong type, is refused (#280).
+        assert!(update_list(&json!([{"number": 1, "comment": "Done.", "close": true}])).is_err());
+        assert!(
+            update_list(&json!([{"number": 1, "comment": "Done.", "closed": "completed"}]))
+                .is_err()
+        );
+        assert!(update_list(&json!([{"number": 1, "comment": "Done.", "reopen": "yes"}])).is_err());
+        assert!(update_list(&json!([{"number": 1, "title": 5}])).is_err());
+        assert!(update_list(&json!(["#1"])).is_err());
         // An empty body is a change: it clears the body.
         assert_eq!(
             update_list(&json!([{"number": 1, "body": ""}])).unwrap(),
