@@ -785,6 +785,7 @@ test('manages credentials and nudges when they are missing', async ({ page }) =>
   await page.goto('/settings');
   await expect(page.getByTestId('session-subtitle')).toHaveText('Signed in as bo0tzz');
   await expect(page.getByTestId('current-user')).toHaveText('Signed in as bo0tzz');
+  await expect(page.getByTestId('runtime-build')).toHaveText('sloppod v0.0.0-mock');
   await expect(row('claude', 'Personal').getByTestId('default-badge')).toBeVisible();
   await expect(row('github-app', 'sloppod-dev')).toContainText('App ID: 1234567');
 

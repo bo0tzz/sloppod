@@ -22,7 +22,7 @@ POST   /api/v1/sessions/{id}/wake   -> Session     brings a parked session back 
 POST   /api/v1/sessions/{id}/repos  -> Session     body: {repo: string}; grants write access to another repository and tells the agent (no-op if it has it)
 PUT    /api/v1/sessions/{id}/review -> Session     body: {review: "off" | "required"}
 GET    /api/v1/repos                -> string[]    repositories sessions can be granted, e.g. ["bo0tzz/sloppod"]
-GET    /api/v1/me                   -> {user: string}
+GET    /api/v1/me                   -> {user: string, build: string | null}   build: what the runtime was built from (SLOPPOD_BUILD), if set
 GET    /api/v1/settings             -> Settings
 PUT    /api/v1/settings             -> Settings    body: {model?: string | null, review?: "off" | "required"}; fields left out stay as they are
 ```

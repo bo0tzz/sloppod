@@ -233,7 +233,8 @@ export const api = {
   addSessionRepo: (id: string, repo: string) =>
     call<Session>('POST', `/sessions/${encodeURIComponent(id)}/repos`, { repo }),
   listRepos: () => call<string[]>('GET', '/repos'),
-  me: () => call<{ user: string }>('GET', '/me'),
+  /** Who we are, and the runtime's build (`SLOPPOD_BUILD`) if it has one. */
+  me: () => call<{ user: string; build: string | null }>('GET', '/me'),
   getSettings: () => call<Settings>('GET', '/settings'),
   updateSettings: (body: { model?: string | null; review?: ReviewPolicy }) => call<Settings>('PUT', '/settings', body),
   setSessionReview: (id: string, review: ReviewPolicy) =>
