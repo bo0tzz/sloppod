@@ -140,6 +140,10 @@ impl AgentAdapter for ClaudeCode {
         }
     }
 
+    fn inference_capability(&self) -> String {
+        capability::MODEL.into()
+    }
+
     fn launch(&self, context: &AgentContext) -> AgentLaunch {
         let session_id = &context.session.session_id;
         let config_dir = format!("{}/.claude", context.workdir);
@@ -265,6 +269,10 @@ impl AgentAdapter for Codex {
             kind: CHATGPT.into(),
             name: "a ChatGPT login".into(),
         }
+    }
+
+    fn inference_capability(&self) -> String {
+        capability::CODEX.into()
     }
 
     fn launch(&self, context: &AgentContext) -> AgentLaunch {

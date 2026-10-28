@@ -15,6 +15,12 @@ use uuid::Uuid;
 
 use crate::{AppState, db};
 
+/// Whether a session without a memini key gets one. A sub-session's memory is what its parent gave it (ADR 27), so
+/// it gets a key only for a memory grant it has.
+fn mints_memory(session: &db::SessionRow, has_memory_grant: bool) -> bool {
+    session.parent_id.is_none() || has_memory_grant
+}
+
 /// Gives a session its memini key when its owner has memini and it has none, e.g. because it was just created, or
 /// its key was lost (ADR 22). Keeps the namespace of an existing memory grant.
 async fn ensure_memini_key(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
@@ -34,6 +40,9 @@ async fn ensure_memini_key(state: &AppState, session: &db::SessionRow) -> anyhow
         .grant(capability::MEMORY)
         .and_then(|g| g.param("namespace"))
         .map(str::to_owned);
+    if !mints_memory(session, granted.is_some()) {
+        return Ok(());
+    }
     let home = memini
         .config("home")
         .map(str::to_owned)
@@ -387,6 +396,18 @@ pub async fn remove_session(state: &AppState, session: &db::SessionRow) -> anyho
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_sub_session_gets_memory_only_if_its_parent_gave_it() {
+        let mut session = crate::db::SessionRow::for_test(uuid::Uuid::new_v4(), "alice");
+        assert!(
+            super::mints_memory(&session, false),
+            "a session of its own gets memory"
+        );
+        session.parent_id = Some(uuid::Uuid::new_v4());
+        assert!(!super::mints_memory(&session, false));
+        assert!(super::mints_memory(&session, true));
+    }
+
     #[test]
     fn a_session_long_on_an_old_image_is_nudged_once() {
         let now = chrono::Utc::now();

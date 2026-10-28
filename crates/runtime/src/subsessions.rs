@@ -88,8 +88,22 @@ pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<
         None => parent.repo.clone(),
     };
     let agent = arguments["agent"].as_str().unwrap_or(&parent.agent);
-    if state.agents.get(agent).is_none() {
-        return Err(format!("there's no agent called {agent}"));
+    let adapter = state
+        .agents
+        .get(agent)
+        .ok_or_else(|| format!("there's no agent called {agent}"))?;
+    let needed = adapter.credential();
+    let has_credential = state
+        .credentials
+        .has_default(&parent.owner, &needed.kind)
+        .await
+        .map_err(|e| e.to_string())?;
+    let inference = adapter.inference_capability();
+    if !has_credential || !grants.iter().any(|g| g.capability == inference) {
+        return Err(format!(
+            "{agent} needs {} and the {inference} grant, which you can't give it",
+            needed.name
+        ));
     }
     let model = arguments["model"].as_str().or(parent.model.as_deref());
     let title = arguments["title"]
