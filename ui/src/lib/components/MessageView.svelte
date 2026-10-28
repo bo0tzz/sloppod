@@ -1,19 +1,31 @@
 <script lang="ts">
-  import { Icon } from '@immich/ui';
-  import { mdiLinkVariant, mdiSteering } from '@mdi/js';
-  import type { MessageItem } from '#lib/acp/transcript.svelte.ts';
+  import { Icon, IconButton } from '@immich/ui';
+  import { mdiCheck, mdiContentCopy, mdiLinkVariant, mdiSteering } from '@mdi/js';
+  import { messageMarkdown, type MessageItem } from '#lib/acp/transcript.svelte.ts';
   import Markdown from './Markdown.svelte';
 
   let { message }: { message: MessageItem } = $props();
 
   const user = $derived(message.type === 'user');
+
+  let copied = $state(false);
+  let copiedTimer: ReturnType<typeof setTimeout> | undefined;
+
+  async function copy() {
+    await navigator.clipboard.writeText(messageMarkdown(message));
+    copied = true;
+    clearTimeout(copiedTimer);
+    copiedTimer = setTimeout(() => (copied = false), 2000);
+  }
+
+  $effect(() => () => clearTimeout(copiedTimer));
 </script>
 
 <div class="flex {user ? 'justify-end' : ''}" data-testid="message-{message.type}" data-steering={message.steering || undefined}>
   <div
     class={user
       ? `max-w-[85%] rounded-2xl rounded-ee-md px-4 py-2.5 ${message.steering ? 'bg-warning-500/15' : 'bg-primary/10'}`
-      : 'w-full min-w-0'}
+      : 'group w-full min-w-0'}
   >
     {#if message.steering}
       <div class="text-warning-700 dark:text-warning-400 mb-1 flex items-center gap-1 text-xs font-medium">
@@ -38,5 +50,19 @@
         </a>
       {/if}
     {/each}
+    {#if !user}
+      <!-- Revealed on hover where there's a pointer to hover with, always shown on touch screens. -->
+      <div data-testid="message-actions" class="pointer-fine:opacity-0 pointer-fine:group-hover:opacity-100 pointer-fine:focus-within:opacity-100 -ms-2 transition-opacity">
+        <IconButton
+          icon={copied ? mdiCheck : mdiContentCopy}
+          aria-label={copied ? 'Copied' : 'Copy message'}
+          variant="ghost"
+          shape="round"
+          color="secondary"
+          size="small"
+          onclick={copy}
+        />
+      </div>
+    {/if}
   </div>
 </div>
