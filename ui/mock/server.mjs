@@ -1649,6 +1649,8 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, child.data);
     }
     if (url.pathname === '/_mock/drop' && req.method === 'POST') {
+      // With `?for=<ms>`, new connections are refused that long, so a UI stays disconnected for a while.
+      refuseConnectionsUntil = Date.now() + Number(url.searchParams.get('for') ?? 0);
       for (const conn of connections) conn.ws.terminate();
       return json(res, 200, { dropped: connections.size });
     }
@@ -1660,9 +1662,12 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+/** Set by `/_mock/drop?for=<ms>`: until then, UIs can't connect. */
+let refuseConnectionsUntil = 0;
+
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
-  if (new URL(req.url ?? '/', 'http://localhost').pathname !== '/acp') {
+  if (new URL(req.url ?? '/', 'http://localhost').pathname !== '/acp' || Date.now() < refuseConnectionsUntil) {
     socket.destroy();
     return;
   }
