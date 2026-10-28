@@ -1718,3 +1718,21 @@ async fn after_a_restart_a_gap_counts_from_the_sessions_last_activity() {
         Some("[sloppod: it's 2026-10-29 16:10 UTC, 2 days since the last message]")
     );
 }
+
+#[tokio::test]
+async fn an_adopted_turn_that_ends_counts_as_hearing_from_the_agent() {
+    let turn = json!({"jsonrpc": "2.0", "id": 7, "method": "session/prompt", "params": {"sessionId": "agent-session", "prompt": []}});
+    let mut h = Harness::adopted(vec![turn.clone()], Vec::new()).await;
+    let chunk = json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "agent-session", "update": {
+        "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Working on it."},
+    }}});
+    from_agent(&h.hub, h.id, &h.agent, chunk).await;
+    h.hub.set_now(later(3 * 60));
+    let next = h.prompt("Next");
+    wait_for_queue(&h, 1).await;
+    h.respond(&turn, json!({"stopReason": "end_turn"})).await;
+    let request = h.next().await;
+    assert_eq!(time_line(&request), None);
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    next.await.unwrap().unwrap();
+}
