@@ -1723,21 +1723,16 @@ impl Hub {
         Ok(())
     }
 
-    /// Shows the questions a restart left unanswered again (#39).
-    pub async fn restore_questions(&self) {
-        let questions = match self.store.questions().await {
-            Ok(questions) => questions,
-            Err(e) => {
-                tracing::error!(error = %e, "loading unanswered questions");
-                return;
-            }
-        };
-        for (id, key, questions) in questions {
+    /// Shows the questions a restart left unanswered again (#39). On an error reading them it shows none, for the
+    /// caller to try again.
+    pub async fn restore_questions(&self) -> sqlx::Result<()> {
+        for (id, key, questions) in self.store.questions().await? {
             match crate::questions::elicitation(&questions, &id.to_string()) {
                 Ok(params) => self.show_question(id, key, questions, params).await,
                 Err(e) => tracing::warn!(session = %id, error = %e, "restoring a question"),
             }
         }
+        Ok(())
     }
 
     async fn show_question(&self, id: Uuid, key: Uuid, questions: Value, params: Value) {

@@ -1339,7 +1339,26 @@ async fn a_question_whose_answer_could_not_be_stored_comes_back_after_a_restart(
 
     h.store.fail_saving_queues.store(false, Ordering::SeqCst);
     let (hub, _agent, _to_agent) = restarted(&h).await;
-    hub.restore_questions().await;
+    hub.restore_questions().await.unwrap();
+    let replay = hub.replay(h.id).await.unwrap();
+    assert_eq!(replay.permissions.len(), 1);
+    assert_eq!(replay.permissions[0].2["message"], "Which backoff?");
+}
+
+#[tokio::test]
+async fn questions_a_restart_could_not_read_are_shown_once_it_can() {
+    let h = Harness::ready().await;
+    let questions = json!([{"question": "Which backoff?", "options": [{"label": "Exponential"}, {"label": "Fixed"}]}]);
+    h.hub.ask(h.id, questions).await.unwrap();
+
+    let (hub, _agent, _to_agent) = restarted(&h).await;
+    h.store.fail_reading_questions.store(true, Ordering::SeqCst);
+    assert!(hub.restore_questions().await.is_err());
+    assert!(hub.replay(h.id).await.unwrap().permissions.is_empty());
+    h.store
+        .fail_reading_questions
+        .store(false, Ordering::SeqCst);
+    hub.restore_questions().await.unwrap();
     let replay = hub.replay(h.id).await.unwrap();
     assert_eq!(replay.permissions.len(), 1);
     assert_eq!(replay.permissions[0].2["message"], "Which backoff?");
@@ -1352,7 +1371,7 @@ async fn a_question_from_ask_user_outlives_a_restart() {
     h.hub.ask(h.id, questions).await.unwrap();
 
     let (hub, agent, mut to_agent) = restarted(&h).await;
-    hub.restore_questions().await;
+    hub.restore_questions().await.unwrap();
     let replay = hub.replay(h.id).await.unwrap();
     let (pid, method, params) = replay.permissions.first().cloned().expect("the question");
     assert_eq!(method, "elicitation/create");
