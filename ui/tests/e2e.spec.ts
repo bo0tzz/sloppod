@@ -1001,6 +1001,21 @@ test('deleting a session deletes its sub-sessions, also below one already delete
   expect(deleted.map((s) => s.id)).toEqual(expect.arrayContaining([a, b, c]));
 });
 
+test('a message from another session shows folded under its summary', async ({ page }) => {
+  await createSession(page, 'Wait for a report');
+  await finishTurn(page);
+  const summary = `Sub-session "Docs" reports it's done`;
+  const text = `sloppod: your sub-session "Docs" reports that it's done: Rewrote the deploy guide.`;
+  await page.request.post(
+    `/_mock/notice?text=${encodeURIComponent(text)}&summary=${encodeURIComponent(summary)}`,
+  );
+  const notice = page.getByTestId('system-notice').filter({ hasText: summary });
+  await expect(notice).toBeVisible();
+  await expect(notice.getByText('Rewrote the deploy guide.')).toBeHidden();
+  await notice.getByText(summary).click();
+  await expect(notice.getByText('Rewrote the deploy guide.')).toBeVisible();
+});
+
 test('parks a session and wakes it by sending a message', async ({ page }) => {
   await page.setViewportSize({ width: 1400, height: 900 });
   await createSession(page, 'Park me in sloppod');

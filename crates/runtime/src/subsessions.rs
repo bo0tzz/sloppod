@@ -182,11 +182,15 @@ pub async fn message(state: &AppState, from: Uuid, arguments: &Value) -> Result<
     let target = db::get_session(&state.db, to)
         .await
         .map_err(|e| e.to_string())?;
-    let who = match &target {
-        Some(target) if target.parent_id == Some(from) => "your parent session".to_owned(),
-        Some(target) if sender.parent_id == Some(target.id) => {
-            format!("your sub-session \"{}\" ({from})", sender.title)
-        }
+    let (who, summary) = match &target {
+        Some(target) if target.parent_id == Some(from) => (
+            "your parent session".to_owned(),
+            "Message from the parent session".to_owned(),
+        ),
+        Some(target) if sender.parent_id == Some(target.id) => (
+            format!("your sub-session \"{}\" ({from})", sender.title),
+            format!("Message from sub-session \"{}\"", sender.title),
+        ),
         _ => return Err("you can message your parent session and your own sub-sessions".into()),
     };
     let target = target.expect("matched above");
@@ -207,7 +211,11 @@ pub async fn message(state: &AppState, from: Uuid, arguments: &Value) -> Result<
     }
     state
         .hub
-        .notify(to, format!("sloppod: a message from {who}: {text}"))
+        .notify_summarised(
+            to,
+            format!("sloppod: a message from {who}: {text}"),
+            Some(summary),
+        )
         .await;
     // A no-op unless it's parked, also if it parked since it was looked at.
     lifecycle::wake(state, &target)

@@ -235,8 +235,12 @@ function promptText(prompt) {
     .join('');
 }
 
-function echoUser(session, text, { steering = false, notice = false, messageId = randomUUID() } = {}) {
-  const sloppod = { ...(steering ? { steering: true } : {}), ...(notice ? { notice: true } : {}) };
+function echoUser(session, text, { steering = false, notice = false, summary = null, messageId = randomUUID() } = {}) {
+  const sloppod = {
+    ...(steering ? { steering: true } : {}),
+    ...(notice ? { notice: true } : {}),
+    ...(summary ? { summary } : {}),
+  };
   session.emit({
     sessionUpdate: 'user_message_chunk',
     content: { type: 'text', text },
@@ -1647,6 +1651,13 @@ const server = http.createServer(async (req, res) => {
       const task = url.searchParams.get('task') ?? 'A sub-task';
       const child = createSession({ prompt: task, repo: parent.data.repo ?? undefined, title: task, parent: parent.data.id });
       return json(res, 200, child.data);
+    }
+    if (url.pathname === '/_mock/notice' && req.method === 'POST') {
+      // A notice in every session, folded under `summary` if given, as a message from another session is.
+      const text = url.searchParams.get('text') ?? '';
+      const summary = url.searchParams.get('summary');
+      for (const session of sessions.values()) echoUser(session, text, { notice: true, summary });
+      return json(res, 200, {});
     }
     if (url.pathname === '/_mock/drop' && req.method === 'POST') {
       for (const conn of connections) conn.ws.terminate();

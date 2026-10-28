@@ -25,6 +25,8 @@ export type MessageItem = {
   steering: boolean;
   /** A message from sloppod itself (`_meta.sloppod.notice`), e.g. that a proposal was decided. */
   notice: boolean;
+  /** A notice's one-line summary (`_meta.sloppod.summary`), e.g. for a message from another session: shown folded. */
+  summary: string | null;
   parts: MessagePart[];
 };
 
@@ -165,13 +167,14 @@ export class Transcript {
     if (type === 'user') {
       this.#plan = null;
     }
-    const sloppodMeta = chunk._meta?.sloppod as { steering?: boolean; notice?: boolean } | undefined;
+    const sloppodMeta = chunk._meta?.sloppod as { steering?: boolean; notice?: boolean; summary?: string } | undefined;
     this.#push({
       type,
       key: this.#key(),
       messageId,
       steering: sloppodMeta?.steering === true,
       notice: sloppodMeta?.notice === true,
+      summary: typeof sloppodMeta?.summary === 'string' ? sloppodMeta.summary : null,
       parts: [part],
     });
   }

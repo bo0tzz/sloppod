@@ -426,7 +426,11 @@ async fn carry_out(
                 notice["session"].as_str().and_then(|s| s.parse().ok()),
                 notice["text"].as_str(),
             ) {
-                state.hub.notify(to, text.to_owned()).await;
+                let summary = notice["summary"].as_str().map(str::to_owned);
+                state
+                    .hub
+                    .notify_summarised(to, text.to_owned(), summary)
+                    .await;
                 if let Ok(Some(recipient)) = db::get_session(&state.db, to).await
                     && let Err(e) = lifecycle::wake(state, &recipient).await
                 {
