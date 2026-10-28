@@ -10,6 +10,7 @@ mod db_tests;
 mod enforcer;
 mod github;
 mod grants;
+mod identity;
 mod lifecycle;
 mod link;
 mod mcp;

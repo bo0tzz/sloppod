@@ -15,9 +15,10 @@ use crate::{AppState, db, proposals, reviews};
 pub async fn handler(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
     Json(message): Json<Value>,
 ) -> Response {
-    let Some(session) = state.pods.session_for_ip(&peer.ip().to_string()) else {
+    let Some(session) = crate::identity::calling_session(&state, &headers, peer.ip()).await else {
         return (StatusCode::FORBIDDEN, "not a session pod").into_response();
     };
     let Some(id) = message.get("id").cloned() else {

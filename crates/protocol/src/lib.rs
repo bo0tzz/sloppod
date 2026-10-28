@@ -286,6 +286,10 @@ pub mod api {
 pub mod link {
     use super::*;
 
+    /// Where the supervisor serves the runtime's session endpoints (MCP, memory) to the agent, attaching the pod's
+    /// ServiceAccount token to each request, so the runtime knows the session from the pod's own identity.
+    pub const LOCAL_PROXY: &str = "127.0.0.1:7811";
+
     /// Whether `name` can be a transcript file: a plain `.jsonl` file name, nothing that reaches outside the
     /// transcript directory. Checked when the runtime stores a file and again when a supervisor restores it.
     pub fn is_transcript_file_name(name: &str) -> bool {
@@ -390,6 +394,9 @@ pub mod link {
             /// An agent still running from an earlier link; the runtime attaches to it rather than launching.
             #[serde(default, skip_serializing_if = "Option::is_none")]
             agent: Option<RunningAgent>,
+            /// The supervisor serves the runtime's session endpoints at [`LOCAL_PROXY`]; older ones don't.
+            #[serde(default)]
+            local_proxy: bool,
         },
         Status {
             message: String,

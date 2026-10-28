@@ -1,6 +1,11 @@
 //! The session pod's entrypoint (ADR 17): connects outward to the runtime, prepares the pod and bridges the
 //! agent's ACP stdio over the link.
 
+mod proxy;
+
+/// Whether the runtime's endpoints are served locally to the agent.
+static LOCAL_PROXY_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -131,6 +136,21 @@ async fn main() -> anyhow::Result<()> {
         return check();
     }
     heartbeat();
+    // Without it the agent calls the runtime directly, as before (#196).
+    match proxy::bind().await {
+        Ok(listener) => {
+            let (runtime, token_file) = (args.url.clone(), args.token_file.clone());
+            LOCAL_PROXY_UP.store(true, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                if let Err(e) = proxy::serve(listener, runtime, token_file).await {
+                    tracing::error!(error = %format!("{e:#}"), "serving the runtime's endpoints locally");
+                }
+            });
+        }
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "binding the local endpoint for the agent");
+        }
+    }
     let mut terminate = signal(SignalKind::terminate())?;
     let mut agent = None;
     let mut backoff = Duration::from_secs(1);
@@ -220,6 +240,7 @@ async fn run(
         &FromSupervisor::Hello {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             agent: agent.as_ref().and_then(Agent::running),
+            local_proxy: LOCAL_PROXY_UP.load(std::sync::atomic::Ordering::SeqCst),
         },
     )
     .await?;
