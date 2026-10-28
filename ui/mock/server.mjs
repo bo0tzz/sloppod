@@ -1222,7 +1222,7 @@ async function handleApi(req, res, url) {
 
   if (parts[0] === 'repos' && parts.length === 1 && method === 'GET') return json(res, 200, availableRepos());
   if (parts[0] === 'me' && parts.length === 1 && method === 'GET') {
-    return json(res, 200, { user: req.headers['x-forwarded-user'] ?? 'bo0tzz' });
+    return json(res, 200, { user: req.headers['x-forwarded-user'] ?? 'bo0tzz', build: 'v0.0.0-mock' });
   }
 
   if (parts[0] === 'credentials') return handleCredentials(req, res, parts);
