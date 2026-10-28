@@ -65,6 +65,9 @@ struct LiveState {
     /// The agent is replaying history for `session/load`; that replay isn't new.
     loading: bool,
     turn_running: bool,
+    /// How many of the agent's commands its supervisor last said were running; `None` until it says, and from
+    /// supervisors that don't.
+    commands: Option<usize>,
     /// The agent is compacting its context; steers wait for it to end. A turn's end ends it too, in case the
     /// compaction's own end never came.
     compacting: bool,
@@ -270,7 +273,22 @@ impl Hub {
         }
         state.agent_session_id = None;
         state.turn_running = false;
+        state.commands = None;
         live.end_compaction(&mut state);
+    }
+
+    /// What the supervisor of `agent`, the session's current one, says about the agent's running commands.
+    pub async fn set_commands(&self, id: Uuid, agent: &Arc<AgentConn>, running: usize) {
+        let live = self.live(id);
+        let mut state = live.state.lock().await;
+        if state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
+            state.commands = Some(running);
+        }
+    }
+
+    /// How many of the agent's commands are running, if its supervisor says.
+    pub async fn commands(&self, id: Uuid) -> Option<usize> {
+        self.live(id).state.lock().await.commands
     }
 
     pub async fn set_restart_notice(&self, id: Uuid, notice: String) {
@@ -586,6 +604,7 @@ impl Hub {
             state.agent = None;
             state.agent_session_id = None;
             state.turn_running = false;
+            state.commands = None;
             live.end_compaction(&mut state);
             self.set_phase(id, Phase::Disconnected).await;
             state

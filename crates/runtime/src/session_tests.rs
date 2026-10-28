@@ -446,6 +446,28 @@ async fn a_turn_that_ends_after_its_agent_retired_hands_nothing_on_to_it() {
 }
 
 #[tokio::test]
+async fn running_commands_are_known_from_the_current_agent_only() {
+    let h = Harness::ready().await;
+    assert_eq!(
+        h.hub.commands(h.id).await,
+        None,
+        "unknown until the supervisor says"
+    );
+    h.hub.set_commands(h.id, &h.agent, 2).await;
+    assert_eq!(h.hub.commands(h.id).await, Some(2));
+
+    // A new agent starts unknown, and an old one's word no longer counts.
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let newer = Arc::new(AgentConn::new(tx));
+    h.hub.attach_agent(h.id, newer.clone()).await;
+    assert_eq!(h.hub.commands(h.id).await, None);
+    h.hub.set_commands(h.id, &h.agent, 5).await;
+    assert_eq!(h.hub.commands(h.id).await, None);
+    h.hub.set_commands(h.id, &newer, 0).await;
+    assert_eq!(h.hub.commands(h.id).await, Some(0));
+}
+
+#[tokio::test]
 async fn a_notice_waits_for_the_agent_to_be_up() {
     let mut h = Harness::starting().await;
     h.hub

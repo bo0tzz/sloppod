@@ -88,6 +88,11 @@ fn output_tail(root: &Path, pid: u32) -> Option<String> {
     (!tail.trim().is_empty()).then_some(tail)
 }
 
+/// How many commands are running under the agent.
+pub fn count(agent: u32) -> usize {
+    commands(&read_procs(Path::new("/proc")), agent).len()
+}
+
 /// The commands still running under the agent, read from `/proc`.
 pub fn running(agent: u32) -> Vec<RunningProcess> {
     running_in(Path::new("/proc"), agent)

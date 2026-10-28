@@ -308,6 +308,8 @@ async fn run(
         Terminate,
     }
     let mut ping = tokio::time::interval(Duration::from_secs(20));
+    // What the runtime was last told about the agent's commands; a new link starts out telling it.
+    let mut commands_told = None;
     let deadline = tokio::time::sleep(LINK_TIMEOUT);
     tokio::pin!(deadline);
     let event = loop {
@@ -357,6 +359,13 @@ async fn run(
             _ = ping.tick() => {
                 if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
                     break Event::LinkEnded;
+                }
+                let running = a.child.id().map(shutdown::count).unwrap_or(0);
+                if commands_told != Some(running) {
+                    if send(&mut sink, &FromSupervisor::Commands { running }).await.is_err() {
+                        break Event::LinkEnded;
+                    }
+                    commands_told = Some(running);
                 }
             }
             _ = &mut deadline => {

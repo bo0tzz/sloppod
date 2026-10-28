@@ -451,6 +451,10 @@ pub mod link {
         Error {
             message: String,
         },
+        /// How many of the agent's commands are running, foreground or in the background; sent when it changes.
+        Commands {
+            running: usize,
+        },
         /// The pod is being terminated, and these of the agent's commands were still running; ending the pod ends
         /// them (ADR 10, 17).
         ShutdownReport {

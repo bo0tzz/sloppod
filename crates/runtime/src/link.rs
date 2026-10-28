@@ -672,6 +672,9 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
                 )
                 .await;
             }
+            FromSupervisor::Commands { running } => {
+                state.hub.set_commands(session_id, &agent, running).await;
+            }
             FromSupervisor::ShutdownReport { running } => {
                 tracing::info!(session = %session_id, commands = running.len(), "pod stopping with commands running");
                 // This agent is about to be stopped with its pod, so the notice waits for the next one.
