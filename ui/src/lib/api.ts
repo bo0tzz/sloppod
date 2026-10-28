@@ -21,6 +21,8 @@ export type Session = {
   agent_status?: string;
   /** Why the agent last failed to start or exited; it's started again meanwhile. */
   agent_error?: string;
+  /** The session that spawned it, for a sub-session. */
+  parent_id?: string;
 };
 
 export type NewSession = {

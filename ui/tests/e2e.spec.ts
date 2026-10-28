@@ -969,6 +969,23 @@ test('the sidebar folds away on narrow screens', async ({ page }) => {
   await expect(sidebar).toBeVisible();
 });
 
+test('lists sub-sessions under their parent', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  await createSession(page, 'Fan out the work in sloppod');
+  await finishTurn(page);
+  const parent = page.url().split('/').pop();
+  const response = await page.request.post(`/_mock/spawn?parent=${parent}&task=Fix%20the%20docs`);
+  expect(response.ok()).toBe(true);
+
+  await page.reload();
+  const list = page.getByTestId('session-list');
+  const parentRow = list.locator('li').filter({ has: page.getByTestId('sub-sessions') });
+  await expect(parentRow.getByTestId('session-row').first()).toContainText('Fan out the work');
+  await expect(parentRow.getByTestId('sub-sessions').getByTestId('session-row')).toContainText('Fix the docs');
+  // Not listed a second time at the top level.
+  await expect(list.getByTestId('session-row').filter({ hasText: 'Fix the docs' })).toHaveCount(1);
+});
+
 test('parks a session and wakes it by sending a message', async ({ page }) => {
   await page.setViewportSize({ width: 1400, height: 900 });
   await createSession(page, 'Park me in sloppod');

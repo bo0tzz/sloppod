@@ -893,8 +893,9 @@ function deriveRepo(prompt) {
   return bare.length === 1 ? bare[0] : null;
 }
 
-/** Creates a session from its first message, which is recorded right away and queued for the agent. */
-function createSession({ prompt, repo, title }) {
+/** Creates a session from its first message, which is recorded right away and queued for the agent; `parent` makes it a
+ * sub-session. */
+function createSession({ prompt, repo, title, parent }) {
   const id = randomUUID();
   const created = now();
   const sessionRepo = repo ?? deriveRepo(prompt);
@@ -930,6 +931,7 @@ function createSession({ prompt, repo, title }) {
     created_at: created,
     updated_at: created,
     active_at: created,
+    ...(parent ? { parent_id: parent } : {}),
   });
   sessions.set(id, session);
   queuePrompt(session, prompt);
@@ -1303,9 +1305,17 @@ async function handleApi(req, res, url) {
       return json(res, 200, session.data);
     }
     if (parts.length === 2 && method === 'DELETE') {
-      cancelTurn(session);
-      session.data.deleted_at = now();
-      session.setPhase('parked');
+      // Its sub-sessions go with it, and theirs in turn.
+      const pending = [session];
+      while (pending.length) {
+        const doomed = pending.pop();
+        cancelTurn(doomed);
+        doomed.data.deleted_at = now();
+        doomed.setPhase('parked');
+        for (const other of sessions.values()) {
+          if (other.data.parent_id === doomed.data.id && !other.data.deleted_at) pending.push(other);
+        }
+      }
       res.writeHead(204).end();
       return;
     }
@@ -1628,6 +1638,14 @@ const server = http.createServer(async (req, res) => {
         session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text }, messageId: randomUUID() });
       }
       return json(res, 200, {});
+    }
+    if (url.pathname === '/_mock/spawn' && req.method === 'POST') {
+      // A sub-session of `parent`, as if its agent called spawn_session.
+      const parent = sessions.get(url.searchParams.get('parent') ?? '');
+      if (!parent) return json(res, 404, { error: 'no such session' });
+      const task = url.searchParams.get('task') ?? 'A sub-task';
+      const child = createSession({ prompt: task, repo: parent.data.repo ?? undefined, title: task, parent: parent.data.id });
+      return json(res, 200, child.data);
     }
     if (url.pathname === '/_mock/drop' && req.method === 'POST') {
       for (const conn of connections) conn.ws.terminate();
