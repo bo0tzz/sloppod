@@ -578,6 +578,36 @@ async fn a_command_run_in_the_pod_gets_its_own_result() {
 }
 
 #[tokio::test]
+async fn a_notice_for_an_idle_session_is_never_steered_into_a_turn() {
+    let mut h = Harness::ready().await;
+    let turn = h.prompt("Busy");
+    let request = h.next().await;
+    assert!(
+        !h.hub
+            .notify_when_idle(h.id, None, "sloppod: a newer image is out.".into())
+            .await
+    );
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    while let Ok(message) = h.to_agent.try_recv() {
+        assert!(
+            !matches!(message, ToSupervisor::Acp { .. }),
+            "the agent was sent {message:?}"
+        );
+    }
+    // Once the session is idle, it goes as a turn of its own.
+    assert!(
+        h.hub
+            .notify_when_idle(h.id, None, "sloppod: a newer image is out.".into())
+            .await
+    );
+    let request = h.next().await;
+    assert_eq!(prompt_text(&request), ["sloppod: a newer image is out."]);
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+}
+
+#[tokio::test]
 async fn a_notice_waits_for_the_agent_to_be_up() {
     let mut h = Harness::starting().await;
     h.hub
