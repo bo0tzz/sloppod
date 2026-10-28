@@ -510,3 +510,24 @@ async fn finds_stacks_set_to_merge(db: PgPool) {
         .collect();
     assert_eq!(found, [ids[0]]);
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_session_log_reads_a_page_at_a_time(db: PgPool) {
+    let s = session(&db, "dev").await;
+    let other = session(&db, "dev").await;
+    let mut seqs = Vec::new();
+    for n in 0..5 {
+        seqs.push(db::append_event(&db, s, &json!({"n": n})).await.unwrap());
+        db::append_event(&db, other, &json!({"other": n}))
+            .await
+            .unwrap();
+    }
+    let first = db::events(&db, s, 0, 2).await.unwrap();
+    assert_eq!(
+        first.iter().map(|e| e.1["n"].clone()).collect::<Vec<_>>(),
+        [json!(0), json!(1)]
+    );
+    let rest = db::events(&db, s, first[1].0, 10).await.unwrap();
+    assert_eq!(rest.iter().map(|e| e.0).collect::<Vec<_>>(), seqs[2..]);
+    assert!(db::events(&db, s, seqs[4], 10).await.unwrap().is_empty());
+}

@@ -139,7 +139,6 @@ pub fn session_update(session: Uuid, update: &Value) -> Value {
 }
 
 pub struct Replay {
-    pub events: Vec<(i64, Value)>,
     pub agent_state: Value,
     /// Open permission requests and questions: id, method, params.
     pub permissions: Vec<(u64, String, Value)>,
@@ -1036,8 +1035,18 @@ impl Hub {
     }
 
     /// Everything a UI needs when it loads a session.
+    /// Up to `limit` of the session's recorded updates after `after`; a UI replays the log a page at a time, so
+    /// the whole of a long session's log is never in memory at once.
+    pub async fn events(
+        &self,
+        id: Uuid,
+        after: i64,
+        limit: i64,
+    ) -> Result<Vec<(i64, Value)>, sqlx::Error> {
+        self.store.events(id, after, limit).await
+    }
+
     pub async fn replay(&self, id: Uuid) -> Result<Replay, sqlx::Error> {
-        let events = self.store.events(id).await?;
         let live = self.live(id);
         let state = live.state.lock().await;
         let agent_state = if state.agent_state.is_null() {
@@ -1056,7 +1065,6 @@ impl Hub {
             .collect();
         permissions.sort_by_key(|(pid, _, _)| *pid);
         Ok(Replay {
-            events,
             agent_state,
             permissions,
             queue: Self::queue_notification(id, &state.queue),
