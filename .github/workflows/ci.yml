@@ -17,7 +17,8 @@ concurrency:
 jobs:
   # Decides which of the other jobs a change needs. Skipping per job, not with a top-level `paths` filter, keeps the
   # required checks reporting: a skipped job counts as passing, a workflow that never starts waits forever. Pushes to
-  # main run everything. The patterns list what each job depends on, so a path a job starts reading has to be added.
+  # main run everything. If this job fails the others run anyway (their conditions test for "false", not "true"), so a
+  # broken scope never lets a change through unchecked. The patterns list what each job depends on, so a path a job starts reading has to be added.
   changes:
     runs-on: ubuntu-latest
     outputs:
@@ -30,10 +31,11 @@ jobs:
           fetch-depth: 2
       - id: scope
         run: |
-          # On a pull request HEAD is its merge into the base, so the first parent is the base.
+          # On a pull request HEAD is its merge into the base, so the first parent is the base. Renames count as a delete and
+          # an add, so moving a file out of a directory still counts as touching it.
           files=
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            files=$(git diff --name-only HEAD^1 HEAD)
+            files=$(git diff --no-renames --name-only HEAD^1 HEAD)
           fi
           scope() {
             if [ -z "$files" ] || printf '%s\n' "$files" | grep -Eq "$2"; then
@@ -50,7 +52,7 @@ jobs:
 
   check:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -60,7 +62,7 @@ jobs:
 
   ui-check:
     needs: changes
-    if: needs.changes.outputs.ui == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.ui != 'false' }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -76,7 +78,7 @@ jobs:
   # The end-to-end tests are most of CI's wall-clock time, so they run in shards, each with its own mock runtime.
   e2e:
     needs: changes
-    if: needs.changes.outputs.ui == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.ui != 'false' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -97,7 +99,7 @@ jobs:
 
   # The one check to require for the UI: it keeps the name `ui`, and passes when the jobs above were skipped.
   ui:
-    needs: [ui-check, e2e]
+    needs: [changes, ui-check, e2e]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -109,7 +111,7 @@ jobs:
   # request, and would crowd main's out of the cache.
   images:
     needs: changes
-    if: github.event_name == 'pull_request' && needs.changes.outputs.images == 'true'
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.changes.outputs.images != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
