@@ -15,6 +15,8 @@ use super::err;
 use crate::credentials::Credentials;
 use crate::db;
 
+pub const REPORT: &str = "sloppod.session.report";
+
 pub struct Report {
     db: PgPool,
     credentials: Arc<Credentials>,
@@ -85,7 +87,7 @@ impl ProposalKind for Report {
     }
 
     fn kind(&self) -> String {
-        "sloppod.session.report".into()
+        REPORT.into()
     }
 
     fn tool(&self) -> ToolSpec {

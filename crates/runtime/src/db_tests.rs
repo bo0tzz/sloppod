@@ -769,3 +769,56 @@ async fn an_owner_has_one_utility_session_that_isnt_listed(db: PgPool) {
     assert!(db::utility_session(&db, "dev").await.unwrap().is_none());
     assert!(db::utility_sessions(&db).await.unwrap().is_empty());
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_sessions_first_message_is_its_task(db: PgPool) {
+    let id = session(&db, "alice").await;
+    assert_eq!(db::first_message(&db, id).await.unwrap(), None);
+    let message = |text: &str| json!({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": text}});
+    db::append_event(
+        &db,
+        id,
+        &json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "hi"}}),
+    )
+    .await
+    .unwrap();
+    db::append_event(&db, id, &message("Fix the build."))
+        .await
+        .unwrap();
+    db::append_event(&db, id, &message("Also the docs."))
+        .await
+        .unwrap();
+    assert_eq!(
+        db::first_message(&db, id).await.unwrap().as_deref(),
+        Some("Fix the build.")
+    );
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn live_descendants_are_found_below_deleted_ones(db: PgPool) {
+    // A → B → C, with B deleted and C restored on its own.
+    let a = session(&db, "alice").await;
+    let b = session(&db, "alice").await;
+    let c = session(&db, "alice").await;
+    db::set_parent(&db, b, a).await.unwrap();
+    db::set_parent(&db, c, b).await.unwrap();
+    db::mark_deleted(&db, b).await.unwrap();
+    let ids = |rows: Vec<db::SessionRow>| rows.iter().map(|r| r.id).collect::<Vec<_>>();
+    assert_eq!(ids(db::live_descendants(&db, a).await.unwrap()), [c]);
+    assert!(db::live_descendants(&db, c).await.unwrap().is_empty());
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_session_below_a_deleted_one_is_in_a_deleted_line(db: PgPool) {
+    // What stops a sub-session spawning a child while its tree is being deleted.
+    let a = session(&db, "alice").await;
+    let b = session(&db, "alice").await;
+    let c = session(&db, "alice").await;
+    db::set_parent(&db, b, a).await.unwrap();
+    db::set_parent(&db, c, b).await.unwrap();
+    assert!(!db::deleted_in_line(&db, c).await.unwrap());
+    db::mark_deleted(&db, a).await.unwrap();
+    for member in [a, b, c] {
+        assert!(db::deleted_in_line(&db, member).await.unwrap());
+    }
+}

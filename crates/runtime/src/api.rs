@@ -19,7 +19,7 @@ use crate::credentials::CHATGPT;
 use crate::proposals::{self, DecideError, Verdict};
 use crate::session::ParkError;
 use crate::users::User;
-use crate::{AppState, db, lifecycle, reviews};
+use crate::{AppState, db, lifecycle, reviews, subsessions};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -408,14 +408,25 @@ async fn delete_session(
     let session = db::owned_session(&state.db, id, &user)
         .await?
         .ok_or_else(not_found)?;
-    // Marked first, so nothing wakes it between parking and marking.
-    db::mark_deleted(&state.db, id).await?;
-    if let Err(e) = park_ending_turn(&state, &session).await {
-        db::restore(&state.db, id).await?;
-        return Err(e);
+    // Its sub-sessions stop with it (ADR 27), at any depth, including any restored below one already deleted. Spawning
+    // waits while the root is marked and the tree listed, and refuses below a deleted session after.
+    let mut pending = {
+        let _spawning = subsessions::SPAWNING.lock().await;
+        db::mark_deleted(&state.db, id).await?;
+        db::live_descendants(&state.db, id).await?
+    };
+    pending.push(session);
+    while let Some(session) = pending.pop() {
+        let id = session.id;
+        // Marked first, so nothing wakes it between parking and marking.
+        db::mark_deleted(&state.db, id).await?;
+        if let Err(e) = park_ending_turn(&state, &session).await {
+            db::restore(&state.db, id).await?;
+            return Err(e);
+        }
+        reviews::abandon(&state, id).await?;
+        state.hub.broadcast_session(id).await;
     }
-    reviews::abandon(&state, id).await?;
-    state.hub.broadcast_session(id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 

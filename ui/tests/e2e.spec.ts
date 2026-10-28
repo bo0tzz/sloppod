@@ -969,6 +969,37 @@ test('the sidebar folds away on narrow screens', async ({ page }) => {
   await expect(sidebar).toBeVisible();
 });
 
+test('lists sub-sessions under their parent', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  await createSession(page, 'Fan out the work in sloppod');
+  await finishTurn(page);
+  const parent = page.url().split('/').pop();
+  const response = await page.request.post(`/_mock/spawn?parent=${parent}&task=Fix%20the%20docs`);
+  expect(response.ok()).toBe(true);
+
+  await page.reload();
+  const list = page.getByTestId('session-list');
+  const parentRow = list.locator('li').filter({ has: page.getByTestId('sub-sessions') });
+  await expect(parentRow.getByTestId('session-row').first()).toContainText('Fan out the work');
+  await expect(parentRow.getByTestId('sub-sessions').getByTestId('session-row')).toContainText('Fix the docs');
+  // Not listed a second time at the top level.
+  await expect(list.getByTestId('session-row').filter({ hasText: 'Fix the docs' })).toHaveCount(1);
+});
+
+test('deleting a session deletes its sub-sessions, also below one already deleted', async ({ page }) => {
+  await createSession(page, 'Root of a tree in sloppod');
+  const a = page.url().split('/').pop();
+  const spawn = async (parent: string | undefined, task: string) =>
+    (await (await page.request.post(`/_mock/spawn?parent=${parent}&task=${task}`)).json()).id as string;
+  const b = await spawn(a, 'Middle');
+  const c = await spawn(b, 'Leaf');
+  expect((await page.request.delete(`/api/v1/sessions/${b}`)).ok()).toBe(true);
+  expect((await page.request.post(`/api/v1/sessions/${c}/restore`)).ok()).toBe(true);
+  expect((await page.request.delete(`/api/v1/sessions/${a}`)).ok()).toBe(true);
+  const deleted = (await (await page.request.get('/api/v1/sessions/deleted')).json()) as { id: string }[];
+  expect(deleted.map((s) => s.id)).toEqual(expect.arrayContaining([a, b, c]));
+});
+
 test('parks a session and wakes it by sending a message', async ({ page }) => {
   await page.setViewportSize({ width: 1400, height: 900 });
   await createSession(page, 'Park me in sloppod');

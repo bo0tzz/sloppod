@@ -12,8 +12,9 @@ use crate::{AppState, db, lifecycle};
 /// The most sub-sessions a tree of sessions may have running at once.
 pub const MAX_RUNNING: i64 = 5;
 
-/// Held from counting a tree's running sub-sessions to starting one, so two spawns can't both pass the count.
-static SPAWNING: Mutex<()> = Mutex::const_new(());
+/// Held from counting a tree's running sub-sessions to starting one, so two spawns can't both pass the count, and
+/// while a deletion marks its root and lists the tree, so a spawn either lands in that list or sees the deletion.
+pub static SPAWNING: Mutex<()> = Mutex::const_new(());
 
 /// A child's name in its branch: its id's first eight characters, like a session branch's.
 fn child_name(child: Uuid) -> String {
@@ -111,6 +112,12 @@ pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<
         .map(str::to_owned)
         .unwrap_or_else(|| crate::api::default_title(task));
     let _spawning = SPAWNING.lock().await;
+    if db::deleted_in_line(&state.db, parent.id)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        return Err("this session, or one it's a sub-session of, is being deleted".into());
+    }
     let running = db::running_in_tree(&state.db, parent.id)
         .await
         .map_err(|e| e.to_string())?;

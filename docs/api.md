@@ -14,7 +14,7 @@ All bodies are JSON. Errors are `{"error": "<message>"}` with a 4xx/5xx status.
 GET    /api/v1/sessions             -> Session[]   (most recently active first)
 POST   /api/v1/sessions             -> Session     body: NewSession
 GET    /api/v1/sessions/{id}        -> Session
-DELETE /api/v1/sessions/{id}        -> 204         parks the session (cancelling its turn) and marks it deleted; restorable for 7 days, then purged with its pod, volume and keys
+DELETE /api/v1/sessions/{id}        -> 204         parks the session (cancelling its turn) and marks it deleted, and its sub-sessions at any depth with it, including any restored below one already deleted; restorable for 7 days, then purged with its pod, volume and keys
 GET    /api/v1/sessions/deleted     -> Session[]   deleted sessions not purged yet, most recently deleted first
 POST   /api/v1/sessions/{id}/restore -> Session    brings a deleted session back, parked
 POST   /api/v1/sessions/{id}/park   -> Session     ends its pod and keeps its volume, transcript, branch, grants and keys; 409 during a turn
