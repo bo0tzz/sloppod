@@ -95,6 +95,10 @@ fn session_prompt(context: &AgentContext) -> String {
         context.workdir, context.workdir
     ));
     workspace.push_str(
+        "- Don't credit yourself in commits, pull requests or issues: no `Co-Authored-By` trailers or \
+         \"Generated with\" lines.\n",
+    );
+    workspace.push_str(
         "- In each repository, you can push only your session branch and branches named after it \
          (`<session branch>-<name>`, e.g. for a second pull request; the name has only letters, digits, `.`, `_` \
          and `-`). For write access to another repository, \
