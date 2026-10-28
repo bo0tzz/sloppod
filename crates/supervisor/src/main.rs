@@ -466,10 +466,11 @@ async fn sync_transcript(dir: &str, synced: &mut HashMap<String, u64>, sink: &mu
         return;
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
-        if entry.path().extension().is_none_or(|x| x != "jsonl") {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Only names the runtime stores and a later pod restores.
+        if !sloppod_protocol::link::is_transcript_file_name(&name) {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
         let Ok(appended) = read_appended(&entry.path(), synced.get(&name).copied()).await else {
             continue;
         };
