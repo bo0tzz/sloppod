@@ -48,6 +48,8 @@ pub struct SessionRow {
     pub agent_error: Option<String>,
     /// The session that spawned this one, for a sub-session (ADR 27).
     pub parent_id: Option<Uuid>,
+    /// When the session, which hit its usage limit, carries on by itself (#251).
+    pub limited_until: Option<DateTime<Utc>>,
 }
 
 impl SessionRow {
@@ -74,6 +76,7 @@ impl SessionRow {
             agent_status: None,
             agent_error: None,
             parent_id: None,
+            limited_until: None,
         }
     }
 
@@ -123,6 +126,7 @@ impl SessionRow {
             agent_status: self.agent_status.clone(),
             agent_error: self.agent_error.clone(),
             parent_id: self.parent_id,
+            limited_until: self.limited_until.map(|d| d.to_rfc3339()),
         }
     }
 
@@ -144,7 +148,7 @@ impl SessionRow {
     }
 }
 
-const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, repo, created_at, updated_at, active_at, deleted_at, agent_status, agent_error, parent_id, \
+const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, repo, created_at, updated_at, active_at, deleted_at, agent_status, agent_error, parent_id, limited_until, \
      coalesce((select jsonb_agg(jsonb_build_object('capability', g.capability, 'params', g.params) order by g.created_at) \
      from session_grants g where g.session_id = sessions.id), '[]'::jsonb) as grants";
 
@@ -511,6 +515,30 @@ pub async fn save_queue(db: &PgPool, id: Uuid, queue: &[Value]) -> sqlx::Result<
     .execute(db)
     .await
     .map(|_| ())
+}
+
+/// Sets when the session, waiting for its usage limit, carries on; none when it isn't waiting.
+pub async fn set_limited_until(
+    db: &PgPool,
+    id: Uuid,
+    until: Option<DateTime<Utc>>,
+) -> sqlx::Result<Option<SessionRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "update sessions set limited_until = $2 where id = $1 returning {SESSION_COLUMNS}"
+    )))
+    .bind(id)
+    .bind(until)
+    .fetch_optional(db)
+    .await
+}
+
+/// The sessions waiting for their usage limit, and when they carry on.
+pub async fn limited_sessions(db: &PgPool) -> sqlx::Result<Vec<(Uuid, DateTime<Utc>)>> {
+    sqlx::query_as(
+        "select id, limited_until from sessions where limited_until is not null and phase <> 'stopped' and deleted_at is null",
+    )
+    .fetch_all(db)
+    .await
 }
 
 /// Every kept queue, oldest change first.

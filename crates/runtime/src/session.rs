@@ -5,12 +5,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use sloppod_protocol::api::{Phase, Proposal};
 use sloppod_protocol::link::RunningAgent;
 use tokio::sync::{Mutex, Notify, broadcast, oneshot};
 use uuid::Uuid;
 
+use crate::limits;
 use crate::link::{AgentConn, RpcError};
 use crate::store::SessionStore;
 
@@ -63,6 +65,30 @@ fn notice_queued(text: &str) -> Queued {
     }
 }
 
+/// How a turn the hub sent ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TurnEnd {
+    Ended,
+    /// It failed, with this error.
+    Failed(String),
+    /// It failed on the account's usage limit; the session carries on once that resets.
+    Limited,
+}
+
+impl TurnEnd {
+    fn of(result: &Result<Value, RpcError>) -> Self {
+        match result {
+            Ok(_) => TurnEnd::Ended,
+            Err(e) if limits::is_usage_limit(e) => TurnEnd::Limited,
+            Err(e) => TurnEnd::Failed(e.message.clone()),
+        }
+    }
+}
+
+/// What a session that waited for its usage limit is told when it carries on.
+const LIMIT_RESET_NOTICE: &str = "sloppod: your last turn stopped at the account's usage limit, which should have \
+     reset by now. Carry on where you left off.";
+
 /// A batch of prompts on its way to the agent.
 struct Held {
     key: Uuid,
@@ -112,10 +138,12 @@ struct LiveState {
     /// The agent is compacting its context; steers wait for it to end. A turn's end ends it too, in case the
     /// compaction's own end never came.
     compacting: bool,
-    /// How many turns the hub sent have ended, and why the last one failed, if it did. A watcher compares the count
-    /// with the one it saw, so no turn's end is missed between its looks.
+    /// How many turns the hub sent have ended, and how the last one did. A watcher compares the count with the one it
+    /// saw, so no turn's end is missed between its looks.
     turns_ended: u64,
-    last_turn_error: Option<String>,
+    last_turn: Option<TurnEnd>,
+    /// The session hit its usage limit: nothing starts a turn by itself until then, when it carries on (#251).
+    limited_until: Option<DateTime<Utc>>,
     permissions: HashMap<u64, Permission>,
     next_permission: u64,
     queue: Vec<Queued>,
@@ -175,12 +203,17 @@ pub type Waker =
 /// Called when a turn the hub sent ends well, e.g. to check what it ended on (ADR 26).
 pub type TurnEnded = Arc<dyn Fn(Uuid) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+/// When the usage limit a session's account is at resets, if that's known (#140's quotas).
+pub type LimitReset =
+    Arc<dyn Fn(Uuid) -> Pin<Box<dyn Future<Output = Option<DateTime<Utc>>> + Send>> + Send + Sync>;
+
 pub struct Hub {
     store: Arc<dyn SessionStore>,
     waker: StdMutex<Option<Waker>>,
     turn_ended: StdMutex<Option<TurnEnded>>,
     sessions: StdMutex<HashMap<Uuid, Arc<Live>>>,
     agent_capabilities: StdMutex<Option<Value>>,
+    limit_reset: StdMutex<Option<LimitReset>>,
 }
 
 fn notification(method: &str, params: Value) -> Value {
@@ -210,6 +243,7 @@ impl Hub {
             turn_ended: StdMutex::default(),
             sessions: StdMutex::default(),
             agent_capabilities: StdMutex::default(),
+            limit_reset: StdMutex::default(),
         }
     }
 
@@ -219,6 +253,10 @@ impl Hub {
 
     pub fn set_turn_ended(&self, turn_ended: TurnEnded) {
         *self.turn_ended.lock().unwrap() = Some(turn_ended);
+    }
+
+    pub fn set_limit_reset(&self, limit_reset: LimitReset) {
+        *self.limit_reset.lock().unwrap() = Some(limit_reset);
     }
 
     /// The session's agent, if it's up.
@@ -453,14 +491,16 @@ impl Hub {
                 }
                 let (hub, agent) = (self.clone(), agent.clone());
                 tokio::spawn(async move {
-                    let error = match turn.await {
-                        Ok(Err(e)) => {
-                            tracing::warn!(session = %id, error = %e, "adopted turn failed");
-                            Some(e.message)
+                    let end = match turn.await {
+                        Ok(result) => {
+                            if let Err(e) = &result {
+                                tracing::warn!(session = %id, error = %e, "adopted turn failed");
+                            }
+                            TurnEnd::of(&result)
                         }
-                        _ => None,
+                        Err(_) => TurnEnd::Ended,
                     };
-                    hub.turn_finished(id, error).await;
+                    hub.turn_finished(id, end).await;
                     hub.end_turn(id, &agent).await;
                 });
             }
@@ -731,7 +771,10 @@ impl Hub {
             let back: Vec<Queued> = held.stored.iter().map(unstored).collect();
             state.queue.extend(back);
             self.release(id, &mut state, Some(key)).await;
-            let idle = state.agent_session_id.is_some() && !state.turn_running && !state.stopped;
+            let idle = state.agent_session_id.is_some()
+                && !state.turn_running
+                && !state.stopped
+                && state.limited_until.is_none();
             match (state.agent.clone(), idle) {
                 (Some(agent), true) => {
                     state.turn_running = true;
@@ -1079,7 +1122,8 @@ impl Hub {
                 );
             }
             let agent_up = state.agent.is_some() && state.agent_session_id.is_some();
-            if agent_up && !state.turn_running {
+            // While the session waits for its usage limit, messages queue as they do behind a turn.
+            if agent_up && !state.turn_running && state.limited_until.is_none() {
                 state.turn_running = true;
                 (None, false)
             } else {
@@ -1162,8 +1206,7 @@ impl Hub {
             let mut state = live.state.lock().await;
             self.release(id, &mut state, held).await;
         }
-        self.turn_finished(id, result.as_ref().err().map(|e| e.message.clone()))
-            .await;
+        self.turn_finished(id, TurnEnd::of(&result)).await;
         self.end_turn(id, agent).await;
         result
     }
@@ -1179,7 +1222,8 @@ impl Hub {
             }
             live.end_compaction(&mut state);
             let agent_up = state.agent_session_id.is_some();
-            state.turn_running = agent_up && !state.queue.is_empty();
+            state.turn_running =
+                agent_up && !state.queue.is_empty() && state.limited_until.is_none();
             let next = state.turn_running.then(|| std::mem::take(&mut state.queue));
             let held = match &next {
                 Some(queued) => self.hold(id, &mut state, queued).await,
@@ -1265,7 +1309,11 @@ impl Hub {
             let live = self.live(id);
             let mut state = live.state.lock().await;
             let up = state.agent.is_some() && state.agent_session_id.is_some();
-            if !up || state.turn_running || turns_ended.is_some_and(|n| n != state.turns_ended) {
+            if !up
+                || state.turn_running
+                || state.limited_until.is_some()
+                || turns_ended.is_some_and(|n| n != state.turns_ended)
+            {
                 return false;
             }
             state.turn_running = true;
@@ -1299,7 +1347,8 @@ impl Hub {
         let delivery = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
-            if state.agent.is_none() || state.agent_session_id.is_none() {
+            let up = state.agent.is_some() && state.agent_session_id.is_some();
+            if !up || (state.limited_until.is_some() && !state.turn_running) {
                 state.queue.push(notice);
                 self.save_queue(id, &state).await;
                 Delivery::Queued
@@ -1569,26 +1618,136 @@ impl Hub {
         self.live(id).state.lock().await.turn_running
     }
 
-    /// Counts a turn the hub sent as ended, failed with `error` or not.
-    async fn turn_finished(&self, id: Uuid, error: Option<String>) {
-        let ok = error.is_none();
-        {
+    /// Counts a turn the hub sent as ended. One that hit the usage limit leaves the session waiting for the reset;
+    /// one that ended well ends any such wait.
+    async fn turn_finished(self: &Arc<Self>, id: Uuid, end: TurnEnd) {
+        let now = Utc::now();
+        let limit_reset = self.limit_reset.lock().unwrap().clone();
+        let reset = match (&end, limit_reset) {
+            (TurnEnd::Limited, Some(limit_reset)) => limit_reset(id).await,
+            _ => None,
+        };
+        let limited = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
             state.turns_ended += 1;
-            state.last_turn_error = error;
+            state.last_turn = Some(end.clone());
+            let until = match end {
+                TurnEnd::Limited => Some(limits::wait_until(reset, now)),
+                TurnEnd::Ended => None,
+                TurnEnd::Failed(_) => state.limited_until,
+            };
+            let changed = until != state.limited_until;
+            if changed {
+                state.limited_until = until;
+                self.save_limit(id, until).await;
+            }
+            until.filter(|_| changed)
+        };
+        if let Some(until) = limited {
+            tracing::info!(session = %id, %until, "the session hit its usage limit; it carries on then");
+            self.resume_at(id, until);
         }
         let turn_ended = self.turn_ended.lock().unwrap().clone();
-        if let (true, Some(turn_ended)) = (ok, turn_ended) {
+        if let (TurnEnd::Ended, Some(turn_ended)) = (end, turn_ended) {
             tokio::spawn(turn_ended(id));
         }
     }
 
-    /// How many of the session's turns have ended, and why the last one failed, if it did.
-    pub async fn turns_ended(&self, id: Uuid) -> (u64, Option<String>) {
+    /// Keeps when a session waiting for its usage limit carries on, and tells the UIs; under the state lock.
+    async fn save_limit(&self, id: Uuid, until: Option<DateTime<Utc>>) {
+        match self.store.set_limited_until(id, until).await {
+            Ok(Some(row)) => self.broadcast(
+                id,
+                UiEvent::Notification {
+                    seq: None,
+                    message: notification("_sloppod/session", json!({"session": row.to_api()})),
+                },
+            ),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(session = %id, error = %e, "keeping the session's usage limit")
+            }
+        }
+    }
+
+    /// When the session waiting for its usage limit is to carry on, if it is.
+    pub async fn limited_until(&self, id: Uuid) -> Option<DateTime<Utc>> {
+        self.live(id).state.lock().await.limited_until
+    }
+
+    /// Carries the session on at `until`, unless its wait has ended or moved meanwhile.
+    fn resume_at(self: &Arc<Self>, id: Uuid, until: DateTime<Utc>) {
+        let hub = self.clone();
+        tokio::spawn(async move {
+            let wait = (until - Utc::now()).to_std().unwrap_or_default();
+            tokio::time::sleep(wait).await;
+            hub.resume_after_limit(id, until).await;
+        });
+    }
+
+    /// Ends a session's wait for its usage limit, if it's still the one that was to end at `until`: the session is
+    /// told to carry on, in one turn with whatever queued meanwhile. If that turn hits the limit again, it waits again.
+    pub(crate) async fn resume_after_limit(self: &Arc<Self>, id: Uuid, until: DateTime<Utc>) {
+        let notice = notice_queued(LIMIT_RESET_NOTICE);
+        let block = notice.blocks[0].clone();
+        let (start, wake) = {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            if state.limited_until != Some(until) || state.stopped {
+                return;
+            }
+            state.limited_until = None;
+            self.save_limit(id, None).await;
+            // A turn the user started meanwhile carries on by itself, and the queue runs after it.
+            if state.turn_running {
+                return;
+            }
+            let up = state.agent.is_some() && state.agent_session_id.is_some();
+            state.queue.insert(0, notice);
+            if up {
+                state.turn_running = true;
+                let queued = std::mem::take(&mut state.queue);
+                let held = self.hold(id, &mut state, &queued).await;
+                (
+                    state.agent.clone().map(|agent| (agent, queued, held)),
+                    false,
+                )
+            } else {
+                self.save_queue(id, &state).await;
+                (None, true)
+            }
+        };
+        self.record_notice(id, &block, None).await;
+        if let Some((agent, queued, held)) = start {
+            self.broadcast_queue(id).await;
+            tokio::spawn(self.clone().run_queued(id, agent, None, queued, held));
+        }
+        if wake && let Err(e) = self.wake_for_message(id).await {
+            tracing::warn!(session = %id, error = %e.message, "waking a session whose usage limit reset");
+        }
+    }
+
+    /// Puts back the waits for usage limits a restart left, each carrying on when it was to.
+    pub async fn restore_limits(self: &Arc<Self>) {
+        let limited = match self.store.limited_sessions().await {
+            Ok(limited) => limited,
+            Err(e) => {
+                tracing::error!(error = %e, "loading sessions waiting for their usage limit");
+                return;
+            }
+        };
+        for (id, until) in limited {
+            self.live(id).state.lock().await.limited_until = Some(until);
+            self.resume_at(id, until);
+        }
+    }
+
+    /// How many of the session's turns have ended, and how the last one did.
+    pub async fn turns_ended(&self, id: Uuid) -> (u64, Option<TurnEnd>) {
         let live = self.live(id);
         let state = live.state.lock().await;
-        (state.turns_ended, state.last_turn_error.clone())
+        (state.turns_ended, state.last_turn.clone())
     }
 
     /// Parks a session between turns (ADR 5): lets go of its agent, then `suspend` ends its pod. Messages sent

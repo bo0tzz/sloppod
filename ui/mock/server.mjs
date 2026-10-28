@@ -1662,6 +1662,16 @@ const server = http.createServer(async (req, res) => {
       for (const session of sessions.values()) echoUser(session, text, { notice: true, summary });
       return json(res, 200, {});
     }
+    if (url.pathname === '/_mock/limit' && req.method === 'POST') {
+      // Every session hits the usage limit, carrying on in `?minutes=` minutes; `0` ends the wait.
+      const minutes = Number(url.searchParams.get('minutes') ?? 90);
+      for (const session of sessions.values()) {
+        if (minutes > 0) session.data.limited_until = new Date(Date.now() + minutes * 60_000).toISOString();
+        else delete session.data.limited_until;
+        session.broadcast();
+      }
+      return json(res, 200, {});
+    }
     if (url.pathname === '/_mock/drop' && req.method === 'POST') {
       // With `?for=<ms>`, new connections are refused that long, so a UI stays disconnected for a while.
       refuseConnectionsUntil = Date.now() + Number(url.searchParams.get('for') ?? 0);

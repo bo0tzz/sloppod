@@ -167,6 +167,9 @@ pub mod api {
         /// The session that spawned this one, for a sub-session (ADR 27).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub parent_id: Option<Uuid>,
+        /// When the session, waiting for its usage limit to reset, carries on by itself (#251).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub limited_until: Option<String>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
