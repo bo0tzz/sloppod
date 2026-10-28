@@ -40,7 +40,7 @@ url_api = "https://api.github.com/repos/kube-rs/kopium/releases/assets/465661288
 [[tools."github:theseus-rs/postgresql-binaries"]]
 version = "18.1.1"
 backend = "github:theseus-rs/postgresql-binaries"
-specifiers = ["18"]
+specifiers = ["18.1.1"]
 
 [tools."github:theseus-rs/postgresql-binaries"."platforms.linux-arm64"]
 checksum = "sha256:433313fd27ca72b6e9f4ff96b27fca83ef4c459bc24247c36901485dbb234f13"
