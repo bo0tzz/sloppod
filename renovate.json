@@ -1,0 +1,231 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":configMigration",
+    "abandonments:recommended",
+    "helpers:pinGitHubActionDigestsToSemver",
+    ":maintainLockFilesWeekly",
+    ":rebaseStalePrs"
+  ],
+  "labels": ["dependencies"],
+  "minimumReleaseAge": "3 days",
+  "internalChecksFilter": "strict",
+  "automergeType": "pr",
+  "platformAutomerge": true,
+  "automergeStrategy": "squash",
+  "ignorePaths": ["**/node_modules/**", "**/target/**", "docs/adr/**"],
+  "dockerfile": {
+    "pinDigests": true
+  },
+  "kubernetes": {
+    "managerFilePatterns": ["/^dev/postgres\\.yaml$/"]
+  },
+  "lockFileMaintenance": {
+    "enabled": true,
+    "automerge": true,
+    "schedule": ["* 0-5 * * 1"]
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "cargo-chef, built into the Rust build stage",
+      "managerFilePatterns": ["/(^|/)Containerfile$/"],
+      "matchStrings": ["ARG CARGO_CHEF_VERSION=(?<currentValue>\\S+)"],
+      "depNameTemplate": "cargo-chef",
+      "datasourceTemplate": "crate"
+    },
+    {
+      "customType": "regex",
+      "description": "memini plugin, cloned at a tag (the repo has tags but no releases)",
+      "managerFilePatterns": ["/(^|/)Containerfile$/"],
+      "matchStrings": ["ARG MEMINI_VERSION=(?<currentValue>\\S+)"],
+      "depNameTemplate": "eleboucher/memini",
+      "datasourceTemplate": "github-tags"
+    },
+    {
+      "customType": "regex",
+      "description": "Claude ACP adapter, installed with npm in the session image",
+      "managerFilePatterns": ["/(^|/)Containerfile$/"],
+      "matchStrings": ["ARG ADAPTER_VERSION=(?<currentValue>\\S+)"],
+      "depNameTemplate": "@agentclientprotocol/claude-agent-acp",
+      "datasourceTemplate": "npm"
+    },
+    {
+      "customType": "regex",
+      "description": "Codex ACP adapter, installed with npm in the session image",
+      "managerFilePatterns": ["/(^|/)Containerfile$/"],
+      "matchStrings": ["ARG CODEX_ADAPTER_VERSION=(?<currentValue>\\S+)"],
+      "depNameTemplate": "@agentclientprotocol/codex-acp",
+      "datasourceTemplate": "npm"
+    },
+    {
+      "customType": "regex",
+      "description": "mise binary in the session image. Its MISE_SHA256 is NOT updated by Renovate (see packageRules)",
+      "managerFilePatterns": ["/(^|/)Containerfile$/"],
+      "matchStrings": ["ARG MISE_VERSION=(?<currentValue>\\S+)"],
+      "depNameTemplate": "jdx/mise",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.+)$"
+    },
+    {
+      "customType": "regex",
+      "description": "gh-stack binary in the session image. Its GH_STACK_SHA256 is NOT updated by Renovate (see packageRules)",
+      "managerFilePatterns": ["/(^|/)Containerfile$/"],
+      "matchStrings": ["ARG GH_STACK_VERSION=(?<currentValue>\\S+)"],
+      "depNameTemplate": "github/gh-stack",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.+)$"
+    },
+    {
+      "customType": "regex",
+      "description": "Helm charts installed by dev/up.sh (Cilium)",
+      "managerFilePatterns": ["/^dev/up\\.sh$/"],
+      "matchStrings": ["helm upgrade --install \\S+ (?<depName>\\S+) --repo (?<registryUrl>\\S+) --version (?<currentValue>\\S+)"],
+      "datasourceTemplate": "helm"
+    },
+    {
+      "customType": "regex",
+      "description": "agent-sandbox release manifest, in dev/up.sh and the prerequisites in docs/deploy.md",
+      "managerFilePatterns": ["/^dev/up\\.sh$/", "/^docs/deploy\\.md$/"],
+      "matchStrings": [
+        "github\\.com/kubernetes-sigs/agent-sandbox/releases/download/(?<currentValue>v[^/\\s]+)/",
+        "\\*\\*agent-sandbox (?<currentValue>v[^:\\s]+):\\*\\*"
+      ],
+      "depNameTemplate": "kubernetes-sigs/agent-sandbox",
+      "datasourceTemplate": "github-releases"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "sloppod's own images: tags are set at release, not by Renovate",
+      "matchPackageNames": ["ghcr.io/bo0tzz/sloppod", "ghcr.io/bo0tzz/sloppod-session"],
+      "enabled": false
+    },
+    {
+      "description": "Rust crates: keep Cargo.toml at the version actually locked, as the repo does today",
+      "matchManagers": ["cargo"],
+      "rangeStrategy": "bump"
+    },
+    {
+      "description": "UI npm deps: raise the ^ floor along with the lockfile",
+      "matchManagers": ["npm"],
+      "rangeStrategy": "bump"
+    },
+    {
+      "description": "Non-breaking crate updates, one weekly PR. Cargo counts 0.x minor bumps as breaking, so those stay separate",
+      "matchManagers": ["cargo"],
+      "matchIsBreaking": false,
+      "groupName": "Rust crates (non-breaking)",
+      "schedule": ["* 0-5 * * 1"],
+      "automerge": true
+    },
+    {
+      "description": "Non-breaking UI updates, one weekly PR. npm treats 0.x minors as minor, so exclude 0.x explicitly",
+      "matchManagers": ["npm"],
+      "matchIsBreaking": false,
+      "matchCurrentVersion": "!/^[\\^~]?0\\./",
+      "groupName": "UI npm (non-breaking)",
+      "schedule": ["* 0-5 * * 1"],
+      "automerge": true
+    },
+    {
+      "description": "kube and k8s-openapi move together (kube pins a k8s-openapi range)",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["kube", "k8s-openapi"],
+      "matchIsBreaking": true,
+      "groupName": "kube-rs"
+    },
+    {
+      "description": "tonic, prost and envoy-types move together (envoy-types pins tonic/prost)",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["tonic", "tonic-prost", "prost", "envoy-types"],
+      "matchIsBreaking": true,
+      "groupName": "tonic + prost + envoy-types"
+    },
+    {
+      "description": "GitHub Actions, one weekly PR; ci.yml exercises these on the PR itself",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["minor", "patch", "digest", "pinDigest"],
+      "groupName": "GitHub Actions",
+      "schedule": ["* 0-5 * * 1"],
+      "automerge": true
+    },
+    {
+      "description": "docker/* actions only run in publish.yml on main, which PR CI never exercises",
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": ["docker/**"],
+      "automerge": false
+    },
+    {
+      "description": "Rust toolchain: rust-toolchain.toml and the Containerfile build image in one PR",
+      "matchDepNames": ["rust"],
+      "matchManagers": ["rust-toolchain", "dockerfile"],
+      "groupName": "Rust toolchain",
+      "automerge": false
+    },
+    {
+      "description": "Node: mise.toml (CI, dev) and the Containerfile ui/session images in one PR",
+      "matchDepNames": ["node"],
+      "matchManagers": ["mise", "dockerfile"],
+      "groupName": "Node.js",
+      "automerge": false
+    },
+    {
+      "description": "Base-image digest refreshes (debian, node, rust), batched weekly",
+      "matchManagers": ["dockerfile"],
+      "matchUpdateTypes": ["digest", "pinDigest"],
+      "groupName": "Container base image digests",
+      "schedule": ["* 0-5 * * 1"],
+      "automerge": false
+    },
+    {
+      "description": "Session image tools: PR CI doesn't build the Containerfile, so these are reviewed by hand",
+      "matchFileNames": ["Containerfile"],
+      "matchManagers": ["custom.regex"],
+      "automerge": false
+    },
+    {
+      "description": "Agent adapters change fast and decide agent behaviour; batch them weekly, one PR each",
+      "matchPackageNames": ["@agentclientprotocol/claude-agent-acp", "@agentclientprotocol/codex-acp"],
+      "schedule": ["* 0-5 * * 1"]
+    },
+    {
+      "description": "Renovate cannot compute release-asset sha256s; the PR needs the checksum updated by hand",
+      "matchPackageNames": ["jdx/mise", "github/gh-stack"],
+      "matchManagers": ["custom.regex"],
+      "automerge": false,
+      "prBodyNotes": [
+        "**Update the matching `*_SHA256` ARG in `Containerfile` before merging**, or the session image build fails on main. For mise: `gh release download v{{{newVersion}}} -R jdx/mise -p SHASUMS256.txt -O - | grep 'linux-x64$'`. For gh-stack: `curl -fsSL https://github.com/github/gh-stack/releases/download/v{{{newVersion}}}/linux-amd64 | sha256sum`."
+      ]
+    },
+    {
+      "description": "Dev-cluster pins (kind, helm, kubectl, kopium, Cilium, agent-sandbox, postgres): weekly, reviewed by hand",
+      "matchFileNames": ["mise.toml", "dev/**", "docs/deploy.md"],
+      "matchDepNames": ["!node"],
+      "groupName": "Dev cluster and tooling",
+      "matchUpdateTypes": ["minor", "patch"],
+      "schedule": ["* 0-5 * * 1"],
+      "automerge": false
+    },
+    {
+      "description": "postgresql-binaries is pinned to a major; lock-only refreshes run the DB tests in CI",
+      "matchManagers": ["mise"],
+      "matchPackageNames": ["/postgresql-binaries/"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "postgresql-binaries",
+      "automerge": true
+    },
+    {
+      "description": "Postgres majors: CI binaries and the dev cluster image together",
+      "matchPackageNames": ["/postgresql-binaries/", "postgres"],
+      "matchUpdateTypes": ["major"],
+      "groupName": "Postgres major"
+    },
+    {
+      "description": "Majors never automerge",
+      "matchUpdateTypes": ["major"],
+      "automerge": false
+    }
+  ]
+}
