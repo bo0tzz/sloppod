@@ -292,6 +292,22 @@ async fn reconcile(state: &AppState) {
                 .await;
         }
     }
+    // Parking releases a session's egress, but one that failed to, or was parked before it did, still holds it.
+    match db::parked_sessions(&state.db).await {
+        Ok(parked) => {
+            for session in parked {
+                let id = session.id.to_string();
+                if let Err(e) = state
+                    .enforcer
+                    .release(&id, &lifecycle::pod_labels(&id))
+                    .await
+                {
+                    tracing::warn!(session = %session.id, error = %e, "releasing a parked session's egress");
+                }
+            }
+        }
+        Err(e) => tracing::error!(error = %e, "listing parked sessions"),
+    }
     proposals::resume_approved(state).await;
     reviews::resume_round_watches(state).await;
     proposals::resume_stack_watches(state).await;
