@@ -1,5 +1,6 @@
 //! Proposals (ADR 3): the kinds an agent can propose, and proposing, deciding and carrying them out.
 
+mod issue_updates;
 mod issues;
 mod pull_request;
 mod repo_access;
@@ -14,6 +15,7 @@ use uuid::Uuid;
 
 use crate::{AppState, db, reviews};
 
+pub use issue_updates::IssueUpdates;
 pub use issues::Issues;
 pub use pull_request::{PullRequest, Stack};
 pub use repo_access::{RepoAccess, grant_repo, repo_granted};

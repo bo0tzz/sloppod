@@ -51,6 +51,17 @@ export type PullRequestPayload = {
 export type RepoGrantPayload = { repo: string; reason: string; branch: string };
 export type IssueDraft = { title: string; body: string; labels: string[] };
 export type IssuesPayload = { repo: string; issues: IssueDraft[] };
+export type IssueUpdate = {
+  number: number;
+  comment?: string;
+  close?: 'completed' | 'not_planned' | 'duplicate';
+  reopen?: boolean;
+  title?: string;
+  body?: string;
+  add_labels?: string[];
+  remove_labels?: string[];
+};
+export type IssueUpdatesPayload = { repo: string; updates: IssueUpdate[] };
 export type ProposalEdits = { title?: string; body?: string; auto_merge?: boolean; issues?: IssueDraft[] };
 
 export type Proposal = {

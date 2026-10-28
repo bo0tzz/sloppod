@@ -1026,3 +1026,19 @@ test('lists the session grants from the session menu', async ({ page }) => {
   await expect(grants.getByText("Claude's API, with the owner's Claude account.")).toBeVisible();
   await expect(grants.getByText(/^bo0tzz\/sloppod: read, and push the session branch `sloppod\//)).toBeVisible();
 });
+
+test('reviews and approves updates to existing issues', async ({ page }) => {
+  await createSession(page, 'Tidy the issues in sloppod');
+  const card = page.getByTestId('proposal-card');
+  await expect(card).toHaveAttribute('data-kind', 'github.issue.update');
+  await card.getByRole('button', { name: 'Review' }).click();
+  const updates = page.getByTestId('issue-update');
+  await expect(updates).toHaveCount(3);
+  await expect(updates.nth(0)).toContainText('#100');
+  await expect(updates.nth(0)).toContainText('close as completed');
+  await expect(updates.nth(0)).toContainText('Remove labels: priority');
+  await expect(updates.nth(1)).toContainText('close as a duplicate');
+  await expect(updates.nth(2)).toContainText('New title: Startup failures show in the UI');
+  await page.getByRole('button', { name: 'Approve', exact: true }).click();
+  await expect(page.getByTestId('system-notice').last()).toContainText('Your issue updates were approved and made');
+});

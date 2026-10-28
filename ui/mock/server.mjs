@@ -483,6 +483,20 @@ async function agentScript(session, turn, prompt) {
     return;
   }
 
+  if (session.data.repo && /tidy the issues/i.test(prompt)) {
+    await step(2);
+    const proposeId = randomUUID();
+    tool({ toolCallId: proposeId, title: 'mcp__sloppod__propose_issue_updates', kind: 'other', status: 'pending' });
+    await step(2);
+    const proposal = createIssueUpdates(session);
+    update(proposeId, {
+      status: 'completed',
+      content: [{ type: 'content', content: { type: 'text', text: `Proposal ${proposal.id} created and waiting for human review.` } }],
+    });
+    await say("I've proposed closing two finished issues and relabelling another.");
+    return;
+  }
+
   if (session.data.repo && /file issues/i.test(prompt)) {
     await step(2);
     const proposeId = randomUUID();
@@ -773,6 +787,28 @@ function createIssues(session) {
         { title: 'Steers should land at the next tool boundary', body: 'Steering interrupts the running generation.', labels: ['dogfood'] },
         { title: 'Fail fast on blocked egress', body: 'Blocked connections hang until the client times out.', labels: ['dogfood', 'enforcement'] },
         { title: 'Show the version in the UI', body: '', labels: [] },
+      ],
+    },
+    created_at: now(),
+  };
+  proposals.set(proposal.id, proposal);
+  broadcastProposal(proposal);
+  applyStandingApproval(proposal);
+  return proposal;
+}
+
+function createIssueUpdates(session) {
+  const proposal = {
+    id: randomUUID(),
+    session_id: session.data.id,
+    kind: 'github.issue.update',
+    status: 'pending',
+    payload: {
+      repo: session.data.repo,
+      updates: [
+        { number: 100, comment: 'Fixed by #148.', close: 'completed', remove_labels: ['priority'] },
+        { number: 65, comment: 'Superseded by #196.', close: 'duplicate' },
+        { number: 59, add_labels: ['priority'], title: 'Startup failures show in the UI' },
       ],
     },
     created_at: now(),
@@ -1283,6 +1319,12 @@ function approve(proposal, body, decidedBy) {
     proposal.result = { pull_requests: opened, stack: 7, auto_merge: Boolean(proposal.payload.auto_merge), message: `Opened ${opened.map((p) => p.url).join(', ')} as stack #7.${merging}` };
     notice = `Your stack was approved. ${proposal.result.message}`;
     ack = 'Great, the stack is open.';
+  } else if (proposal.kind === 'github.issue.update') {
+    const updated = proposal.payload.updates.map((u) => ({ number: u.number }));
+    proposal.status = 'executed';
+    proposal.result = { updated, failed: [], message: `Updated ${updated.map((u) => `#${u.number}`).join(', ')}.` };
+    notice = `Your issue updates were approved and made: ${proposal.result.message}`;
+    ack = 'Thanks, the tracker is tidy.';
   } else if (proposal.kind === 'github.issue.create') {
     if (Array.isArray(body.issues)) proposal.payload.issues = body.issues;
     const filed = proposal.payload.issues.map((issue, index) => {

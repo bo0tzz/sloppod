@@ -20,6 +20,7 @@
     api,
     type IssueDraft,
     type IssuesPayload,
+    type IssueUpdatesPayload,
     type Proposal,
     type ProposalDetail,
     type ProposalEdits,
@@ -62,6 +63,10 @@
   const pr = $derived(detail?.kind === 'github.pr.create' ? (detail.payload as PullRequestPayload) : null);
   const grant = $derived(detail?.kind === 'sloppod.repo.grant' ? (detail.payload as RepoGrantPayload) : null);
   const issues = $derived(detail?.kind === 'github.issue.create' ? (detail.payload as IssuesPayload) : null);
+  const issueUpdates = $derived(
+    detail?.kind === 'github.issue.update' ? (detail.payload as IssueUpdatesPayload) : null,
+  );
+  const closeReasons = { completed: 'completed', not_planned: 'not planned', duplicate: 'a duplicate' };
   const filing = $derived(drafts.filter((draft) => draft.file).length);
   const summary = $derived(proposalSummary(detail ?? proposal));
   const stack = $derived(detail?.kind === 'github.stack.create' ? (detail.payload as StackPayload) : null);
@@ -242,6 +247,32 @@
           {@render stackedPullRequests(detail, stack)}
         {:else if issues}
           {@render issueList()}
+        {:else if issueUpdates}
+          <ul class="flex flex-col gap-3" data-testid="issue-updates">
+            {#each issueUpdates.updates as update (update.number)}
+              <li class="border-light-200 flex flex-col gap-1 rounded-xl border p-3" data-testid="issue-update">
+                <Text fontWeight="semi-bold">
+                  #{update.number}
+                  {#if update.close}<span class="text-muted font-normal">· close as {closeReasons[update.close]}</span>{/if}
+                  {#if update.reopen}<span class="text-muted font-normal">· reopen</span>{/if}
+                </Text>
+                {#if update.title}<Text size="small">New title: {update.title}</Text>{/if}
+                {#if update.add_labels?.length}<Text size="small">Add labels: {update.add_labels.join(', ')}</Text>{/if}
+                {#if update.remove_labels?.length}
+                  <Text size="small">Remove labels: {update.remove_labels.join(', ')}</Text>
+                {/if}
+                {#if update.comment}
+                  <div class="bg-light-100 rounded-lg p-2 text-sm"><Markdown text={update.comment} /></div>
+                {/if}
+                {#if update.body}
+                  <details>
+                    <summary class="text-muted cursor-pointer text-sm">New body</summary>
+                    <div class="bg-light-100 mt-1 rounded-lg p-2 text-sm"><Markdown text={update.body} /></div>
+                  </details>
+                {/if}
+              </li>
+            {/each}
+          </ul>
         {:else if grant}
           <div class="flex flex-col gap-3">
             <Heading tag="h2" size="tiny" data-testid="proposal-title">{summary.title}</Heading>
