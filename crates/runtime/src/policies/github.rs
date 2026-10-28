@@ -348,17 +348,21 @@ impl RequestPolicy for GitHubPolicy {
 }
 
 fn proposal_hint(what: &str, session: &SessionContext) -> String {
+    // A review session has none of the proposal tools, so there's nothing to point it to.
+    if session.repo_requests == sloppod_contracts::RepoRequests::Never {
+        return format!(
+            "sloppod: {what}. This session can't make GitHub writes or propose them.\n"
+        );
+    }
     let pull_request = match session.writable_repo() {
         Some(grant) => format!(
             "to open a pull request, push to your session branch `{}` and call the propose_pull_request tool",
             grant.branch
         ),
-        None => match session.repo_requests.advice() {
-            Some(advice) => format!(
-                "to change a repository, {advice}, then push to your session branch and call propose_pull_request"
-            ),
-            None => "this session can't change a repository".to_owned(),
-        },
+        None => format!(
+            "to change a repository, {}, then push to your session branch and call propose_pull_request",
+            session.repo_requests.advice().unwrap_or_default()
+        ),
     };
     format!(
         "sloppod: {what}. Outward actions go through human review: {pull_request}. Issues are filed with \
@@ -653,6 +657,14 @@ mod tests {
         );
         assert!(!hint.contains("request_repository"), "{hint}");
         assert!(hint.contains("your report"), "{hint}");
+
+        let hint = proposal_hint(
+            "that's refused",
+            &context(sloppod_contracts::RepoRequests::Never),
+        );
+        for tool in ["propose_", "request_"] {
+            assert!(!hint.contains(tool), "{hint}");
+        }
     }
 
     fn pkt(line: &str) -> Vec<u8> {
