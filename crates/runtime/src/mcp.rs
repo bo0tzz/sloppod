@@ -50,7 +50,10 @@ pub async fn handler(
 /// Which tools a session gets depends on its kind, so a session that can't be loaded gets none.
 async fn session_kind(state: &AppState, session: Uuid) -> Result<SessionKind, String> {
     match db::get_session(&state.db, session).await {
-        Ok(Some(row)) => Ok(row.kind),
+        Ok(Some(row)) => match row.not_acting() {
+            None => Ok(row.kind),
+            Some(why) => Err(format!("this session is {why}, so it has no tools")),
+        },
         Ok(None) => Err("this session no longer exists".into()),
         Err(e) => Err(format!("couldn't load the session: {e}")),
     }

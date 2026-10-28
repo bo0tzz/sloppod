@@ -125,6 +125,19 @@ impl SessionRow {
     pub fn phase(&self) -> Phase {
         Phase::parse(&self.phase)
     }
+
+    /// Why the session can't act any more, if it can't: it's stopped, parked or deleted. A pod of it that's still up
+    /// gets nothing done in its name: no egress through the authorizer, no tools, no memory (#60).
+    pub fn not_acting(&self) -> Option<&'static str> {
+        if self.deleted_at.is_some() {
+            return Some("deleted");
+        }
+        match self.phase() {
+            Phase::Stopped => Some("stopped"),
+            Phase::Parked => Some("parked"),
+            _ => None,
+        }
+    }
 }
 
 const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, repo, created_at, updated_at, active_at, deleted_at, agent_status, agent_error, \
@@ -417,18 +430,31 @@ pub async fn last_event(db: &PgPool, id: Uuid) -> sqlx::Result<i64> {
         .await
 }
 
-/// Up to `limit` of the session's events after `after`, in order.
-pub async fn events(
+/// Whether the session has a user message with this id, as its UI gave it.
+pub async fn has_message(db: &PgPool, id: Uuid, message_id: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "select exists(select 1 from session_events where session_id = $1 \
+         and payload->>'sessionUpdate' = 'user_message_chunk' and payload->>'messageId' = $2)",
+    )
+    .bind(id)
+    .bind(message_id.to_string())
+    .fetch_one(db)
+    .await
+}
+
+/// Up to `limit` of the session's latest events before `before`, in order.
+pub async fn events_before(
     db: &PgPool,
     id: Uuid,
-    after: i64,
+    before: i64,
     limit: i64,
 ) -> sqlx::Result<Vec<(i64, Value)>> {
     let rows = sqlx::query(
-        "select seq, payload from session_events where session_id = $1 and seq > $2 order by seq limit $3",
+        "select seq, payload from (select seq, payload from session_events where session_id = $1 and seq < $2 \
+         order by seq desc limit $3) latest order by seq",
     )
     .bind(id)
-    .bind(after)
+    .bind(before)
     .bind(limit)
     .fetch_all(db)
     .await?;
@@ -732,6 +758,23 @@ pub async fn approved_proposals(db: &PgPool) -> sqlx::Result<Vec<ProposalRow>> {
 }
 
 /// Stacks that were set to merge themselves; the watch on each ends at its first check once it has merged.
+/// The fingerprint of the change a pull request made when it was proposed and set to merge itself, if it was.
+pub async fn pull_fingerprint(
+    db: &PgPool,
+    repo: &str,
+    number: u64,
+) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar(
+        "select result->>'fingerprint' from proposals where kind = 'github.pr.create' and status = 'executed' \
+         and lower(payload->>'repo') = lower($1) and (result->>'number')::bigint = $2 \
+         and result ? 'fingerprint' order by created_at desc limit 1",
+    )
+    .bind(repo)
+    .bind(number as i64)
+    .fetch_optional(db)
+    .await
+}
+
 pub async fn merging_stacks(db: &PgPool) -> sqlx::Result<Vec<ProposalRow>> {
     sqlx::query_as(AssertSqlSafe(format!(
         "select {PROPOSAL_COLUMNS} from proposals where kind = 'github.stack.create' and status = 'executed' \

@@ -16,11 +16,13 @@ mod link;
 mod mcp;
 mod memini;
 mod memory;
+mod origin;
 mod placement;
 mod pods;
 mod policies;
 mod proposals;
 mod questions;
+mod rebases;
 mod reviews;
 mod session;
 #[cfg(test)]
@@ -71,6 +73,8 @@ pub struct Inner {
     pub authz_addr: SocketAddr,
     pub agents: adapter::Agents,
     pub instructions: Option<String>,
+    /// Pushes to heads of pull requests set to merge themselves, waiting to be rechecked (#106).
+    pub rechecks: Arc<rebases::Rechecks>,
 }
 
 #[derive(Clone)]
@@ -136,9 +140,11 @@ async fn main() -> anyhow::Result<()> {
     policies.register(Arc::new(ModelPolicy::new(credentials.clone())));
     policies.register(Arc::new(CodexPolicy::new(credentials.clone())));
     let pushes = Arc::new(github::PushLog::default());
+    let (rechecks, pushes_to_recheck) = rebases::Rechecks::new(db.clone());
     policies.register(Arc::new(GitHubPolicy::new(
         credentials.clone(),
         pushes.clone(),
+        rechecks.clone(),
     )));
 
     let mut proposals = ProposalKinds::default();
@@ -201,6 +207,7 @@ async fn main() -> anyhow::Result<()> {
         authz_addr,
         agents,
         instructions,
+        rechecks,
     }));
     // A message queued for a parked session's absent agent wakes the session.
     let waker = state.clone();
@@ -230,6 +237,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    tokio::spawn(rebases::run(state.clone(), pushes_to_recheck));
     let authz = tokio::spawn(authz::serve(config.authz_listen, state.clone()));
     let ui =
         ServeDir::new(&config.ui_dir).fallback(ServeFile::new(config.ui_dir.join("index.html")));
@@ -238,6 +246,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/acp", get(acp::handler))
         .route("/healthz", get(|| async { "ok" }))
         .fallback_service(ui)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            origin::same_origin,
+        ))
         .with_state(state.clone());
     let sessions = Router::new()
         .route(sloppod_protocol::link::PATH, get(link::handler))

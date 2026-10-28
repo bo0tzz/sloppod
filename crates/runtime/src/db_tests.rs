@@ -628,7 +628,7 @@ async fn a_replacement_in_pieces_keeps_the_old_copy_until_it_is_whole(db: PgPool
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
-async fn a_session_log_reads_a_page_at_a_time(db: PgPool) {
+async fn a_session_log_reads_back_from_its_latest(db: PgPool) {
     let s = session(&db, "dev").await;
     let other = session(&db, "dev").await;
     let mut seqs = Vec::new();
@@ -638,14 +638,19 @@ async fn a_session_log_reads_a_page_at_a_time(db: PgPool) {
             .await
             .unwrap();
     }
-    let first = db::events(&db, s, 0, 2).await.unwrap();
+    let latest = db::events_before(&db, s, i64::MAX, 2).await.unwrap();
     assert_eq!(
-        first.iter().map(|e| e.1["n"].clone()).collect::<Vec<_>>(),
-        [json!(0), json!(1)]
+        latest.iter().map(|e| e.1["n"].clone()).collect::<Vec<_>>(),
+        [json!(3), json!(4)]
     );
-    let rest = db::events(&db, s, first[1].0, 10).await.unwrap();
-    assert_eq!(rest.iter().map(|e| e.0).collect::<Vec<_>>(), seqs[2..]);
-    assert!(db::events(&db, s, seqs[4], 10).await.unwrap().is_empty());
+    let older = db::events_before(&db, s, latest[0].0, 10).await.unwrap();
+    assert_eq!(older.iter().map(|e| e.0).collect::<Vec<_>>(), seqs[..3]);
+    assert!(
+        db::events_before(&db, s, seqs[0], 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
@@ -657,4 +662,65 @@ async fn a_session_log_has_a_last_event(db: PgPool) {
         .await
         .unwrap();
     assert_eq!(db::last_event(&db, s).await.unwrap(), seq);
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_pull_requests_fingerprint_is_found_by_repository_and_number(db: PgPool) {
+    let s = session(&db, "dev").await;
+    for (repo, number, fingerprint) in [("O/R", 7, Some("abc")), ("o/r", 8, None)] {
+        let id = db::insert_proposal(
+            &db,
+            s,
+            "github.pr.create",
+            ProposalStatus::Pending,
+            &json!({"repo": repo}),
+        )
+        .await
+        .unwrap()
+        .id;
+        db::decide_proposal(
+            &db,
+            id,
+            ProposalStatus::Approved,
+            &json!({"repo": repo}),
+            None,
+            "dev",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut result = json!({"number": number, "auto_merge": true});
+        if let Some(fingerprint) = fingerprint {
+            result["fingerprint"] = json!(fingerprint);
+        }
+        db::finish_proposal(&db, id, ProposalStatus::Executed, Some(&result), None)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        db::pull_fingerprint(&db, "o/r", 7)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("abc")
+    );
+    assert_eq!(db::pull_fingerprint(&db, "o/r", 8).await.unwrap(), None);
+    assert_eq!(db::pull_fingerprint(&db, "o/other", 7).await.unwrap(), None);
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn only_a_live_session_acts(db: PgPool) {
+    use sloppod_protocol::api::Phase;
+
+    let s = session(&db, "dev").await;
+    let row = || async { db::get_session(&db, s).await.unwrap().unwrap() };
+    assert_eq!(row().await.not_acting(), None);
+    for (phase, why) in [(Phase::Parked, "parked"), (Phase::Stopped, "stopped")] {
+        db::set_phase(&db, s, phase).await.unwrap();
+        assert_eq!(row().await.not_acting(), Some(why));
+    }
+    let deleted = session(&db, "dev").await;
+    db::mark_deleted(&db, deleted).await.unwrap();
+    let row = db::get_session(&db, deleted).await.unwrap().unwrap();
+    assert_eq!(row.not_acting(), Some("deleted"));
 }

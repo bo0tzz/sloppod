@@ -777,9 +777,24 @@ impl Hub {
     pub async fn prompt(self: &Arc<Self>, id: Uuid, params: Value) -> Result<Value, RpcError> {
         let blocks = params["prompt"].as_array().cloned().unwrap_or_default();
         let message_id = client_message_id(&params);
+        // A UI sends a message again when it can't tell whether the first send arrived, e.g. after a reload; it
+        // doesn't run twice. A UI can't always tell: it only has the latest of a long session's history.
+        let received = match message_id {
+            Some(message_id) => self
+                .store
+                .has_message(id, message_id)
+                .await
+                .map_err(|e| RpcError::new(-32603, e.to_string()))?,
+            None => false,
+        };
         let (queued, behind_turn) = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
+            if received || message_id.is_some_and(|m| state.queue.iter().any(|q| q.id == Some(m))) {
+                return Ok(
+                    json!({"stopReason": "end_turn", "_meta": {"sloppod": {"alreadyReceived": true}}}),
+                );
+            }
             let agent_up = state.agent.is_some() && state.agent_session_id.is_some();
             if agent_up && !state.turn_running {
                 state.turn_running = true;
@@ -1103,16 +1118,15 @@ impl Hub {
         Ok(result)
     }
 
-    /// Everything a UI needs when it loads a session.
-    /// Up to `limit` of the session's recorded updates after `after`; a UI replays the log a page at a time, so
-    /// the whole of a long session's log is never in memory at once.
-    pub async fn events(
+    /// Up to `limit` of the session's latest recorded updates before `before`. A UI gets the latest when it loads a
+    /// session and older pages as it asks for them, so neither it nor the runtime holds a long session's whole log.
+    pub async fn events_before(
         &self,
         id: Uuid,
-        after: i64,
+        before: i64,
         limit: i64,
     ) -> Result<Vec<(i64, Value)>, sqlx::Error> {
-        self.store.events(id, after, limit).await
+        self.store.events_before(id, before, limit).await
     }
 
     /// The sequence number of the session's latest recorded update; 0 when it has none.
@@ -1120,6 +1134,7 @@ impl Hub {
         self.store.last_event(id).await
     }
 
+    /// Everything a UI needs when it loads a session, but the log.
     pub async fn replay(&self, id: Uuid) -> Result<Replay, sqlx::Error> {
         let live = self.live(id);
         let state = live.state.lock().await;

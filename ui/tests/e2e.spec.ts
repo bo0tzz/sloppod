@@ -552,6 +552,58 @@ test('says what the pod is doing while the agent starts, and why a start failed'
   await expect(failure).toBeVisible();
 });
 
+test('a long session opens at its latest messages, and older ones load on the way up', async ({ page }) => {
+  const prompt = 'Write a long history in sloppod';
+  await createSession(page, prompt);
+  await expect(page.getByText('The end.')).toBeVisible({ timeout: 20_000 });
+
+  await page.reload();
+  await expect(page.getByText('The end.')).toBeVisible();
+  const earlier = page.getByRole('button', { name: 'Load earlier messages' });
+  await expect(earlier).toBeAttached();
+  // The first message is in the page before; scrolling up to the top brings it in.
+  await page.getByText('The end.').hover();
+  for (let i = 0; i < 20 && (await earlier.count()) > 0; i++) await page.mouse.wheel(0, -5000);
+  await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(1);
+  await expect(earlier).not.toBeAttached();
+  await expect(page.getByText('The end.')).toBeVisible();
+});
+
+test('a message sent again after a reload runs once, even when it is older than the latest page', async ({ page }) => {
+  await createSession(page, 'Write a long history in sloppod');
+  await expect(page.getByText('The end.')).toBeVisible({ timeout: 20_000 });
+  // Learn the id the page sends its next message under.
+  let messageId = '';
+  page.on('websocket', (socket) =>
+    socket.on('framesent', ({ payload }) => {
+      const message = JSON.parse(String(payload));
+      if (message.method === 'session/prompt') messageId = message.params._meta.sloppod.messageId;
+    }),
+  );
+  await page.reload();
+  await expect(page.getByText('The end.')).toBeVisible();
+  const again = 'Write a long history in sloppod, again';
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill(again);
+  await box.press('Enter');
+  await expect(page.getByText('The end.')).toHaveCount(2, { timeout: 20_000 });
+  expect(messageId).not.toBe('');
+
+  // As if the page reloaded before the runtime confirmed it: by then it's older than the latest page.
+  const id = page.url().split('/').pop()!;
+  await page.evaluate(
+    ([session, message, text]) =>
+      localStorage.setItem(`sloppod.unconfirmed.${session}`, JSON.stringify([{ id: message, text }])),
+    [id, messageId, again],
+  );
+  await page.reload();
+  await expect(page.getByText('The end.')).toBeVisible();
+  await page.waitForTimeout(500);
+  // Not run again: the latest page still ends with its answer, and nothing new was sent to the agent.
+  await expect(userMessages(page).filter({ hasText: again })).toHaveCount(0);
+  await expect(page.getByTestId('activity')).toBeHidden();
+});
+
 test('runs a session without a repository', async ({ page }) => {
   const prompt = 'Explain what the runtime does';
   await createSession(page, prompt);

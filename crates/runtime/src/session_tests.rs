@@ -361,6 +361,32 @@ async fn stopping_a_session_mid_compaction_fails_waiting_steers() {
 }
 
 #[tokio::test]
+async fn a_message_sent_again_does_not_run_twice() {
+    let mut h = Harness::ready().await;
+    let message_id = Uuid::new_v4();
+    let params = json!({"sessionId": h.id, "prompt": [{"type": "text", "text": "Once"}],
+        "_meta": {"sloppod": {"messageId": message_id}}});
+    let first = {
+        let (hub, id, params) = (h.hub.clone(), h.id, params.clone());
+        tokio::spawn(async move { hub.prompt(id, params).await })
+    };
+    let request = h.next().await;
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    first.await.unwrap().unwrap();
+
+    // The UI couldn't tell it arrived, e.g. it only loaded the latest of a long history, and sends it again.
+    let again = h.hub.prompt(h.id, params).await.unwrap();
+    assert_eq!(again["_meta"]["sloppod"]["alreadyReceived"], true);
+    while let Ok(message) = h.to_agent.try_recv() {
+        assert!(
+            !matches!(message, ToSupervisor::Acp { .. }),
+            "the agent was sent {message:?}"
+        );
+    }
+    assert_eq!(h.user_messages(), [("Once".to_owned(), false)]);
+}
+
+#[tokio::test]
 async fn a_notice_waits_for_the_agent_to_be_up() {
     let mut h = Harness::starting().await;
     h.hub

@@ -91,6 +91,13 @@ async fn forward(state: &AppState, peer: SocketAddr, request: Request) -> anyhow
     let session = db::get_session(&state.db, session)
         .await?
         .context("unknown session")?;
+    if let Some(why) = session.not_acting() {
+        return Ok((
+            StatusCode::FORBIDDEN,
+            format!("sloppod: this session is {why}, so it has no memory\n"),
+        )
+            .into_response());
+    }
     // Only its URL is needed here; the admin key stays sealed.
     let Some(credential) = state
         .credentials
