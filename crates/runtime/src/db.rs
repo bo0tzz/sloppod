@@ -501,6 +501,18 @@ pub async fn has_message(db: &PgPool, id: Uuid, message_id: Uuid) -> sqlx::Resul
     .await
 }
 
+/// The text of the session's first message, e.g. a sub-session's task.
+pub async fn first_message(db: &PgPool, id: Uuid) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar(
+        "select payload->'content'->>'text' from session_events where session_id = $1 \
+         and payload->>'sessionUpdate' = 'user_message_chunk' order by seq limit 1",
+    )
+    .bind(id)
+    .fetch_optional(db)
+    .await
+    .map(Option::flatten)
+}
+
 /// Up to `limit` of the session's latest events before `before`, in order.
 pub async fn events_before(
     db: &PgPool,
