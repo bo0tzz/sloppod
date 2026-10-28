@@ -1350,6 +1350,42 @@ test('a browser whose storage is full still sends', async ({ page }) => {
   await finishTurn(page);
 });
 
+test('the sidebar shows how much of each usage limit is left', async ({ page }) => {
+  const inTwoHours = new Date(Date.now() + 2 * 3600_000).toISOString();
+  const quota = (kind: string, name: string, limited: boolean, windows: [string, number, string][]) => ({
+    credential_id: `${kind}-${name}`,
+    kind,
+    name,
+    limited,
+    resets_at: limited ? inTwoHours : null,
+    windows: windows.map(([window, utilization, status]) => ({ window, utilization, resets_at: inTwoHours, status })),
+    observed_at: new Date().toISOString(),
+  });
+  await page.request.post('/_mock/quotas', {
+    data: [
+      quota('claude', 'work', false, [
+        ['five_hour', 0.2, 'allowed'],
+        ['seven_day', 0.95, 'warning'],
+      ]),
+      quota('chatgpt', 'reviews', true, [['five_hour', 1, 'rejected']]),
+    ],
+  });
+  try {
+    await page.goto('/settings');
+    const meters = page.getByTestId('sidebar').getByTestId('quota');
+    await expect(meters).toHaveCount(2);
+    const claude = meters.filter({ hasText: 'Claude' });
+    await expect(claude).toContainText('95% of week');
+    await expect(claude).toHaveAttribute('data-level', 'warning');
+    await expect(claude).toHaveAttribute('title', /session: 20% used, resets in 2 hours/);
+    const chatgpt = meters.filter({ hasText: 'ChatGPT' });
+    await expect(chatgpt).toContainText('limit reached');
+    await expect(chatgpt).toHaveAttribute('data-level', 'danger');
+  } finally {
+    await page.request.post('/_mock/quotas', { data: [] });
+  }
+});
+
 test('only the transcript scrolls, not the page around it', async ({ page }) => {
   await page.setViewportSize({ width: 1000, height: 500 });
   await createSession(page, 'Give me a long answer in sloppod');

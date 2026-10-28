@@ -19,7 +19,7 @@ use crate::credentials::CHATGPT;
 use crate::proposals::{self, DecideError, Verdict};
 use crate::session::ParkError;
 use crate::users::User;
-use crate::{AppState, db, lifecycle, reviews, subsessions};
+use crate::{AppState, db, lifecycle, quota, reviews, subsessions};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -40,6 +40,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/default", post(default_credential))
+        .route("/quotas", get(list_quotas))
         .route(
             "/standing-approvals",
             get(list_standing_approvals).post(create_standing_approval),
@@ -546,6 +547,15 @@ async fn create_credential(
         Ok(row) => Ok((StatusCode::CREATED, Json(row.to_api()))),
         Err(invalid) => Err(bad_request(invalid.0)),
     }
+}
+
+async fn list_quotas(
+    State(state): State<AppState>,
+    User(user): User,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(
+        quota::list(&state.db, &user, chrono::Utc::now()).await?,
+    ))
 }
 
 async fn list_standing_approvals(

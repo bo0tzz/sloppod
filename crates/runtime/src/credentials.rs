@@ -344,6 +344,16 @@ impl Credentials {
         Ok(self.default_row(owner, kind).await?.is_some())
     }
 
+    /// The owners who have a default credential of a kind.
+    pub async fn owners_with_default(&self, kind: &str) -> sqlx::Result<Vec<String>> {
+        sqlx::query_scalar(
+            "select owner from credentials where kind = $1 and is_default order by owner",
+        )
+        .bind(kind)
+        .fetch_all(&self.db)
+        .await
+    }
+
     /// The owner's default credential of a kind, still sealed.
     pub async fn default_row(
         &self,
@@ -374,16 +384,21 @@ impl Credentials {
 
     /// The owner's ChatGPT access token and account id, refreshed first when it's about to expire.
     pub async fn chatgpt(&self, owner: &str) -> anyhow::Result<Option<ChatGptTokens>> {
-        let Some((_, secret)) = self.secret(owner, CHATGPT).await? else {
+        Ok(self.chatgpt_login(owner).await?.map(|(_, tokens)| tokens))
+    }
+
+    /// The same, with the id of the login they're from: the default when it was read, which may change meanwhile.
+    pub async fn chatgpt_login(
+        &self,
+        owner: &str,
+    ) -> anyhow::Result<Option<(Uuid, ChatGptTokens)>> {
+        let Some((login, secret)) = self.secret(owner, CHATGPT).await? else {
             return Ok(None);
         };
         let tokens: ChatGptTokens = serde_json::from_str(&secret)?;
         if !tokens.expires_soon() {
-            return Ok(Some(tokens));
+            return Ok(Some((login.id, tokens)));
         }
-        let Some(login) = self.default_row(owner, CHATGPT).await? else {
-            return Ok(None);
-        };
         let lock = self
             .chatgpt_refresh
             .lock()
@@ -406,7 +421,7 @@ impl Credentials {
         let secret = self.vault.decrypt_string(&row.secret)?;
         let mut tokens: ChatGptTokens = serde_json::from_str(&secret)?;
         if !tokens.expires_soon() {
-            return Ok(Some(tokens));
+            return Ok(Some((row.id, tokens)));
         }
         let response = self
             .http
@@ -448,7 +463,7 @@ impl Credentials {
             tracing::error!(%owner, credential = %row.id, error = %e, "storing a refreshed ChatGPT login; it will need signing in again");
             return Err(e.into());
         }
-        Ok(Some(tokens))
+        Ok(Some((row.id, tokens)))
     }
 
     pub async fn github(&self, owner: &str) -> anyhow::Result<Arc<GitHubApp>> {

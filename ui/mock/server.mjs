@@ -46,6 +46,8 @@ const proposals = new Map();
 const reviews = new Map();
 const connections = new Set();
 const credentials = [];
+/** Set by `/_mock/quotas`: what `GET /api/v1/quotas` answers. */
+let quotas = [];
 
 const now = () => new Date().toISOString();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -1230,6 +1232,7 @@ async function handleApi(req, res, url) {
   }
 
   if (parts[0] === 'credentials') return handleCredentials(req, res, parts);
+  if (parts[0] === 'quotas' && parts.length === 1 && method === 'GET') return json(res, 200, quotas);
   if (parts[0] === 'standing-approvals') return handleStandingApprovals(req, res, parts);
 
   if (parts[0] === 'settings' && parts.length === 1) {
@@ -1635,6 +1638,10 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   try {
     if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
+    if (url.pathname === '/_mock/quotas' && req.method === 'POST') {
+      quotas = await readBody(req);
+      return json(res, 200, {});
+    }
     if (url.pathname === '/_mock/fail-next-prompt' && req.method === 'POST') {
       failNextPrompt = true;
       return json(res, 200, { failNextPrompt });

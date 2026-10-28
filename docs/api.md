@@ -114,6 +114,33 @@ type Credential = {
 };
 ```
 
+### Quotas
+
+What's left of the usage limits of the user's inference credentials, as last reported (#140). Claude Code reports a Claude subscription's limits in its sessions' `usage_update`s (`_meta["_claude/rateLimit"]`), under the session owner's default Claude credential; they're known once a session has used it. A ChatGPT login's are read from ChatGPT every five minutes, as the Codex CLI reads them, since codex-acp doesn't report them. Each report updates the windows it covers and keeps the others as they were; one that arrives after a newer one changes nothing the newer one said. A ChatGPT report that isn't as expected is logged and ignored. A quota reads as it stands now: a window whose reset has passed shows as unused, and a refusal ends at its `resets_at`. Only credentials with a report are listed.
+
+```
+GET /api/v1/quotas -> Quota[]
+```
+
+```ts
+type Quota = {
+  credential_id: string;
+  kind: CredentialKind;    // "claude" or "chatgpt"
+  name: string;
+  limited: boolean;        // the provider refuses its requests now, until resets_at
+  resets_at: string | null;
+  windows: QuotaWindow[];
+  observed_at: string;     // when the last report came
+};
+
+type QuotaWindow = {
+  window: string;          // "five_hour" (the session limit), "seven_day" (the weekly one), or another limit's name
+  utilization: number | null;  // the fraction used, usually 0 to 1
+  resets_at: string | null;
+  status: "allowed" | "warning" | "rejected";  // warning: past a threshold the provider set; rejected: at the limit
+};
+```
+
 ### Proposals
 
 Outward actions and access the agent asked for ([ADR 3](adr/0003-proposals-and-trusted-executor.md), [ADR 2](adr/0002-capabilities.md)). Kinds:
