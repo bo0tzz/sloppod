@@ -122,6 +122,8 @@ export type ElicitationRequest = {
   message: string;
   requestedSchema: { type: 'object'; properties: Record<string, ElicitationField>; required?: string[] };
   toolCallId?: string;
+  /** `sloppod.questionId`: an `ask_user` question's own id, the same each time the runtime sends it. */
+  _meta?: { sloppod?: { questionId?: string } };
 };
 
 export type ElicitationResponse =

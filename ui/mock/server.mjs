@@ -479,12 +479,15 @@ async function agentScript(session, turn, prompt) {
   if (/ask_user/i.test(prompt)) {
     await step(1);
     // "twice" asks each question with a call of its own, so the second request waits behind the first.
-    for (const question of /twice/i.test(prompt) ? QUESTIONS : [QUESTIONS[0]]) {
+    // "the same question twice" asks one question in two calls, as distinct questions that look alike.
+    const asked = /same question twice/i.test(prompt) ? [QUESTIONS[0], QUESTIONS[0]] : /twice/i.test(prompt) ? QUESTIONS : [QUESTIONS[0]];
+    for (const question of asked) {
       const askId = randomUUID();
       tool({ toolCallId: askId, title: 'mcp__sloppod__ask_user', kind: 'other', status: 'pending', rawInput: { questions: [question] } });
       void requestFromUser(session, {
         method: 'elicitation/create',
-        params: questionsToElicitation([question], session.data.id),
+        // As the runtime sends an ask_user question: with its own id.
+        params: { ...questionsToElicitation([question], session.data.id), _meta: { sloppod: { questionId: randomUUID() } } },
         cancelled: { action: 'cancel' },
         blocking: false,
       }).then((response) => {

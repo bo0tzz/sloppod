@@ -1180,6 +1180,21 @@ test('shows an open question again after a reload', async ({ page }) => {
   await expect(agentMessages(page).filter({ hasText: 'Backoff: Whatever you think is best.' })).toBeVisible();
 });
 
+test('two identical questions asked separately stay two questions', async ({ page }) => {
+  await createSession(page, 'Use ask_user to ask me the same question twice');
+  await expect(questionCard(page)).toBeVisible();
+  await expect(questionCard(page).getByTestId('questions-queued')).toHaveText('One more request after this');
+  await questionField(page, 'question_0').getByRole('radio', { name: /Exponential/ }).check();
+  await questionCard(page).getByRole('button', { name: 'Answer' }).click();
+  // The second one is still open, with nothing of the first one's answer in it.
+  await expect(questionCard(page)).toBeVisible();
+  await expect(questionCard(page).getByTestId('questions-queued')).toHaveCount(0);
+  await expect(questionField(page, 'question_0').getByRole('radio', { name: /Exponential/ })).not.toBeChecked();
+  await questionField(page, 'question_0').getByRole('radio', { name: /Fixed/ }).check();
+  await questionCard(page).getByRole('button', { name: 'Answer' }).click();
+  await expect(questionCard(page)).toBeHidden();
+});
+
 test('a half-given answer stays through a dropped connection and a reload', async ({ page }) => {
   // Every connection goes through here, so the test can drop one, as a flaky network would.
   const sockets: WebSocketRoute[] = [];

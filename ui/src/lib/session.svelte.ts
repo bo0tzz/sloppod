@@ -30,9 +30,13 @@ export type PendingPermission = RequestPermissionRequest & { rpcId: RequestId };
  */
 export type PendingQuestion = ElicitationRequest & { rpcId: RequestId; stale?: boolean };
 
-/** What stays the same about a question across reconnects, unlike the request id it comes with. */
-export const questionKey = (question: ElicitationRequest) =>
-  question.toolCallId ?? JSON.stringify([question.message, question.requestedSchema]);
+/**
+ * What stays the same about a question across reconnects, unlike the request id it comes with: an `ask_user`
+ * question's own id, or the agent's tool call. A question with neither is only itself, and isn't matched when it's
+ * sent again.
+ */
+export const questionKey = (question: PendingQuestion) =>
+  question._meta?.sloppod?.questionId ?? question.toolCallId ?? `request:${String(question.rpcId)}`;
 
 /** How long a question shown while reconnecting waits to be sent again before it's taken down. */
 const STALE_QUESTION_GRACE_MS = 10_000;
@@ -263,8 +267,9 @@ export class SessionView {
           this.#conn.respondError(rpcId, -32602, `Unsupported elicitation mode: ${request.mode}`);
           return;
         }
-        const key = questionKey(request);
-        this.questions = [...this.questions.filter((question) => questionKey(question) !== key), { ...request, rpcId }];
+        const pending = { ...request, rpcId };
+        const key = questionKey(pending);
+        this.questions = [...this.questions.filter((question) => questionKey(question) !== key), pending];
         return;
       }
     }
