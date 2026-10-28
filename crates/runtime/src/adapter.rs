@@ -6,6 +6,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use sloppod_contracts::{
     AgentAdapter, AgentContext, AgentFile, AgentLaunch, Manifest, NeededCredential, RepoGrant,
+    capability,
 };
 use sloppod_protocol::link::RUNTIME_INFO;
 
@@ -199,8 +200,7 @@ impl AgentAdapter for ClaudeCode {
             });
         }
 
-        let mcp_servers =
-            json!([{"type": "http", "name": "sloppod", "url": context.tools_url, "headers": []}]);
+        let mcp_servers = mcp_servers(context);
         let meta = json!({"claudeCode": {"options": {"plugins": plugins, "disallowedTools": DISALLOWED_TOOLS}}});
         let system_prompt = json!({"mode": "append", "content": [{"type": "text", "text": session_prompt(context)}]});
         let session_params =
@@ -224,6 +224,16 @@ impl AgentAdapter for ClaudeCode {
             mode: Some("auto".into()),
         }
     }
+}
+
+/// The MCP servers every agent gets: sloppod's own tools, and the docs server if the session may use it.
+fn mcp_servers(context: &AgentContext) -> Value {
+    let mut servers =
+        vec![json!({"type": "http", "name": "sloppod", "url": context.tools_url, "headers": []})];
+    if context.session.has(capability::DOCS) {
+        servers.push(json!({"type": "http", "name": "docs", "url": crate::policies::docs::URL, "headers": []}));
+    }
+    Value::Array(servers)
 }
 
 /// Codex through `codex-acp`, on the owner's ChatGPT subscription (ADR 24).
@@ -275,9 +285,7 @@ impl AgentAdapter for Codex {
                 overwrite: true,
             },
         ];
-        let mcp_servers =
-            json!([{"type": "http", "name": "sloppod", "url": context.tools_url, "headers": []}]);
-        let session_params = json!({"mcpServers": mcp_servers});
+        let session_params = json!({"mcpServers": mcp_servers(context)});
         AgentLaunch {
             command: vec!["codex-acp".to_owned()],
             env: vec![
@@ -332,6 +340,30 @@ mod tests {
             model: Some("claude-haiku".into()),
             memory: None,
         }
+    }
+
+    #[test]
+    fn agents_get_the_docs_server_with_the_grant() {
+        let names = |context: &AgentContext| {
+            mcp_servers(context)
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["name"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let mut context = context();
+        assert_eq!(names(&context), ["sloppod"]);
+        context
+            .session
+            .grants
+            .push(sloppod_contracts::Grant::new(capability::DOCS, json!({})));
+        assert_eq!(names(&context), ["sloppod", "docs"]);
+        // Both agents get the same servers.
+        assert_eq!(
+            ClaudeCode.launch(&context).new_session["mcpServers"],
+            Codex.launch(&context).new_session["mcpServers"]
+        );
     }
 
     #[test]

@@ -13,6 +13,9 @@ pub fn describe(grant: &Grant) -> String {
                        others)."
             .into(),
         capability::CODEX => "Codex's API on chatgpt.com, with the owner's ChatGPT login.".into(),
+        capability::DOCS => "Library documentation, searched by library and topic, through Context7's MCP server (the `docs` \
+                   tools)."
+            .into(),
         capability::MEMORY => match grant.param("namespace") {
             Some(namespace) => format!("Long-term memory (memini), in the namespace {namespace}."),
             None => "Long-term memory (memini).".into(),
