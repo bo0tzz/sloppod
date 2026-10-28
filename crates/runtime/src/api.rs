@@ -165,12 +165,14 @@ async fn put_settings(
     User(user): User,
     Json(update): Json<SettingsUpdate>,
 ) -> ApiResult<impl IntoResponse> {
+    // Checked before anything is written, so a bad field doesn't leave the others half applied.
+    let review = update.review.as_deref().map(review_policy).transpose()?;
     if let Some(model) = &update.model {
         let model = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
         db::set_user_model(&state.db, &user, model).await?;
     }
-    if let Some(review) = &update.review {
-        db::set_user_review(&state.db, &user, review_policy(review)?).await?;
+    if let Some(review) = review {
+        db::set_user_review(&state.db, &user, review).await?;
     }
     Ok(Json(settings(&state, &user).await?))
 }
