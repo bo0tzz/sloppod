@@ -1483,7 +1483,9 @@ async fn a_question_whose_answer_could_not_be_stored_comes_back_after_a_restart(
     let (pid, _, _) = h.hub.replay(h.id).await.unwrap().permissions[0].clone();
     h.store.fail_saving_queues.store(true, Ordering::SeqCst);
     let answer = json!({"action": "accept", "content": {"question_0": "Fixed"}});
-    h.hub.answer_permission(h.id, pid, Ok(answer)).await;
+    h.hub
+        .answer_permission(h.id, pid, Ok(answer), "a test")
+        .await;
     assert_eq!(h.store.questions().await.unwrap().len(), 1);
 
     h.store.fail_saving_queues.store(false, Ordering::SeqCst);
@@ -1530,7 +1532,7 @@ async fn a_question_from_ask_user_outlives_a_restart() {
     hub.agent_ready(h.id, &agent, "agent-session".into(), json!({}), None)
         .await;
     let answer = json!({"action": "accept", "content": {"question_0": "Fixed"}});
-    hub.answer_permission(h.id, pid, Ok(answer)).await;
+    hub.answer_permission(h.id, pid, Ok(answer), "a test").await;
     assert_eq!(
         prompt_text(&next_prompt(&mut to_agent).await),
         ["sloppod: the user answered your question:\n- Which backoff?: Fixed"]
