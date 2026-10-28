@@ -626,6 +626,79 @@ test('follows new output while the reader is at the bottom, across a reconnect',
   await expect(page.getByText('Still held.')).not.toBeInViewport();
 });
 
+test('sending a message scrolls the transcript down to it', async ({ page }) => {
+  await page.setViewportSize({ width: 1000, height: 500 });
+  await createSession(page, 'Give me a long answer in sloppod');
+  const end = page.getByText('The end.');
+  await expect(end).toBeInViewport({ timeout: 20_000 });
+  await end.hover();
+  await page.mouse.wheel(0, -2000);
+  await expect(end).not.toBeInViewport();
+
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Where was I?');
+  await box.press('Enter');
+  await expect(userMessages(page).filter({ hasText: 'Where was I?' })).toBeInViewport();
+});
+
+test('scrolling the session list past its end scrolls the transcript', async ({ page }) => {
+  await page.setViewportSize({ width: 1100, height: 500 });
+  await createSession(page, 'Give me a long answer in sloppod');
+  const end = page.getByText('The end.');
+  await expect(end).toBeInViewport({ timeout: 20_000 });
+
+  const list = page.getByTestId('sidebar-list');
+  await list.evaluate((element) => element.scrollTo({ top: 0 }));
+  await list.hover();
+  await page.mouse.wheel(0, -1000);
+  await expect(end).not.toBeInViewport();
+  // That counts as the reader scrolling up: new output leaves the view where it is.
+  await page.request.post('/_mock/say?text=Not%20followed.');
+  await expect(page.getByText('Not followed.')).toBeAttached();
+  await expect(page.getByText('Not followed.')).not.toBeInViewport();
+});
+
+test('a bar marks where the reader had read up to', async ({ page }) => {
+  const setVisible = (visible: boolean) =>
+    page.evaluate((visible) => {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => (visible ? 'visible' : 'hidden') });
+      document.dispatchEvent(new Event('visibilitychange'));
+    }, visible);
+  const bar = page.getByTestId('last-read');
+  const afterBar = bar.locator('xpath=following-sibling::*[1]');
+
+  await createSession(page, 'Fix the flaky test in sloppod');
+  await finishTurn(page);
+  await expect(bar).toHaveCount(0);
+
+  // Output that arrives while the page is hidden is new when the reader comes back.
+  await setVisible(false);
+  await page.request.post('/_mock/say?text=Arrived%20while%20away.');
+  await expect(page.getByText('Arrived while away.')).toBeAttached();
+  await setVisible(true);
+  await expect(afterBar).toContainText('Arrived while away.');
+
+  // It's read now, so the next visit has nothing new.
+  await page.reload();
+  await expect(page.getByText('Arrived while away.')).toBeVisible();
+  await expect(bar).toHaveCount(0);
+
+  // Output from while the session wasn't open is new on the next visit.
+  await page.goto('/settings');
+  await page.request.post('/_mock/say?text=Arrived%20while%20closed.');
+  await page.goBack();
+  await expect(page.getByText('Arrived while closed.')).toBeVisible();
+  await expect(afterBar).toContainText('Arrived while closed.');
+
+  // Sending a message means the reader has caught up.
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Thanks');
+  await box.press('Enter');
+  await expect(userMessages(page).filter({ hasText: 'Thanks' })).toHaveCount(1);
+  await expect(bar).toHaveCount(0);
+});
+
+
 test('says what the pod is doing while the agent starts, and why a start failed', async ({ page }) => {
   await createSession(page, 'failing start: fix the build in bo0tzz/sloppod');
   const activity = page.getByTestId('activity');

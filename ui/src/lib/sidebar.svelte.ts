@@ -8,6 +8,8 @@ class Sidebar {
   readonly #available = new MediaQuery('(min-width: 768px)');
   readonly #wide = new MediaQuery('(min-width: 1024px)');
   #toggled = $state<{ wide: boolean; open: boolean } | null>(null);
+  /** Scrolls the page beside the sidebar by that many pixels, when the page has something to scroll. */
+  passScroll: ((pixels: number) => void) | null = null;
 
   get available() {
     return this.#available.current;

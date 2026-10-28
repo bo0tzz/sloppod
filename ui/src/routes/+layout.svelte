@@ -16,6 +16,16 @@
   // The home page is the full session list, so the sidebar would only repeat it.
   const showSidebar = $derived(sidebar.available && page.route.id !== '/');
 
+  /** A wheel turn the session list has no room left for goes to the page beside it. */
+  function onListWheel(event: WheelEvent) {
+    const list = event.currentTarget as HTMLElement;
+    const down = event.deltaY > 0;
+    const room = down ? list.scrollHeight - list.clientHeight - list.scrollTop : list.scrollTop;
+    if (event.deltaY === 0 || room > 1 || !sidebar.passScroll) return;
+    const unit = { [WheelEvent.DOM_DELTA_LINE]: 40, [WheelEvent.DOM_DELTA_PAGE]: list.clientHeight }[event.deltaMode] ?? 1;
+    sidebar.passScroll(event.deltaY * unit);
+  }
+
   afterNavigate(() => {
     if (!sidebar.wide) sidebar.open = false;
   });
@@ -57,7 +67,7 @@
               {/if}
             </div>
           </div>
-          <div class="min-h-0 grow overflow-y-auto">
+          <div class="min-h-0 grow overflow-y-auto" onwheel={onListWheel} data-testid="sidebar-list">
             <SessionList compact sessions={sessions.sorted} activeId={page.params.id} />
           </div>
           <div class="border-light-200 flex h-12 shrink-0 items-center gap-2 border-t ps-4 pe-2">

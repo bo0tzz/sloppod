@@ -24,8 +24,10 @@
   } from '@mdi/js';
   import { onMount } from 'svelte';
   import { api } from '#lib/api.ts';
+  import { ReadMarker } from '#lib/read.svelte.ts';
   import { SessionView } from '#lib/session.svelte.ts';
   import { sessions } from '#lib/sessions.svelte.ts';
+  import { sidebar } from '#lib/sidebar.svelte.ts';
   import AddRepoModal from './AddRepoModal.svelte';
   import ChatHeader from './ChatHeader.svelte';
   import GrantsModal from './GrantsModal.svelte';
@@ -52,6 +54,8 @@
   // The route wraps this component in {#key id}, so capturing the first id is intended.
   // svelte-ignore state_referenced_locally
   const view = new SessionView(id);
+  // svelte-ignore state_referenced_locally
+  const marker = new ReadMarker(id);
 
   const session = $derived(view.session);
   const title = $derived(session?.title || 'New session');
@@ -106,6 +110,36 @@
     loadAutoApprovals().catch(() => {});
     view.start();
     return () => view.stop();
+  });
+
+  let visible = $state(document.visibilityState === 'visible');
+  $effect(() => {
+    const changed = () => {
+      // Before `visible` lets what's on screen count as read, so the bar marks where they were when they left.
+      if (document.visibilityState === 'visible' && !visible) marker.returned();
+      visible = document.visibilityState === 'visible';
+    };
+    document.addEventListener('visibilitychange', changed);
+    return () => document.removeEventListener('visibilitychange', changed);
+  });
+  $effect(() => {
+    if (view.loaded && visible && atBottom) marker.read(view.transcript.items);
+  });
+
+  function onSent() {
+    marker.clear();
+    atBottom = true;
+    scrollToBottom();
+  }
+
+  // Scrolling the sidebar's session list past its end scrolls the transcript instead.
+  $effect(() => {
+    if (!scroller) return;
+    sidebar.passScroll = (pixels) => {
+      lastUserScroll = performance.now();
+      scroller?.scrollBy({ top: pixels, behavior: 'instant' });
+    };
+    return () => (sidebar.passScroll = null);
   });
 
   function onScroll() {
@@ -397,7 +431,11 @@
                     </Button>
                   </div>
                 {/if}
-                <TranscriptView items={view.transcript.items} running={view.turnRunning} />
+                <TranscriptView
+                  items={view.transcript.items}
+                  running={view.turnRunning}
+                  unreadFrom={marker.unreadFrom(view.transcript.items)}
+                />
                 {#if activity}
                   <div class="text-muted flex items-center gap-2 py-1 text-sm" data-testid="activity">
                     <LoadingSpinner size="tiny" />
@@ -430,7 +468,7 @@
           </div>
         {/if}
 
-        <SessionComposer {view} />
+        <SessionComposer {view} {onSent} />
       </div>
       {#if waiting && sidePanel}
         <aside

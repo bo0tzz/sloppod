@@ -7,7 +7,7 @@
   import { loadDraft, saveDraft } from '#lib/drafts.ts';
   import Composer from './Composer.svelte';
 
-  let { view }: { view: SessionView } = $props();
+  let { view, onSent }: { view: SessionView; onSent?: () => void } = $props();
 
   // Kept across a page reload, per session. The route remounts this per session, so the first id is the one.
   // svelte-ignore state_referenced_locally
@@ -66,6 +66,7 @@
     const message = text.trim();
     if (!message || blockedReason) return;
     text = '';
+    onSent?.();
     const id = crypto.randomUUID();
     if (view.connection !== 'open') {
       view.sendWhenConnected(message, id);
