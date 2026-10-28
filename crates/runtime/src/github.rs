@@ -99,6 +99,21 @@ pub struct StackMerge<'a> {
     pub layers: &'a [(&'a str, &'a str)],
 }
 
+/// A query string, `?k=v&…`, with every value encoded: a branch name with `#` or `&` in it must not end the value.
+fn query(pairs: &[(&str, &str)]) -> String {
+    let pairs: Vec<String> = pairs
+        .iter()
+        .map(|(key, value)| format!("{key}={}", utf8_percent_encode(value, NON_ALPHANUMERIC)))
+        .collect();
+    format!("?{}", pairs.join("&"))
+}
+
+/// A branch as GitHub's pull request filters name it, `owner:branch`.
+fn head_ref(repo: &str, branch: &str) -> String {
+    let owner = repo.split('/').next().unwrap_or_default();
+    format!("{owner}:{branch}")
+}
+
 /// A branch name as a URL path segment: its `/`s stay, since GitHub reads them as part of the name there.
 fn branch_in_path(branch: &str) -> String {
     const KEEP: &AsciiSet = &NON_ALPHANUMERIC
@@ -649,7 +664,7 @@ impl GitHubApp {
     /// The commit a branch (or commit) points to.
     pub async fn branch_sha(&self, repo: &str, reference: &str) -> anyhow::Result<String> {
         let commit: Value = self
-            .repo_json(repo, &format!("/commits/{reference}"))
+            .repo_json(repo, &format!("/commits/{}", branch_in_path(reference)))
             .await?;
         commit["sha"]
             .as_str()
@@ -659,13 +674,12 @@ impl GitHubApp {
 
     /// Turns auto-merge off on open pull requests from `branch`, returning their numbers.
     pub async fn disable_auto_merge(&self, repo: &str, branch: &str) -> anyhow::Result<Vec<u64>> {
-        let owner = repo.split('/').next().unwrap_or_default();
         let headed: Vec<Value> = self
             .repo_json(
                 repo,
                 &format!(
-                    "/pulls?state=open&head={}",
-                    utf8_percent_encode(&format!("{owner}:{branch}"), NON_ALPHANUMERIC)
+                    "/pulls{}",
+                    query(&[("state", "open"), ("head", &head_ref(repo, branch))])
                 ),
             )
             .await?;
@@ -801,11 +815,17 @@ impl GitHubApp {
         head: &str,
         base: &str,
     ) -> anyhow::Result<Option<Value>> {
-        let owner = repo.split('/').next().unwrap_or_default();
         let pulls: Vec<Value> = self
             .repo_json(
                 repo,
-                &format!("/pulls?state=open&head={owner}:{head}&base={base}"),
+                &format!(
+                    "/pulls{}",
+                    query(&[
+                        ("state", "open"),
+                        ("head", &head_ref(repo, head)),
+                        ("base", base)
+                    ])
+                ),
             )
             .await?;
         Ok(pulls.first().map(|body| {
@@ -1406,6 +1426,10 @@ mod tests {
             "sloppod/abcd1234-v1.2_x"
         );
         assert_eq!(branch_in_path("a#b+c d"), "a%23b%2Bc%20d");
+        assert_eq!(
+            query(&[("head", &head_ref("o/r", "a#b")), ("base", "m&x=1")]),
+            "?head=o%3Aa%23b&base=m%26x%3D1"
+        );
     }
 
     #[tokio::test]
