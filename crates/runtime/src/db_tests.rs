@@ -999,3 +999,28 @@ async fn a_quota_keeps_the_windows_a_report_leaves_out(db: PgPool) {
             .is_empty()
     );
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_users_timezone_is_kept_and_utc_without_one(db: PgPool) {
+    assert_eq!(db::user_timezone(&db, "dev").await.unwrap(), None);
+    assert_eq!(db::user_zone(&db, "dev").await.unwrap(), chrono_tz::UTC);
+    db::set_user_review(&db, "dev", ReviewPolicy::Required)
+        .await
+        .unwrap();
+    db::set_user_timezone(&db, "dev", "Europe/Amsterdam")
+        .await
+        .unwrap();
+    assert_eq!(
+        db::user_timezone(&db, "dev").await.unwrap().as_deref(),
+        Some("Europe/Amsterdam")
+    );
+    assert_eq!(
+        db::user_zone(&db, "dev").await.unwrap(),
+        chrono_tz::Europe::Amsterdam
+    );
+    // Setting it leaves the user's other settings alone.
+    assert_eq!(
+        db::user_review(&db, "dev").await.unwrap(),
+        ReviewPolicy::Required
+    );
+}

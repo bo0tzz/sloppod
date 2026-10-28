@@ -70,22 +70,29 @@ fn notice_queued(text: &str) -> Queued {
 /// How long the agent has to have been quiet before a prompt tells it the time.
 const TIME_AFTER: chrono::Duration = chrono::Duration::minutes(30);
 
-/// The line telling the agent the time (#105): its agent only knows the date it started on. Sent after a gap, or
-/// once the date has changed, since the agent was last heard from (`heard_at`), and with every notice.
-fn time_line(now: DateTime<Utc>, heard_at: Option<DateTime<Utc>>, notice: bool) -> Option<String> {
+/// The line telling the agent the time (#105), in its owner's timezone (#253): its agent only knows the date it
+/// started on. Sent after a gap, or once the owner's date has changed, since the agent was last heard from
+/// (`heard_at`), and with every notice.
+fn time_line(
+    now: DateTime<Utc>,
+    heard_at: Option<DateTime<Utc>>,
+    notice: bool,
+    zone: chrono_tz::Tz,
+) -> Option<String> {
+    let date = |at: DateTime<Utc>| at.with_timezone(&zone).date_naive();
     let gap = heard_at
-        .filter(|h| now - *h >= TIME_AFTER || h.date_naive() != now.date_naive())
+        .filter(|h| now - *h >= TIME_AFTER || date(*h) != date(now))
         .map(|h| now - h);
     if gap.is_none() && !notice {
         return None;
     }
-    let time = now.format("%Y-%m-%d %H:%M");
+    let time = now.with_timezone(&zone).format("%Y-%m-%d %H:%M %Z");
     Some(match gap {
         Some(gap) => format!(
-            "[sloppod: it's {time} UTC, {} since the last message]",
+            "[sloppod: it's {time}, {} since the last message]",
             how_long(gap)
         ),
-        None => format!("[sloppod: it's {time} UTC]"),
+        None => format!("[sloppod: it's {time}]"),
     })
 }
 
@@ -286,7 +293,16 @@ impl Hub {
     /// `blocks` as the agent gets them: after a gap, and always for a notice, led by a line with the time.
     async fn with_time(&self, id: Uuid, blocks: Vec<Value>, notice: bool) -> Vec<Value> {
         let heard_at = self.heard_at(id).await;
-        match time_line(self.now(), heard_at, notice) {
+        let zone = match self.store.get_session(id).await {
+            Ok(Some(row)) => self.store.owner_zone(&row.owner).await,
+            Ok(None) => Ok(chrono_tz::UTC),
+            Err(e) => Err(e),
+        }
+        .unwrap_or_else(|e| {
+            tracing::warn!(session = %id, error = %e, "reading the owner's timezone");
+            chrono_tz::UTC
+        });
+        match time_line(self.now(), heard_at, notice, zone) {
             Some(line) => std::iter::once(json!({"type": "text", "text": line}))
                 .chain(blocks)
                 .collect(),

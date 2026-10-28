@@ -217,6 +217,8 @@ export type Settings = {
   model: string | null;
   models: { value: string; name: string }[];
   review: ReviewPolicy;
+  /** The user's timezone, e.g. `Europe/Amsterdam`, for the times agents are told and their pods' clocks. */
+  timezone: string | null;
 };
 
 /** Whether proposals are reviewed by another model before a human sees them. */
@@ -270,7 +272,8 @@ export const api = {
   /** Who we are, and the runtime's version and the commit or tag it was built from, if it knows them. */
   me: () => call<{ user: string; version: string | null; build: string | null }>('GET', '/me'),
   getSettings: () => call<Settings>('GET', '/settings'),
-  updateSettings: (body: { model?: string | null; review?: ReviewPolicy }) => call<Settings>('PUT', '/settings', body),
+  updateSettings: (body: { model?: string | null; review?: ReviewPolicy; timezone?: string }) =>
+    call<Settings>('PUT', '/settings', body),
   setSessionReview: (id: string, review: ReviewPolicy) =>
     call<Session>('PUT', `/sessions/${encodeURIComponent(id)}/review`, { review }),
   listCredentials: () => call<Credential[]>('GET', '/credentials'),

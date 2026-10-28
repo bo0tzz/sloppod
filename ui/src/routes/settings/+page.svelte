@@ -6,6 +6,7 @@
   import ChatHeader from '#lib/components/ChatHeader.svelte';
   import CredentialSection from '#lib/components/CredentialSection.svelte';
   import SessionDefaults from '#lib/components/SessionDefaults.svelte';
+  import TimezoneSetting from '#lib/components/TimezoneSetting.svelte';
   import StandingApprovals from '#lib/components/StandingApprovals.svelte';
   import DeletedSessions from '#lib/components/DeletedSessions.svelte';
   import { credentialKinds } from '#lib/presentation.ts';
@@ -37,6 +38,7 @@
   <div class="min-h-0 grow overflow-y-auto">
     <div class="mx-auto flex w-full max-w-2xl flex-col gap-8 px-4 py-6">
       <SessionDefaults />
+      <TimezoneSetting />
       <StandingApprovals />
       <DeletedSessions />
       {#if error}
