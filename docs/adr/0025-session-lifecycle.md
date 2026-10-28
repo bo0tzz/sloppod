@@ -18,7 +18,7 @@ A session is in one of five states. The first four hold a progressively smaller 
 | **active** (`starting`/`idle`/`working`/`waiting`) | yes | yes | yes | yes | sessions |
 | **parked** | no | yes | yes | yes | sessions, marked parked |
 | **archived** | no | no | no | yes | Archived section |
-| **deleted** | no | no | no | yes, until purged | Settings → Deleted, restorable for 7 days |
+| **deleted** | no | kept until purged, if it had one | kept until purged | yes, until purged | Settings → Deleted, restorable for 7 days |
 | **purged** | — | — | — | gone | — |
 
 - **Automatic transitions:**
@@ -26,10 +26,11 @@ A session is in one of five states. The first four hold a progressively smaller 
   - A session that's been **parked for 14 days** is archived.
   - A deleted session is purged after 7 days, as now.
   - The thresholds are runtime settings (the chart's `session.parkAfter`, `session.archiveAfter`), so a cluster can tune or turn them off.
+- **Waiting sessions aren't archived:** a parked session with a pending wake condition (ADR 5: a time, an event, a check) is exempt from automatic archiving until the condition fires or is cleared, however long that takes. The 14 days count from then.
 - **Pinning:** a pinned session is never archived automatically; it can still be parked when idle, since parking keeps everything and wakes on a message. Pinning is a flag the user sets from the sidebar's context menu or the session menu, and pinned sessions sort to the top of the list.
 - **Archiving** removes the pod, the volume, the session's keys (memini key, runtime secrets) and its egress policy, like a purge does, but keeps the session row, transcript, events, grants and proposals. An archived session is read-only in the UI: its transcript and proposals show, the composer doesn't.
 - **Resuming** an archived session (from its menu, or by sending it a message, like waking) recreates it: a new pod and volume, its repositories cloned again at their session branches (which still exist on GitHub, holding anything that was pushed), its keys minted again, and the agent's own transcript restored from the runtime's copy (ADR 1), so `session/load` picks the conversation up. Uncommitted, unpushed work in the old volume is gone, which is why archiving waits two weeks after parking, and why the agent should push what matters before it goes idle.
-- **Deleting** stays the explicit, heavy action, now from the context menu with a confirmation; an archived session can be deleted too.
+- **Deleting** stays the explicit, heavy action, now from the context menu with a confirmation, and keeps today's contract: the session is parked and marked deleted, keeps whatever it had (its volume and keys too) until it's purged a week later, and restoring it brings it back parked with its work intact ([ADR 22](0022-memini-keys-per-session.md)). An archived session can be deleted too; it has no volume or keys left to keep.
 - **The sidebar context menu** on a session offers, as they apply: Rename, Pin/Unpin, Park/Wake, Archive/Resume, Delete.
 - **Wake conditions** from ADR 5 (a time, an event, a check script) are unchanged and still to come; they apply to parked sessions. An archived session isn't woken by a condition, only resumed by the user or by a message.
 
