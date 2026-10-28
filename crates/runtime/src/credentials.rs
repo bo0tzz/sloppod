@@ -122,6 +122,10 @@ pub struct Credentials {
     http: reqwest::Client,
 }
 
+fn has_userinfo(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|u| !u.username().is_empty() || u.password().is_some())
+}
+
 fn host_of(url: &str) -> Option<String> {
     reqwest::Url::parse(url)
         .ok()?
@@ -195,6 +199,12 @@ impl Credentials {
                 if host_of(url).is_none() {
                     return Ok(Err(Invalid(
                         "memini needs its base URL, e.g. https://memini.example".into(),
+                    )));
+                }
+                // The config is shown back by the API, unlike the secret.
+                if has_userinfo(url) {
+                    return Ok(Err(Invalid(
+                        "memini's URL can't hold a username or password; the admin key goes in the secret".into(),
                     )));
                 }
                 let mut stored = serde_json::json!({"url": url});
@@ -435,5 +445,17 @@ impl Credentials {
             .execute(&self.db)
             .await
             .map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::*;
+
+    #[test]
+    fn memini_urls_carry_no_credentials() {
+        assert!(!has_userinfo("https://memini.example"));
+        assert!(has_userinfo("https://admin@memini.example"));
+        assert!(has_userinfo("https://admin:key@memini.example"));
     }
 }
