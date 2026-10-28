@@ -1404,3 +1404,18 @@ test('only the transcript scrolls, not the page around it', async ({ page }) => 
   expect(overflowing).toEqual({ transcript: true, found: [] });
   await expect(page.getByRole('textbox', { name: 'Prompt' })).toBeInViewport({ ratio: 1 });
 });
+
+test('a session at its usage limit says when it carries on', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  await createSession(page, 'Hit the limit');
+  await finishTurn(page);
+  await page.request.post('/_mock/limit?minutes=90');
+  const banner = page.getByTestId('limited');
+  await expect(banner).toContainText('usage limit');
+  await expect(banner).toContainText('in 1 h 30 min');
+  await expect(page.getByTestId('session-row').first().getByTestId('session-limited')).toBeVisible();
+
+  await page.request.post('/_mock/limit?minutes=0');
+  await expect(banner).toBeHidden();
+  await expect(page.getByTestId('session-limited')).toBeHidden();
+});
