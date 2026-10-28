@@ -10,7 +10,9 @@ use sloppod_contracts::{
 use sloppod_contracts::{repo_from_git_path, same_repo};
 
 use crate::credentials::Credentials;
-use crate::github::{GitHubApp, PushLog};
+use tracing::Instrument;
+
+use crate::github::{GitHubApp, PushLog, acting_span};
 use crate::proposals::is_session_branch;
 use crate::rebases::{Recheck, Rechecks};
 
@@ -124,6 +126,8 @@ impl GitHubPolicy {
                     }
                     Err(refusal) => return Ok(refusal),
                 };
+                // Before the guard, which may refuse the push, so every push made as the user is logged.
+                audit(session, &app, repo, request);
                 if !git.advertisement {
                     match pushed_refs(&request.body) {
                         Some(push) if !push.refs.is_empty() => {
@@ -172,6 +176,9 @@ impl GitHubPolicy {
                                     let number = admission.number;
                                     self.rechecks.send(Recheck {
                                         owner: session.owner.clone(),
+                                        credential: session
+                                            .repo_credential(repo)
+                                            .map(str::to_owned),
                                         session: session_id,
                                         repo: repo.to_owned(),
                                         branch: pushed.to_owned(),
@@ -208,7 +215,6 @@ impl GitHubPolicy {
                     }
                 }
                 let token = app.push_token(repo).await.map_err(err)?;
-                audit(session, &app, repo, request);
                 Ok(Decision::allow_with(
                     vec![("authorization".into(), basic(&token))],
                     Vec::new(),
@@ -315,7 +321,8 @@ impl RequestPolicy for GitHubPolicy {
             "api.github.com" => self.api(session, request).await,
             _ => {
                 if let Some(git) = GitRequest::parse(request) {
-                    return self.git(session, request, git).await;
+                    let span = acting_span(&session.session_id, session.repo_credential(&git.repo));
+                    return self.git(session, request, git).instrument(span).await;
                 }
                 if matches!(request.method.as_str(), "GET" | "HEAD") {
                     return Ok(Decision::allow_with(Vec::new(), Vec::new()));

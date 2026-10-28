@@ -651,6 +651,46 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn a_grant_s_github_token_is_used_as_it_is_and_never_swapped_for_the_app(db: PgPool) {
+        let credentials = credentials(db.clone()).await;
+        let id = Uuid::now_v7();
+        let sealed = credentials.vault.encrypt(b"github_pat_x").unwrap();
+        sqlx::query(
+            "insert into credentials (id, owner, kind, name, config, secret, is_default) \
+             values ($1, 'dev', $2, 'mine', '{\"login\": \"dev\"}', $3, true)",
+        )
+        .bind(id)
+        .bind(GITHUB_USER)
+        .bind(&sealed)
+        .execute(&db)
+        .await
+        .unwrap();
+        let id = id.to_string();
+
+        // Without a GitHub App configured, as on a repository only the token reaches.
+        let client = credentials.github_as("dev", Some(&id)).await.unwrap();
+        assert_eq!(client.user_login(), Some("dev"));
+        assert_eq!(
+            client.token_for("dev/private").await.unwrap(),
+            "github_pat_x"
+        );
+        assert!(
+            credentials.github_as("dev", None).await.is_err(),
+            "no App to fall back to"
+        );
+        assert!(
+            credentials.github_as("other", Some(&id)).await.is_err(),
+            "not another owner's"
+        );
+        assert!(
+            credentials
+                .github_as("dev", Some("nonsense"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[sqlx::test]
     async fn a_github_user_token_has_to_be_fine_grained(db: PgPool) {
         let credentials = credentials(db).await;
         for (secret, why) in [

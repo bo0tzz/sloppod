@@ -203,6 +203,11 @@ fn push_permissions(installation: &BTreeMap<String, String>) -> BTreeMap<String,
     permissions
 }
 
+/// The span to run a user-token client's calls in, so each logged call names the session and credential it's for.
+pub fn acting_span(session: &str, credential: Option<&str>) -> tracing::Span {
+    tracing::info_span!("acting", session = %session, credential = credential.unwrap_or("app"))
+}
+
 /// A GitHub client acting with one identity (ADR 29): the owner's GitHub App, through its installations' tokens, or
 /// one of the owner's personal access tokens, used as it is.
 pub struct GitHubApp {
@@ -308,6 +313,14 @@ impl GitHubApp {
     /// Who this client acts as: the user's login, or none for the App.
     pub fn user_login(&self) -> Option<&str> {
         self.user.as_ref().map(|(_, login)| login.as_str())
+    }
+
+    /// Logs a call the runtime makes with a user's token (ADR 28's audit). Callers run it inside a span naming the
+    /// session and credential it's made for (`acting_span`).
+    fn audit(&self, method: &str, path: &str) {
+        if let Some(login) = self.user_login() {
+            tracing::info!(as_user = login, %method, %path, "runtime call with the owner's GitHub token");
+        }
     }
 
     /// The user's token, when acting as a user: it's used for every repository, whatever the scope asked for.
@@ -685,6 +698,7 @@ impl GitHubApp {
         accept: &str,
     ) -> anyhow::Result<reqwest::Response> {
         let token = self.token_for(repo).await?;
+        self.audit("GET", &format!("/repos/{repo}{path}"));
         Ok(self
             .http
             .get(self.url(&format!("/repos/{repo}{path}")))
@@ -828,6 +842,7 @@ impl GitHubApp {
         variables: Value,
     ) -> anyhow::Result<Value> {
         let token = self.token_for(repo).await?;
+        self.audit("POST", &format!("/graphql ({repo})"));
         let response: Value = self
             .http
             .post(self.url("/graphql"))
@@ -872,6 +887,7 @@ impl GitHubApp {
         payload: Option<&Value>,
     ) -> anyhow::Result<Value> {
         let token = self.token_for(repo).await?;
+        self.audit(method.as_str(), &format!("/repos/{repo}{path}"));
         let mut request = self
             .http
             .request(method, self.url(&format!("/repos/{repo}{path}")))
