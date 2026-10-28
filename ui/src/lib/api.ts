@@ -284,8 +284,9 @@ export const api = {
   restoreSession: (id: string) => call<Session>('POST', `/sessions/${encodeURIComponent(id)}/restore`, {}),
   parkSession: (id: string) => call<Session>('POST', `/sessions/${encodeURIComponent(id)}/park`, {}),
   wakeSession: (id: string) => call<Session>('POST', `/sessions/${encodeURIComponent(id)}/wake`, {}),
-  addSessionRepo: (id: string, repo: string) =>
-    call<Session>('POST', `/sessions/${encodeURIComponent(id)}/repos`, { repo }),
+  /** Write access to `repo`; with `credential`, one of the user's GitHub tokens, the session acts on it as them (ADR 29). */
+  addSessionRepo: (id: string, repo: string, credential?: string) =>
+    call<Session>('POST', `/sessions/${encodeURIComponent(id)}/repos`, { repo, credential }),
   grantSession: (id: string, capability: string, expires_at?: string) =>
     call<Session>('POST', `/sessions/${encodeURIComponent(id)}/grants`, { capability, expires_at }),
   changeGrant: (id: string, grant: string, change: GrantChange) =>
