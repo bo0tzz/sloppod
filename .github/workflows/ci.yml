@@ -32,14 +32,18 @@ jobs:
       - id: scope
         run: |
           # On a pull request HEAD is its merge into the base, so the first parent is the base. Renames count as a
-          # delete and an add, so moving a file out of a directory still counts as touching it. quotePath is off so a
-          # non-ASCII name comes out raw, not as a quoted escape the anchored patterns would miss.
-          files=
+          # delete and an add, so moving a file out of a directory still counts as touching it. The paths are read
+          # NUL-delimited and raw: without -z git quotes names with non-ASCII or special characters, which the
+          # anchored patterns would miss.
+          files="$RUNNER_TEMP/files"
+          everything=
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            files=$(git -c core.quotePath=false diff --no-renames --name-only HEAD^1 HEAD)
+            git diff -z --no-renames --name-only HEAD^1 HEAD > "$files"
+          else
+            everything=1
           fi
           scope() {
-            if [ -z "$files" ] || printf '%s\n' "$files" | grep -Eq "$2"; then
+            if [ -n "$everything" ] || grep -Ezq "$2" "$files"; then
               echo "$1=true" >> "$GITHUB_OUTPUT"
             else
               echo "$1=false" >> "$GITHUB_OUTPUT"
