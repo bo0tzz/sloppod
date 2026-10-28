@@ -23,9 +23,8 @@ pub async fn available(state: &AppState, owner: &str) -> anyhow::Result<bool> {
     };
     Ok(state
         .credentials
-        .secret(owner, &reviewer.credential().kind)
-        .await?
-        .is_some())
+        .has_default(owner, &reviewer.credential().kind)
+        .await?)
 }
 
 /// Starts the next review round of a proposal in review: in a new review session for the first round, or in the

@@ -165,12 +165,14 @@ async fn put_settings(
     User(user): User,
     Json(update): Json<SettingsUpdate>,
 ) -> ApiResult<impl IntoResponse> {
+    // Checked before anything is written, so a bad field doesn't leave the others half applied.
+    let review = update.review.as_deref().map(review_policy).transpose()?;
     if let Some(model) = &update.model {
         let model = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
         db::set_user_model(&state.db, &user, model).await?;
     }
-    if let Some(review) = &update.review {
-        db::set_user_review(&state.db, &user, review_policy(review)?).await?;
+    if let Some(review) = review {
+        db::set_user_review(&state.db, &user, review).await?;
     }
     Ok(Json(settings(&state, &user).await?))
 }
@@ -337,7 +339,7 @@ async fn create_session(
     };
     let needed = adapter.credential();
     let (kind, account) = (needed.kind.as_str(), needed.name.as_str());
-    if state.credentials.secret(&user, kind).await?.is_none() {
+    if !state.credentials.has_default(&user, kind).await? {
         return Err(ApiError(
             StatusCode::CONFLICT,
             format!("add {account} in settings before starting a session"),
@@ -363,7 +365,7 @@ async fn create_session(
         Grant::new(capability::GITHUB, json!({})),
         Grant::new(capability::PACKAGES, json!({})),
     ];
-    if state.credentials.secret(&user, CHATGPT).await?.is_some() {
+    if state.credentials.has_default(&user, CHATGPT).await? {
         grants.push(Grant::new(capability::CODEX, json!({})));
     }
     if let Some(repo) = &repo {
