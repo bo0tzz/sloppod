@@ -1046,6 +1046,11 @@ impl Hub {
         self.store.events(id, after, limit).await
     }
 
+    /// The sequence number of the session's latest recorded update; 0 when it has none.
+    pub async fn last_event(&self, id: Uuid) -> Result<i64, sqlx::Error> {
+        self.store.last_event(id).await
+    }
+
     pub async fn replay(&self, id: Uuid) -> Result<Replay, sqlx::Error> {
         let live = self.live(id);
         let state = live.state.lock().await;

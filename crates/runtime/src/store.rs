@@ -16,6 +16,8 @@ pub trait SessionStore: Send + Sync {
     async fn set_session_model(&self, id: Uuid, model: &str) -> sqlx::Result<()>;
     /// Appends to the session's event log and returns the event's sequence number.
     async fn append_event(&self, id: Uuid, payload: &Value) -> sqlx::Result<i64>;
+    /// The sequence number of the session's latest event; 0 when it has none.
+    async fn last_event(&self, id: Uuid) -> sqlx::Result<i64>;
     /// Up to `limit` of the session's events after `after`, in order.
     async fn events(&self, id: Uuid, after: i64, limit: i64) -> sqlx::Result<Vec<(i64, Value)>>;
     /// The session's first message, until a turn has started with it.
@@ -46,6 +48,10 @@ impl SessionStore for PgStore {
 
     async fn append_event(&self, id: Uuid, payload: &Value) -> sqlx::Result<i64> {
         db::append_event(&self.0, id, payload).await
+    }
+
+    async fn last_event(&self, id: Uuid) -> sqlx::Result<i64> {
+        db::last_event(&self.0, id).await
     }
 
     async fn events(&self, id: Uuid, after: i64, limit: i64) -> sqlx::Result<Vec<(i64, Value)>> {
@@ -132,6 +138,16 @@ pub mod memory {
             let seq = events.len() as i64 + 1;
             events.push((id, seq, payload.clone()));
             Ok(seq)
+        }
+
+        async fn last_event(&self, id: Uuid) -> sqlx::Result<i64> {
+            let events = self.events.lock().unwrap();
+            Ok(events
+                .iter()
+                .filter(|(s, _, _)| *s == id)
+                .map(|(_, seq, _)| *seq)
+                .max()
+                .unwrap_or(0))
         }
 
         async fn events(

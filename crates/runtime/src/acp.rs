@@ -37,6 +37,8 @@ struct Conn {
     permissions: Mutex<HashMap<i64, (Uuid, u64)>>,
     next_id: std::sync::atomic::AtomicI64,
     loaded: Mutex<HashMap<Uuid, JoinHandle<()>>>,
+    /// Ends the connection: a UI that fell too far behind reconnects and replays rather than missing updates.
+    drop_connection: tokio::sync::Notify,
 }
 
 impl Conn {
@@ -96,7 +98,9 @@ impl Conn {
                     .await;
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(%session, skipped = n, "UI fell behind; it should reload the session");
+                    tracing::warn!(%session, skipped = n, "UI fell behind; dropping it so it reloads");
+                    self.drop_connection.notify_one();
+                    return;
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
             }
@@ -117,8 +121,10 @@ impl Conn {
         }
         // Subscribe before reading the log, so nothing falls between the two; the sequence filter drops overlap.
         let events = self.state.hub.subscribe(session);
+        // Up to the end of the log as it is now; what's recorded meanwhile comes from the subscription.
+        let until = self.state.hub.last_event(session).await.map_err(internal)?;
         let mut after = 0;
-        loop {
+        while after < until {
             let page = self
                 .state
                 .hub
@@ -127,10 +133,11 @@ impl Conn {
                 .map_err(internal)?;
             let Some((last, _)) = page.last() else { break };
             after = *last;
-            for (_, update) in &page {
+            for (_, update) in page.iter().filter(|(seq, _)| *seq <= until) {
                 self.send(session_update(session, update)).await;
             }
         }
+        let after = until;
         let replay = self.state.hub.replay(session).await.map_err(internal)?;
         let task = tokio::spawn(self.clone().forward(session, events, after));
         if let Some(old) = self.loaded.lock().await.insert(session, task) {
@@ -273,8 +280,14 @@ async fn run(state: AppState, user: String, socket: WebSocket) {
         permissions: Mutex::default(),
         next_id: std::sync::atomic::AtomicI64::new(1),
         loaded: Mutex::default(),
+        drop_connection: tokio::sync::Notify::new(),
     });
-    while let Some(Ok(message)) = stream.next().await {
+    loop {
+        let message = tokio::select! {
+            message = stream.next() => message,
+            _ = conn.drop_connection.notified() => break,
+        };
+        let Some(Ok(message)) = message else { break };
         let text = match message {
             Message::Text(text) => text,
             Message::Close(_) => break,

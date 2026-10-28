@@ -531,3 +531,14 @@ async fn a_session_log_reads_a_page_at_a_time(db: PgPool) {
     assert_eq!(rest.iter().map(|e| e.0).collect::<Vec<_>>(), seqs[2..]);
     assert!(db::events(&db, s, seqs[4], 10).await.unwrap().is_empty());
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_session_log_has_a_last_event(db: PgPool) {
+    let s = session(&db, "dev").await;
+    assert_eq!(db::last_event(&db, s).await.unwrap(), 0);
+    let seq = db::append_event(&db, s, &json!({})).await.unwrap();
+    db::append_event(&db, session(&db, "dev").await, &json!({}))
+        .await
+        .unwrap();
+    assert_eq!(db::last_event(&db, s).await.unwrap(), seq);
+}
