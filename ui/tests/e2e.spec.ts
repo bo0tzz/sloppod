@@ -1933,7 +1933,8 @@ test('a browser whose storage is full still sends', async ({ page }) => {
   await finishTurn(page);
 });
 
-test('the sidebar shows every usage window of each account, by its name', async ({ page }) => {
+// Two accounts' usage for the mock to report: a Claude one with three windows, and a ChatGPT one at its limit.
+async function mockQuotas(page: Page) {
   const inTwoHours = new Date(Date.now() + 2 * 3600_000).toISOString();
   const quota = (kind: string, name: string, limited: boolean, windows: [string, number, string][]) => ({
     credential_id: `${kind}-${name}`,
@@ -1954,6 +1955,29 @@ test('the sidebar shows every usage window of each account, by its name', async 
       quota('chatgpt', 'reviews', true, [['five_hour', 1, 'rejected']]),
     ],
   });
+}
+
+test('a phone has no sidebar, and the home page shows the usage meters instead', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await mockQuotas(page);
+  try {
+    await page.goto('/');
+    await expect(page.getByTestId('sidebar')).toHaveCount(0);
+    const meters = page.getByTestId('quota');
+    await expect(meters).toHaveCount(2);
+    await expect(meters.filter({ hasText: 'work' }).getByTestId('quota-window')).toHaveCount(3);
+    await expect(meters.filter({ hasText: 'reviews' }).getByTestId('quota-limited')).toContainText('Limit reached');
+    await expect(meters.first()).toBeInViewport();
+    // Nothing runs off the screen's width.
+    const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    expect(overflow).toBeLessThanOrEqual(0);
+  } finally {
+    await page.request.post('/_mock/quotas', { data: [] });
+  }
+});
+
+test('the sidebar shows every usage window of each account, by its name', async ({ page }) => {
+  await mockQuotas(page);
   try {
     await page.goto('/settings');
     const meters = page.getByTestId('sidebar').getByTestId('quota');

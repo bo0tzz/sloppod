@@ -4,6 +4,7 @@
   import { onMount } from 'svelte';
   import { api } from '#lib/api.ts';
   import AppIcon from '#lib/components/AppIcon.svelte';
+  import QuotaMeters from '#lib/components/QuotaMeters.svelte';
   import SessionList from '#lib/components/SessionList.svelte';
   import { sessions } from '#lib/sessions.svelte.ts';
 
@@ -43,6 +44,9 @@
       </Alert>
     </div>
   {/if}
+
+  <!-- The sidebar, where they are elsewhere, isn't on this page, and on a phone it isn't anywhere. -->
+  <QuotaMeters framed />
 
   {#if sessions.error}
     <Alert color="danger" title="Couldn't load sessions" size="small">{sessions.error}</Alert>

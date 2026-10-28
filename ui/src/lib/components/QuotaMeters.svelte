@@ -4,6 +4,9 @@
   import { quotas } from '#lib/quotas.svelte.ts';
   import { onMount } from 'svelte';
 
+  /** On a page of its own, as a box in the page's column; by default it closes the sidebar. */
+  let { framed = false }: { framed?: boolean } = $props();
+
   onMount(() => quotas.subscribe());
 
   const providers: Record<string, string> = { claude: 'Claude', chatgpt: 'ChatGPT' };
@@ -45,7 +48,10 @@
 </script>
 
 {#if quotas.list.length > 0}
-  <ul class="border-light-200 flex shrink-0 flex-col gap-3 border-t px-4 py-2" aria-label="Usage limits">
+  <ul
+    class="border-light-200 flex shrink-0 flex-col gap-3 {framed ? 'rounded-xl border p-3' : 'border-t px-4 py-2'}"
+    aria-label="Usage limits"
+  >
     {#each quotas.list as quota (quota.credential_id)}
       <li class="flex flex-col gap-1 text-xs" data-testid="quota" data-limited={quota.limited}>
         <div class="flex items-baseline justify-between gap-2" title="As of {absoluteTime(quota.observed_at)}">
