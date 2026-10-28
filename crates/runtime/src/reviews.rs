@@ -242,7 +242,8 @@ pub async fn resume_round_watches(state: &AppState) {
     }
 }
 
-/// Hands a proposal whose review stalled to the user, unreviewed: no standing approval matches it then.
+/// Hands a proposal whose review stalled on, unreviewed: to the user, as no standing approval matches it then, or,
+/// for one that isn't outward, to be carried out.
 async fn give_up(
     state: &AppState,
     proposal: Uuid,
@@ -262,22 +263,36 @@ async fn give_up(
         return Ok(());
     };
     state.hub.broadcast_proposal(&row.to_api());
-    let about = state
-        .proposals
-        .get(&row.kind)
-        .map(|kind| kind.summary(&row.payload))
-        .unwrap_or_else(|| row.kind.clone());
+    let Some(kind) = state.proposals.get(&row.kind).cloned() else {
+        end(state, session);
+        return Ok(());
+    };
+    let about = kind.summary(&row.payload);
+    let went = if kind.outward() {
+        "It went to the user unreviewed."
+    } else {
+        "It's being carried out unreviewed."
+    };
     state
         .hub
         .notify(
             row.session_id,
             format!(
-                "sloppod: the review of your proposal ({about}) didn't finish: round {round} got no verdict. It went \
-                 to the user unreviewed."
+                "sloppod: the review of your proposal ({about}) didn't finish: round {round} got no verdict. {went}"
             ),
         )
         .await;
     end(state, session);
+    if let Some(author) = db::get_session(&state.db, row.session_id).await? {
+        proposals::settle(
+            state,
+            &author,
+            kind.as_ref(),
+            row.to_api(),
+            Some(json!({"verdict": "stalled"})),
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -626,20 +641,23 @@ pub async fn submit(state: &AppState, session: Uuid, arguments: &Value) -> Resul
     .map_err(|e| e.to_string())?
     .ok_or("the proposal changed meanwhile")?;
     state.hub.broadcast_proposal(&row.to_api());
+    let (next, went) = if kind.outward() {
+        ("It's waiting for the user now", "it went to the user")
+    } else {
+        ("It's being carried out now", "it's being carried out")
+    };
     let notice = if verdict == "pass" && findings.is_empty() {
-        format!(
-            "sloppod: your proposal ({about}) passed review: {summary} It's waiting for the user now."
-        )
+        format!("sloppod: your proposal ({about}) passed review: {summary} {next}.")
     } else if verdict == "pass" {
         format!(
-            "sloppod: your proposal ({about}) passed review: {summary} It's waiting for the user now, with these \
-             optional points attached:\n\n{}",
+            "sloppod: your proposal ({about}) passed review: {summary} {next}, with these optional points \
+             attached:\n\n{}",
             findings_text(&findings)
         )
     } else {
         format!(
-            "sloppod: your proposal ({about}) still had findings after {MAX_ROUNDS} review rounds, so it went to the \
-             user with them attached:\n\n{}",
+            "sloppod: your proposal ({about}) still had findings after {MAX_ROUNDS} review rounds, so {went} with \
+             them attached:\n\n{}",
             findings_text(&findings)
         )
     };
@@ -649,7 +667,9 @@ pub async fn submit(state: &AppState, session: Uuid, arguments: &Value) -> Resul
         .await
         .map_err(|e| e.to_string())?
         .ok_or("the proposing session is gone")?;
-    proposals::apply_standing_approval(state, &author, kind.as_ref(), row.to_api())
+    let review =
+        json!({"verdict": verdict, "summary": summary, "findings": findings_text(&findings)});
+    proposals::settle(state, &author, kind.as_ref(), row.to_api(), Some(review))
         .await
         .map_err(e)?;
     Ok("Review recorded. That's the end of this review.".into())

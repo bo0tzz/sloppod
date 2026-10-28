@@ -11,11 +11,28 @@ use crate::placement::{TOKEN_DIR, WORKDIR};
 use crate::pods::SESSION_LABEL;
 use crate::policies::SESSION_KEY;
 use crate::session::ParkError;
+use uuid::Uuid;
+
 use crate::{AppState, db};
+
+/// Whether a session without a memini key gets one. A sub-session's memory is what its parent gave it (ADR 27), so
+/// it gets a key only for a memory grant it has.
+fn mints_memory(session: &db::SessionRow, has_memory_grant: bool) -> bool {
+    session.parent_id.is_none() || has_memory_grant
+}
+
+/// Whether a session of `kind` gets the owner's memory when they have memini. A utility session (ADR 26) only has
+/// model access.
+fn gets_memory(kind: sloppod_protocol::api::SessionKind) -> bool {
+    kind != sloppod_protocol::api::SessionKind::Utility
+}
 
 /// Gives a session its memini key when its owner has memini and it has none, e.g. because it was just created, or
 /// its key was lost (ADR 22). Keeps the namespace of an existing memory grant.
 async fn ensure_memini_key(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
+    if !gets_memory(session.kind) {
+        return Ok(());
+    }
     let Some((admin, memini)) = state.credentials.memini(&session.owner).await? else {
         return Ok(());
     };
@@ -32,6 +49,9 @@ async fn ensure_memini_key(state: &AppState, session: &db::SessionRow) -> anyhow
         .grant(capability::MEMORY)
         .and_then(|g| g.param("namespace"))
         .map(str::to_owned);
+    if !mints_memory(session, granted.is_some()) {
+        return Ok(());
+    }
     let home = memini
         .config("home")
         .map(str::to_owned)
@@ -64,6 +84,70 @@ async fn ensure_memini_key(state: &AppState, session: &db::SessionRow) -> anyhow
 /// The labels a session's egress policy selects its pod by.
 pub fn pod_labels(session_id: &str) -> BTreeMap<String, String> {
     BTreeMap::from([(SESSION_LABEL.to_owned(), session_id.to_owned())])
+}
+
+/// A session to start: what `start_session` needs besides its id.
+pub struct NewSession<'a> {
+    pub owner: &'a str,
+    pub prompt: &'a str,
+    pub title: &'a str,
+    pub custom_title: bool,
+    pub agent: &'a str,
+    pub model: Option<&'a str>,
+    pub review: sloppod_protocol::api::ReviewPolicy,
+    pub repo: Option<&'a str>,
+    pub grants: &'a [Grant],
+    /// The session that spawned it, for a sub-session (ADR 27).
+    pub parent: Option<Uuid>,
+}
+
+/// Starts a work session: records it and its first message, and places its pod. A session whose pod can't be
+/// placed is stopped, and the error says why.
+pub async fn start_session(
+    state: &AppState,
+    id: Uuid,
+    new: NewSession<'_>,
+) -> anyhow::Result<db::SessionRow> {
+    db::insert_session(
+        &state.db,
+        db::NewSessionRow {
+            id,
+            owner: new.owner,
+            title: new.title,
+            custom_title: new.custom_title,
+            pending_prompt: new.prompt,
+            agent: new.agent,
+            kind: sloppod_protocol::api::SessionKind::Work,
+            review: new.review,
+            model: new.model,
+            repo: new.repo,
+            grants: new.grants,
+        },
+    )
+    .await?;
+    if let Some(parent) = new.parent {
+        db::set_parent(&state.db, id, parent).await?;
+    }
+    state
+        .hub
+        .record_user_message(
+            id,
+            &json!([{"type": "text", "text": new.prompt}]),
+            false,
+            None,
+        )
+        .await;
+    let row = db::get_session(&state.db, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("session {id} vanished"))?;
+    if let Err(e) = place(state, &row).await {
+        state
+            .hub
+            .set_phase(id, sloppod_protocol::api::Phase::Stopped)
+            .await;
+        anyhow::bail!("starting the session pod: {e}");
+    }
+    Ok(row)
 }
 
 /// Makes sure a session's pod and egress policy exist.
@@ -168,6 +252,44 @@ const ROLL_AFTER_IDLE: chrono::Duration = chrono::Duration::minutes(15);
 /// could), so it's given longer for background work to finish.
 const ROLL_AFTER_IDLE_UNKNOWN: chrono::Duration = chrono::Duration::hours(2);
 
+/// How long a session's pod may run an older image before its agent is asked to find a quiet moment (#230).
+const NUDGE_AFTER: chrono::Duration = chrono::Duration::hours(24);
+
+/// Sessions whose agent was asked to quiet down for an image, so it's asked once per image.
+#[derive(Default)]
+pub struct ImageNudges(std::sync::Mutex<std::collections::HashSet<(Uuid, String)>>);
+
+impl ImageNudges {
+    fn sent(&self, session: Uuid, image: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .contains(&(session, image.to_owned()))
+    }
+
+    fn record(&self, session: Uuid, image: &str) {
+        self.0.lock().unwrap().insert((session, image.to_owned()));
+    }
+}
+
+/// Whether a session that can't be given a new pod yet should be asked to find a quiet moment: its pod has run an
+/// older image for long enough. The notice only goes while no turn is running, so it interrupts none.
+fn due_for_nudge(
+    pod_made: Option<chrono::DateTime<chrono::Utc>>,
+    running: Option<&str>,
+    current: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    running.is_some_and(|image| image != current)
+        && pod_made.is_some_and(|made| now - made >= NUDGE_AFTER)
+}
+
+const NUDGE: &str = "sloppod: a newer session image is out, and this session's pod has run the old one for over a \
+                     day. The pod is replaced with a new one the next time the session is quiet: idle, with nothing \
+                     queued and none of your commands running. When it suits your work, wrap up or stop what you \
+                     have running in the background, so that can happen. Anything still running then is ended, and \
+                     you're told what was.";
+
 /// Whether a session's pod is due to be replaced for the current session image: it runs another, and the session
 /// has been idle long enough that the replacement interrupts nothing. `busy` is [`Hub::busy`](crate::session::Hub::busy).
 fn due_for_image(
@@ -200,15 +322,25 @@ pub async fn roll_images(state: &AppState) {
     };
     let current = &state.config.session_image;
     for session in sessions {
-        let running = state.pods.session_image(session.id);
+        let pod = state.pods.session_pod(session.id);
+        let running = pod.as_ref().map(|pod| pod.image.clone());
         let busy = state.hub.busy(session.id).await;
-        if !due_for_image(
-            &session,
-            running.as_deref(),
-            current,
-            busy,
-            chrono::Utc::now(),
-        ) {
+        let now = chrono::Utc::now();
+        if !due_for_image(&session, running.as_deref(), current, busy, now) {
+            // Recorded only once it's sent: a session busy with a turn now is asked at a later sweep.
+            if due_for_nudge(
+                pod.and_then(|pod| pod.made),
+                running.as_deref(),
+                current,
+                now,
+            ) && !state.image_nudges.sent(session.id, current)
+                && state
+                    .hub
+                    .notify_when_idle(session.id, None, NUDGE.to_owned())
+                    .await
+            {
+                state.image_nudges.record(session.id, current);
+            }
             continue;
         }
         let id = session.id.to_string();
@@ -273,6 +405,62 @@ pub async fn remove_session(state: &AppState, session: &db::SessionRow) -> anyho
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_sub_session_gets_memory_only_if_its_parent_gave_it() {
+        let mut session = crate::db::SessionRow::for_test(uuid::Uuid::new_v4(), "alice");
+        assert!(
+            super::mints_memory(&session, false),
+            "a session of its own gets memory"
+        );
+        session.parent_id = Some(uuid::Uuid::new_v4());
+        assert!(!super::mints_memory(&session, false));
+        assert!(super::mints_memory(&session, true));
+    }
+
+    #[test]
+    fn a_utility_session_gets_no_memory() {
+        use sloppod_protocol::api::SessionKind;
+        assert!(gets_memory(SessionKind::Work));
+        assert!(gets_memory(SessionKind::Review));
+        assert!(!gets_memory(SessionKind::Utility));
+    }
+
+    #[test]
+    fn a_session_long_on_an_old_image_is_nudged_once() {
+        let now = chrono::Utc::now();
+        let day_ago = Some(now - chrono::Duration::hours(25));
+        assert!(due_for_nudge(
+            day_ago,
+            Some("session:old"),
+            "session:new",
+            now
+        ));
+        // Not before a day, not on the current image, not without a pod.
+        assert!(!due_for_nudge(
+            Some(now - chrono::Duration::hours(2)),
+            Some("session:old"),
+            "session:new",
+            now
+        ));
+        assert!(!due_for_nudge(
+            day_ago,
+            Some("session:new"),
+            "session:new",
+            now
+        ));
+        assert!(!due_for_nudge(day_ago, None, "session:new", now));
+
+        let nudges = ImageNudges::default();
+        let session = Uuid::now_v7();
+        assert!(!nudges.sent(session, "session:new"));
+        nudges.record(session, "session:new");
+        assert!(nudges.sent(session, "session:new"));
+        assert!(
+            !nudges.sent(session, "session:newer"),
+            "again for the next image"
+        );
+    }
+
     use chrono::{Duration, Utc};
     use sloppod_protocol::api::Phase;
     use uuid::Uuid;

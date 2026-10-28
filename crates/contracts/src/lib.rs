@@ -399,6 +399,8 @@ pub trait AgentAdapter: Send + Sync {
     fn agent(&self) -> String;
     /// The credential its model needs from the session's owner.
     fn credential(&self) -> NeededCredential;
+    /// The capability a session needs for its model requests, e.g. `model`.
+    fn inference_capability(&self) -> String;
     fn launch(&self, context: &AgentContext) -> AgentLaunch;
 }
 
@@ -449,6 +451,11 @@ pub trait ProposalKind: Send + Sync {
     /// What a review session reviews for a proposal (ADR 24); `None` for kinds that aren't reviewed.
     fn review_subject(&self, _payload: &Value) -> Option<ReviewSubject> {
         None
+    }
+    /// Whether carrying it out acts outside sloppod. One that doesn't, like a sub-session's report to its parent, is
+    /// carried out by the runtime once its review is over, without waiting for a person (ADR 27).
+    fn outward(&self) -> bool {
+        true
     }
     /// Applies the reviewer's edits, sent along with the approval, to the payload.
     fn edit(&self, payload: &Value, edits: &Value) -> Result<Value> {

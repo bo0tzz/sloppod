@@ -112,6 +112,8 @@ pub mod api {
             Work = "work",
             /// It reviews another session's proposal (ADR 24).
             Review = "review",
+            /// An owner's own, for the runtime's judgements (ADR 26); its agent isn't prompted.
+            Utility = "utility",
         }
     }
 
@@ -162,6 +164,9 @@ pub mod api {
         /// Why the agent last failed to start or exited; it's started again meanwhile.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub agent_error: Option<String>,
+        /// The session that spawned this one, for a sub-session (ADR 27).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub parent_id: Option<Uuid>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -335,6 +340,9 @@ pub mod link {
         /// A commit to check out, detached, at every start, e.g. the one a review session reviews.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub commit: Option<String>,
+        /// The branch a new session branch starts from, e.g. a sub-session's from its parent's; else the default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub from: Option<String>,
     }
 
     /// A transcript file the runtime has, and how many bytes of it.

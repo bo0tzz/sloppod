@@ -2,7 +2,7 @@
 
 use chrono::{Duration, Utc};
 use serde_json::json;
-use sloppod_protocol::api::{ProposalStatus, ReviewPolicy, SessionKind};
+use sloppod_protocol::api::{Phase, ProposalStatus, ReviewPolicy, SessionKind};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -373,8 +373,6 @@ async fn an_agent_failure_is_news_once_until_the_agent_is_ready(db: PgPool) {
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
 async fn parked_sessions_are_left_alone_on_startup(db: PgPool) {
-    use sloppod_protocol::api::Phase;
-
     let running = session(&db, "dev").await;
     let parked = session(&db, "dev").await;
     let deleted = session(&db, "dev").await;
@@ -799,4 +797,51 @@ async fn the_pull_requests_sloppod_opened_are_watched_until_they_close(db: PgPoo
         [1, 3],
         "a merged one isn't watched any more"
     );
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_tree_counts_its_running_sub_sessions_at_any_depth(db: PgPool) {
+    let root = session(&db, "alice").await;
+    let child = session(&db, "alice").await;
+    let grandchild = session(&db, "alice").await;
+    let parked = session(&db, "alice").await;
+    let elsewhere = session(&db, "alice").await;
+    db::set_parent(&db, child, root).await.unwrap();
+    db::set_parent(&db, grandchild, child).await.unwrap();
+    db::set_parent(&db, parked, root).await.unwrap();
+    db::set_phase(&db, parked, Phase::Parked).await.unwrap();
+
+    // The same count from anywhere in the tree; the root itself and other trees don't count.
+    for member in [root, child, grandchild] {
+        assert_eq!(db::running_in_tree(&db, member).await.unwrap(), 2);
+    }
+    assert_eq!(db::running_in_tree(&db, elsewhere).await.unwrap(), 0);
+    let children: Vec<Uuid> = db::children(&db, root)
+        .await
+        .unwrap()
+        .iter()
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(children, [child, parked]);
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn an_owner_has_one_utility_session_that_isnt_listed(db: PgPool) {
+    use sloppod_protocol::api::Phase;
+
+    assert!(db::utility_session(&db, "dev").await.unwrap().is_none());
+    let utility = session_of_kind(&db, "dev", SessionKind::Utility).await;
+    session_of_kind(&db, "other", SessionKind::Work).await;
+    assert_eq!(
+        db::utility_session(&db, "dev").await.unwrap().map(|s| s.id),
+        Some(utility)
+    );
+    assert!(db::utility_session(&db, "other").await.unwrap().is_none());
+    // Not among the owner's sessions in the UI.
+    assert!(db::list_sessions(&db, "dev").await.unwrap().is_empty());
+    assert_eq!(db::utility_sessions(&db).await.unwrap().len(), 1);
+    // A stopped one is no longer theirs to use.
+    db::set_phase(&db, utility, Phase::Stopped).await.unwrap();
+    assert!(db::utility_session(&db, "dev").await.unwrap().is_none());
+    assert!(db::utility_sessions(&db).await.unwrap().is_empty());
 }

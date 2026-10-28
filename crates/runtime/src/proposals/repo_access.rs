@@ -101,6 +101,17 @@ impl ProposalKind for RepoAccess {
                 "this session can already push to {wanted}"
             )));
         }
+        // A sub-session works where its parent can push, so the parent can integrate it (ADR 27).
+        let id: Uuid = session.session_id.parse().map_err(err)?;
+        if db::get_session(&self.db, id)
+            .await
+            .map_err(err)?
+            .is_some_and(|row| row.parent_id.is_some())
+        {
+            return Err(Error::new(
+                "a sub-session can't get write access to another repository: say in your report that you need                  it, and your parent session can request it",
+            ));
+        }
         let repos = self
             .credentials
             .github(&session.owner)

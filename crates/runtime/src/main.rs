@@ -11,6 +11,7 @@ mod enforcer;
 mod github;
 mod grants;
 mod identity;
+mod inference;
 mod lifecycle;
 mod link;
 mod mcp;
@@ -29,6 +30,7 @@ mod session;
 #[cfg(test)]
 mod session_tests;
 mod store;
+mod subsessions;
 mod tls;
 mod users;
 mod vault;
@@ -74,6 +76,10 @@ pub struct Inner {
     pub authz_addr: SocketAddr,
     pub agents: adapter::Agents,
     pub instructions: Option<String>,
+    /// The runtime's own small model calls (ADR 26).
+    pub inference: inference::Inference,
+    /// Sessions asked to quiet down for a new session image (#230).
+    pub image_nudges: lifecycle::ImageNudges,
     /// Pushes to heads of pull requests set to merge themselves, waiting to be rechecked (#106).
     pub rechecks: Arc<rebases::Rechecks>,
 }
@@ -154,6 +160,10 @@ async fn main() -> anyhow::Result<()> {
     proposals.register(Arc::new(proposals::Stack::new(credentials.clone(), pushes)));
     proposals.register(Arc::new(proposals::Issues::new(credentials.clone())));
     proposals.register(Arc::new(proposals::IssueUpdates::new(credentials.clone())));
+    proposals.register(Arc::new(proposals::Report::new(
+        db.clone(),
+        credentials.clone(),
+    )));
     proposals.register(Arc::new(proposals::RepoAccess::new(
         db.clone(),
         credentials.clone(),
@@ -209,6 +219,8 @@ async fn main() -> anyhow::Result<()> {
         authz_addr,
         agents,
         instructions,
+        inference: inference::Inference::default(),
+        image_nudges: lifecycle::ImageNudges::default(),
         rechecks,
     }));
     // A message queued for a parked session's absent agent wakes the session.
@@ -221,6 +233,11 @@ async fn main() -> anyhow::Result<()> {
                 None => Ok(()),
             }
         })
+    }));
+    let checker = state.clone();
+    state.hub.set_turn_ended(Arc::new(move |id| {
+        let state = checker.clone();
+        Box::pin(async move { inference::check_turn_end(&state, id).await })
     }));
     state
         .install_listener()
@@ -251,6 +268,16 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::spawn(rebases::run(state.clone(), pushes_to_recheck));
     tokio::spawn(pulls::run(state.clone()));
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(std::time::Duration::from_secs(120));
+            loop {
+                every.tick().await;
+                inference::park_idle(&state).await;
+            }
+        });
+    }
     let authz = tokio::spawn(authz::serve(config.authz_listen, state.clone()));
     let ui =
         ServeDir::new(&config.ui_dir).fallback(ServeFile::new(config.ui_dir.join("index.html")));
