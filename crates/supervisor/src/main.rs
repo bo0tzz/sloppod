@@ -479,15 +479,25 @@ async fn stop(child: &mut Child) {
 
 /// Fetches a transcript file from the runtime into `path`, through a partial file so a fetch cut off midway isn't
 /// taken for the whole file next time.
+/// Where the runtime serves a transcript file; the name is one path segment, whatever it contains.
+fn transcript_url(base: &str, name: &str) -> anyhow::Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(base)?;
+    url.path_segments_mut()
+        .map_err(|()| anyhow::anyhow!("the runtime URL {base} can't have a path"))?
+        .pop_if_empty()
+        .extend(
+            sloppod_protocol::link::TRANSCRIPT_PATH
+                .split('/')
+                .filter(|s| !s.is_empty()),
+        )
+        .push(name);
+    Ok(url)
+}
+
 async fn fetch_transcript(args: &Args, name: &str, path: &Path) -> anyhow::Result<()> {
     let token = std::fs::read_to_string(&args.token_file).context("reading the pod's token")?;
-    let url = format!(
-        "{}{}/{name}",
-        args.url.trim_end_matches('/'),
-        sloppod_protocol::link::TRANSCRIPT_PATH
-    );
     let mut response = reqwest::Client::new()
-        .get(&url)
+        .get(transcript_url(&args.url, name)?)
         .bearer_auth(token.trim())
         .send()
         .await?
@@ -519,6 +529,15 @@ fn sync_from(len: u64, synced: Option<u64>) -> Option<u64> {
 /// The most of a transcript file one sync message carries.
 const SYNC_CHUNK: usize = 4 << 20;
 
+/// What's to sync, in pieces, so a file sent whole isn't one message the size of the file. Nothing to send is still
+/// one piece: a file that became empty replaces the runtime's copy with nothing.
+fn sync_pieces(content: &[u8]) -> Vec<&[u8]> {
+    if content.is_empty() {
+        return vec![content];
+    }
+    content.chunks(SYNC_CHUNK).collect()
+}
+
 async fn sync_transcript(dir: &str, synced: &mut HashMap<String, u64>, sink: &mut Sink) {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return;
@@ -535,9 +554,8 @@ async fn sync_transcript(dir: &str, synced: &mut HashMap<String, u64>, sink: &mu
         let Some((offset, content)) = appended else {
             continue;
         };
-        // In pieces, so a file sent whole isn't one message the size of the file.
         let mut sent = offset;
-        for piece in content.chunks(SYNC_CHUNK) {
+        for piece in sync_pieces(&content) {
             let message = FromSupervisor::TranscriptAppend {
                 name: name.clone(),
                 offset: sent,
@@ -832,6 +850,28 @@ async fn run_cmd(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_sync_goes_in_bounded_pieces_and_an_empty_file_still_syncs() {
+        let big = vec![b'x'; SYNC_CHUNK * 2 + 1];
+        let lens: Vec<usize> = sync_pieces(&big).iter().map(|p| p.len()).collect();
+        assert_eq!(lens, [SYNC_CHUNK, SYNC_CHUNK, 1]);
+        assert_eq!(sync_pieces(b""), [b"" as &[u8]]);
+    }
+
+    #[test]
+    fn a_transcript_name_is_one_path_segment() {
+        for (name, path) in [
+            ("a.jsonl", "/link/v1/transcript/a.jsonl"),
+            ("a#b.jsonl", "/link/v1/transcript/a%23b.jsonl"),
+            ("a?b.jsonl", "/link/v1/transcript/a%3Fb.jsonl"),
+            ("a%b.jsonl", "/link/v1/transcript/a%25b.jsonl"),
+        ] {
+            let url = transcript_url("http://sloppod:8080/", name).unwrap();
+            assert_eq!(url.path(), path, "{name}");
+            assert_eq!((url.query(), url.fragment()), (None, None));
+        }
+    }
+
     use super::*;
     use serde_json::json;
 
