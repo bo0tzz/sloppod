@@ -468,7 +468,8 @@ async fn restore_session(
 async fn park_ending_turn(state: &AppState, session: &db::SessionRow) -> ApiResult<()> {
     for attempt in 0..30 {
         match lifecycle::park(state, session).await {
-            Ok(()) => return Ok(()),
+            // A stopped session, e.g. one whose pod never started, has nothing to park.
+            Ok(()) | Err(ParkError::Stopped) => return Ok(()),
             Err(ParkError::InTurn) => {
                 if attempt == 0 {
                     state.hub.cancel(session.id).await;
