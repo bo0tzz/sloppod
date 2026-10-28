@@ -1332,3 +1332,117 @@ async fn a_sub_session_s_copy_of_a_grant_runs_out_with_it(db: PgPool) {
         soon.timestamp()
     );
 }
+
+/// A `github-user` credential of `owner`'s, stored as adding one would, without asking GitHub.
+async fn github_token(
+    db: &PgPool,
+    credentials: &crate::credentials::Credentials,
+    vault: &crate::vault::Vault,
+    owner: &str,
+    login: &str,
+    repositories: &[&str],
+) -> Uuid {
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "insert into credentials (id, owner, kind, name, config, secret, is_default) \
+         values ($1, $2, 'github-user', $3, $4, $5, false)",
+    )
+    .bind(id)
+    .bind(owner)
+    .bind(login)
+    .bind(json!({"login": login, "repositories": repositories, "more_repositories": false}))
+    .bind(vault.encrypt(b"github_pat_x").unwrap())
+    .execute(db)
+    .await
+    .unwrap();
+    assert!(
+        credentials
+            .github_user(owner, &id.to_string())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    id
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn an_agent_asks_to_act_as_the_owner_and_the_owner_picks_the_token(db: PgPool) {
+    use base64::Engine;
+    use sloppod_contracts::ProposalKind;
+    use std::sync::Arc;
+
+    let key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+    let vault = crate::vault::Vault::from_base64(&key).unwrap();
+    let credentials = Arc::new(
+        crate::credentials::Credentials::new(
+            db.clone(),
+            crate::vault::Vault::from_base64(&key).unwrap(),
+        )
+        .await
+        .unwrap(),
+    );
+    let kind = crate::proposals::ActAsOwner::new(db.clone(), credentials.clone());
+    let id = session(&db, "dev").await;
+    let context = || async { db::get_session(&db, id).await.unwrap().unwrap().context() };
+    let ask = |repo: &str| json!({"repo": repo, "reason": "the App isn't installed there"});
+
+    let none = kind
+        .prepare(&context().await, ask("dev/private"))
+        .await
+        .unwrap_err();
+    assert!(none.0.contains("no GitHub token"), "{}", none.0);
+
+    let work = github_token(&db, &credentials, &vault, "dev", "dev-work", &["org/tools"]).await;
+    let mine = github_token(&db, &credentials, &vault, "dev", "dev", &["Dev/Private"]).await;
+    github_token(
+        &db,
+        &credentials,
+        &vault,
+        "other",
+        "other",
+        &["dev/private"],
+    )
+    .await;
+    let unreached = kind
+        .prepare(&context().await, ask("dev/elsewhere"))
+        .await
+        .unwrap_err();
+    assert!(
+        unreached
+            .0
+            .contains("none of the user's GitHub tokens reach"),
+        "{}",
+        unreached.0
+    );
+
+    // The token that reaches it, under GitHub's name for it.
+    let payload = kind
+        .prepare(&context().await, ask("dev/private"))
+        .await
+        .unwrap();
+    assert_eq!(payload["repo"], "Dev/Private");
+    assert_eq!(payload["credential"], mine.to_string());
+    assert_eq!(payload["login"], "dev");
+
+    // The owner picks a token that doesn't reach it: nothing is granted.
+    let other = kind
+        .edit(&payload, &json!({"credential": work.to_string()}))
+        .unwrap();
+    assert!(other.get("login").is_none());
+    assert!(kind.execute(&context().await, &other).await.is_err());
+    assert!(context().await.writable_repo_for("dev/private").is_none());
+
+    kind.execute(&context().await, &payload).await.unwrap();
+    let granted = context().await;
+    assert_eq!(
+        granted.repo_credential("dev/private"),
+        Some(mine.to_string().as_str())
+    );
+    assert_eq!(granted.repo_acting_as("dev/private"), Some("dev"));
+    assert!(granted.writable_repo_for("dev/private").is_some());
+    let again = kind
+        .prepare(&granted, ask("dev/private"))
+        .await
+        .unwrap_err();
+    assert!(again.0.contains("already acts as dev"), "{}", again.0);
+}

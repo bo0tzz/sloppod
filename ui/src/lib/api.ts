@@ -88,6 +88,8 @@ export type ProposalEdits = {
   auto_merge?: boolean;
   issues?: IssueDraft[];
   updates?: IssueUpdate[];
+  /** `sloppod.repo.act_as_owner`: which of the user's GitHub tokens to act with. */
+  credential?: string;
 };
 
 export type Proposal = {

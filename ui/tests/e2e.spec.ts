@@ -891,6 +891,37 @@ test('approves a repository access request', async ({ page }) => {
   await expect(agentMessages(page).filter({ hasText: 'I can push to immich-app/static-pages now' })).toBeVisible();
 });
 
+test('approves a request to act as the user, with the token they pick', async ({ page }) => {
+  const add = async (name: string) =>
+    (await (
+      await page.request.post('/api/v1/credentials', { data: { kind: 'github-user', name, secret: 'github_pat_x', config: {} } })
+    ).json()) as { id: string };
+  const work = await add('work');
+  const personal = await add('personal');
+  try {
+    await createSession(page, 'Act as me on bo0tzz/dotfiles');
+    const card = page.getByTestId('proposal-card');
+    await expect(card).toHaveAttribute('data-kind', 'sloppod.repo.act_as_owner');
+    await expect(card).toContainText("sloppod's GitHub App isn't installed there.");
+    await expect(card).toContainText('act on bo0tzz/dotfiles as bo0tzz, with your own GitHub token');
+
+    // The agent's suggestion is the first token that reaches it; the user picks the other.
+    await card.getByTestId('proposal-token').getByRole('combobox').click();
+    await page.getByRole('option', { name: 'bo0tzz (personal)' }).click();
+    const approving = page.waitForRequest((request) => request.url().endsWith('/approve'));
+    await card.getByRole('button', { name: 'Approve' }).click();
+    expect((await approving).postDataJSON()).toEqual({ credential: personal.id });
+    await expect(card).toBeHidden();
+    await expect(page.getByTestId('system-notice')).toContainText('On bo0tzz/dotfiles you now act as bo0tzz.');
+
+    await page.getByRole('button', { name: 'Session actions' }).click();
+    await page.getByRole('menuitem', { name: 'Grants' }).click();
+    await expect(page.getByTestId('grants').getByTestId('grant-repo')).toContainText('as bo0tzz');
+  } finally {
+    for (const { id } of [work, personal]) await page.request.delete(`/api/v1/credentials/${id}`);
+  }
+});
+
 test('adds a repository from the session menu', async ({ page }) => {
   await createSession(page, 'Just chat for now');
   await expect(page.getByTestId('session-subtitle')).toHaveText('No repository');
