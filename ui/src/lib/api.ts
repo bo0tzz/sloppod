@@ -34,7 +34,19 @@ export type NewSession = {
   title?: string;
 };
 
-export type Grant = { capability: string; params: Record<string, unknown>; description?: string };
+export type Grant = {
+  /** Set on a session's own grants, which the owner can change. */
+  id?: string;
+  capability: string;
+  params: Record<string, unknown>;
+  description?: string;
+  created_at?: string;
+  /** When it runs out; it stops counting then. */
+  expires_at?: string;
+};
+
+/** A change to one of a session's grants: when it runs out (`null`: never), or narrowing it. */
+export type GrantChange = { expires_at?: string | null; narrow?: true };
 
 export type ProposalStatus =
   | 'in_review'
@@ -270,6 +282,12 @@ export const api = {
   wakeSession: (id: string) => call<Session>('POST', `/sessions/${encodeURIComponent(id)}/wake`, {}),
   addSessionRepo: (id: string, repo: string) =>
     call<Session>('POST', `/sessions/${encodeURIComponent(id)}/repos`, { repo }),
+  grantSession: (id: string, capability: string, expires_at?: string) =>
+    call<Session>('POST', `/sessions/${encodeURIComponent(id)}/grants`, { capability, expires_at }),
+  changeGrant: (id: string, grant: string, change: GrantChange) =>
+    call<Session>('PATCH', `/sessions/${encodeURIComponent(id)}/grants/${encodeURIComponent(grant)}`, change),
+  revokeGrant: (id: string, grant: string) =>
+    call<Session>('DELETE', `/sessions/${encodeURIComponent(id)}/grants/${encodeURIComponent(grant)}`),
   listRepos: () => call<string[]>('GET', '/repos'),
   /** Who we are, and the runtime's version and the commit or tag it was built from, if it knows them. */
   me: () => call<{ user: string; version: string | null; build: string | null }>('GET', '/me'),

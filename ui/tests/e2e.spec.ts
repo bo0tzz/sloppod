@@ -1457,6 +1457,32 @@ test('lists the session grants from the session menu', async ({ page }) => {
   await expect(grants.getByText(/^bo0tzz\/sloppod: read, and push the session branch `sloppod\//)).toBeVisible();
 });
 
+test('grants, narrows, times and revokes the grants of a running session', async ({ page }) => {
+  await createSession(page, 'Fix the build in bo0tzz/sloppod');
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await page.getByRole('menuitem', { name: 'Grants' }).click();
+  const grants = page.getByTestId('grants');
+
+  const add = grants.getByTestId('add-grant');
+  await add.getByRole('combobox', { name: 'Grant' }).click();
+  await page.getByRole('option', { name: 'docs' }).click();
+  await add.getByRole('combobox', { name: 'Runs out' }).click();
+  await page.getByRole('option', { name: 'In an hour' }).click();
+  await add.getByRole('button', { name: 'Grant' }).click();
+  const docs = grants.getByTestId('grant-docs');
+  await expect(docs).toContainText('Library documentation');
+  await expect(docs).toContainText('Runs out');
+
+  const repo = grants.getByTestId('grant-repo');
+  await repo.getByRole('button', { name: 'Make read only' }).click();
+  await expect(repo).toContainText('bo0tzz/sloppod: read only.');
+  await expect(repo.getByRole('button', { name: 'Make read only' })).toHaveCount(0);
+
+  await grants.getByTestId('grant-packages').getByRole('button', { name: 'Revoke' }).click();
+  await expect(grants.getByTestId('grant-packages')).toHaveCount(0);
+  await expect(page.getByText("sloppod: the user revoked this session's grant packages.")).toBeVisible();
+});
+
 test('reviews and approves updates to existing issues', async ({ page }) => {
   await createSession(page, 'Tidy the issues in sloppod');
   const card = page.getByTestId('proposal-card');
