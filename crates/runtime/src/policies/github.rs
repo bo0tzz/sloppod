@@ -173,12 +173,19 @@ impl GitHubPolicy {
                 session,
             )));
         }
-        // Reads carry a read-only token covering the granted repositories (in the first one's installation), which
-        // also reads public data. Sessions without a repository grant, or a GitHub App, read unauthenticated.
+        // Reads carry a read-only token covering the granted repositories in one installation, which also reads
+        // public data: the installation of the repository the path names, if it's granted, or else the first granted
+        // repository whose installation still works. Without any, or without a GitHub App, reads are unauthenticated.
         let granted: Vec<&str> = session.repos().collect();
-        let token = match (self.app(session).await, granted.first()) {
-            (Some(app), Some(repo)) => Some(app.read_token(repo, &granted).await.map_err(err)?),
-            _ => None,
+        let token = match self.app(session).await {
+            Some(app) => {
+                let order = read_token_order(path, &granted);
+                first_token(&session.session_id, order, READ_TOKEN_BUDGET, |repo| {
+                    app.read_token(repo, &granted)
+                })
+                .await
+            }
+            None => None,
         };
         let headers = token
             .map(|t| vec![("authorization".into(), format!("token {t}"))])
@@ -242,6 +249,60 @@ fn proposal_hint(what: &str, session: &SessionContext) -> String {
         "sloppod: {what}. Outward actions go through human review: {pull_request}. To file issues, call the \
          propose_issues tool. Other GitHub writes (comments, reviews, releases) aren't available to sessions yet.\n"
     )
+}
+
+/// How long finding a read token may take, well inside Envoy's 10 s limit on the whole decision.
+const READ_TOKEN_BUDGET: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// The first token `mint` gives for `repos`, tried in order, or `None` if none does within `budget`. Each attempt can
+/// take a while when GitHub is slow, and Envoy gives up on the whole decision after 10 s; reading unauthenticated
+/// before then is better than failing the read.
+async fn first_token<'a, F, Fut>(
+    session: &str,
+    repos: Vec<&'a str>,
+    budget: std::time::Duration,
+    mint: F,
+) -> Option<String>
+where
+    F: Fn(&'a str) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<String>>,
+{
+    let attempts = async {
+        for repo in repos {
+            match mint(repo).await {
+                Ok(token) => return Some(token),
+                Err(e) => tracing::warn!(session, repo, error = %e, "minting a read token"),
+            }
+        }
+        None
+    };
+    tokio::time::timeout(budget, attempts)
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!(
+                session,
+                "minting a read token took too long; reading without one"
+            );
+            None
+        })
+}
+
+/// Granted repositories to mint a read token through, in order: the one the API path names first, if any.
+fn read_token_order<'a>(path: &str, granted: &[&'a str]) -> Vec<&'a str> {
+    let named = path.strip_prefix("/repos/").and_then(|rest| {
+        let mut parts = rest.splitn(3, '/');
+        Some(format!("{}/{}", parts.next()?, parts.next()?))
+    });
+    let first = named.and_then(|named| {
+        granted
+            .iter()
+            .find(|g| g.eq_ignore_ascii_case(&named))
+            .copied()
+    });
+    first
+        .into_iter()
+        .chain(granted.iter().copied().filter(|g| Some(*g) != first))
+        .collect()
 }
 
 fn basic(token: &str) -> String {
@@ -460,6 +521,54 @@ mod tests {
         assert!(message.starts_with("0008\u{2}no\n"));
         assert!(message.contains("ng refs/heads/main refused by sloppod"));
         assert!(message.ends_with("00000000"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_token_service_falls_back_to_reading_without_one_in_time() {
+        let budget = std::time::Duration::from_secs(6);
+        let slow = |_: &str| async {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            anyhow::bail!("timed out")
+        };
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            first_token("s", vec!["o/a", "o/b", "o/c"], budget, slow).await,
+            None
+        );
+        assert_eq!(started.elapsed(), budget);
+
+        let second_works = |repo: &str| {
+            let repo = repo.to_owned();
+            async move {
+                if repo == "o/a" {
+                    anyhow::bail!("gone")
+                }
+                Ok(format!("token for {repo}"))
+            }
+        };
+        assert_eq!(
+            first_token("s", vec!["o/a", "o/b"], budget, second_works).await,
+            Some("token for o/b".to_owned())
+        );
+    }
+
+    #[test]
+    fn reads_go_through_the_named_repository_first() {
+        let granted = ["o/a", "o/b", "p/c"];
+        assert_eq!(
+            read_token_order("/repos/o/b/pulls", &granted),
+            ["o/b", "o/a", "p/c"]
+        );
+        assert_eq!(
+            read_token_order("/repos/O/B", &granted),
+            ["o/b", "o/a", "p/c"]
+        );
+        assert_eq!(
+            read_token_order("/repos/x/y/issues", &granted),
+            ["o/a", "o/b", "p/c"]
+        );
+        assert_eq!(read_token_order("/user", &granted), ["o/a", "o/b", "p/c"]);
+        assert!(read_token_order("/user", &[]).is_empty());
     }
 
     #[test]
