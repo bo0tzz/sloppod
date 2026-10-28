@@ -655,7 +655,11 @@ impl Hub {
             state.agent_state = agent_state;
             state.loading = false;
             self.settle_restored(id, &mut state, &[]).await;
-            let queued = std::mem::take(&mut state.queue);
+            // A session waiting for its usage limit keeps its queue until then.
+            let queued = match state.limited_until {
+                Some(_) => Vec::new(),
+                None => std::mem::take(&mut state.queue),
+            };
             let held = self.hold(id, &mut state, &queued).await;
             if pending.is_some() || !queued.is_empty() {
                 state.turn_running = true;
@@ -997,6 +1001,10 @@ impl Hub {
                 self.save_queue(id, &state).await;
             }
             self.broadcast_queue(id).await;
+            // One waiting for its usage limit is woken when that ends.
+            if self.limited_until(id).await.is_some() {
+                continue;
+            }
             if let Err(e) = self.wake_for_message(id).await {
                 tracing::warn!(session = %id, error = %e.message, "waking a session for its queued messages");
             }
@@ -1279,15 +1287,17 @@ impl Hub {
                 state.turn_running = true;
                 (None, false)
             } else {
+                // Shown as waiting, and not waking a parked session, unless it waits only for the agent to be up.
+                let waiting = agent_up || state.limited_until.is_some();
                 let (reply, receiver) = oneshot::channel();
                 state.queue.push(Queued {
-                    id: agent_up.then(|| message_id.unwrap_or_else(Uuid::new_v4)),
+                    id: waiting.then(|| message_id.unwrap_or_else(Uuid::new_v4)),
                     blocks: blocks.clone(),
                     notice: false,
                     reply: Some(reply),
                 });
                 self.save_queue(id, &state).await;
-                (Some(receiver), agent_up)
+                (Some(receiver), waiting)
             }
         };
         if behind_turn {
@@ -1409,6 +1419,17 @@ impl Hub {
             .as_str()
             .and_then(|q| q.parse::<Uuid>().ok())
             .ok_or_else(|| RpcError::new(-32602, "missing or invalid id"))?;
+        // Waiting for its usage limit with no agent to steer into, the session carries on now, with all it has queued.
+        let try_now = {
+            let live = self.live(id);
+            let state = live.state.lock().await;
+            let up = state.agent.is_some() && state.agent_session_id.is_some();
+            !up && state.limited_until.is_some() && state.queue.iter().any(|q| q.id == Some(qid))
+        };
+        if try_now {
+            self.move_limit(id, self.now()).await;
+            return Ok(json!({"outcome": "queued"}));
+        }
         let queued = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
@@ -1869,7 +1890,7 @@ impl Hub {
     fn resume_at(self: &Arc<Self>, id: Uuid, until: DateTime<Utc>) {
         let hub = self.clone();
         tokio::spawn(async move {
-            let wait = (until - Utc::now()).to_std().unwrap_or_default();
+            let wait = (until - hub.now()).to_std().unwrap_or_default();
             tokio::time::sleep(wait).await;
             hub.resume_after_limit(id, until).await;
         });
@@ -1917,17 +1938,25 @@ impl Hub {
         }
     }
 
-    /// Puts back the waits for usage limits a restart left, each carrying on when it was to.
-    pub async fn restore_limits(self: &Arc<Self>) {
+    /// Puts back the waits for usage limits a restart left, and returns them for [`Self::resume_limits`] once the
+    /// queues are back too, so none carries on, and keeps its queue, before its queue is restored.
+    pub async fn restore_limits(&self) -> Vec<(Uuid, DateTime<Utc>)> {
         let limited = match self.store.limited_sessions().await {
             Ok(limited) => limited,
             Err(e) => {
                 tracing::error!(error = %e, "loading sessions waiting for their usage limit");
-                return;
+                return Vec::new();
             }
         };
+        for (id, until) in &limited {
+            self.live(*id).state.lock().await.limited_until = Some(*until);
+        }
+        limited
+    }
+
+    /// Has the restored waits carry on when they were to.
+    pub fn resume_limits(self: &Arc<Self>, limited: Vec<(Uuid, DateTime<Utc>)>) {
         for (id, until) in limited {
-            self.live(id).state.lock().await.limited_until = Some(until);
             self.resume_at(id, until);
         }
     }

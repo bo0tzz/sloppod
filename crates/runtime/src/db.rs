@@ -1211,6 +1211,8 @@ pub struct ReviewRow {
     pub resolved: Value,
     pub created_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
+    /// How long the reviewer has waited for its usage limit in this round, in seconds.
+    pub paused_seconds: i64,
 }
 
 impl ReviewRow {
@@ -1229,8 +1231,7 @@ impl ReviewRow {
     }
 }
 
-const REVIEW_COLUMNS: &str =
-    "round, head_sha, replies, verdict, summary, findings, resolved, created_at, finished_at";
+const REVIEW_COLUMNS: &str = "round, head_sha, replies, verdict, summary, findings, resolved, created_at, finished_at, paused_seconds";
 
 /// A proposal's review rounds, first to last.
 pub async fn reviews(db: &PgPool, proposal: Uuid) -> sqlx::Result<Vec<ReviewRow>> {
@@ -1240,6 +1241,24 @@ pub async fn reviews(db: &PgPool, proposal: Uuid) -> sqlx::Result<Vec<ReviewRow>
     .bind(proposal)
     .fetch_all(db)
     .await
+}
+
+/// Adds to how long a review round's reviewer has waited for its usage limit.
+pub async fn add_review_pause(
+    db: &PgPool,
+    proposal: Uuid,
+    round: i32,
+    seconds: i64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "update reviews set paused_seconds = paused_seconds + $3 where proposal_id = $1 and round = $2",
+    )
+    .bind(proposal)
+    .bind(round)
+    .bind(seconds)
+    .execute(db)
+    .await
+    .map(|_| ())
 }
 
 /// Starts the next review round of a proposal; returns its number.
