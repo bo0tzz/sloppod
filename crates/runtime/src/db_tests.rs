@@ -465,3 +465,40 @@ async fn a_purge_claim_wins_over_restoring_and_is_retried_until_done(db: PgPool)
             .is_empty()
     );
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn finds_stacks_set_to_merge(db: PgPool) {
+    let s = session(&db, "dev").await;
+    let mut ids = Vec::new();
+    for (kind, auto_merge) in [
+        ("github.stack.create", true),
+        ("github.stack.create", false),
+        ("github.pr.create", true),
+    ] {
+        let id = db::insert_proposal(&db, s, kind, ProposalStatus::Pending, &json!({}))
+            .await
+            .unwrap()
+            .id;
+        db::decide_proposal(&db, id, ProposalStatus::Approved, &json!({}), None, "dev")
+            .await
+            .unwrap()
+            .unwrap();
+        db::finish_proposal(
+            &db,
+            id,
+            ProposalStatus::Executed,
+            Some(&json!({"auto_merge": auto_merge})),
+            None,
+        )
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    let found: Vec<Uuid> = db::merging_stacks(&db)
+        .await
+        .unwrap()
+        .iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(found, [ids[0]]);
+}
