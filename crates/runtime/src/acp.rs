@@ -204,6 +204,7 @@ impl Conn {
             ("session/prompt", Some(session)) => hub.prompt(session, params).await,
             ("_session/steering", Some(session)) => hub.steer(session, params).await,
             ("_sloppod/steer_queued", Some(session)) => hub.steer_queued(session, params).await,
+            ("_sloppod/remove_queued", Some(session)) => hub.remove_queued(session, params).await,
             ("session/set_config_option", Some(session)) => {
                 hub.set_config_option(session, params).await
             }
