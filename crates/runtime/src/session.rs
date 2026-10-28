@@ -1436,6 +1436,19 @@ impl Hub {
         id: Uuid,
         params: Value,
     ) -> Result<Value, RpcError> {
+        // Waiting for its usage limit with no agent to steer into, the session carries on now, with all it has queued.
+        let qid = params["id"].as_str().and_then(|q| q.parse::<Uuid>().ok());
+        let try_now = {
+            let live = self.live(id);
+            let state = live.state.lock().await;
+            let up = state.agent.is_some() && state.agent_session_id.is_some();
+            !up && state.limited_until.is_some()
+                && state.queue.iter().any(|q| qid.is_some() && q.id == qid)
+        };
+        if try_now {
+            self.move_limit(id, self.now()).await;
+            return Ok(json!({"outcome": "queued"}));
+        }
         let queued = self.take_queued(id, &params, false).await?;
         self.record_user_message(id, &json!(queued.blocks), true, queued.id)
             .await;
@@ -1467,17 +1480,6 @@ impl Hub {
             .as_str()
             .and_then(|q| q.parse::<Uuid>().ok())
             .ok_or_else(|| RpcError::new(-32602, "missing or invalid id"))?;
-        // Waiting for its usage limit with no agent to steer into, the session carries on now, with all it has queued.
-        let try_now = {
-            let live = self.live(id);
-            let state = live.state.lock().await;
-            let up = state.agent.is_some() && state.agent_session_id.is_some();
-            !up && state.limited_until.is_some() && state.queue.iter().any(|q| q.id == Some(qid))
-        };
-        if try_now {
-            self.move_limit(id, self.now()).await;
-            return Ok(json!({"outcome": "queued"}));
-        }
         let queued = {
             let live = self.live(id);
             let mut state = live.state.lock().await;

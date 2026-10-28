@@ -2290,7 +2290,7 @@ impl Harness {
         hub.attach_agent(id, agent.clone()).await;
         let limited = hub.restore_limits().await;
         assert_eq!(limited, [(id, until)]);
-        hub.restore_queues().await;
+        hub.restore_queues().await.unwrap();
         hub.resume_limits(limited);
         Self {
             hub,
