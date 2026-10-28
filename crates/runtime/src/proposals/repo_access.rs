@@ -5,6 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use sloppod_contracts::capability;
+use sloppod_contracts::find_repo;
 use sloppod_contracts::{
     Error, Grant, Manifest, ProposalKind, READ_WRITE, Result, SessionContext, ToolSpec,
 };
@@ -108,7 +109,7 @@ impl ProposalKind for RepoAccess {
             .repos()
             .await
             .map_err(err)?;
-        let Some(repo) = repos.into_iter().find(|r| r.eq_ignore_ascii_case(wanted)) else {
+        let Some(repo) = find_repo(&repos, wanted).cloned() else {
             return Err(Error::new(format!(
                 "sloppod's GitHub App isn't installed on {wanted}, so it can't be granted"
             )));

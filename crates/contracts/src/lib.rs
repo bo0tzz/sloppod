@@ -115,14 +115,13 @@ impl SessionContext {
     }
 
     pub fn writable_repo_for(&self, repo: &str) -> Option<RepoGrant<'_>> {
-        self.writable_repos()
-            .find(|g| g.repo.eq_ignore_ascii_case(repo))
+        self.writable_repos().find(|g| same_repo(g.repo, repo))
     }
 
     /// A read-only grant of `repo` with the branch to check out, e.g. a review session's (ADR 24).
     pub fn readable_repo_for(&self, repo: &str) -> Option<RepoGrant<'_>> {
         self.repo_grants(READ_ONLY)
-            .find(|g| g.repo.eq_ignore_ascii_case(repo))
+            .find(|g| same_repo(g.repo, repo))
     }
 }
 
@@ -140,6 +139,25 @@ pub mod capability {
     pub const MEMORY: &str = "memory";
     /// A repository: `{repo, access, branch?, commit?}`.
     pub const REPO: &str = "repo";
+}
+
+/// Whether two names are the same GitHub repository: GitHub's names are case-insensitive. Every comparison of
+/// repository names goes through here.
+pub fn same_repo(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+/// The name in `repos` that is `wanted`, as written there (the canonical form, when `repos` came from GitHub).
+pub fn find_repo<'a, S: AsRef<str> + ?Sized + 'a>(
+    repos: impl IntoIterator<Item = &'a S>,
+    wanted: &str,
+) -> Option<&'a S> {
+    repos.into_iter().find(|r| same_repo(r.as_ref(), wanted))
+}
+
+/// A repository name as written in a git URL path: `.git` is optional, and only one is stripped.
+pub fn repo_from_git_path(name: &str) -> &str {
+    name.strip_suffix(".git").unwrap_or(name)
 }
 
 /// A repository grant's `access`: read only, or read and push the session's branches (ADR 2).
@@ -380,4 +398,21 @@ pub trait ProposalKind: Send + Sync {
     }
     /// Runs the approved action with the runtime's credentials.
     async fn execute(&self, session: &SessionContext, payload: &Value) -> Result<Value>;
+}
+
+#[cfg(test)]
+mod repo_tests {
+    use super::*;
+
+    #[test]
+    fn repository_names_compare_as_github_does() {
+        assert!(same_repo("Bo0tzz/Sloppod", "bo0tzz/sloppod"));
+        assert_eq!(
+            find_repo(&["bo0tzz/sloppod".to_owned()], "BO0TZZ/sloppod").map(String::as_str),
+            Some("bo0tzz/sloppod")
+        );
+        assert_eq!(repo_from_git_path("sloppod.git"), "sloppod");
+        assert_eq!(repo_from_git_path("sloppod.git.git"), "sloppod.git");
+        assert_eq!(repo_from_git_path("sloppod"), "sloppod");
+    }
 }
