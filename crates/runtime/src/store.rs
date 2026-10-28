@@ -20,6 +20,10 @@ pub trait SessionStore: Send + Sync {
     async fn last_event(&self, id: Uuid) -> sqlx::Result<i64>;
     /// Up to `limit` of the session's events after `after`, in order.
     async fn events(&self, id: Uuid, after: i64, limit: i64) -> sqlx::Result<Vec<(i64, Value)>>;
+    /// Keeps a session's queued messages, `{id, blocks}` each, replacing what was kept; none clears them.
+    async fn save_queue(&self, id: Uuid, queue: &[Value]) -> sqlx::Result<()>;
+    /// Every session's kept queue, for after a restart.
+    async fn queues(&self) -> sqlx::Result<Vec<(Uuid, Vec<Value>)>>;
     /// The session's first message, until a turn has started with it.
     async fn pending_prompt(&self, id: Uuid) -> sqlx::Result<Option<String>>;
     /// Forgets the session's first message, once a turn has started with it.
@@ -62,6 +66,14 @@ impl SessionStore for PgStore {
         db::pending_prompt(&self.0, id).await
     }
 
+    async fn save_queue(&self, id: Uuid, queue: &[Value]) -> sqlx::Result<()> {
+        db::save_queue(&self.0, id, queue).await
+    }
+
+    async fn queues(&self) -> sqlx::Result<Vec<(Uuid, Vec<Value>)>> {
+        db::queues(&self.0).await
+    }
+
     async fn clear_pending_prompt(&self, id: Uuid) -> sqlx::Result<()> {
         db::clear_pending_prompt(&self.0, id).await
     }
@@ -79,6 +91,8 @@ pub mod memory {
     pub struct MemoryStore {
         sessions: Mutex<HashMap<Uuid, SessionRow>>,
         events: Mutex<Vec<(Uuid, i64, Value)>>,
+        /// Sessions' kept queues.
+        pub queues: Mutex<HashMap<Uuid, Vec<Value>>>,
         /// Sessions' first messages, until a turn starts with them.
         pub pending_prompts: Mutex<HashMap<Uuid, String>>,
         /// Sessions whose first message a turn has started with.
@@ -163,6 +177,20 @@ pub mod memory {
                 .take(limit as usize)
                 .map(|(_, seq, p)| (*seq, p.clone()))
                 .collect())
+        }
+
+        async fn save_queue(&self, id: Uuid, queue: &[Value]) -> sqlx::Result<()> {
+            let mut queues = self.queues.lock().unwrap();
+            if queue.is_empty() {
+                queues.remove(&id);
+            } else {
+                queues.insert(id, queue.to_vec());
+            }
+            Ok(())
+        }
+
+        async fn queues(&self) -> sqlx::Result<Vec<(Uuid, Vec<Value>)>> {
+            Ok(self.queues.lock().unwrap().clone().into_iter().collect())
         }
 
         async fn pending_prompt(&self, id: Uuid) -> sqlx::Result<Option<String>> {

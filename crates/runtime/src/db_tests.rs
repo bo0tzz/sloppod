@@ -496,6 +496,16 @@ async fn a_purge_claim_wins_over_restoring_and_is_retried_until_done(db: PgPool)
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_queue_is_kept_until_emptied(db: PgPool) {
+    let s = session(&db, "dev").await;
+    let queue = [json!({"id": null, "blocks": [{"type": "text", "text": "hi"}]})];
+    db::save_queue(&db, s, &queue).await.unwrap();
+    assert_eq!(db::queues(&db).await.unwrap(), [(s, queue.to_vec())]);
+    db::save_queue(&db, s, &[]).await.unwrap();
+    assert!(db::queues(&db).await.unwrap().is_empty());
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
 async fn finds_stacks_set_to_merge(db: PgPool) {
     let s = session(&db, "dev").await;
     let mut ids = Vec::new();
