@@ -988,7 +988,8 @@ impl GitHubApp {
         unread.map_or(Ok(StackWatch::Holding), Err)
     }
 
-    async fn pull(&self, repo: &str, number: u64) -> anyhow::Result<Value> {
+    /// A pull request as GitHub's REST API has it: its state, head and base, and node id.
+    pub async fn pull(&self, repo: &str, number: u64) -> anyhow::Result<Value> {
         self.repo_json(repo, &format!("/pulls/{number}")).await
     }
 

@@ -11,12 +11,14 @@ use sloppod_contracts::{
 use crate::credentials::Credentials;
 use crate::github::{GitHubApp, PushLog};
 use crate::proposals::is_session_branch;
+use crate::rebases::{Recheck, Rechecks};
 
 /// GitHub: reads and session-branch pushes with the owner's GitHub App, through tokens scoped to the session's
 /// grants (ADR 11); all other writes go through proposals.
 pub struct GitHubPolicy {
     credentials: Arc<Credentials>,
     pushes: Arc<PushLog>,
+    rechecks: Rechecks,
 }
 
 fn err(e: impl std::fmt::Display) -> Error {
@@ -24,10 +26,11 @@ fn err(e: impl std::fmt::Display) -> Error {
 }
 
 impl GitHubPolicy {
-    pub fn new(credentials: Arc<Credentials>, pushes: Arc<PushLog>) -> Self {
+    pub fn new(credentials: Arc<Credentials>, pushes: Arc<PushLog>, rechecks: Rechecks) -> Self {
         Self {
             credentials,
             pushes,
+            rechecks,
         }
     }
 
@@ -95,16 +98,31 @@ impl GitHubPolicy {
                                 return Ok(push.reject(&message));
                             }
                             // Auto-merge must only merge what was reviewed (ADR 3): new commits on its head turn
-                            // it off, and the agent hears about it before the push goes through.
-                            for pushed in push
-                                .refs
-                                .iter()
-                                .filter_map(|r| r.strip_prefix("refs/heads/"))
-                            {
+                            // it off. A push to a branch goes through, and once it has landed, auto-merge goes back
+                            // on if the change is still the one reviewed (#106); the agent hears either way. Otherwise
+                            // it hears before the push goes through.
+                            for (name, new) in push.refs.iter().zip(&push.new) {
+                                let Some(pushed) = name.strip_prefix("refs/heads/") else {
+                                    continue;
+                                };
                                 self.pushes.admit(repo, pushed);
                                 let disabled =
                                     app.disable_auto_merge(repo, pushed).await.map_err(err)?;
-                                if !disabled.is_empty() {
+                                if disabled.is_empty() {
+                                    continue;
+                                }
+                                if let (Ok(session_id), false) =
+                                    (session.session_id.parse(), is_deletion(new))
+                                {
+                                    self.rechecks.send(Recheck {
+                                        owner: session.owner.clone(),
+                                        session: session_id,
+                                        repo: repo.to_owned(),
+                                        branch: pushed.to_owned(),
+                                        pulls: disabled,
+                                        sha: new.clone(),
+                                    });
+                                } else {
                                     let pulls: Vec<String> =
                                         disabled.iter().map(|n| format!("#{n}")).collect();
                                     let message = format!(
@@ -360,7 +378,14 @@ impl GitRequest {
 /// A `git-receive-pack` request's ref updates and the capabilities the client asked for.
 struct Push {
     refs: Vec<String>,
+    /// The commit each of `refs` is set to.
+    new: Vec<String>,
     capabilities: Vec<String>,
+}
+
+/// The all-zero commit git sets a ref to when deleting it.
+fn is_deletion(sha: &str) -> bool {
+    sha.bytes().all(|b| b == b'0')
 }
 
 fn pkt(line: &str) -> String {
@@ -406,6 +431,7 @@ fn is_push_probe(request: &HttpRequest) -> bool {
 fn pushed_refs(body: &[u8]) -> Option<Push> {
     let mut push = Push {
         refs: Vec::new(),
+        new: Vec::new(),
         capabilities: Vec::new(),
     };
     let mut rest = body;
@@ -441,8 +467,9 @@ fn pushed_refs(body: &[u8]) -> Option<Push> {
             return None;
         }
         let mut fields = command.split(' ');
-        let (_old, _new, name) = (fields.next()?, fields.next()?, fields.next()?);
+        let (_old, new, name) = (fields.next()?, fields.next()?, fields.next()?);
         push.refs.push(name.to_owned());
+        push.new.push(new.to_owned());
     }
 }
 
@@ -494,6 +521,8 @@ mod tests {
                 "refs/heads/main".to_owned()
             ]
         );
+        assert_eq!(push.new, vec![new.clone(), zero.clone()]);
+        assert!(!is_deletion(&push.new[0]) && is_deletion(&push.new[1]));
         assert_eq!(push.capabilities, vec!["report-status", "side-band-64k"]);
         assert!(pushed_refs(b"00").is_none());
         let probe = |body: &[u8], body_truncated: bool| HttpRequest {

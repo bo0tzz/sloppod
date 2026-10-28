@@ -181,6 +181,17 @@ impl ProposalKind for PullRequest {
         {
             Ok(()) => {
                 result["auto_merge"] = json!(true);
+                // What a later push is compared with, to keep auto-merge on through a rebase (#106).
+                let base = payload["base"].as_str().unwrap_or_default();
+                match app.compare(repo, base, head).await {
+                    Ok(comparison) if comparison.head_sha == reviewed => {
+                        if let Some(fingerprint) = crate::rebases::fingerprint(&comparison.diff) {
+                            result["fingerprint"] = json!(fingerprint);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(%repo, error = %e, "fingerprinting a pull request"),
+                }
                 format!("{url} is open and merges once its required checks pass.")
             }
             Err(e) => {
