@@ -7,6 +7,7 @@
   import { onMount, type Snippet } from 'svelte';
   import { account, sourceLink } from '#lib/account.svelte.ts';
   import AppIcon from '#lib/components/AppIcon.svelte';
+  import QuotaMeters from '#lib/components/QuotaMeters.svelte';
   import SessionList from '#lib/components/SessionList.svelte';
   import { sessions } from '#lib/sessions.svelte.ts';
   import { sidebar } from '#lib/sidebar.svelte.ts';
@@ -60,6 +61,7 @@
           <div class="min-h-0 grow overflow-y-auto">
             <SessionList compact sessions={sessions.sorted} activeId={page.params.id} />
           </div>
+          <QuotaMeters />
           <div class="border-light-200 flex h-12 shrink-0 items-center gap-2 border-t ps-4 pe-2">
             <div class="text-muted flex min-w-0 grow flex-col text-xs">
               <span class="truncate" data-testid="current-user">

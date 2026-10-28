@@ -1766,3 +1766,32 @@ async fn a_message_kept_across_a_restart_tells_the_agent_how_long_it_waited() {
         ]
     );
 }
+
+#[tokio::test]
+async fn usage_updates_are_handed_on_but_not_when_replayed() {
+    let h = Harness::ready().await;
+    let (tx, mut seen) = mpsc::unbounded_channel();
+    h.hub.set_usage_seen(Arc::new(move |id, update| {
+        let tx = tx.clone();
+        Box::pin(async move {
+            let _ = tx.send((id, update));
+        })
+    }));
+    let usage = |used: u64| {
+        json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "agent-session", "update": {
+            "sessionUpdate": "usage_update", "used": used, "size": 200_000,
+            "_meta": {"_claude/rateLimit": {"status": "allowed"}},
+        }}})
+    };
+    h.hub.set_loading(h.id, true).await;
+    from_agent(&h.hub, h.id, &h.agent, usage(1)).await;
+    h.hub.set_loading(h.id, false).await;
+    from_agent(&h.hub, h.id, &h.agent, usage(2)).await;
+    let (id, update) = tokio::time::timeout(Duration::from_secs(5), seen.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(id, h.id);
+    assert_eq!(update["used"], 2);
+    assert!(seen.try_recv().is_err());
+}

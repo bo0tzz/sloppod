@@ -898,3 +898,95 @@ async fn a_session_below_a_deleted_one_is_in_a_deleted_line(db: PgPool) {
         assert!(db::deleted_in_line(&db, member).await.unwrap());
     }
 }
+
+async fn credential(db: &PgPool, owner: &str, kind: &str) -> Uuid {
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "insert into credentials (id, owner, kind, name, secret, is_default) values ($1, $2, $3, $3, '\\x00', true)",
+    )
+    .bind(id)
+    .bind(owner)
+    .bind(kind)
+    .execute(db)
+    .await
+    .unwrap();
+    id
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_quota_keeps_the_windows_a_report_leaves_out(db: PgPool) {
+    use crate::quota::{self, Observation, Window};
+    use sloppod_protocol::api::QuotaStatus;
+    let claude = credential(&db, "dev", "claude").await;
+    credential(&db, "someone", "claude").await;
+    let window = |utilization: f64, status| Window {
+        utilization: Some(utilization),
+        resets_at: Some(Utc::now() + Duration::hours(3)),
+        status,
+    };
+    let both = Observation {
+        limited: false,
+        resets_at: None,
+        windows: [
+            ("five_hour".to_owned(), window(0.5, QuotaStatus::Allowed)),
+            ("seven_day".to_owned(), window(0.8, QuotaStatus::Warning)),
+        ]
+        .into(),
+    };
+    quota::store(&db, claude, &both, Utc::now()).await.unwrap();
+    let reset_at = Utc::now() + Duration::hours(1);
+    let refused = Observation {
+        limited: true,
+        resets_at: Some(reset_at),
+        windows: [("five_hour".to_owned(), window(1.0, QuotaStatus::Rejected))].into(),
+    };
+    quota::store(&db, claude, &refused, Utc::now())
+        .await
+        .unwrap();
+
+    let quotas = quota::list(&db, "dev", Utc::now()).await.unwrap();
+    assert_eq!(quotas.len(), 1);
+    let quota = &quotas[0];
+    assert_eq!(
+        (quota.credential_id, quota.kind.as_str()),
+        (claude, "claude")
+    );
+    assert!(quota.limited);
+    let windows: Vec<_> = quota
+        .windows
+        .iter()
+        .map(|w| (w.window.as_str(), w.utilization, w.status))
+        .collect();
+    assert_eq!(
+        windows,
+        [
+            ("five_hour", Some(1.0), QuotaStatus::Rejected),
+            ("seven_day", Some(0.8), QuotaStatus::Warning)
+        ]
+    );
+    // Once the reset has passed, it's over.
+    let later = quota::for_credential(&db, claude, reset_at + Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!later.limited);
+    // Only the owner's own credentials, and only those with a report.
+    assert!(
+        quota::list(&db, "someone", Utc::now())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    sqlx::query("delete from credentials where id = $1")
+        .bind(claude)
+        .execute(&db)
+        .await
+        .unwrap();
+    assert!(
+        quota::list(&db, "dev", Utc::now())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

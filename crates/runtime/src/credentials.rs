@@ -344,6 +344,16 @@ impl Credentials {
         Ok(self.default_row(owner, kind).await?.is_some())
     }
 
+    /// The owners who have a default credential of a kind.
+    pub async fn owners_with_default(&self, kind: &str) -> sqlx::Result<Vec<String>> {
+        sqlx::query_scalar(
+            "select owner from credentials where kind = $1 and is_default order by owner",
+        )
+        .bind(kind)
+        .fetch_all(&self.db)
+        .await
+    }
+
     /// The owner's default credential of a kind, still sealed.
     pub async fn default_row(
         &self,
