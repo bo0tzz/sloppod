@@ -396,7 +396,8 @@ async fn reconcile(state: &AppState) {
     let limited = state.hub.restore_limits().await;
     // After the pods are placed, so a queue for a running session waits for its agent and a parked one wakes for it;
     // before anything that can queue a notice, which would otherwise replace the kept queue before it's read.
-    state.hub.restore_queues().await;
+    // Nothing is listening yet, so nothing can queue a message or answer a question until this is done.
+    until_done("restoring queued messages", || state.hub.restore_queues()).await;
     state.hub.resume_limits(limited);
     proposals::resume_approved(state).await;
     reviews::resume_round_watches(state).await;
@@ -413,6 +414,18 @@ fn restart_notice(build: Option<&str>) -> String {
          was running, any background tasks you started and any question you were waiting on are gone; your working \
          tree and files are intact. Check what had finished, then carry on where you left off."
     )
+}
+
+/// Retries a startup step that reads the database until it succeeds, e.g. through a brief database outage.
+async fn until_done<F, Fut>(what: &str, step: F)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = sqlx::Result<()>>,
+{
+    while let Err(e) = step().await {
+        tracing::error!(error = %e, "{what}; trying again");
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
 }
 
 #[cfg(test)]

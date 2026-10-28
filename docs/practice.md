@@ -12,7 +12,7 @@ What bo0tzz and the sessions working on sloppod have learned about working toget
 
 ## Talking to the user
 
-- **Anything needed from the user goes through `ask_user`**, not prose in a reply, where it scrolls away and can't be told apart from a status update. That includes decisions, choices between options, and "merge this by hand".
+- **Decisions needed from the user go through `ask_user`**, not prose in a reply, where they scroll away and can't be told apart from a status update. Requests to act, like "merge this by hand", stay plain messages with the link.
 - **Check before claiming:** look up a pull request's state (`gh pr view <n> --json state,mergedAt`) right before saying it's waiting on the user. Things get merged fast.
 - **Make GitHub actions links,** e.g. the pull request to merge.
 - **Don't treat your own recommendation as the user's decision.** If they haven't answered, it's still open.
@@ -38,7 +38,7 @@ The parent session manages, and sub-sessions ([ADR 27](adr/0027-sub-sessions.md)
 - **Branches:** a sub-session's branches are named after the parent's, so the parent proposes them as pull requests directly; no copying commits. Sub-sessions rebase onto main and resolve conflicts themselves, since they know their change best. Force pushes aren't allowed, so a rebased branch gets a new name (`-2`).
 - **Review findings go back to the sub-session that wrote the change.** It builds on the pull request's branch and pushes its own branch; the parent fast-forwards the PR branch and asks for the next round.
 - **Sub-sessions can't message each other;** the parent passes on what one needs from another, word for word where it's a design.
-- **The parent allocates migration numbers** across sub-sessions working at the same time, and proposes changes whose migrations depend on each other as a stack.
+- **The parent allocates migration numbers** across sub-sessions working at the same time, so no two pending migrations share one. A migration that depends on another (alters its table, say) gets a higher number, since a fresh database runs them in numeric order, and the two changes are proposed as a stack so the prerequisite merges first. Independent migrations don't need renumbering above ones already shipped: sqlx applies any migration not yet applied, whatever its number.
 
 ## Proposals and merging
 
@@ -50,7 +50,6 @@ The parent session manages, and sub-sessions ([ADR 27](adr/0027-sub-sessions.md)
   - A conflict-free merge can still be wrong: read the result, e.g. an early return from one change that defeats another.
   - `git checkout --theirs <file>` takes the other side's whole file and silently drops this branch's other changes in it.
   - Never build a commit from a sub-session's whole tree; its base may be older than main, which would revert what merged since. Cherry-pick or merge, then check `git diff origin/main --stat` lists only the change's files.
-  - Renumber a pending migration above any that has already shipped.
 
 ## Environment
 
