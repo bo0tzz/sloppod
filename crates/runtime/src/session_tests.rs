@@ -680,6 +680,45 @@ async fn a_batch_for_a_replaced_agent_waits_behind_the_new_ones_turn() {
 }
 
 #[tokio::test]
+async fn the_first_message_is_forgotten_only_once_a_turn_starts_with_it() {
+    let mut h = Harness::starting().await;
+    h.hub
+        .agent_ready(
+            h.id,
+            &h.agent,
+            "agent-session".into(),
+            json!({}),
+            Some("Hello".into()),
+        )
+        .await;
+    let request = loop {
+        let message = h.next().await;
+        if message["method"] == "session/prompt" {
+            break message;
+        }
+    };
+    assert_eq!(prompt_text(&request), ["Hello"]);
+    assert_eq!(*h.store.cleared_prompts.lock().unwrap(), [h.id]);
+}
+
+#[tokio::test]
+async fn a_first_message_taken_for_a_replaced_agent_stays_stored_for_the_next() {
+    let h = Harness::ready().await;
+    let old = h.agent.clone();
+    let (_new, mut to_new) = replace_agent(&h).await;
+    h.hub
+        .clone()
+        .run_queued(h.id, old, Some("Hello".into()), Vec::new())
+        .await;
+    // Not run, not forgotten, and not queued in memory either: the next agent reads it from the store. With
+    // nothing else to requeue, the new agent isn't sent an empty turn.
+    assert!(h.store.cleared_prompts.lock().unwrap().is_empty());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(to_new.try_recv().is_err());
+    assert_eq!(h.phase().await, "idle");
+}
+
+#[tokio::test]
 async fn a_batch_that_can_no_longer_start_in_a_stopped_session_fails() {
     let h = Harness::ready().await;
     let agent = h.agent.clone();

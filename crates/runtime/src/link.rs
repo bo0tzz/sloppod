@@ -573,7 +573,8 @@ async fn start_agent_session(
     };
     let agent_state = adapter::agent_state(&response);
     db::set_agent_session(&state.db, session.id, &agent_session_id, &agent_state).await?;
-    let pending = db::take_pending_prompt(&state.db, session.id).await?;
+    // Cleared once a turn starts with it, so an agent that goes before then leaves it for the next.
+    let pending = db::pending_prompt(&state.db, session.id).await?;
     agent.ready(AgentReady {
         agent_session_id: agent_session_id.clone(),
         capabilities: init,

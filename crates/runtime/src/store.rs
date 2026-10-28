@@ -17,6 +17,8 @@ pub trait SessionStore: Send + Sync {
     /// Appends to the session's event log and returns the event's sequence number.
     async fn append_event(&self, id: Uuid, payload: &Value) -> sqlx::Result<i64>;
     async fn events(&self, id: Uuid) -> sqlx::Result<Vec<(i64, Value)>>;
+    /// Forgets the session's first message, once a turn has started with it.
+    async fn clear_pending_prompt(&self, id: Uuid) -> sqlx::Result<()>;
 }
 
 pub struct PgStore(pub PgPool);
@@ -46,6 +48,10 @@ impl SessionStore for PgStore {
     async fn events(&self, id: Uuid) -> sqlx::Result<Vec<(i64, Value)>> {
         db::events(&self.0, id).await
     }
+
+    async fn clear_pending_prompt(&self, id: Uuid) -> sqlx::Result<()> {
+        db::clear_pending_prompt(&self.0, id).await
+    }
 }
 
 #[cfg(test)]
@@ -60,6 +66,8 @@ pub mod memory {
     pub struct MemoryStore {
         sessions: Mutex<HashMap<Uuid, SessionRow>>,
         events: Mutex<Vec<(Uuid, i64, Value)>>,
+        /// Sessions whose first message a turn has started with.
+        pub cleared_prompts: Mutex<Vec<Uuid>>,
     }
 
     impl MemoryStore {
@@ -122,6 +130,11 @@ pub mod memory {
                 .filter(|(s, _, _)| *s == id)
                 .map(|(_, seq, p)| (*seq, p.clone()))
                 .collect())
+        }
+
+        async fn clear_pending_prompt(&self, id: Uuid) -> sqlx::Result<()> {
+            self.cleared_prompts.lock().unwrap().push(id);
+            Ok(())
         }
     }
 }

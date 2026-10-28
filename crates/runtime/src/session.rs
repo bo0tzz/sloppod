@@ -384,6 +384,13 @@ impl Hub {
                 match (&state.agent_session_id, current) {
                     (Some(agent_session_id), true) => {
                         let agent_session_id = agent_session_id.clone();
+                        // The first message is kept until now, so an agent that went before it ran leaves it for
+                        // the next; from here this turn has it.
+                        if pending.is_some()
+                            && let Err(e) = self.store.clear_pending_prompt(id).await
+                        {
+                            tracing::warn!(session = %id, error = %e, "clearing the first message");
+                        }
                         self.set_phase(id, Phase::Working).await;
                         Start::Run(agent_session_id, queued)
                     }
@@ -391,16 +398,14 @@ impl Hub {
                     _ => {
                         // Taken for an agent that's gone: everything goes back, ahead of what's queued since,
                         // recorded already so not shown as waiting behind a turn. A newer agent that's up and idle
-                        // runs it now.
+                        // runs it now. The first message isn't requeued: it's still stored, and the next agent to
+                        // be ready reads it from there.
                         let requeued = queued.into_iter().map(|q| Queued { id: None, ..q });
-                        let pending = pending.map(|text| Queued {
-                            id: None,
-                            blocks: vec![json!({"type": "text", "text": text})],
-                            reply: None,
-                        });
                         let rest = std::mem::take(&mut state.queue);
-                        state.queue = pending.into_iter().chain(requeued).chain(rest).collect();
-                        let idle = state.agent_session_id.is_some() && !state.turn_running;
+                        state.queue = requeued.chain(rest).collect();
+                        let idle = state.agent_session_id.is_some()
+                            && !state.turn_running
+                            && !state.queue.is_empty();
                         match (state.agent.clone(), idle) {
                             (Some(agent), true) => {
                                 state.turn_running = true;
