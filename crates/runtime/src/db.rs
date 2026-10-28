@@ -1264,6 +1264,22 @@ pub async fn pause_review(
     .map(|_| ())
 }
 
+/// Marks the running review round a reviewer session works on as waiting for its usage limit from `at`, unless it
+/// already is; done as the limit hits, so a restart before the round's watcher looks doesn't lose the wait.
+pub async fn pause_reviewer(db: &PgPool, reviewer: Uuid, at: DateTime<Utc>) -> sqlx::Result<()> {
+    sqlx::query(
+        "update reviews r set paused_since = $2 from proposals p \
+         where p.review_session_id = $1 and p.status = 'in_review' and r.proposal_id = p.id \
+         and r.verdict is null and r.paused_since is null \
+         and r.round = (select max(round) from reviews where proposal_id = p.id)",
+    )
+    .bind(reviewer)
+    .bind(at)
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
 /// Ends a review round's wait for the usage limit at `at`, adding it to the time the round has waited.
 pub async fn unpause_review(
     db: &PgPool,

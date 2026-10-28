@@ -244,10 +244,10 @@ async fn main() -> anyhow::Result<()> {
         let (state, at) = (usage.clone(), chrono::Utc::now());
         Box::pin(async move { quota::seen(&state, id, update, at).await })
     }));
-    let resets = state.clone();
-    state.hub.set_limit_reset(Arc::new(move |id| {
-        let state = resets.clone();
-        Box::pin(async move { limits::reset(&state, id).await })
+    let limited = state.clone();
+    state.hub.set_limit_hit(Arc::new(move |id| {
+        let state = limited.clone();
+        Box::pin(async move { limits::hit(&state, id).await })
     }));
     limits::follow_quotas(&state);
     let checker = state.clone();

@@ -1971,7 +1971,7 @@ async fn a_session_at_its_usage_limit_waits_then_carries_on_with_what_queued() {
     let mut h = Harness::ready().await;
     let reset = chrono::Utc::now() + chrono::Duration::hours(2);
     h.hub
-        .set_limit_reset(Arc::new(move |_| Box::pin(async move { Some(reset) })));
+        .set_limit_hit(Arc::new(move |_| Box::pin(async move { Some(reset) })));
     let turn = h.prompt("Work");
     let request = h.next().await;
     hit_the_limit(&h, &request).await;
