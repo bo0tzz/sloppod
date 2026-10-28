@@ -11,8 +11,7 @@ use serde_json::json;
 use sloppod_contracts::capability;
 use sloppod_contracts::{Grant, READ_WRITE, find_repo};
 use sloppod_protocol::api::{
-    Decision, NewCredential, NewSession, NewStandingApproval, Phase, ProposalStatus, ReviewPolicy,
-    SessionKind,
+    Decision, NewCredential, NewSession, NewStandingApproval, ProposalStatus, ReviewPolicy,
 };
 use uuid::Uuid;
 
@@ -277,7 +276,7 @@ async fn repos(State(state): State<AppState>, User(user): User) -> impl IntoResp
     Json(accessible_repos(&state, &user).await)
 }
 
-fn default_title(prompt: &str) -> String {
+pub(crate) fn default_title(prompt: &str) -> String {
     let line = prompt
         .lines()
         .find(|l| !l.trim().is_empty())
@@ -380,38 +379,24 @@ async fn create_session(
     let title = custom
         .map(str::to_owned)
         .unwrap_or_else(|| default_title(prompt));
-    db::insert_session(
-        &state.db,
-        db::NewSessionRow {
-            id,
+    let row = lifecycle::start_session(
+        &state,
+        id,
+        lifecycle::NewSession {
             owner: &user,
+            prompt,
             title: &title,
             custom_title: custom.is_some(),
-            pending_prompt: prompt,
             agent,
-            kind: SessionKind::Work,
-            review,
             model: model.as_deref(),
+            review,
             repo: repo.as_deref(),
             grants: &grants,
+            parent: None,
         },
     )
-    .await?;
-
-    state
-        .hub
-        .record_user_message(id, &json!([{"type": "text", "text": prompt}]), false, None)
-        .await;
-    let row = db::get_session(&state.db, id)
-        .await?
-        .ok_or_else(not_found)?;
-    if let Err(e) = lifecycle::place(&state, &row).await {
-        state.hub.set_phase(id, Phase::Stopped).await;
-        return Err(ApiError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("starting the session pod: {e}"),
-        ));
-    }
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok((StatusCode::CREATED, Json(row.to_api())))
 }
 

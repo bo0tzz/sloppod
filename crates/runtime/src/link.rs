@@ -439,6 +439,17 @@ async fn launch_for(
                     })
                     .and_then(|g| g.param("commit"))
                     .map(str::to_owned),
+                from: context
+                    .session
+                    .grants
+                    .iter()
+                    .find(|g| {
+                        g.capability == capability::REPO
+                            && g.param("repo")
+                                .is_some_and(|r| sloppod_contracts::same_repo(r, grant.repo))
+                    })
+                    .and_then(|g| g.param("from"))
+                    .map(str::to_owned),
             }),
         install_tools: session.repo.is_some(),
         command: agent.command.clone(),

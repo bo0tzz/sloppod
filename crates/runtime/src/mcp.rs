@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use sloppod_protocol::api::{ProposalStatus, SessionKind};
 use uuid::Uuid;
 
-use crate::{AppState, db, proposals, reviews};
+use crate::{AppState, db, proposals, reviews, subsessions};
 
 pub async fn handler(
     State(state): State<AppState>,
@@ -188,6 +188,9 @@ fn tools(state: &AppState, kind: SessionKind) -> Vec<Value> {
             "required": ["id"],
         },
     }));
+    if kind == SessionKind::Work {
+        tools.extend(subsessions::tools());
+    }
     tools
 }
 
@@ -212,6 +215,8 @@ async fn call(state: &AppState, session: Uuid, params: &Value) -> Value {
         LIST_GRANTS => list_grants_text(state, session).await,
         "get_proposal" => get_proposal(state, session, &arguments).await,
         "withdraw_proposal" => withdraw_proposal(state, session, &arguments).await,
+        "spawn_session" => subsessions::spawn(state, session, &arguments).await,
+        "list_sessions" => subsessions::list(state, session).await,
         _ => propose(state, session, name, arguments).await,
     };
     match result {

@@ -870,7 +870,26 @@ async fn prepare(
                 )
                 .await?;
             } else {
-                run_cmd(&env, &repo.path, "git", &["checkout", "-b", &repo.branch]).await?;
+                // A new session branch starts from `from` if it's given and there, else from the default branch.
+                let from = match &repo.from {
+                    Some(from) => run_cmd(
+                        &env,
+                        &repo.path,
+                        "git",
+                        &["fetch", "origin", &format!("refs/heads/{from}")],
+                    )
+                    .await
+                    .is_ok(),
+                    None => false,
+                };
+                let start = if from { "FETCH_HEAD" } else { "HEAD" };
+                run_cmd(
+                    &env,
+                    &repo.path,
+                    "git",
+                    &["checkout", "-b", &repo.branch, start],
+                )
+                .await?;
             }
         }
         if let Some(commit) = &repo.commit {

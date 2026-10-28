@@ -399,6 +399,8 @@ pub trait AgentAdapter: Send + Sync {
     fn agent(&self) -> String;
     /// The credential its model needs from the session's owner.
     fn credential(&self) -> NeededCredential;
+    /// The capability a session needs for its model requests, e.g. `model`.
+    fn inference_capability(&self) -> String;
     fn launch(&self, context: &AgentContext) -> AgentLaunch;
 }
 

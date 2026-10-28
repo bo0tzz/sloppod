@@ -15,14 +15,20 @@ use uuid::Uuid;
 
 use crate::{AppState, db};
 
-/// Gives a session its memini key when its owner has memini and it has none, e.g. because it was just created, or
-/// its key was lost (ADR 22). Keeps the namespace of an existing memory grant.
+/// Whether a session without a memini key gets one. A sub-session's memory is what its parent gave it (ADR 27), so
+/// it gets a key only for a memory grant it has.
+fn mints_memory(session: &db::SessionRow, has_memory_grant: bool) -> bool {
+    session.parent_id.is_none() || has_memory_grant
+}
+
 /// Whether a session of `kind` gets the owner's memory when they have memini. A utility session (ADR 26) only has
 /// model access.
 fn gets_memory(kind: sloppod_protocol::api::SessionKind) -> bool {
     kind != sloppod_protocol::api::SessionKind::Utility
 }
 
+/// Gives a session its memini key when its owner has memini and it has none, e.g. because it was just created, or
+/// its key was lost (ADR 22). Keeps the namespace of an existing memory grant.
 async fn ensure_memini_key(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
     if !gets_memory(session.kind) {
         return Ok(());
@@ -43,6 +49,9 @@ async fn ensure_memini_key(state: &AppState, session: &db::SessionRow) -> anyhow
         .grant(capability::MEMORY)
         .and_then(|g| g.param("namespace"))
         .map(str::to_owned);
+    if !mints_memory(session, granted.is_some()) {
+        return Ok(());
+    }
     let home = memini
         .config("home")
         .map(str::to_owned)
@@ -75,6 +84,70 @@ async fn ensure_memini_key(state: &AppState, session: &db::SessionRow) -> anyhow
 /// The labels a session's egress policy selects its pod by.
 pub fn pod_labels(session_id: &str) -> BTreeMap<String, String> {
     BTreeMap::from([(SESSION_LABEL.to_owned(), session_id.to_owned())])
+}
+
+/// A session to start: what `start_session` needs besides its id.
+pub struct NewSession<'a> {
+    pub owner: &'a str,
+    pub prompt: &'a str,
+    pub title: &'a str,
+    pub custom_title: bool,
+    pub agent: &'a str,
+    pub model: Option<&'a str>,
+    pub review: sloppod_protocol::api::ReviewPolicy,
+    pub repo: Option<&'a str>,
+    pub grants: &'a [Grant],
+    /// The session that spawned it, for a sub-session (ADR 27).
+    pub parent: Option<Uuid>,
+}
+
+/// Starts a work session: records it and its first message, and places its pod. A session whose pod can't be
+/// placed is stopped, and the error says why.
+pub async fn start_session(
+    state: &AppState,
+    id: Uuid,
+    new: NewSession<'_>,
+) -> anyhow::Result<db::SessionRow> {
+    db::insert_session(
+        &state.db,
+        db::NewSessionRow {
+            id,
+            owner: new.owner,
+            title: new.title,
+            custom_title: new.custom_title,
+            pending_prompt: new.prompt,
+            agent: new.agent,
+            kind: sloppod_protocol::api::SessionKind::Work,
+            review: new.review,
+            model: new.model,
+            repo: new.repo,
+            grants: new.grants,
+        },
+    )
+    .await?;
+    if let Some(parent) = new.parent {
+        db::set_parent(&state.db, id, parent).await?;
+    }
+    state
+        .hub
+        .record_user_message(
+            id,
+            &json!([{"type": "text", "text": new.prompt}]),
+            false,
+            None,
+        )
+        .await;
+    let row = db::get_session(&state.db, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("session {id} vanished"))?;
+    if let Err(e) = place(state, &row).await {
+        state
+            .hub
+            .set_phase(id, sloppod_protocol::api::Phase::Stopped)
+            .await;
+        anyhow::bail!("starting the session pod: {e}");
+    }
+    Ok(row)
 }
 
 /// Makes sure a session's pod and egress policy exist.
@@ -332,6 +405,18 @@ pub async fn remove_session(state: &AppState, session: &db::SessionRow) -> anyho
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_sub_session_gets_memory_only_if_its_parent_gave_it() {
+        let mut session = crate::db::SessionRow::for_test(uuid::Uuid::new_v4(), "alice");
+        assert!(
+            super::mints_memory(&session, false),
+            "a session of its own gets memory"
+        );
+        session.parent_id = Some(uuid::Uuid::new_v4());
+        assert!(!super::mints_memory(&session, false));
+        assert!(super::mints_memory(&session, true));
+    }
+
     #[test]
     fn a_utility_session_gets_no_memory() {
         use sloppod_protocol::api::SessionKind;
