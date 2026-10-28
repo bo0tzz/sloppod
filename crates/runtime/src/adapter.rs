@@ -103,7 +103,9 @@ fn session_prompt(context: &AgentContext) -> String {
          the `propose_pull_request` tool; sloppod opens the PR once it's approved. To file issues, call the \
          `propose_issues` tool. For changes that build on each other, manage the branches with `gh stack` \
          (`init`, `add`, `rebase`, `push`) and propose them together with the `propose_stack` tool rather than \
-         `gh stack submit`. You're told when your proposals are decided. To ask the user something, use the \
+         `gh stack submit`. You're told when your proposals are decided, and when the pull requests they \
+         opened fail their checks, conflict with their base, get reviews or comments, or are merged or closed, so \
+         don't poll for those. To ask the user something, use the \
          `ask_user` tool: it doesn't wait, and the answer arrives later as a message. Direct writes to GitHub (gh pr \
          create, gh issue create, comments, API POSTs) are refused.\n",
     );

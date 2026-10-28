@@ -724,6 +724,82 @@ async fn only_a_live_session_acts(db: PgPool) {
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
+async fn the_pull_requests_sloppod_opened_are_watched_until_they_close(db: PgPool) {
+    use sloppod_protocol::api::Phase;
+
+    let s = session(&db, "dev").await;
+    let stopped = session(&db, "dev").await;
+    let executed =
+        |session, kind: &'static str, payload: serde_json::Value, result: serde_json::Value| {
+            let db = db.clone();
+            async move {
+                let id = db::insert_proposal(&db, session, kind, ProposalStatus::Pending, &payload)
+                    .await
+                    .unwrap()
+                    .id;
+                db::decide_proposal(&db, id, ProposalStatus::Approved, &payload, None, "dev")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                db::finish_proposal(&db, id, ProposalStatus::Executed, Some(&result), None)
+                    .await
+                    .unwrap();
+            }
+        };
+    executed(
+        s,
+        "github.pr.create",
+        json!({"repo": "O/R"}),
+        json!({"number": 1}),
+    )
+    .await;
+    executed(
+        s,
+        "github.stack.create",
+        json!({"repo": "o/r"}),
+        json!({"pull_requests": [{"number": 2}, {"number": 3}]}),
+    )
+    .await;
+    executed(
+        stopped,
+        "github.pr.create",
+        json!({"repo": "o/r"}),
+        json!({"number": 4}),
+    )
+    .await;
+    db::set_phase(&db, stopped, Phase::Stopped).await.unwrap();
+
+    let numbers = |pulls: Vec<db::WatchedPull>| pulls.iter().map(|p| p.number).collect::<Vec<_>>();
+    let watched = db::watched_pulls(&db).await.unwrap();
+    assert!(
+        watched
+            .iter()
+            .all(|p| p.repo == "o/r" && p.observed.is_none())
+    );
+    assert_eq!(numbers(watched), [1, 2, 3]);
+
+    db::save_pull_watch(
+        &db,
+        "o/r",
+        1,
+        s,
+        &json!({"state": "OPEN", "checks": "SUCCESS"}),
+    )
+    .await
+    .unwrap();
+    db::save_pull_watch(&db, "o/r", 2, s, &json!({"state": "MERGED"}))
+        .await
+        .unwrap();
+    let watched = db::watched_pulls(&db).await.unwrap();
+    assert_eq!(watched[0].observed.as_ref().unwrap()["checks"], "SUCCESS");
+    assert_eq!(
+        numbers(watched),
+        [1, 3],
+        "a merged one isn't watched any more"
+    );
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
 async fn a_tree_counts_its_running_sub_sessions_at_any_depth(db: PgPool) {
     let root = session(&db, "alice").await;
     let child = session(&db, "alice").await;

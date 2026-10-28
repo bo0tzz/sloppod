@@ -318,6 +318,38 @@ pub async fn finish_purge(db: &PgPool, id: Uuid) -> sqlx::Result<()> {
         .map(|_| ())
 }
 
+/// A pull request the runtime opened for a session, and what it last saw of it (`pulls`).
+#[derive(Debug, FromRow)]
+pub struct WatchedPull {
+    pub session_id: Uuid,
+    pub owner: String,
+    pub repo: String,
+    pub number: i64,
+    pub observed: Option<Value>,
+}
+
+/// The open pull requests the runtime opened, from executed pull request and stack proposals, of sessions that
+/// aren't stopped or deleted. One last seen merged or closed isn't watched any more.
+pub async fn watched_pulls(db: &PgPool) -> sqlx::Result<Vec<WatchedPull>> {
+    sqlx::query_as(
+        "with opened as ( \
+           select p.session_id, lower(p.payload->>'repo') as repo, (p.result->>'number')::bigint as number \
+           from proposals p where p.kind = 'github.pr.create' and p.status = 'executed' and p.result ? 'number' \
+           union \
+           select p.session_id, lower(p.payload->>'repo'), (pull->>'number')::bigint \
+           from proposals p, jsonb_array_elements(p.result->'pull_requests') pull \
+           where p.kind = 'github.stack.create' and p.status = 'executed' and pull ? 'number' \
+         ) \
+         select o.session_id, s.owner, o.repo, o.number, w.observed from opened o \
+         join sessions s on s.id = o.session_id \
+         left join pull_watches w on w.repo = o.repo and w.number = o.number \
+         where s.phase <> 'stopped' and s.deleted_at is null and coalesce(w.observed->>'state', 'OPEN') = 'OPEN' \
+         order by o.repo, o.number",
+    )
+    .fetch_all(db)
+    .await
+}
+
 /// The owner's utility session (ADR 26), if they have one that isn't stopped.
 pub async fn utility_session(db: &PgPool, owner: &str) -> sqlx::Result<Option<SessionRow>> {
     sqlx::query_as(AssertSqlSafe(format!(
@@ -336,6 +368,27 @@ pub async fn utility_sessions(db: &PgPool) -> sqlx::Result<Vec<SessionRow>> {
     )))
     .fetch_all(db)
     .await
+}
+
+/// Keeps what was last seen of a pull request.
+pub async fn save_pull_watch(
+    db: &PgPool,
+    repo: &str,
+    number: i64,
+    session: Uuid,
+    observed: &Value,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "insert into pull_watches (repo, number, session_id, observed) values ($1, $2, $3, $4) \
+         on conflict (repo, number) do update set observed = excluded.observed, updated_at = now()",
+    )
+    .bind(repo)
+    .bind(number)
+    .bind(session)
+    .bind(observed)
+    .execute(db)
+    .await?;
+    Ok(())
 }
 
 pub async fn active_sessions(db: &PgPool) -> sqlx::Result<Vec<SessionRow>> {

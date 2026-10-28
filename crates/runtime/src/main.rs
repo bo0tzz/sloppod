@@ -22,6 +22,7 @@ mod placement;
 mod pods;
 mod policies;
 mod proposals;
+mod pulls;
 mod questions;
 mod rebases;
 mod reviews;
@@ -266,6 +267,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     tokio::spawn(rebases::run(state.clone(), pushes_to_recheck));
+    tokio::spawn(pulls::run(state.clone()));
     {
         let state = state.clone();
         tokio::spawn(async move {

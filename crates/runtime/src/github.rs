@@ -744,7 +744,12 @@ impl GitHubApp {
     }
 
     /// Runs a GraphQL query or mutation with the repository's token; GraphQL errors come back as errors.
-    async fn graphql(&self, repo: &str, query: &str, variables: Value) -> anyhow::Result<Value> {
+    pub(crate) async fn graphql(
+        &self,
+        repo: &str,
+        query: &str,
+        variables: Value,
+    ) -> anyhow::Result<Value> {
         let token = self.token_for(repo).await?;
         let response: Value = self
             .http
