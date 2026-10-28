@@ -1,3 +1,4 @@
+import { account } from './account.svelte.ts';
 import { api, newerSession, sortSessions, type Session } from './api.ts';
 
 /** The session list, shared by the list page and the sidebar. The runtime has no list-wide push, so it polls. */
@@ -29,6 +30,8 @@ class SessionStore {
         .filter((session) => (this.#removed.get(session.id) ?? 0) <= removals)
         .map((session) => newerSession(current.get(session.id), session));
       for (const [id, removal] of this.#removed) if (removal <= removals) this.#removed.delete(id);
+      // The runtime is back after being unreachable, and may have been redeployed meanwhile.
+      if (this.error) account.refresh();
       this.error = null;
     } catch (error) {
       this.error = error instanceof Error ? error.message : String(error);
