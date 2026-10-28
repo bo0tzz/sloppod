@@ -1226,7 +1226,7 @@ async function handleApi(req, res, url) {
 
   if (parts[0] === 'repos' && parts.length === 1 && method === 'GET') return json(res, 200, availableRepos());
   if (parts[0] === 'me' && parts.length === 1 && method === 'GET') {
-    return json(res, 200, { user: req.headers['x-forwarded-user'] ?? 'bo0tzz', build: 'v0.0.0-mock' });
+    return json(res, 200, { user: req.headers['x-forwarded-user'] ?? 'bo0tzz', version: '0.0.1-main.1', build: '11396d515413b2bec5e7c052b06d5df78cc68052' });
   }
 
   if (parts[0] === 'credentials') return handleCredentials(req, res, parts);
