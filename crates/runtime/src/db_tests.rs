@@ -702,3 +702,20 @@ async fn a_pull_requests_fingerprint_is_found_by_repository_and_number(db: PgPoo
     assert_eq!(db::pull_fingerprint(&db, "o/r", 8).await.unwrap(), None);
     assert_eq!(db::pull_fingerprint(&db, "o/other", 7).await.unwrap(), None);
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn only_a_live_session_acts(db: PgPool) {
+    use sloppod_protocol::api::Phase;
+
+    let s = session(&db, "dev").await;
+    let row = || async { db::get_session(&db, s).await.unwrap().unwrap() };
+    assert_eq!(row().await.not_acting(), None);
+    for (phase, why) in [(Phase::Parked, "parked"), (Phase::Stopped, "stopped")] {
+        db::set_phase(&db, s, phase).await.unwrap();
+        assert_eq!(row().await.not_acting(), Some(why));
+    }
+    let deleted = session(&db, "dev").await;
+    db::mark_deleted(&db, deleted).await.unwrap();
+    let row = db::get_session(&db, deleted).await.unwrap().unwrap();
+    assert_eq!(row.not_acting(), Some("deleted"));
+}

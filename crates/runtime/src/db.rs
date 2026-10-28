@@ -125,6 +125,19 @@ impl SessionRow {
     pub fn phase(&self) -> Phase {
         Phase::parse(&self.phase)
     }
+
+    /// Why the session can't act any more, if it can't: it's stopped, parked or deleted. A pod of it that's still up
+    /// gets nothing done in its name: no egress through the authorizer, no tools, no memory (#60).
+    pub fn not_acting(&self) -> Option<&'static str> {
+        if self.deleted_at.is_some() {
+            return Some("deleted");
+        }
+        match self.phase() {
+            Phase::Stopped => Some("stopped"),
+            Phase::Parked => Some("parked"),
+            _ => None,
+        }
+    }
 }
 
 const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, repo, created_at, updated_at, active_at, deleted_at, agent_status, agent_error, \
