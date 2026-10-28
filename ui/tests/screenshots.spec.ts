@@ -73,7 +73,7 @@ for (const [form, device] of Object.entries(viewports)) {
         const session: Session = await response.json();
         await page.goto(`/sessions/${session.id}`);
         await expect(page.getByTestId('permission-request')).toBeVisible();
-        await page.getByRole('textbox', { name: 'Steering message' }).fill('Cap it at ten seconds');
+        await page.getByRole('textbox', { name: 'Prompt' }).fill('Cap it at ten seconds');
         await shot(page, 'permission');
       });
 

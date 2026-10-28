@@ -3229,6 +3229,7 @@ name = "sloppod-contracts"
 version = "0.1.1"
 dependencies = [
  "async-trait",
+ "percent-encoding",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -3261,6 +3262,7 @@ dependencies = [
  "jsonwebtoken",
  "k8s-openapi",
  "kube",
+ "percent-encoding",
  "prost",
  "rand 0.10.3",
  "rcgen",
@@ -3268,6 +3270,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "sloppod-contracts",
  "sloppod-protocol",
  "sqlx",
@@ -3285,9 +3288,11 @@ name = "sloppod-supervisor"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "axum",
  "base64 0.23.1",
  "clap",
  "futures",
+ "reqwest",
  "rustls",
  "serde_json",
  "sloppod-protocol",

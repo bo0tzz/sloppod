@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use sloppod_contracts::capability;
 use sloppod_contracts::{
     Decision, Error, HttpRequest, Manifest, RequestPolicy, Result, SessionContext,
 };
@@ -35,7 +36,7 @@ impl RequestPolicy for ModelPolicy {
     }
 
     async fn decide(&self, session: &SessionContext, request: &HttpRequest) -> Result<Decision> {
-        if !session.has("model") {
+        if !session.has(capability::MODEL) {
             return Ok(Decision::deny(
                 "sloppod: this session has no model access.\n",
             ));
@@ -60,7 +61,7 @@ impl RequestPolicy for ModelPolicy {
         };
         Ok(Decision::allow_with(
             vec![("authorization".into(), format!("Bearer {token}"))],
-            vec!["x-api-key".into()],
+            Vec::new(),
         ))
     }
 }

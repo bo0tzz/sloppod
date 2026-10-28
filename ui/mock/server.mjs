@@ -25,6 +25,8 @@ const { values: args } = parseArgs({
 });
 
 const DELAY = Number(args.delay);
+/** How many updates a UI gets at once, as the runtime sends them. */
+const HISTORY_PAGE = 2000;
 const REPOS = ['bo0tzz/sloppod', 'bo0tzz/memini', 'immich-app/static-pages'];
 // The adapter's model picker, as it appears in `configOptions`.
 const MODELS = [
@@ -34,12 +36,14 @@ const MODELS = [
   { value: 'haiku', name: 'Haiku' },
 ];
 /** The user's defaults for new sessions. `models` fills in once a session has offered them. */
-const settings = { model: null, models: [] };
+const settings = { model: null, models: [], review: 'off' };
 const CANCELLED = Symbol('cancelled');
 
 /** @type {Map<string, MockSession>} */
 const sessions = new Map();
 const proposals = new Map();
+/** Review rounds by proposal id (ADR 24). */
+const reviews = new Map();
 const connections = new Set();
 const credentials = [];
 
@@ -68,6 +72,7 @@ class MockSession {
   emit(update) {
     const params = { sessionId: this.data.id, update };
     this.log.push(params);
+    this.data.active_at = now();
     for (const conn of this.subscribers) conn.notify('session/update', params);
   }
 
@@ -230,12 +235,16 @@ function promptText(prompt) {
     .join('');
 }
 
-function echoUser(session, text, { steering = false, notice = false } = {}) {
-  const sloppod = { ...(steering ? { steering: true } : {}), ...(notice ? { notice: true } : {}) };
+function echoUser(session, text, { steering = false, notice = false, summary = null, messageId = randomUUID() } = {}) {
+  const sloppod = {
+    ...(steering ? { steering: true } : {}),
+    ...(notice ? { notice: true } : {}),
+    ...(summary ? { summary } : {}),
+  };
   session.emit({
     sessionUpdate: 'user_message_chunk',
     content: { type: 'text', text },
-    messageId: randomUUID(),
+    messageId,
     ...(steering || notice ? { _meta: { sloppod } } : {}),
   });
 }
@@ -273,7 +282,11 @@ const hasRepoGrant = (session, repo) =>
 /** Gives the session write access to another repository; the first one also becomes its `repo`. */
 function grantRepo(session, repo) {
   if (!hasRepoGrant(session, repo)) {
-    session.data.grants.push({ capability: 'repo', params: { repo, access: 'rw', branch: sessionBranch(session) } });
+    session.data.grants.push({
+      capability: 'repo',
+      params: { repo, access: 'rw', branch: sessionBranch(session) },
+      description: `${repo}: read, and push the session branch \`${sessionBranch(session)}\` and branches named after it.`,
+    });
   }
   if (!session.data.repo) {
     session.data.repo = repo;
@@ -283,14 +296,15 @@ function grantRepo(session, repo) {
 }
 
 /**
- * A request the agent is blocked on until someone answers: a permission request or a question (form
- * elicitation). Sent to every viewer, re-sent to UIs that load the session while it's open; first answer wins.
+ * A request for the user: a permission request or a question (form elicitation). Sent to every viewer, re-sent to
+ * UIs that load the session while it's open; first answer wins. A blocking one belongs to the turn: the session
+ * waits on it and cancelling the turn cancels it. An `ask_user` question isn't blocking.
  */
-function requestFromUser(session, { method, params, toolCallId, cancelled }) {
+function requestFromUser(session, { method, params, toolCallId, cancelled, blocking = true }) {
   return new Promise((resolve) => {
-    const pending = { method, params, toolCallId, cancelled, resolve, requests: new Map() };
+    const pending = { method, params, toolCallId, cancelled, blocking, resolve, requests: new Map() };
     session.pending.set(pending, pending);
-    session.setPhase('waiting');
+    if (blocking) session.setPhase('waiting');
     for (const conn of session.subscribers) sendPending(session, pending, conn);
   });
 }
@@ -321,15 +335,16 @@ function resolvePending(session, pending, result) {
     });
   }
   pending.requests.clear();
-  if (session.data.phase === 'waiting' && session.pending.size === 0) session.setPhase('working');
+  const blocked = [...session.pending.values()].some((other) => other.blocking);
+  if (session.data.phase === 'waiting' && !blocked) session.setPhase('working');
   pending.resolve(result);
 }
 
-async function runTurn(session, text, { echo = true } = {}) {
+async function runTurn(session, text, { echo = true, messageId } = {}) {
   const turn = { cancelled: false, steers: [] };
   session.turn = turn;
   session.setPhase('working');
-  if (echo) echoUser(session, text);
+  if (echo) echoUser(session, text, { messageId });
   if (!session.data.title) {
     const title = text.split('\n')[0].slice(0, 60);
     session.emit({ sessionUpdate: 'session_info_update', title, updatedAt: now() });
@@ -360,7 +375,10 @@ async function runTurn(session, text, { echo = true } = {}) {
     throw error;
   } finally {
     session.turn = null;
-    if (sessions.has(session.data.id) && session.data.phase !== 'stopped') session.setPhase('idle');
+    if (sessions.has(session.data.id) && session.data.phase !== 'stopped') {
+      session.setPhase('idle');
+      startWaiting(session);
+    }
   }
 }
 
@@ -408,6 +426,49 @@ async function agentScript(session, turn, prompt) {
       ],
     });
 
+  if (/ask_user/i.test(prompt)) {
+    await step(1);
+    const askId = randomUUID();
+    tool({ toolCallId: askId, title: 'mcp__sloppod__ask_user', kind: 'other', status: 'pending', rawInput: { questions: [QUESTIONS[0]] } });
+    void requestFromUser(session, {
+      method: 'elicitation/create',
+      params: questionsToElicitation([QUESTIONS[0]], session.data.id),
+      cancelled: { action: 'cancel' },
+      blocking: false,
+    }).then((response) => {
+      const answers = response.action === 'accept' ? summariseAnswers([QUESTIONS[0]], response.content ?? {}) : [];
+      const notice = answers.length
+        ? `sloppod: the user answered your question:\n- ${QUESTIONS[0].question}: ${answers.join(' ')}`
+        : `sloppod: the user dismissed your question without answering it:\n- ${QUESTIONS[0].question}`;
+      void notifyAgent(session, notice, answers.length ? `Thanks, going with that. ${answers.join(' ')}` : "I'll use my own judgement then.");
+    });
+    update(askId, { status: 'completed' });
+    await say("I've asked you about the backoff; I'll carry on meanwhile.");
+    await step(4);
+    await say('Done with the parts that don\'t depend on your answer.');
+    return;
+  }
+
+  if (/long answer/i.test(prompt)) {
+    // Several screens of output in one go, as a long agent message arrives.
+    const messageId = randomUUID();
+    for (let i = 0; i < 2000; i++) {
+      session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'word ' }, messageId });
+    }
+    await say('The end.');
+    return;
+  }
+
+  if (/long history/i.test(prompt)) {
+    // More updates than one page of history, so a reload starts partway through.
+    const messageId = randomUUID();
+    for (let i = 0; i < HISTORY_PAGE + 100; i++) {
+      session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'word ' }, messageId });
+    }
+    await say('The end.');
+    return;
+  }
+
   if (/ask me/i.test(prompt)) {
     await step(2);
     await say('Before I start, a couple of questions.');
@@ -431,6 +492,48 @@ async function agentScript(session, turn, prompt) {
     }
     const answers = summariseAnswers(QUESTIONS, response.content ?? {});
     await say(answers.length ? `Thanks! ${answers.join(' ')}` : "Thanks, though you didn't pick anything.");
+    return;
+  }
+
+  if (session.data.repo && /propose a stack/i.test(prompt)) {
+    await step(2);
+    const proposeId = randomUUID();
+    tool({ toolCallId: proposeId, title: 'mcp__sloppod__propose_stack', kind: 'other', status: 'pending' });
+    await step(2);
+    const proposal = createStack(session);
+    update(proposeId, {
+      status: 'completed',
+      content: [{ type: 'content', content: { type: 'text', text: `Proposal ${proposal.id} created and waiting for human review.` } }],
+    });
+    await say("I've proposed the change as a stack of two pull requests.");
+    return;
+  }
+
+  if (session.data.repo && /tidy the issues/i.test(prompt)) {
+    await step(2);
+    const proposeId = randomUUID();
+    tool({ toolCallId: proposeId, title: 'mcp__sloppod__propose_issue_updates', kind: 'other', status: 'pending' });
+    await step(2);
+    const proposal = createIssueUpdates(session);
+    update(proposeId, {
+      status: 'completed',
+      content: [{ type: 'content', content: { type: 'text', text: `Proposal ${proposal.id} created and waiting for human review.` } }],
+    });
+    await say("I've proposed closing two finished issues and relabelling another.");
+    return;
+  }
+
+  if (session.data.repo && /file issues/i.test(prompt)) {
+    await step(2);
+    const proposeId = randomUUID();
+    tool({ toolCallId: proposeId, title: 'mcp__sloppod__propose_issues', kind: 'other', status: 'pending' });
+    await step(2);
+    const proposal = createIssues(session);
+    update(proposeId, {
+      status: 'completed',
+      content: [{ type: 'content', content: { type: 'text', text: `Proposal ${proposal.id} created and waiting for human review.` } }],
+    });
+    await say("I've proposed three issues for the backlog. They're filed once you approve them.");
     return;
   }
 
@@ -585,6 +688,62 @@ async function agentScript(session, turn, prompt) {
   );
 }
 
+/** A review that asked for changes once, then passed: what a proposal looks like when it reaches the user. */
+function addReview(proposal) {
+  const created = now();
+  const reviewer = new MockSession({
+    id: randomUUID(),
+    title: `Review: ${proposal.payload.title}`,
+    repo: proposal.payload.repo,
+    branch: null,
+    grants: [],
+    phase: 'parked',
+    agent: 'codex',
+    kind: 'review',
+    review: 'off',
+    created_at: created,
+    updated_at: created,
+    active_at: created,
+  });
+  sessions.set(reviewer.data.id, reviewer);
+  proposal.review_session_id = reviewer.data.id;
+  reviews.set(proposal.id, [
+    {
+      round: 1,
+      head_sha: sha(),
+      verdict: 'changes',
+      summary: 'The backoff works, but it never resets.',
+      findings: [
+        {
+          id: '1.1',
+          severity: 'p1',
+          category: 'reliability',
+          title: 'The backoff never resets',
+          path: FILE,
+          line: 12,
+          explanation: 'After any run of failed reconnects, every later reconnect waits the full 10 s.',
+          suggested_fix: 'Reset the attempt counter after a successful session/load.',
+        },
+        { id: '1.2', severity: 'p2', category: 'tests', title: 'No test covers the cap', explanation: 'Nothing checks the 10 s cap.' },
+      ],
+      resolved: [],
+      created_at: now(),
+      finished_at: now(),
+    },
+    {
+      round: 2,
+      head_sha: sha(),
+      replies: 'Reset it after a successful session/load. The cap is a constant; a test would only restate it.',
+      verdict: 'pass',
+      summary: 'The reset is in place, and the reply about the cap is fair.',
+      findings: [],
+      resolved: ['1.1', '1.2'],
+      created_at: now(),
+      finished_at: now(),
+    },
+  ]);
+}
+
 function createProposal(session) {
   const oldFile = `export class AcpConnection {\n  #timer: ReturnType<typeof setTimeout> | undefined;\n\n  connect() {\n    // …\n  }\n\n${OLD_SNIPPET}\n}\n`;
   const newFile = `const MAX_BACKOFF_MS = 10_000;\n\nexport class AcpConnection {\n  #timer: ReturnType<typeof setTimeout> | undefined;\n  #attempt = 0;\n\n  connect() {\n    // …\n  }\n\n${NEW_SNIPPET}\n}\n`;
@@ -620,8 +779,10 @@ function createProposal(session) {
       { sha: sha(), message: 'Test reconnecting after the socket drops' },
     ],
   };
+  if (session.data.review === 'required') addReview(proposal);
   proposals.set(id, proposal);
   broadcastProposal(proposal);
+  applyStandingApproval(proposal);
   return proposal;
 }
 
@@ -636,11 +797,87 @@ function createRepoGrant(session, repo, reason) {
   };
   proposals.set(proposal.id, proposal);
   broadcastProposal(proposal);
+  applyStandingApproval(proposal);
+  return proposal;
+}
+
+function createIssues(session) {
+  const proposal = {
+    id: randomUUID(),
+    session_id: session.data.id,
+    kind: 'github.issue.create',
+    status: 'pending',
+    payload: {
+      repo: session.data.repo,
+      issues: [
+        { title: 'Steers should land at the next tool boundary', body: 'Steering interrupts the running generation.', labels: ['dogfood'] },
+        { title: 'Fail fast on blocked egress', body: 'Blocked connections hang until the client times out.', labels: ['dogfood', 'enforcement'] },
+        { title: 'Show the version in the UI', body: '', labels: [] },
+      ],
+    },
+    created_at: now(),
+  };
+  proposals.set(proposal.id, proposal);
+  broadcastProposal(proposal);
+  applyStandingApproval(proposal);
+  return proposal;
+}
+
+function createIssueUpdates(session) {
+  const proposal = {
+    id: randomUUID(),
+    session_id: session.data.id,
+    kind: 'github.issue.update',
+    status: 'pending',
+    payload: {
+      repo: session.data.repo,
+      updates: [
+        { number: 100, comment: 'Fixed by #148.', close: 'completed', remove_labels: ['priority'] },
+        { number: 65, comment: 'Superseded by #196.', close: 'duplicate' },
+        { number: 59, add_labels: ['priority'], title: 'Startup failures show in the UI' },
+      ],
+    },
+    created_at: now(),
+  };
+  proposals.set(proposal.id, proposal);
+  broadcastProposal(proposal);
+  applyStandingApproval(proposal);
+  return proposal;
+}
+
+function createStack(session) {
+  const branch = session.data.branch;
+  const layer = (file, before, after, message) => ({
+    diff: formatPatch({ ...structuredPatch(`a/${file}`, `b/${file}`, before, after, '', '', { context: 3 }), isGit: true }),
+    commits: [{ sha: sha(), message }],
+  });
+  const proposal = {
+    id: randomUUID(),
+    session_id: session.data.id,
+    kind: 'github.stack.create',
+    status: 'pending',
+    payload: {
+      repo: session.data.repo,
+      base: 'main',
+      pull_requests: [
+        { head: `${branch}-backoff`, base: 'main', head_sha: sha(), title: 'Back off when reconnecting', body: 'The backoff itself.', draft: false },
+        { head: `${branch}-ui`, base: `${branch}-backoff`, head_sha: sha(), title: 'Show the reconnect countdown', body: 'Uses the backoff.', draft: false },
+      ],
+    },
+    created_at: now(),
+    layers: [
+      layer(FILE, 'const DELAY = 1000;\n', 'const MAX_BACKOFF_MS = 10_000;\n', 'Back off exponentially'),
+      layer('ui/src/lib/components/Reconnecting.svelte', '<p>Reconnecting…</p>\n', '<p>Reconnecting in {seconds} s…</p>\n', 'Show the countdown'),
+    ],
+  };
+  proposals.set(proposal.id, proposal);
+  broadcastProposal(proposal);
+  applyStandingApproval(proposal);
   return proposal;
 }
 
 function publicProposal(proposal) {
-  const { diff: _diff, commits: _commits, ...rest } = proposal;
+  const { diff: _diff, commits: _commits, layers: _layers, ...rest } = proposal;
   return rest;
 }
 
@@ -660,8 +897,9 @@ function deriveRepo(prompt) {
   return bare.length === 1 ? bare[0] : null;
 }
 
-/** Creates a session from its first message, which is recorded right away and queued for the agent. */
-function createSession({ prompt, repo, title }) {
+/** Creates a session from its first message, which is recorded right away and queued for the agent; `parent` makes it a
+ * sub-session. */
+function createSession({ prompt, repo, title, parent }) {
   const id = randomUUID();
   const created = now();
   const sessionRepo = repo ?? deriveRepo(prompt);
@@ -672,23 +910,56 @@ function createSession({ prompt, repo, title }) {
     repo: sessionRepo,
     branch,
     grants: [
-      { capability: 'model', params: {} },
-      { capability: 'github', params: {} },
-      { capability: 'packages', params: {} },
-      ...(sessionRepo ? [{ capability: 'repo', params: { repo: sessionRepo, access: 'rw', branch } }] : []),
-      { capability: 'memory', params: { namespace: sessionRepo ?? 'bo0tzz', access: 'rw' } },
+      { capability: 'model', params: {}, description: "Claude's API, with the owner's Claude account." },
+      { capability: 'github', params: {}, description: "GitHub's API and git." },
+      { capability: 'packages', params: {}, description: 'Package registries and tool downloads.' },
+      ...(sessionRepo
+        ? [
+            {
+              capability: 'repo',
+              params: { repo: sessionRepo, access: 'rw', branch },
+              description: `${sessionRepo}: read, and push the session branch \`${branch}\` and branches named after it.`,
+            },
+          ]
+        : []),
+      {
+        capability: 'memory',
+        params: { namespace: sessionRepo ?? 'bo0tzz', access: 'rw' },
+        description: `Long-term memory (memini), in the namespace ${sessionRepo ?? 'bo0tzz'}.`,
+      },
     ],
     phase: 'starting',
+    agent: 'claude-code',
+    kind: 'work',
+    review: settings.review,
     created_at: created,
     updated_at: created,
+    active_at: created,
+    ...(parent ? { parent_id: parent } : {}),
   });
   sessions.set(id, session);
   queuePrompt(session, prompt);
   return session;
 }
 
-function queuePrompt(session, text, done = () => {}, fail = () => {}) {
-  echoUser(session, text);
+/** Messages queued behind the running turn, `{ id, text, resolve, reject }`; UIs show them and can steer them in. */
+const waitingList = (session) => (session.waiting ??= []);
+
+function broadcastQueue(session, conns = session.subscribers) {
+  const messages = waitingList(session).map(({ id, text }) => ({ id, prompt: [{ type: 'text', text }] }));
+  for (const conn of conns ?? []) conn.notify('_sloppod/queue', { sessionId: session.data.id, messages });
+}
+
+/** Like the runtime, runs the next queued message once a turn ends. */
+function startWaiting(session) {
+  const next = waitingList(session).shift();
+  if (!next) return;
+  broadcastQueue(session);
+  runTurn(session, next.text, { messageId: next.id }).then(next.resolve, next.reject);
+}
+
+function queuePrompt(session, text, done = () => {}, fail = () => {}, messageId = undefined) {
+  echoUser(session, text, { messageId });
   session.queue.push({ text, done, fail });
 }
 
@@ -699,6 +970,8 @@ function startAgent(session, ms) {
     session.startTimer = null;
     if (!sessions.has(session.data.id)) return;
     rememberModels();
+    delete session.data.agent_status;
+    delete session.data.agent_error;
     session.setPhase('idle');
     const items = session.queue.splice(0);
     if (items.length === 0) return;
@@ -716,11 +989,25 @@ function startAgent(session, ms) {
 /** The runtime remembers the models the agent offered, for the settings page. */
 const rememberModels = () => (settings.models = MODELS.map(({ value, name }) => ({ value, name })));
 
-const startupDelay = (prompt) => (/slow start/i.test(prompt) ? 3000 : DELAY * 8);
+/** Like a pod whose first start fails: a status, then the error, then a start that works. */
+function failStart(session) {
+  session.data.agent_status = 'cloning https://github.com/bo0tzz/sloppod.git';
+  setTimeout(() => {
+    const error = 'preparing the pod: git clone exited with status 128';
+    delete session.data.agent_status;
+    session.data.agent_error = error;
+    session.emit({ sessionUpdate: 'notice', severity: 'error', title: "The session's pod couldn't start the agent", description: error });
+    session.broadcast();
+  }, 1000);
+}
+
+const startupDelay = (prompt) => (/slow start|failing start/i.test(prompt) ? 3000 : DELAY * 8);
 
 function cancelTurn(session) {
   if (session.turn) session.turn.cancelled = true;
-  for (const pending of [...session.pending.values()]) resolvePending(session, pending, pending.cancelled);
+  for (const pending of [...session.pending.values()]) {
+    if (pending.blocking) resolvePending(session, pending, pending.cancelled);
+  }
 }
 
 // --- ACP over WebSocket ---------------------------------------------------------------------
@@ -752,35 +1039,85 @@ function handleCall(conn, message) {
         conn.error(id, -32602, `Unknown session ${params.sessionId}`);
         return;
       }
-      for (const entry of session.log) conn.notify('session/update', entry);
+      // Like the runtime: only the latest of the log, with where to ask for older pages. An update's seq is its
+      // position in the log, from 1.
+      const start = Math.max(0, session.log.length - HISTORY_PAGE);
+      for (const entry of session.log.slice(start)) conn.notify('session/update', entry);
       session.subscribers.add(conn);
       conn.loaded.add(session.data.id);
-      conn.respond(id, { configOptions: session.configOptions() });
+      // Like the runtime: the queue before the response.
+      broadcastQueue(session, [conn]);
+      conn.respond(id, {
+        configOptions: session.configOptions(),
+        _meta: { sloppod: { historyBefore: start > 0 ? start + 1 : null } },
+      });
       for (const pending of session.pending.values()) sendPending(session, pending, conn);
+      return;
+    }
+
+    case '_sloppod/history': {
+      if (!needLoaded()) return;
+      const end = Math.max(0, Math.min(session.log.length, Number(params.before) - 1));
+      const start = Math.max(0, end - HISTORY_PAGE);
+      conn.respond(id, {
+        updates: session.log.slice(start, end).map((entry) => entry.update),
+        before: start > 0 ? start + 1 : null,
+      });
       return;
     }
 
     case 'session/prompt': {
       if (!needLoaded()) return;
+      const messageId = params._meta?.sloppod?.messageId ?? randomUUID();
+      // Like the runtime: a message sent again isn't run twice.
+      const received = session.log.some(
+        (entry) => entry.update.sessionUpdate === 'user_message_chunk' && entry.update.messageId === messageId,
+      );
+      if (received || waitingList(session).some((waiting) => waiting.id === messageId)) {
+        conn.respond(id, { stopReason: 'end_turn', _meta: { sloppod: { alreadyReceived: true } } });
+        return;
+      }
+      // Tests drop the connection as a prompt arrives, before or after the runtime takes it.
+      const drop = dropNextPrompt;
+      dropNextPrompt = null;
+      if (drop === 'before') {
+        conn.ws.terminate();
+        return;
+      }
+      // Dropped as soon as the prompt is taken, so this connection never hears about it, e.g. its queue entry.
+      if (drop === 'after') conn.ws.terminate();
+      if (failNextPrompt && drop === null) {
+        failNextPrompt = false;
+        conn.error(id, -32000, 'the runtime refused it');
+        return;
+      }
+      if (session.data.phase === 'parked') session.setPhase('starting');
       if (session.data.phase === 'starting' || session.data.phase === 'disconnected') {
         queuePrompt(
           session,
           promptText(params.prompt),
           (stopReason) => conn.respond(id, { stopReason }),
           (error) => conn.error(id, -32603, String(error)),
+          messageId,
         );
         startAgent(session, DELAY * 8);
         return;
       }
       if (session.turn) {
-        conn.error(id, -32000, 'A turn is already running; use _session/steering');
+        waitingList(session).push({
+          id: messageId,
+          text: promptText(params.prompt),
+          resolve: (stopReason) => conn.respond(id, { stopReason }),
+          reject: (error) => conn.error(id, -32603, String(error)),
+        });
+        broadcastQueue(session);
         return;
       }
       if (session.data.phase !== 'idle') {
         conn.error(id, -32000, `The session is ${session.data.phase}`);
         return;
       }
-      runTurn(session, promptText(params.prompt)).then(
+      runTurn(session, promptText(params.prompt), { messageId }).then(
         (stopReason) => conn.respond(id, { stopReason }),
         (error) => conn.error(id, -32603, String(error)),
       );
@@ -790,6 +1127,28 @@ function handleCall(conn, message) {
     case 'session/cancel':
       if (session) cancelTurn(session);
       return;
+
+    case '_sloppod/steer_queued': {
+      if (!needLoaded()) return;
+      const waiting = waitingList(session);
+      const index = waiting.findIndex((message) => message.id === params.id);
+      if (index < 0) {
+        conn.error(id, -32002, "that message isn't queued any more");
+        return;
+      }
+      const [message] = waiting.splice(index, 1);
+      broadcastQueue(session);
+      if (session.turn) {
+        echoUser(session, message.text, { steering: true });
+        session.turn.steers.push({ text: message.text });
+        conn.respond(id, { outcome: 'injected' });
+        message.resolve('end_turn');
+      } else {
+        runTurn(session, message.text).then(message.resolve, message.reject);
+        conn.respond(id, { outcome: 'startedNewTurn' });
+      }
+      return;
+    }
 
     case '_session/steering': {
       if (!needLoaded()) return;
@@ -856,7 +1215,10 @@ async function readBody(req) {
 }
 
 const sortedSessions = () =>
-  [...sessions.values()].map((s) => s.data).sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
+  [...sessions.values()]
+    .map((s) => s.data)
+    .filter((d) => d.kind === 'work' && !d.deleted_at)
+    .sort((a, b) => Date.parse(b.active_at) - Date.parse(a.active_at));
 
 async function handleApi(req, res, url) {
   const parts = url.pathname.replace(/^\/api\/v1\/?/, '').split('/').filter(Boolean);
@@ -864,10 +1226,11 @@ async function handleApi(req, res, url) {
 
   if (parts[0] === 'repos' && parts.length === 1 && method === 'GET') return json(res, 200, availableRepos());
   if (parts[0] === 'me' && parts.length === 1 && method === 'GET') {
-    return json(res, 200, { user: req.headers['x-forwarded-user'] ?? 'bo0tzz' });
+    return json(res, 200, { user: req.headers['x-forwarded-user'] ?? 'bo0tzz', build: 'v0.0.0-mock' });
   }
 
   if (parts[0] === 'credentials') return handleCredentials(req, res, parts);
+  if (parts[0] === 'standing-approvals') return handleStandingApprovals(req, res, parts);
 
   if (parts[0] === 'settings' && parts.length === 1) {
     if (method === 'GET') return json(res, 200, settings);
@@ -876,6 +1239,10 @@ async function handleApi(req, res, url) {
       if ('model' in body) {
         if (body.model !== null && typeof body.model !== 'string') return json(res, 400, { error: 'model must be a string or null' });
         settings.model = body.model || null;
+      }
+      if ('review' in body) {
+        if (!['off', 'required'].includes(body.review)) return json(res, 400, { error: 'review must be one of off, required' });
+        settings.review = body.review;
       }
       return json(res, 200, settings);
     }
@@ -894,11 +1261,39 @@ async function handleApi(req, res, url) {
       }
       const session = createSession(body);
       startAgent(session, startupDelay(body.prompt));
+      if (/failing start/i.test(body.prompt)) failStart(session);
       return json(res, 201, session.data);
+    }
+    if (parts.length === 2 && parts[1] === 'deleted' && method === 'GET') {
+      return json(res, 200, [...sessions.values()].map((s) => s.data).filter((d) => d.deleted_at));
     }
     const session = sessions.get(parts[1]);
     if (!session) return json(res, 404, { error: 'session not found' });
     if (parts.length === 2 && method === 'GET') return json(res, 200, session.data);
+    if (parts.length === 3 && parts[2] === 'review' && method === 'PUT') {
+      const body = await readBody(req);
+      if (!['off', 'required'].includes(body.review)) return json(res, 400, { error: 'review must be one of off, required' });
+      session.data.review = body.review;
+      session.broadcast();
+      return json(res, 200, session.data);
+    }
+    if (parts.length === 3 && parts[2] === 'park' && method === 'POST') {
+      if (session.data.phase === 'working' || session.data.phase === 'waiting') {
+        return json(res, 409, { error: 'the session is in a turn; stop it or let it finish before parking' });
+      }
+      session.setPhase('parked');
+      return json(res, 200, session.data);
+    }
+    if (parts.length === 3 && parts[2] === 'wake' && method === 'POST' && session.data.deleted_at) {
+      return json(res, 409, { error: 'the session is deleted; restore it first' });
+    }
+    if (parts.length === 3 && parts[2] === 'wake' && method === 'POST') {
+      if (session.data.phase === 'parked') {
+        session.setPhase('starting');
+        startAgent(session, DELAY * 8);
+      }
+      return json(res, 200, session.data);
+    }
     if (parts.length === 3 && parts[2] === 'repos' && method === 'POST') {
       const body = await readBody(req);
       if (!availableRepos().includes(body.repo)) return json(res, 400, { error: `unknown repository ${body.repo}` });
@@ -914,11 +1309,26 @@ async function handleApi(req, res, url) {
       return json(res, 200, session.data);
     }
     if (parts.length === 2 && method === 'DELETE') {
-      cancelTurn(session);
-      session.setPhase('stopped');
-      sessions.delete(session.data.id);
+      // Its sub-sessions go with it, at any depth, also below ones already deleted.
+      const tree = [session];
+      for (let i = 0; i < tree.length; i++) {
+        for (const other of sessions.values()) {
+          if (other.data.parent_id === tree[i].data.id) tree.push(other);
+        }
+      }
+      for (const doomed of tree.filter((s) => s === session || !s.data.deleted_at)) {
+        cancelTurn(doomed);
+        doomed.data.deleted_at = now();
+        doomed.setPhase('parked');
+      }
       res.writeHead(204).end();
       return;
+    }
+    if (parts.length === 3 && parts[2] === 'restore' && method === 'POST') {
+      if (!session.data.deleted_at) return json(res, 404, { error: 'not found' });
+      delete session.data.deleted_at;
+      session.broadcast();
+      return json(res, 200, session.data);
     }
   }
 
@@ -934,6 +1344,7 @@ async function handleApi(req, res, url) {
     const proposal = proposals.get(parts[1]);
     if (!proposal) return json(res, 404, { error: 'proposal not found' });
     if (parts.length === 2 && method === 'GET') return json(res, 200, proposal);
+    if (parts.length === 3 && parts[2] === 'reviews' && method === 'GET') return json(res, 200, reviews.get(proposal.id) ?? []);
     if (parts.length === 3 && method === 'POST' && (parts[2] === 'approve' || parts[2] === 'reject')) {
       if (proposal.status !== 'pending') return json(res, 409, { error: `proposal is already ${proposal.status}` });
       const body = await readBody(req);
@@ -946,24 +1357,8 @@ async function handleApi(req, res, url) {
         if (body.reason) proposal.reason = body.reason;
         notice = `Your proposal was rejected${body.reason ? `: ${body.reason}` : '.'}`;
         ack = "Understood, I'll leave that be.";
-      } else if (proposal.kind === 'github.pr.create') {
-        if (typeof body.title === 'string') proposal.payload.title = body.title;
-        if (typeof body.body === 'string') proposal.payload.body = body.body;
-        if (typeof body.auto_merge === 'boolean') proposal.payload.auto_merge = body.auto_merge;
-        const number = 100 + proposals.size;
-        proposal.status = 'executed';
-        proposal.result = { url: `https://github.com/${proposal.payload.repo}/pull/${number}`, number };
-        notice = `Your pull request was approved and opened: ${proposal.result.url}`;
-        ack = 'Great, the pull request is open.';
-      } else if (proposal.kind === 'sloppod.repo.grant') {
-        proposal.status = 'executed';
-        if (session) grantRepo(session, proposal.payload.repo);
-        notice = `You now have write access to ${proposal.payload.repo} on ${proposal.payload.branch}.`;
-        ack = `Thanks, I can push to ${proposal.payload.repo} now.`;
       } else {
-        proposal.status = 'executed';
-        notice = `Your ${proposal.kind} proposal was approved.`;
-        ack = 'Thanks.';
+        return json(res, 200, approve(proposal, body, 'dev'));
       }
       broadcastProposal(proposal);
       if (session) void notifyAgent(session, notice, ack);
@@ -974,7 +1369,105 @@ async function handleApi(req, res, url) {
   return json(res, 404, { error: 'not found' });
 }
 
-const CREDENTIAL_CONFIG = { claude: [], 'github-app': ['app_id'], memini: ['url'] };
+/** Approves a proposal; like the runtime, it answers right away and the outcome follows as a proposal update. */
+function approve(proposal, body, decidedBy) {
+  const session = sessions.get(proposal.session_id);
+  proposal.decided_at = now();
+  proposal.decided_by = decidedBy;
+  let notice;
+  let ack;
+  if (proposal.kind === 'github.pr.create') {
+    if (typeof body.title === 'string') proposal.payload.title = body.title;
+    if (typeof body.body === 'string') proposal.payload.body = body.body;
+    if (typeof body.auto_merge === 'boolean') proposal.payload.auto_merge = body.auto_merge;
+    const number = 100 + proposals.size;
+    proposal.status = 'executed';
+    proposal.result = { url: `https://github.com/${proposal.payload.repo}/pull/${number}`, number };
+    notice = `Your pull request was approved and opened: ${proposal.result.url}`;
+    ack = 'Great, the pull request is open.';
+  } else if (proposal.kind === 'github.stack.create') {
+    if (typeof body.auto_merge === 'boolean') proposal.payload.auto_merge = body.auto_merge;
+    const opened = proposal.payload.pull_requests.map((_, index) => {
+      const number = 300 + proposals.size * 10 + index;
+      return { url: `https://github.com/${proposal.payload.repo}/pull/${number}`, number };
+    });
+    proposal.status = 'executed';
+    const merging = proposal.payload.auto_merge ? ' The stack merges once its required checks pass.' : '';
+    proposal.result = { pull_requests: opened, stack: 7, auto_merge: Boolean(proposal.payload.auto_merge), message: `Opened ${opened.map((p) => p.url).join(', ')} as stack #7.${merging}` };
+    notice = `Your stack was approved. ${proposal.result.message}`;
+    ack = 'Great, the stack is open.';
+  } else if (proposal.kind === 'github.issue.update') {
+    if (Array.isArray(body.updates)) proposal.payload.updates = body.updates;
+    const updated = proposal.payload.updates.map((u) => ({ number: u.number }));
+    proposal.status = 'executed';
+    proposal.result = { updated, failed: [], message: `Updated ${updated.map((u) => `#${u.number}`).join(', ')}.` };
+    notice = `Your issue updates were approved and made: ${proposal.result.message}`;
+    ack = 'Thanks, the tracker is tidy.';
+  } else if (proposal.kind === 'github.issue.create') {
+    if (Array.isArray(body.issues)) proposal.payload.issues = body.issues;
+    const filed = proposal.payload.issues.map((issue, index) => {
+      const number = 200 + proposals.size * 10 + index;
+      return { title: issue.title, url: `https://github.com/${proposal.payload.repo}/issues/${number}`, number };
+    });
+    proposal.status = 'executed';
+    proposal.result = { issues: filed, failed: [], message: `Filed ${filed.map((i) => `#${i.number}`).join(', ')}.` };
+    notice = `Your issues were approved and filed: ${filed.map((i) => i.url).join(', ')}`;
+    ack = 'Thanks, the issues are filed.';
+  } else if (proposal.kind === 'sloppod.repo.grant') {
+    proposal.status = 'executed';
+    if (session) grantRepo(session, proposal.payload.repo);
+    notice = `You now have write access to ${proposal.payload.repo} on ${proposal.payload.branch}.`;
+    ack = `Thanks, I can push to ${proposal.payload.repo} now.`;
+  } else {
+    proposal.status = 'executed';
+    notice = `Your ${proposal.kind} proposal was approved.`;
+    ack = 'Thanks.';
+  }
+  // Like the runtime, approving answers right away and the outcome follows as a proposal update.
+  const approved = { ...publicProposal(proposal), status: 'approved', result: undefined };
+  setTimeout(() => {
+    broadcastProposal(proposal);
+    if (session) void notifyAgent(session, notice, ack);
+  }, DELAY * 4);
+  return approved;
+}
+
+/** Standing approvals (`{ id, kind, target, edits, expires_at }`); matching proposals are approved as they're made. */
+const standingApprovals = [];
+
+function applyStandingApproval(proposal) {
+  const match = standingApprovals.find(
+    (a) =>
+      a.kind === proposal.kind &&
+      a.session_id === proposal.session_id &&
+      (!a.target || a.target.toLowerCase() === String(proposal.payload.repo ?? '').toLowerCase()) &&
+      (!a.expires_at || Date.parse(a.expires_at) > Date.now()),
+  );
+  if (match) broadcastProposal(approve(proposal, match.edits ?? {}, `standing-approval:${match.id}`));
+}
+
+function handleStandingApprovals(req, res, parts) {
+  const method = req.method;
+  if (parts.length === 1 && method === 'GET') return json(res, 200, standingApprovals);
+  if (parts.length === 1 && method === 'POST') {
+    return readBody(req).then((body) => {
+      if (!body.session_id) return json(res, 400, { error: 'a standing approval is for one session; give its session_id' });
+      const approval = { id: randomUUID(), kind: body.kind, session_id: body.session_id, target: body.target, edits: body.edits ?? {}, expires_at: body.expires_at, created_at: now() };
+      standingApprovals.push(approval);
+      return json(res, 201, approval);
+    });
+  }
+  if (parts.length === 2 && method === 'DELETE') {
+    const index = standingApprovals.findIndex((a) => a.id === parts[1]);
+    if (index < 0) return json(res, 404, { error: 'not found' });
+    standingApprovals.splice(index, 1);
+    res.writeHead(204).end();
+    return;
+  }
+  return json(res, 404, { error: 'not found' });
+}
+
+const CREDENTIAL_CONFIG = { claude: [], 'github-app': ['app_id'], memini: ['url'], chatgpt: [] };
 
 function addCredential({ kind, name, config }) {
   const credential = {
@@ -1068,6 +1561,7 @@ async function seed() {
   first.alwaysAllow = false;
   first.data.created_at = ago(95);
   first.data.updated_at = ago(12);
+  first.data.active_at = ago(12);
   for (const proposal of proposals.values()) proposal.created_at = ago(13);
 
   const second = seeded({
@@ -1094,12 +1588,14 @@ async function seed() {
   second.data.phase = 'stopped';
   second.data.created_at = ago(60 * 26);
   second.data.updated_at = ago(60 * 24);
+  second.data.active_at = ago(60 * 24);
 
   const third = seeded({ prompt: 'Bump kopium to 0.24 and regenerate the CRDs.', repo: 'bo0tzz/sloppod', title: 'Bump kopium to 0.24' });
   reply(third, 'On it. Updating `mise.toml` first.');
   third.data.phase = 'disconnected';
   third.data.created_at = ago(40);
   third.data.updated_at = ago(3);
+  third.data.active_at = ago(3);
 
   const fourth = seeded({ prompt: 'What does park and wake mean for a session?', title: 'Park and wake' });
   reply(
@@ -1118,14 +1614,51 @@ async function seed() {
   proposals.set(unknown.id, unknown);
   fourth.data.created_at = ago(60 * 3);
   fourth.data.updated_at = ago(60 * 2);
+  fourth.data.active_at = ago(60 * 2);
 }
 
 // --- server ---------------------------------------------------------------------------------
+
+/** Set by `/_mock/drop-next-prompt`: drop the connection the next prompt arrives on, before or after taking it. */
+let dropNextPrompt = null;
+/** Set by `/_mock/fail-next-prompt`: refuse the next prompt that isn't dropped, without taking it. */
+let failNextPrompt = false;
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   try {
     if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
+    if (url.pathname === '/_mock/fail-next-prompt' && req.method === 'POST') {
+      failNextPrompt = true;
+      return json(res, 200, { failNextPrompt });
+    }
+    if (url.pathname === '/_mock/drop-next-prompt' && req.method === 'POST') {
+      dropNextPrompt = url.searchParams.get('when') === 'after' ? 'after' : 'before';
+      return json(res, 200, { dropNextPrompt });
+    }
+    if (url.pathname === '/_mock/say' && req.method === 'POST') {
+      // More output in every session, as if its agent carried on.
+      const text = url.searchParams.get('text') ?? '';
+      for (const session of sessions.values()) {
+        session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text }, messageId: randomUUID() });
+      }
+      return json(res, 200, {});
+    }
+    if (url.pathname === '/_mock/spawn' && req.method === 'POST') {
+      // A sub-session of `parent`, as if its agent called spawn_session.
+      const parent = sessions.get(url.searchParams.get('parent') ?? '');
+      if (!parent) return json(res, 404, { error: 'no such session' });
+      const task = url.searchParams.get('task') ?? 'A sub-task';
+      const child = createSession({ prompt: task, repo: parent.data.repo ?? undefined, title: task, parent: parent.data.id });
+      return json(res, 200, child.data);
+    }
+    if (url.pathname === '/_mock/notice' && req.method === 'POST') {
+      // A notice in every session, folded under `summary` if given, as a message from another session is.
+      const text = url.searchParams.get('text') ?? '';
+      const summary = url.searchParams.get('summary');
+      for (const session of sessions.values()) echoUser(session, text, { notice: true, summary });
+      return json(res, 200, {});
+    }
     if (url.pathname === '/_mock/drop' && req.method === 'POST') {
       for (const conn of connections) conn.ws.terminate();
       return json(res, 200, { dropped: connections.size });

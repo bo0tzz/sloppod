@@ -13,10 +13,31 @@ use axum::http::{HeaderName, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use sloppod_contracts::{Decision, HttpRequest, RequestPolicy};
 
+use crate::credentials::MEMINI;
 use crate::{AppState, db};
 
 /// Where sessions find memini on the runtime's sessions port.
 pub const PREFIX: &str = "/memini";
+
+/// The memini path and query a request is for, in the one form the policy checks and memini receives: read by the
+/// shared path parser, then encoded again, so a `/` within a segment (as in a namespace) stays within it.
+fn canonical_path(path_and_query: &str) -> anyhow::Result<String> {
+    let (path, query) = match path_and_query.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (path_and_query, None),
+    };
+    let segments = sloppod_contracts::path_segments(path)?;
+    let mut canonical = reqwest::Url::parse("http://memini.invalid/")?;
+    canonical
+        .path_segments_mut()
+        .map_err(|()| anyhow::anyhow!("no path"))?
+        .extend(&segments);
+    canonical.set_query(query);
+    Ok(match canonical.query() {
+        Some(query) => format!("{}?{query}", canonical.path()),
+        None => canonical.path().to_owned(),
+    })
+}
 const MAX_BODY: usize = 8 << 20;
 
 /// Streams responses (MCP uses server-sent events), so there's no overall timeout.
@@ -59,7 +80,8 @@ pub async fn proxy(
 }
 
 async fn forward(state: &AppState, peer: SocketAddr, request: Request) -> anyhow::Result<Response> {
-    let Some(session) = state.pods.session_for_ip(&peer.ip().to_string()) else {
+    let Some(session) = crate::identity::calling_session(state, request.headers(), peer.ip()).await
+    else {
         return Ok((
             StatusCode::FORBIDDEN,
             "sloppod: memory is only for session pods\n",
@@ -69,7 +91,19 @@ async fn forward(state: &AppState, peer: SocketAddr, request: Request) -> anyhow
     let session = db::get_session(&state.db, session)
         .await?
         .context("unknown session")?;
-    let Some((_, credential)) = state.credentials.memini(&session.owner).await? else {
+    if let Some(why) = session.not_acting() {
+        return Ok((
+            StatusCode::FORBIDDEN,
+            format!("sloppod: this session is {why}, so it has no memory\n"),
+        )
+            .into_response());
+    }
+    // Only its URL is needed here; the admin key stays sealed.
+    let Some(credential) = state
+        .credentials
+        .default_row(&session.owner, MEMINI)
+        .await?
+    else {
         return Ok((StatusCode::NOT_FOUND, "sloppod: no memini is configured\n").into_response());
     };
     let base = credential
@@ -88,6 +122,9 @@ async fn forward(state: &AppState, peer: SocketAddr, request: Request) -> anyhow
         Some(rest) if rest.starts_with('/') => rest.to_owned(),
         Some(rest) => format!("/{rest}"),
         None => path_and_query.to_owned(),
+    };
+    let Ok(path) = canonical_path(&path) else {
+        return Ok((StatusCode::BAD_REQUEST, "sloppod: invalid memini path\n").into_response());
     };
     let body = axum::body::to_bytes(body, MAX_BODY)
         .await
@@ -121,7 +158,7 @@ async fn forward(state: &AppState, peer: SocketAddr, request: Request) -> anyhow
         Decision::Allow {
             set_headers,
             remove_headers,
-        } => (set_headers, remove_headers),
+        } => sloppod_contracts::header_ops(set_headers, remove_headers),
         Decision::Deny {
             status,
             message,
@@ -163,4 +200,32 @@ async fn forward(state: &AppState, peer: SocketAddr, request: Request) -> anyhow
         }
     }
     Ok(proxied.body(Body::from_stream(response.bytes_stream()))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_are_canonical() {
+        for (raw, canonical) in [
+            ("/v1/memories", "/v1/memories"),
+            ("/v1/%6Beys", "/v1/keys"),
+            ("/v1//keys/", "/v1/keys"),
+            ("/v1/memories?q=a%20b", "/v1/memories?q=a%20b"),
+            ("/v1/namespaces/a%2Fb", "/v1/namespaces/a%2Fb"),
+            ("/", "/"),
+        ] {
+            assert_eq!(canonical_path(raw).unwrap(), canonical, "{raw}");
+        }
+        // Dot segments are refused, not resolved: the policy and memini can't read them differently.
+        for raw in [
+            "/v1/x/../pins",
+            "/v1/x/%2e%2e/keys",
+            "/v1/./memories",
+            "/../../v1/keys",
+        ] {
+            assert!(canonical_path(raw).is_err(), "{raw}");
+        }
+    }
 }

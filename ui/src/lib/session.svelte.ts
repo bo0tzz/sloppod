@@ -1,4 +1,10 @@
-import { AcpConnection, acpUrl, type ConnectionState, type RequestId } from './acp/connection.ts';
+import {
+  AcpConnection,
+  acpUrl,
+  ConnectionClosedError,
+  type ConnectionState,
+  type RequestId,
+} from './acp/connection.ts';
 import { Transcript } from './acp/transcript.svelte.ts';
 import type {
   ContentBlock,
@@ -12,11 +18,17 @@ import type {
   SessionUpdate,
   StopReason,
 } from './acp/types.ts';
-import { api, ApiError, newerSession, type Proposal, type Session } from './api.ts';
+import { api, ApiError, newerProposal, newerSession, type Proposal, type Session } from './api.ts';
+import { loadUnconfirmed, saveUnconfirmed } from './drafts.ts';
 import { sessions } from './sessions.svelte.ts';
 
 export type PendingPermission = RequestPermissionRequest & { rpcId: RequestId };
 export type PendingQuestion = ElicitationRequest & { rpcId: RequestId };
+/** A message waiting for the running turn to end (`_sloppod/queue`). */
+export type QueuedMessage = { id: string; prompt: ContentBlock[] };
+
+export const queuedText = (message: QueuedMessage) =>
+  message.prompt.map((block) => (block.type === 'text' ? block.text : '')).join('');
 
 const textPrompt = (text: string): ContentBlock[] => [{ type: 'text', text }];
 
@@ -31,6 +43,11 @@ export class SessionView {
   loaded = $state(false);
   connection = $state<ConnectionState>('connecting');
   connectionError = $state<string | null>(null);
+  /** Why the session's REST side (the session and its proposals) didn't load; it's retried meanwhile. */
+  loadError = $state<string | null>(null);
+  #loadFailures = 0;
+  #loadRetry: ReturnType<typeof setTimeout> | undefined;
+  #stopped = false;
 
   configOptions = $state<SessionConfigOption[]>([]);
   /** The agent's model picker, if it offers one. */
@@ -44,6 +61,8 @@ export class SessionView {
 
   /** Prompts sent from here whose turn hasn't ended. Queued prompts all resolve when their shared turn ends. */
   promptsInFlight = $state(0);
+  /** Messages waiting for the running turn to end. */
+  queue = $state<QueuedMessage[]>([]);
 
   turnRunning = $derived(
     this.promptsInFlight > 0 || this.session?.phase === 'working' || this.session?.phase === 'waiting',
@@ -52,9 +71,21 @@ export class SessionView {
   #conn: AcpConnection;
   /** Receives the history replay of a (re)load, and replaces `transcript` once the load completes. */
   #replay: Transcript | null = null;
+  /** The updates `transcript` is built from, oldest first, so older history can go in front of them. */
+  #updates: SessionUpdate[] = [];
+  #replayUpdates: SessionUpdate[] | null = null;
+  /** Where to ask for older history, when the session has more than was loaded; `null` once it's all here. */
+  historyBefore = $state<number | null>(null);
+  loadingHistory = $state(false);
+  /** Messages a dropped connection cut off before the runtime confirmed them; the next load settles each. */
+  #unconfirmed: { id: string; text: string }[] = [];
+  /** Messages that couldn't be delivered, kept until the user puts each back or dismisses it. */
+  undelivered = $state<{ id: string; text: string }[]>([]);
 
   constructor(id: string) {
     this.id = id;
+    // Sent before a reload and never confirmed: settled like any other once the session loads.
+    this.#unconfirmed = loadUnconfirmed(id);
     this.#conn = new AcpConnection(acpUrl(), {
       onReady: (connection) => this.#onReady(connection),
       onNotification: (method, params) => this.#onNotification(method, params),
@@ -72,6 +103,7 @@ export class SessionView {
   }
 
   start() {
+    this.#stopped = false;
     void this.refresh();
     this.#conn.connect();
     document.addEventListener('visibilitychange', this.#onVisible);
@@ -79,6 +111,8 @@ export class SessionView {
   }
 
   stop() {
+    this.#stopped = true;
+    clearTimeout(this.#loadRetry);
     document.removeEventListener('visibilitychange', this.#onVisible);
     window.removeEventListener('online', this.#onVisible);
     this.#conn.close();
@@ -88,8 +122,13 @@ export class SessionView {
     if (document.visibilityState === 'visible') this.#conn.reconnectNow();
   };
 
-  /** Refetches the REST side: the session itself and its proposals. */
+  /**
+   * Refetches the REST side: the session itself and its proposals. A failure is retried with backoff, since nothing
+   * else would fetch them again until a reconnect.
+   */
   async refresh() {
+    if (this.#stopped) return;
+    clearTimeout(this.#loadRetry);
     try {
       const [session, proposals] = await Promise.all([
         api.getSession(this.id),
@@ -97,11 +136,20 @@ export class SessionView {
       ]);
       this.setSession(session);
       for (const proposal of proposals) this.upsertProposal(proposal);
+      this.loadError = null;
+      this.#loadFailures = 0;
     } catch (error) {
       if (error instanceof ApiError && error.status === 404) {
         this.notFound = true;
         this.stop();
+        return;
       }
+      if (this.#stopped) return;
+      this.loadError = error instanceof Error ? error.message : String(error);
+      // Overlapping refreshes (a reconnect during a retry) can both fail; only one retry stays scheduled.
+      clearTimeout(this.#loadRetry);
+      const delay = Math.min(30_000, 1000 * 2 ** this.#loadFailures++);
+      this.#loadRetry = setTimeout(() => void this.refresh(), delay);
     }
   }
 
@@ -115,6 +163,7 @@ export class SessionView {
 
     const rest = this.loaded ? this.refresh() : Promise.resolve();
     this.#replay = new Transcript();
+    this.#replayUpdates = [];
     try {
       const response = await connection.request<LoadSessionResponse>('session/load', {
         sessionId: this.id,
@@ -122,11 +171,15 @@ export class SessionView {
         mcpServers: [],
       });
       this.transcript = this.#replay;
+      this.#updates = this.#replayUpdates;
+      this.historyBefore = (response?._meta?.sloppod as { historyBefore?: number | null } | undefined)?.historyBefore ?? null;
       this.configOptions = response?.configOptions ?? [];
     } finally {
       this.#replay = null;
+      this.#replayUpdates = null;
     }
     this.loaded = true;
+    this.#settleUnconfirmed();
     await rest;
   }
 
@@ -140,6 +193,11 @@ export class SessionView {
       case '_sloppod/session': {
         const { session } = params as { session: Session };
         if (session.id === this.id) this.setSession(session);
+        break;
+      }
+      case '_sloppod/queue': {
+        const { sessionId, messages } = params as { sessionId: string; messages: QueuedMessage[] };
+        if (sessionId === this.id) this.queue = messages;
         break;
       }
       case '_sloppod/proposal': {
@@ -198,6 +256,30 @@ export class SessionView {
         return;
     }
     (this.#replay ?? this.transcript).apply(update);
+    (this.#replayUpdates ?? this.#updates).push(update);
+  }
+
+  /** Puts the page of history before what's loaded in front of it. */
+  async loadEarlier() {
+    const before = this.historyBefore;
+    if (before === null || this.loadingHistory || this.#replay) return;
+    this.loadingHistory = true;
+    try {
+      const page = await this.#conn.request<{ updates: SessionUpdate[]; before: number | null }>('_sloppod/history', {
+        sessionId: this.id,
+        before,
+      });
+      // A reload meanwhile has replaced what this page goes in front of.
+      if (this.historyBefore !== before || !page) return;
+      const transcript = new Transcript();
+      const updates = [...page.updates, ...this.#updates];
+      for (const update of updates) transcript.apply(update);
+      this.#updates = updates;
+      this.transcript = transcript;
+      this.historyBefore = page.before;
+    } finally {
+      this.loadingHistory = false;
+    }
   }
 
   setSession(session: Session) {
@@ -210,39 +292,82 @@ export class SessionView {
     if (index === -1) {
       this.proposals.push(proposal);
     } else {
-      this.proposals[index] = proposal;
+      this.proposals[index] = newerProposal(this.proposals[index], proposal);
     }
   }
 
-  /** Starts a turn. The returned promise settles with the stop reason when the turn ends. */
-  async prompt(text: string): Promise<StopReason | undefined> {
+  /**
+   * Starts a turn. The returned promise settles with the stop reason when the turn ends. The message carries an id
+   * the runtime records it under, so if the connection drops first, the next load can tell whether it arrived: if
+   * not, it's sent again once, and if that fails it ends up in `undelivered`.
+   */
+  async prompt(text: string, id: string = crypto.randomUUID()): Promise<StopReason | undefined> {
     this.promptsInFlight++;
+    // Kept until the runtime answers, so a page reload before then can still tell whether it arrived.
+    this.#keepSending(id, text);
     try {
       const result = await this.#conn.request<{ stopReason: StopReason }>('session/prompt', {
         sessionId: this.id,
         prompt: textPrompt(text),
+        _meta: { sloppod: { messageId: id } },
       });
+      this.#doneSending(id);
       return result?.stopReason;
+    } catch (error) {
+      if (error instanceof ConnectionClosedError) this.#unconfirmed.push({ id, text });
+      else this.#doneSending(id);
+      throw error;
     } finally {
       this.promptsInFlight--;
     }
   }
 
-  steer(text: string) {
-    return this.#conn.request('_session/steering', { sessionId: this.id, prompt: textPrompt(text) });
+  #keepSending(id: string, text: string) {
+    const kept = loadUnconfirmed(this.id).filter((message) => message.id !== id);
+    saveUnconfirmed(this.id, [...kept, { id, text }]);
   }
 
+  #doneSending(id: string) {
+    saveUnconfirmed(
+      this.id,
+      loadUnconfirmed(this.id).filter((message) => message.id !== id),
+    );
+  }
+
+  /** Whether the runtime has a message: recorded in the transcript, or waiting in the queue. */
+  received(id: string): boolean {
+    return (
+      this.transcript.items.some((item) => item.type === 'user' && item.messageId === id) ||
+      this.queue.some((message) => message.id === id)
+    );
+  }
+
+  /** After a load: messages that arrived are done; ones that didn't are sent again, once. */
+  #settleUnconfirmed() {
+    const unconfirmed = this.#unconfirmed.splice(0);
+    for (const message of unconfirmed) {
+      if (this.received(message.id)) {
+        this.#doneSending(message.id);
+        continue;
+      }
+      this.prompt(message.text, message.id).catch((error) => {
+        if (error instanceof ConnectionClosedError || this.received(message.id)) return;
+        this.undelivered.push(message);
+      });
+    }
+  }
+
+  /** Moves a queued message into the running turn. */
+  steerQueued(id: string) {
+    return this.#conn.request('_sloppod/steer_queued', { sessionId: this.id, id });
+  }
+
+  /**
+   * Stops the turn. The runtime answers the turn's open requests as cancelled and tells every UI they're resolved;
+   * questions asked with `ask_user` aren't the turn's, so they stay open.
+   */
   cancel() {
     this.#conn.notify('session/cancel', { sessionId: this.id });
-    // ACP: after cancelling, the client answers its open permission requests as cancelled.
-    for (const request of this.permissions) {
-      this.#conn.respond(request.rpcId, { outcome: { outcome: 'cancelled' } });
-    }
-    for (const question of this.questions) {
-      this.#conn.respond(question.rpcId, { action: 'cancel' } satisfies ElicitationResponse);
-    }
-    this.permissions = [];
-    this.questions = [];
   }
 
   async setConfigOption(configId: string, value: string) {

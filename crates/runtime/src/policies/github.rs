@@ -3,18 +3,23 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use base64::Engine;
 use graphql_parser::query::{Definition, OperationDefinition};
+use sloppod_contracts::capability;
 use sloppod_contracts::{
     Decision, Error, HttpRequest, Manifest, RequestPolicy, Result, SessionContext,
 };
+use sloppod_contracts::{repo_from_git_path, same_repo};
 
 use crate::credentials::Credentials;
-use crate::github::GitHubApp;
+use crate::github::{GitHubApp, PushLog};
 use crate::proposals::is_session_branch;
+use crate::rebases::{Recheck, Rechecks};
 
-/// GitHub: reads with the owner's GitHub App, pushes only to the session branch, all other writes through
-/// proposals.
+/// GitHub: reads and session-branch pushes with the owner's GitHub App, through tokens scoped to the session's
+/// grants (ADR 11); all other writes go through proposals.
 pub struct GitHubPolicy {
     credentials: Arc<Credentials>,
+    pushes: Arc<PushLog>,
+    rechecks: Arc<Rechecks>,
 }
 
 fn err(e: impl std::fmt::Display) -> Error {
@@ -22,8 +27,16 @@ fn err(e: impl std::fmt::Display) -> Error {
 }
 
 impl GitHubPolicy {
-    pub fn new(credentials: Arc<Credentials>) -> Self {
-        Self { credentials }
+    pub fn new(
+        credentials: Arc<Credentials>,
+        pushes: Arc<PushLog>,
+        rechecks: Arc<Rechecks>,
+    ) -> Self {
+        Self {
+            credentials,
+            pushes,
+            rechecks,
+        }
     }
 
     /// The owner's GitHub App, if they configured one.
@@ -39,15 +52,19 @@ impl GitHubPolicy {
     ) -> Result<Decision> {
         match git.service {
             Service::UploadPack => {
-                // Repositories outside the app's installations may still be public, so read those without a token.
+                // Granted repositories are read with a token covering only the grants. Anything else goes out
+                // without one, so it's readable only if it's public.
+                let granted: Vec<&str> = session.repos().collect();
                 let token = match self.app(session).await {
-                    Some(app) => app.token_for(&git.repo).await.ok(),
-                    None => None,
+                    Some(app) if granted.iter().any(|r| same_repo(r, &git.repo)) => {
+                        app.read_token(&git.repo, &granted).await.ok()
+                    }
+                    _ => None,
                 };
                 let headers = token
                     .map(|t| vec![("authorization".into(), basic(&t))])
                     .unwrap_or_default();
-                Ok(Decision::allow_with(headers, vec!["authorization".into()]))
+                Ok(Decision::allow_with(headers, Vec::new()))
             }
             Service::ReceivePack => {
                 let Some(grant) = session.writable_repo_for(&git.repo) else {
@@ -85,7 +102,67 @@ impl GitHubPolicy {
                                 );
                                 return Ok(push.reject(&message));
                             }
+                            // Auto-merge must only merge what was reviewed (ADR 3): new commits on its head turn
+                            // it off. If every pull request it's turned off for knows what was reviewed, the push goes
+                            // through and is rechecked once it lands: auto-merge goes back on if the change is still
+                            // the one reviewed (#106), and the agent hears either way. Otherwise the agent hears
+                            // before the push goes through.
+                            for (name, new) in push.refs.iter().zip(&push.new) {
+                                let Some(pushed) = name.strip_prefix("refs/heads/") else {
+                                    continue;
+                                };
+                                self.pushes.admit(repo, pushed);
+                                // Holds the branch until this push is decided, and from now on no recheck of an earlier
+                                // push turns auto-merge back on.
+                                let admission = self.rechecks.admit(repo, pushed).await;
+                                let waiting = admission.waiting();
+                                let disabled =
+                                    app.disable_auto_merge(repo, pushed).await.map_err(err)?;
+                                if disabled.is_empty() && waiting.is_empty() {
+                                    continue;
+                                }
+                                let reviewed = match (session.session_id.parse(), is_deletion(new))
+                                {
+                                    (Ok(session_id), false) => self
+                                        .rechecks
+                                        .reviewed(repo, &disabled)
+                                        .await
+                                        .map_err(err)?
+                                        .map(|pulls| (session_id, pulls)),
+                                    _ => None,
+                                };
+                                if let Some((session_id, pulls)) = reviewed {
+                                    let number = admission.number;
+                                    self.rechecks.send(Recheck {
+                                        owner: session.owner.clone(),
+                                        session: session_id,
+                                        repo: repo.to_owned(),
+                                        branch: pushed.to_owned(),
+                                        pulls: admission.recheck(pulls),
+                                        sha: new.clone(),
+                                        admission: number,
+                                    });
+                                } else {
+                                    admission.forget();
+                                    let mut affected = disabled.clone();
+                                    affected.extend(waiting.iter().copied());
+                                    affected.sort_unstable();
+                                    affected.dedup();
+                                    let pulls: Vec<String> =
+                                        affected.iter().map(|n| format!("#{n}")).collect();
+                                    let message = format!(
+                                        "sloppod: `{pushed}` is the head of {}, which was set to merge once its checks \
+                                         pass. New commits there haven't been reviewed, so auto-merge is now off and it \
+                                         needs merging by hand. Push again to go ahead.",
+                                        pulls.join(", ")
+                                    );
+                                    return Ok(push.reject(&message));
+                                }
+                            }
                         }
+                        // Before a push larger than its post buffer, git checks it can talk to the server with a
+                        // request that updates nothing.
+                        _ if is_push_probe(request) => {}
                         _ => {
                             return Ok(Decision::deny(
                                 "sloppod: could not read which refs this push updates.\n",
@@ -93,7 +170,7 @@ impl GitHubPolicy {
                         }
                     }
                 }
-                let token = app.token_for(repo).await.map_err(err)?;
+                let token = app.push_token(repo).await.map_err(err)?;
                 Ok(Decision::allow_with(
                     vec![("authorization".into(), basic(&token))],
                     Vec::new(),
@@ -139,17 +216,24 @@ impl GitHubPolicy {
                 session,
             )));
         }
-        // Reads use the session repository's installation, or any installation for sessions without one. Without
-        // a GitHub App they go out unauthenticated.
-        let token = match (self.app(session).await, session.writable_repo()) {
-            (Some(app), Some(grant)) => Some(app.token_for(grant.repo).await.map_err(err)?),
-            (Some(app), None) => Some(app.any_token().await.map_err(err)?),
-            (None, _) => None,
+        // Reads carry a read-only token covering the granted repositories in one installation, which also reads
+        // public data: the installation of the repository the path names, if it's granted, or else the first granted
+        // repository whose installation still works. Without any, or without a GitHub App, reads are unauthenticated.
+        let granted: Vec<&str> = session.repos().collect();
+        let token = match self.app(session).await {
+            Some(app) => {
+                let order = read_token_order(path, &granted);
+                first_token(&session.session_id, order, READ_TOKEN_BUDGET, |repo| {
+                    app.read_token(repo, &granted)
+                })
+                .await
+            }
+            None => None,
         };
         let headers = token
             .map(|t| vec![("authorization".into(), format!("token {t}"))])
             .unwrap_or_default();
-        Ok(Decision::allow_with(headers, vec!["authorization".into()]))
+        Ok(Decision::allow_with(headers, Vec::new()))
     }
 }
 
@@ -164,7 +248,7 @@ impl RequestPolicy for GitHubPolicy {
     }
 
     async fn decide(&self, session: &SessionContext, request: &HttpRequest) -> Result<Decision> {
-        if !session.has("github") {
+        if !session.has(capability::GITHUB) {
             return Ok(Decision::deny(
                 "sloppod: this session has no GitHub access.\n",
             ));
@@ -176,10 +260,7 @@ impl RequestPolicy for GitHubPolicy {
                     return self.git(session, request, git).await;
                 }
                 if matches!(request.method.as_str(), "GET" | "HEAD") {
-                    return Ok(Decision::allow_with(
-                        Vec::new(),
-                        vec!["authorization".into(), "cookie".into()],
-                    ));
+                    return Ok(Decision::allow_with(Vec::new(), Vec::new()));
                 }
                 Ok(Decision::deny(proposal_hint(
                     &format!(
@@ -205,9 +286,58 @@ fn proposal_hint(what: &str, session: &SessionContext) -> String {
             .to_owned(),
     };
     format!(
-        "sloppod: {what}. Outward actions go through human review: {pull_request}. Other GitHub writes \
-         (comments, issues, reviews, releases) aren't available to sessions yet.\n"
+        "sloppod: {what}. Outward actions go through human review: {pull_request}. To file issues, call the \
+         propose_issues tool. Other GitHub writes (comments, reviews, releases) aren't available to sessions yet.\n"
     )
+}
+
+/// How long finding a read token may take, well inside Envoy's 10 s limit on the whole decision.
+const READ_TOKEN_BUDGET: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// The first token `mint` gives for `repos`, tried in order, or `None` if none does within `budget`. Each attempt can
+/// take a while when GitHub is slow, and Envoy gives up on the whole decision after 10 s; reading unauthenticated
+/// before then is better than failing the read.
+async fn first_token<'a, F, Fut>(
+    session: &str,
+    repos: Vec<&'a str>,
+    budget: std::time::Duration,
+    mint: F,
+) -> Option<String>
+where
+    F: Fn(&'a str) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<String>>,
+{
+    let attempts = async {
+        for repo in repos {
+            match mint(repo).await {
+                Ok(token) => return Some(token),
+                Err(e) => tracing::warn!(session, repo, error = %e, "minting a read token"),
+            }
+        }
+        None
+    };
+    tokio::time::timeout(budget, attempts)
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!(
+                session,
+                "minting a read token took too long; reading without one"
+            );
+            None
+        })
+}
+
+/// Granted repositories to mint a read token through, in order: the one the API path names first, if any.
+fn read_token_order<'a>(path: &str, granted: &[&'a str]) -> Vec<&'a str> {
+    let named = path.strip_prefix("/repos/").and_then(|rest| {
+        let mut parts = rest.splitn(3, '/');
+        Some(format!("{}/{}", parts.next()?, parts.next()?))
+    });
+    let first = named.and_then(|named| granted.iter().find(|g| same_repo(g, &named)).copied());
+    first
+        .into_iter()
+        .chain(granted.iter().copied().filter(|g| Some(*g) != first))
+        .collect()
 }
 
 fn basic(token: &str) -> String {
@@ -236,7 +366,7 @@ impl GitRequest {
         let path = request.path_only().trim_start_matches('/');
         let mut parts = path.splitn(3, '/');
         let owner = parts.next()?;
-        let repo = parts.next()?.trim_end_matches(".git");
+        let repo = repo_from_git_path(parts.next()?);
         let rest = parts.next()?;
         let (service, advertisement) = match (request.method.as_str(), rest) {
             ("GET", "info/refs") => {
@@ -268,7 +398,14 @@ impl GitRequest {
 /// A `git-receive-pack` request's ref updates and the capabilities the client asked for.
 struct Push {
     refs: Vec<String>,
+    /// The commit each of `refs` is set to.
+    new: Vec<String>,
     capabilities: Vec<String>,
+}
+
+/// The all-zero commit git sets a ref to when deleting it.
+fn is_deletion(sha: &str) -> bool {
+    sha.bytes().all(|b| b == b'0')
 }
 
 fn pkt(line: &str) -> String {
@@ -305,10 +442,16 @@ impl Push {
     }
 }
 
+/// git's probe before a large push: a `git-receive-pack` request with no commands, just a flush packet.
+fn is_push_probe(request: &HttpRequest) -> bool {
+    !request.body_truncated && request.body == b"0000"
+}
+
 /// Reads the leading pkt-lines of a `git-receive-pack` request.
 fn pushed_refs(body: &[u8]) -> Option<Push> {
     let mut push = Push {
         refs: Vec::new(),
+        new: Vec::new(),
         capabilities: Vec::new(),
     };
     let mut rest = body;
@@ -344,8 +487,9 @@ fn pushed_refs(body: &[u8]) -> Option<Push> {
             return None;
         }
         let mut fields = command.split(' ');
-        let (_old, _new, name) = (fields.next()?, fields.next()?, fields.next()?);
+        let (_old, new, name) = (fields.next()?, fields.next()?, fields.next()?);
         push.refs.push(name.to_owned());
+        push.new.push(new.to_owned());
     }
 }
 
@@ -397,8 +541,22 @@ mod tests {
                 "refs/heads/main".to_owned()
             ]
         );
+        assert_eq!(push.new, vec![new.clone(), zero.clone()]);
+        assert!(!is_deletion(&push.new[0]) && is_deletion(&push.new[1]));
         assert_eq!(push.capabilities, vec!["report-status", "side-band-64k"]);
         assert!(pushed_refs(b"00").is_none());
+        let probe = |body: &[u8], body_truncated: bool| HttpRequest {
+            method: "POST".into(),
+            host: "github.com".into(),
+            path: "/o/r.git/git-receive-pack".into(),
+            headers: Default::default(),
+            body: body.to_vec(),
+            body_truncated,
+        };
+        assert!(is_push_probe(&probe(b"0000", false)));
+        assert!(!is_push_probe(&probe(b"0000", true)));
+        assert!(!is_push_probe(&probe(b"0000PACK", false)));
+        assert!(!is_push_probe(&probe(&body, false)));
         let Decision::Deny {
             status, message, ..
         } = push.reject("no")
@@ -409,6 +567,54 @@ mod tests {
         assert!(message.starts_with("0008\u{2}no\n"));
         assert!(message.contains("ng refs/heads/main refused by sloppod"));
         assert!(message.ends_with("00000000"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_token_service_falls_back_to_reading_without_one_in_time() {
+        let budget = std::time::Duration::from_secs(6);
+        let slow = |_: &str| async {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            anyhow::bail!("timed out")
+        };
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            first_token("s", vec!["o/a", "o/b", "o/c"], budget, slow).await,
+            None
+        );
+        assert_eq!(started.elapsed(), budget);
+
+        let second_works = |repo: &str| {
+            let repo = repo.to_owned();
+            async move {
+                if repo == "o/a" {
+                    anyhow::bail!("gone")
+                }
+                Ok(format!("token for {repo}"))
+            }
+        };
+        assert_eq!(
+            first_token("s", vec!["o/a", "o/b"], budget, second_works).await,
+            Some("token for o/b".to_owned())
+        );
+    }
+
+    #[test]
+    fn reads_go_through_the_named_repository_first() {
+        let granted = ["o/a", "o/b", "p/c"];
+        assert_eq!(
+            read_token_order("/repos/o/b/pulls", &granted),
+            ["o/b", "o/a", "p/c"]
+        );
+        assert_eq!(
+            read_token_order("/repos/O/B", &granted),
+            ["o/b", "o/a", "p/c"]
+        );
+        assert_eq!(
+            read_token_order("/repos/x/y/issues", &granted),
+            ["o/a", "o/b", "p/c"]
+        );
+        assert_eq!(read_token_order("/user", &granted), ["o/a", "o/b", "p/c"]);
+        assert!(read_token_order("/user", &[]).is_empty());
     }
 
     #[test]

@@ -10,13 +10,25 @@
     modalManager,
     toastManager,
   } from '@immich/ui';
-  import { mdiArrowDown, mdiCogOutline, mdiSourcePull, mdiSourceRepository, mdiTrashCanOutline } from '@mdi/js';
+  import {
+    mdiArrowDown,
+    mdiCheckDecagramOutline,
+    mdiCogOutline,
+    mdiPauseCircleOutline,
+    mdiPlayCircleOutline,
+    mdiMagnifyScan,
+    mdiShieldKeyOutline,
+    mdiSourcePull,
+    mdiSourceRepository,
+    mdiTrashCanOutline,
+  } from '@mdi/js';
   import { onMount } from 'svelte';
   import { api } from '#lib/api.ts';
   import { SessionView } from '#lib/session.svelte.ts';
   import { sessions } from '#lib/sessions.svelte.ts';
   import AddRepoModal from './AddRepoModal.svelte';
   import ChatHeader from './ChatHeader.svelte';
+  import GrantsModal from './GrantsModal.svelte';
   import PermissionCard from './PermissionCard.svelte';
   import QuestionCard from './QuestionCard.svelte';
   import PhaseBadge from './PhaseBadge.svelte';
@@ -28,6 +40,15 @@
 
   let { id }: { id: string } = $props();
 
+  /** Calls `action` whenever the element scrolls into view. */
+  function whenVisible(node: HTMLElement, action: () => void) {
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) action();
+    });
+    observer.observe(node);
+    return { destroy: () => observer.disconnect() };
+  }
+
   // The route wraps this component in {#key id}, so capturing the first id is intended.
   // svelte-ignore state_referenced_locally
   const view = new SessionView(id);
@@ -35,13 +56,19 @@
   const session = $derived(view.session);
   const title = $derived(session?.title || 'New session');
   const pendingProposals = $derived(view.proposals.filter((proposal) => proposal.status === 'pending'));
+  // Approved proposals are carried out in the background; their cards stay until that's done. Failures go to the
+  // agent, not here.
+  const openProposals = $derived(
+    view.proposals.filter((proposal) => proposal.status === 'pending' || proposal.status === 'approved'),
+  );
   const showReconnecting = $derived(view.loaded && view.connection !== 'open');
   const activity = $derived.by(() => {
+    const status = session?.agent_status ? `${session.agent_status[0].toUpperCase()}${session.agent_status.slice(1)}…` : null;
     switch (session?.phase) {
       case 'starting':
-        return 'Starting the agent…';
+        return status ?? (session.agent_error ? 'Starting the agent again…' : 'Starting the agent…');
       case 'disconnected':
-        return 'Bringing the agent back…';
+        return status ?? 'Bringing the agent back…';
       case 'waiting':
         return view.questions.length > 0 && view.permissions.length === 0 ? 'Waiting for your answer' : 'Waiting for your decision';
       default:
@@ -51,26 +78,79 @@
 
   let openProposalId = $state<string | null>(null);
   const openProposal = $derived(view.proposals.find((proposal) => proposal.id === openProposalId));
-  let showProposalList = $state(false);
+  /** The proposals list: everything (from the menu), or just the open ones (from the bar above the composer). */
+  let proposalList = $state<'all' | 'open' | null>(null);
   let showAddRepo = $state(false);
+  let showGrants = $state(false);
+  /** This session's standing approvals for pull requests; any one of them approves its pull requests. */
+  let autoApprovals = $state<string[]>([]);
+  let togglingApproval = $state(false);
+
+  async function loadAutoApprovals() {
+    const approvals = await api.listStandingApprovals();
+    autoApprovals = approvals.filter((a) => a.session_id === id && a.kind === 'github.pr.create').map((a) => a.id);
+  }
+
+  const waiting = $derived(view.permissions.length > 0 || view.questions.length > 0 || openProposals.length > 0);
+  let width = $state(0);
+  // Room for the chat at its full width (max-w-3xl and its padding) with the panel beside it.
+  const sidePanel = $derived(width >= 1184);
 
   let scroller = $state<HTMLElement | null>(null);
   let content = $state<HTMLElement | null>(null);
   let atBottom = $state(true);
+  /** Earlier history loads by itself only once the reader has scrolled, not when the view starts out at the top. */
+  let userScrolled = false;
 
   onMount(() => {
+    loadAutoApprovals().catch(() => {});
     view.start();
     return () => view.stop();
   });
 
   function onScroll() {
     if (!scroller) return;
-    atBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
+    if (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80) {
+      atBottom = true;
+    } else if (pointerHeld || performance.now() - lastUserScroll < 1000) {
+      atBottom = false;
+    }
   }
+
+  // Only the reader stops the view following new output. The browser scrolls by itself too, e.g. to keep what's on
+  // screen in place while something above it changes size, and that's no sign they've scrolled up.
+  let lastUserScroll = -Infinity;
+  /** A pointer pressed on the transcript, e.g. dragging the scrollbar, counts as the reader scrolling until it lets go. */
+  let pointerHeld = false;
+  $effect(() => {
+    if (!scroller) return;
+    const scrolling = () => (lastUserScroll = performance.now());
+    const press = () => (pointerHeld = true);
+    const release = () => (pointerHeld = false);
+    const events = ['wheel', 'touchmove', 'keydown', 'pointerdown'] as const;
+    for (const event of events) scroller.addEventListener(event, scrolling, { passive: true });
+    scroller.addEventListener('pointerdown', press);
+    window.addEventListener('pointerup', release);
+    window.addEventListener('pointercancel', release);
+    return () => {
+      events.forEach((event) => scroller?.removeEventListener(event, scrolling));
+      scroller?.removeEventListener('pointerdown', press);
+      window.removeEventListener('pointerup', release);
+      window.removeEventListener('pointercancel', release);
+    };
+  });
 
   function scrollToBottom(behavior: ScrollBehavior = 'instant') {
     scroller?.scrollTo({ top: scroller.scrollHeight, behavior });
   }
+
+  $effect(() => {
+    if (!scroller) return;
+    const scrolled = () => (userScrolled = true);
+    const events = ['wheel', 'touchmove', 'keydown'] as const;
+    for (const event of events) scroller.addEventListener(event, scrolled, { passive: true });
+    return () => events.forEach((event) => scroller?.removeEventListener(event, scrolled));
+  });
 
   // Follow new output while the reader is at the bottom, but leave them alone when they scrolled up.
   $effect(() => {
@@ -83,10 +163,58 @@
     return () => observer.disconnect();
   });
 
+  async function toggleReview() {
+    if (!session) return;
+    try {
+      view.setSession(await api.setSessionReview(id, session.review === 'required' ? 'off' : 'required'));
+    } catch (error) {
+      toastManager.danger({
+        title: "Couldn't change the review setting",
+        description: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /** Turns automatic approval on or off as chosen, whatever another tab did since the menu was drawn. */
+  async function setAutoApproval(on: boolean) {
+    if (togglingApproval) return;
+    togglingApproval = true;
+    try {
+      // Fresh, so another tab's changes count: any live approval keeps approving until all are revoked.
+      await loadAutoApprovals();
+      if (!on) {
+        await Promise.all(autoApprovals.map((approval) => api.revokeStandingApproval(approval)));
+      } else if (autoApprovals.length === 0) {
+        await api.createStandingApproval({ kind: 'github.pr.create', session_id: id, edits: { auto_merge: true } });
+      }
+      await loadAutoApprovals();
+    } catch (error) {
+      toastManager.danger({
+        title: "Couldn't change automatic approval",
+        description: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      togglingApproval = false;
+    }
+  }
+
+  async function setParked(parked: boolean) {
+    try {
+      view.setSession(await (parked ? api.parkSession(id) : api.wakeSession(id)));
+    } catch (error) {
+      toastManager.danger({
+        title: parked ? "Couldn't park the session" : "Couldn't wake the session",
+        description: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   async function deleteSession() {
     const confirmed = await modalManager.showDialog({
       title: 'Delete session?',
-      prompt: 'This stops the session and deletes its pod and volume.',
+      prompt:
+        'It stops and leaves your sessions. For a week you can restore it from Settings, with its files, branch and ' +
+        'memory; after that it is gone for good. To just stop it for now, park it instead.',
       confirmText: 'Delete',
       icon: mdiTrashCanOutline,
     });
@@ -108,6 +236,52 @@
   <title>{title} · sloppod</title>
 </svelte:head>
 
+{#snippet waitingItems()}
+      {#each view.questions as question (question.rpcId)}
+        <QuestionCard request={question} onRespond={(response) => view.answerQuestion(question, response)} />
+      {/each}
+      {#each view.permissions as request (request.rpcId)}
+        <PermissionCard
+          {request}
+          grants={session?.grants ?? []}
+          tool={view.transcript.tool(request.toolCall.toolCallId)}
+          onAnswer={(optionId) => view.answerPermission(request, optionId)}
+        />
+      {/each}
+      {#if sidePanel}
+        {#each openProposals as proposal (proposal.id)}
+          <ProposalCard
+            {proposal}
+            onOpen={() => (openProposalId = proposal.id)}
+            onChange={(updated) => view.upsertProposal(updated)}
+          />
+        {/each}
+      {:else if openProposals.length === 1}
+        <ProposalCard
+          proposal={openProposals[0]}
+          onOpen={() => (openProposalId = openProposals[0].id)}
+          onChange={(proposal) => view.upsertProposal(proposal)}
+        />
+      {:else if openProposals.length > 1}
+        <!-- Several at once would crowd out the chat, especially on a phone. -->
+        <div class="border-primary/40 bg-primary/5 flex items-center gap-3 rounded-2xl border px-3 py-2" data-testid="proposals-bar">
+          <span class="grow text-sm">
+            {#if pendingProposals.length > 0}
+              <span class="font-medium">{pendingProposals.length} {pendingProposals.length === 1 ? 'proposal' : 'proposals'} to review</span>
+            {/if}
+            {#if openProposals.length > pendingProposals.length}
+              <span class="text-muted">
+                {pendingProposals.length > 0 ? ', ' : ''}{openProposals.length - pendingProposals.length} being carried out
+              </span>
+            {/if}
+          </span>
+          <Button size="small" shape="round" onclick={() => (proposalList = 'open')}>
+            {pendingProposals.length > 0 ? 'Review' : 'View'}
+          </Button>
+        </div>
+      {/if}
+{/snippet}
+
 {#if view.notFound}
   <div class="mx-auto flex max-w-md flex-col items-center gap-4 px-4 py-16 text-center">
     <Text size="large" fontWeight="semi-bold">Session not found</Text>
@@ -128,16 +302,46 @@
           shape="round"
           color="secondary"
           indicator={pendingProposals.length > 0 ? 'warning' : undefined}
-          onclick={() => (showProposalList = true)}
+          onclick={() => (proposalList = 'all')}
         />
         <ContextMenuButton
           aria-label="Session actions"
           items={[
             {
+              title: 'Grants',
+              icon: mdiShieldKeyOutline,
+              $if: () => Boolean(session),
+              onAction: () => (showGrants = true),
+            },
+            {
               title: 'Add repository…',
               icon: mdiSourceRepository,
               $if: () => Boolean(session) && session?.phase !== 'stopped',
               onAction: () => (showAddRepo = true),
+            },
+            {
+              title: session?.review === 'required' ? 'Stop requiring review' : 'Require review by Codex',
+              icon: mdiMagnifyScan,
+              $if: () => session?.kind === 'work',
+              onAction: toggleReview,
+            },
+            {
+              title: autoApprovals.length > 0 ? 'Stop approving its pull requests' : 'Approve its pull requests automatically',
+              icon: mdiCheckDecagramOutline,
+              $if: () => session?.kind === 'work',
+              onAction: () => setAutoApproval(autoApprovals.length === 0),
+            },
+            {
+              title: 'Park',
+              icon: mdiPauseCircleOutline,
+              $if: () => session?.phase === 'idle' || session?.phase === 'disconnected',
+              onAction: () => setParked(true),
+            },
+            {
+              title: 'Wake',
+              icon: mdiPlayCircleOutline,
+              $if: () => session?.phase === 'parked',
+              onAction: () => setParked(false),
             },
             { title: 'Settings', icon: mdiCogOutline, href: '/settings' },
             { title: 'Delete session', icon: mdiTrashCanOutline, color: 'danger', onAction: deleteSession },
@@ -157,85 +361,104 @@
       </div>
     {/if}
 
-    <div class="relative min-h-0 grow">
-      <div bind:this={scroller} onscroll={onScroll} class="immich-scrollbar h-full overflow-y-auto">
-        <div bind:this={content} class="mx-auto flex w-full max-w-3xl flex-col gap-3 px-3 py-4 md:px-4">
-          {#if !view.loaded}
-            <div class="flex justify-center py-16">
-              {#if view.connectionError}
-                <Alert color="danger" size="small" title="Couldn't load the session">{view.connectionError}</Alert>
+    <div class="flex min-h-0 grow" bind:clientWidth={width}>
+      <div class="flex min-w-0 grow flex-col">
+        <div class="relative min-h-0 grow">
+          <div
+            bind:this={scroller}
+            onscroll={onScroll}
+            class="immich-scrollbar h-full overflow-y-auto"
+            data-testid="transcript-scroller"
+          >
+            <div bind:this={content} class="mx-auto flex w-full max-w-3xl flex-col gap-3 px-3 py-4 md:px-4">
+              {#if view.loadError}
+                <div data-testid="load-error">
+                  <Alert color="warning" size="small" title="Couldn't load the session's details">
+                    {view.loadError}. Trying again…
+                  </Alert>
+                </div>
+              {/if}
+              {#if !view.loaded}
+                <div class="flex justify-center py-16">
+                  {#if view.connectionError}
+                    <Alert color="danger" size="small" title="Couldn't load the session">{view.connectionError}</Alert>
+                  {:else}
+                    <LoadingSpinner size="large" />
+                  {/if}
+                </div>
               {:else}
-                <LoadingSpinner size="large" />
+                {#if view.transcript.items.length === 0 && session?.phase !== 'starting'}
+                  <Text color="muted" class="py-16 text-center">Nothing here yet. Send a message to get going.</Text>
+                {/if}
+                {#if view.historyBefore !== null}
+                  <div class="flex justify-center py-2" use:whenVisible={() => userScrolled && view.loadEarlier()}>
+                    <Button size="small" variant="ghost" loading={view.loadingHistory} onclick={() => view.loadEarlier()}>
+                      Load earlier messages
+                    </Button>
+                  </div>
+                {/if}
+                <TranscriptView items={view.transcript.items} running={view.turnRunning} />
+                {#if activity}
+                  <div class="text-muted flex items-center gap-2 py-1 text-sm" data-testid="activity">
+                    <LoadingSpinner size="tiny" />
+                    {activity}
+                  </div>
+                {/if}
               {/if}
             </div>
-          {:else}
-            {#if view.transcript.items.length === 0 && session?.phase !== 'starting'}
-              <Text color="muted" class="py-16 text-center">Nothing here yet. Send a message to get going.</Text>
-            {/if}
-            <TranscriptView items={view.transcript.items} running={view.turnRunning} />
-            {#if activity}
-              <div class="text-muted flex items-center gap-2 py-1 text-sm" data-testid="activity">
-                <LoadingSpinner size="tiny" />
-                {activity}
-              </div>
-            {/if}
+          </div>
+          {#if !atBottom}
+            <div class="absolute end-4 bottom-3">
+              <IconButton
+                icon={mdiArrowDown}
+                aria-label="Scroll to the latest message"
+                shape="round"
+                color="secondary"
+                size="small"
+                class="shadow-md"
+                onclick={() => scrollToBottom('smooth')}
+              />
+            </div>
           {/if}
         </div>
+
+        {#if waiting && !sidePanel}
+          <div class="border-light-200 max-h-[55dvh] shrink-0 overflow-y-auto border-t px-3 py-2">
+            <div class="mx-auto flex w-full max-w-3xl flex-col gap-2">
+              {@render waitingItems()}
+            </div>
+          </div>
+        {/if}
+
+        <SessionComposer {view} />
       </div>
-      {#if !atBottom}
-        <div class="absolute end-4 bottom-3">
-          <IconButton
-            icon={mdiArrowDown}
-            aria-label="Scroll to the latest message"
-            shape="round"
-            color="secondary"
-            size="small"
-            class="shadow-md"
-            onclick={() => scrollToBottom('smooth')}
-          />
-        </div>
+      {#if waiting && sidePanel}
+        <aside
+          class="border-light-200 immich-scrollbar flex w-96 shrink-0 flex-col gap-2 overflow-y-auto border-s p-3"
+          aria-label="Waiting on you"
+          data-testid="side-panel"
+        >
+          {@render waitingItems()}
+        </aside>
       {/if}
     </div>
-
-    {#if view.permissions.length > 0 || view.questions.length > 0 || pendingProposals.length > 0}
-      <div class="border-light-200 max-h-[55dvh] shrink-0 overflow-y-auto border-t px-3 py-2">
-        <div class="mx-auto flex w-full max-w-3xl flex-col gap-2">
-          {#each view.questions as question (question.rpcId)}
-            <QuestionCard request={question} onRespond={(response) => view.answerQuestion(question, response)} />
-          {/each}
-          {#each view.permissions as request (request.rpcId)}
-            <PermissionCard
-              {request}
-              grants={session?.grants ?? []}
-              tool={view.transcript.tool(request.toolCall.toolCallId)}
-              onAnswer={(optionId) => view.answerPermission(request, optionId)}
-            />
-          {/each}
-          {#each pendingProposals as proposal (proposal.id)}
-            <ProposalCard
-              {proposal}
-              onOpen={() => (openProposalId = proposal.id)}
-              onChange={(proposal) => view.upsertProposal(proposal)}
-            />
-          {/each}
-        </div>
-      </div>
-    {/if}
-
-    <SessionComposer {view} />
   </div>
 {/if}
 
-{#if showProposalList}
+{#if proposalList}
   <ProposalListModal
-    proposals={[...view.proposals].reverse()}
+    proposals={[...(proposalList === 'open' ? openProposals : view.proposals)].reverse()}
     onOpen={(proposalId) => {
-      showProposalList = false;
+      proposalList = null;
       openProposalId = proposalId;
     }}
     onChange={(proposal) => view.upsertProposal(proposal)}
-    onClose={() => (showProposalList = false)}
+    onClose={() => (proposalList = null)}
   />
+{/if}
+
+{#if showGrants && session}
+  <GrantsModal grants={session.grants} onClose={() => (showGrants = false)} />
 {/if}
 
 {#if showAddRepo && session}

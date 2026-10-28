@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use sloppod_contracts::capability;
 use sloppod_contracts::{
     Decision, Error, HttpRequest, Manifest, RequestPolicy, Result, SessionContext,
 };
@@ -21,8 +22,8 @@ impl MeminiPolicy {
     }
 }
 
-fn administrative(method: &str, path: &str) -> bool {
-    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+fn administrative(method: &str, segments: &[String]) -> bool {
+    let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
     match (method, segments.as_slice()) {
         (_, ["v1", "keys", ..]) => true,
         (_, ["v1", "fsck" | "dedup"]) => true,
@@ -50,14 +51,22 @@ impl RequestPolicy for MeminiPolicy {
 
     async fn decide(&self, session: &SessionContext, request: &HttpRequest) -> Result<Decision> {
         let path = request.path_only();
-        if administrative(&request.method, path) {
+        let Ok(segments) = request.segments() else {
+            return Ok(Decision::deny(format!(
+                "sloppod: {path} isn't a path memini takes.\n"
+            )));
+        };
+        if administrative(&request.method, &segments) {
             return Ok(Decision::deny(format!(
                 "sloppod: memini administration ({} {path}) isn't available to sessions; the runtime manages \
                  namespaces, pins, links and keys.\n",
                 request.method
             )));
         }
-        let Some(namespace) = session.grant("memory").and_then(|g| g.param("namespace")) else {
+        let Some(namespace) = session
+            .grant(capability::MEMORY)
+            .and_then(|g| g.param("namespace"))
+        else {
             return Ok(Decision::deny(
                 "sloppod: this session has no memory access.\n",
             ));
@@ -88,6 +97,10 @@ impl RequestPolicy for MeminiPolicy {
 mod tests {
     use super::*;
 
+    fn segments(path: &str) -> Vec<String> {
+        sloppod_contracts::path_segments(path).unwrap()
+    }
+
     #[test]
     fn administration_is_refused() {
         for (method, path) in [
@@ -101,7 +114,7 @@ mod tests {
             ("POST", "/register"),
             ("GET", "/.well-known/oauth-authorization-server"),
         ] {
-            assert!(administrative(method, path), "{method} {path}");
+            assert!(administrative(method, &segments(path)), "{method} {path}");
         }
         for (method, path) in [
             ("POST", "/mcp"),
@@ -112,7 +125,7 @@ mod tests {
             ("GET", "/v1/namespaces/briefing"),
             ("GET", "/v1/pins"),
         ] {
-            assert!(!administrative(method, path), "{method} {path}");
+            assert!(!administrative(method, &segments(path)), "{method} {path}");
         }
     }
 }

@@ -45,6 +45,8 @@ spec:
                   fieldPath: metadata.namespace
             - name: SLOPPOD_SERVICE
               value: {{ include "sloppod.fullname" . }}
+            - name: SLOPPOD_CLUSTER_DOMAIN
+              value: {{ .Values.clusterDomain | quote }}
             - name: SLOPPOD_RUNTIME_SELECTOR
               value: app.kubernetes.io/name=sloppod,app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=runtime
             - name: SLOPPOD_CA_SECRET
@@ -90,6 +92,10 @@ spec:
             {{- with .Values.auth.defaultUser }}
             - name: SLOPPOD_DEFAULT_USER
               value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.auth.allowedOrigins }}
+            - name: SLOPPOD_ALLOWED_ORIGINS
+              value: {{ join "," . | quote }}
             {{- end }}
             {{- with .Values.memory.namespacePrefix }}
             - name: SLOPPOD_MEMINI_NAMESPACE_PREFIX

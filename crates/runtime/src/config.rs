@@ -6,7 +6,9 @@ use clap::Parser;
 const DEFAULT_DIRECT_HOSTS: &str = "static.rust-lang.org,sh.rustup.rs,index.crates.io,static.crates.io,crates.io,\
 objects.githubusercontent.com,release-assets.githubusercontent.com,raw.githubusercontent.com,codeload.github.com,\
 registry.npmjs.org,nodejs.org,pypi.org,files.pythonhosted.org,mise.jdx.dev,mise-versions.jdx.dev,\
-dl.k8s.io,get.helm.sh,proxy.golang.org,sum.golang.org,storage.googleapis.com";
+dl.k8s.io,get.helm.sh,proxy.golang.org,sum.golang.org,storage.googleapis.com,\
+results-receiver.actions.githubusercontent.com,pipelines.actions.githubusercontent.com,productionresultssa*.blob.core.windows.net,\
+cdn.playwright.dev,playwright.download.prss.microsoft.com,tuf-repo-cdn.sigstore.dev";
 
 #[derive(Debug, Clone, Parser)]
 #[command(version, about)]
@@ -33,6 +35,10 @@ pub struct Config {
     /// The runtime's Service, used by session pods and by Envoy.
     #[arg(long, env = "SLOPPOD_SERVICE", default_value = "sloppod")]
     pub service: String,
+
+    /// The cluster's DNS domain. Sessions may look up names under it, and otherwise only hosts they may reach.
+    #[arg(long, env = "SLOPPOD_CLUSTER_DOMAIN", default_value = "cluster.local")]
+    pub cluster_domain: String,
 
     /// Labels selecting runtime pods, for session egress policy (`k=v,k=v`).
     #[arg(
@@ -87,6 +93,10 @@ pub struct Config {
     #[arg(long, env = "SLOPPOD_USER_HEADER", default_value = "x-forwarded-user")]
     pub user_header: String,
 
+    /// Origins besides the runtime's own a browser may write or open `/acp` from, e.g. `https://ui.example.com`.
+    #[arg(long, env = "SLOPPOD_ALLOWED_ORIGINS", value_delimiter = ',')]
+    pub allowed_origins: Vec<String>,
+
     /// User for requests without the header; unset, such requests are refused.
     #[arg(long, env = "SLOPPOD_DEFAULT_USER")]
     pub default_user: Option<String>,
@@ -95,7 +105,7 @@ pub struct Config {
     #[arg(long, env = "SLOPPOD_MEMINI_NAMESPACE_PREFIX", default_value = "")]
     pub memini_namespace_prefix: String,
 
-    /// What this runtime was built from (a release tag or commit); agents are told it.
+    /// What this runtime was built from (a release tag or commit); agents can read it in their pod.
     #[arg(long, env = "SLOPPOD_BUILD")]
     pub build: Option<String>,
 

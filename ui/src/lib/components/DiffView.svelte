@@ -3,7 +3,9 @@
   import { mdiChevronRight } from '@mdi/js';
   import type { FileDiff } from '#lib/diff.ts';
 
-  let { diff, open = true }: { diff: FileDiff; open?: boolean } = $props();
+  let { diff, open = true, wrap = false }: { diff: FileDiff; open?: boolean; wrap?: boolean } = $props();
+
+  const space = $derived(wrap ? 'whitespace-pre-wrap break-all' : 'whitespace-pre');
 
   const PAGE = 400;
   let limit = $state(PAGE);
@@ -22,11 +24,11 @@
   const marker = { add: '+', del: '-', ctx: ' ', hunk: '', meta: '' } as const;
 </script>
 
-<details class="group border-light-200 overflow-hidden rounded-lg border" {open} data-testid="diff">
+<details class="group/file border-light-200 overflow-hidden rounded-lg border" {open} data-testid="diff">
   <summary
     class="bg-light-100 flex cursor-pointer list-none items-center gap-2 px-3 py-1.5 text-xs select-none [&::-webkit-details-marker]:hidden"
   >
-    <Icon icon={mdiChevronRight} class="shrink-0 transition-transform group-open:rotate-90" aria-hidden />
+    <Icon icon={mdiChevronRight} class="shrink-0 transition-transform group-open/file:rotate-90" aria-hidden />
     <span class="min-w-0 grow truncate font-mono" title={diff.path}>
       {#if diff.oldPath}{diff.oldPath} → {/if}{diff.path}
     </span>
@@ -42,12 +44,12 @@
         {#each shown as line, index (index)}
           <tr class={rowClass[line.type]}>
             {#if line.type === 'hunk' || line.type === 'meta'}
-              <td colspan="2" class="px-3 whitespace-pre">{line.text}</td>
+              <td colspan="2" class="px-3 {space}">{line.text}</td>
             {:else}
               <td class="text-muted w-px border-e border-light-200 px-2 text-end align-top select-none">
                 {line.type === 'del' ? line.oldNo : line.newNo}
               </td>
-              <td class="pe-3 whitespace-pre"><span class="inline-block w-4 text-center select-none opacity-60">{marker[line.type]}</span>{line.text}</td>
+              <td class="pe-3 {space}"><span class="inline-block w-4 text-center select-none opacity-60">{marker[line.type]}</span>{line.text}</td>
             {/if}
           </tr>
         {/each}

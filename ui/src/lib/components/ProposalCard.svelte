@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Badge, Button, Icon } from '@immich/ui';
+  import { Badge, Button, Icon, LoadingSpinner } from '@immich/ui';
   import { api, type Proposal } from '#lib/api.ts';
   import { proposalStatus, proposalSummary } from '#lib/presentation.ts';
 
@@ -42,8 +42,11 @@
     <Icon icon={summary.icon} class="text-primary shrink-0" size="1.5em" aria-hidden />
     <div class="flex min-w-0 grow flex-col gap-0.5">
       <div class="flex items-center gap-2">
-        <span class="text-muted text-xs">{summary.label}</span>
-        <Badge size="tiny" shape="round" color={status.color}>{status.label}</Badge>
+        <span class="text-muted min-w-0 truncate text-xs">{summary.label}</span>
+        <!-- A pending card's Review button already says it's waiting on the user. -->
+        {#if !pending}
+          <Badge size="tiny" shape="round" color={status.color} class="shrink-0 whitespace-nowrap">{status.label}</Badge>
+        {/if}
       </div>
       <span class="truncate text-sm font-medium" title={summary.title}>{summary.title}</span>
       {#if summary.detail && !inline}
@@ -52,12 +55,20 @@
         </span>
       {/if}
     </div>
-    {#if !inline}
+    {#if proposal.status === 'approved'}
+      <span class="text-muted flex shrink-0 items-center gap-2 text-xs" data-testid="proposal-working">
+        <LoadingSpinner size="small" />
+        Carrying it out…
+      </span>
+    {:else if !inline}
       <Button size="small" shape="round" variant={pending ? 'filled' : 'outline'} color={pending ? 'primary' : 'secondary'} onclick={onOpen}>
         {pending ? 'Review' : 'View'}
       </Button>
     {/if}
   </div>
+  {#if proposal.status === 'failed' && proposal.error}
+    <p class="text-danger text-xs" data-testid="proposal-error">{proposal.error}</p>
+  {/if}
   {#if inline}
     {#if payload.reason}
       <p class="text-sm whitespace-pre-wrap" data-testid="proposal-reason">{payload.reason}</p>

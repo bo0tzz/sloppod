@@ -5,17 +5,32 @@ mod authz;
 mod config;
 mod credentials;
 mod db;
+#[cfg(test)]
+mod db_tests;
 mod enforcer;
 mod github;
+mod grants;
+mod identity;
+mod inference;
+mod lifecycle;
 mod link;
 mod mcp;
 mod memini;
 mod memory;
+mod origin;
 mod placement;
 mod pods;
 mod policies;
 mod proposals;
+mod pulls;
+mod questions;
+mod rebases;
+mod reviews;
 mod session;
+#[cfg(test)]
+mod session_tests;
+mod store;
+mod subsessions;
 mod tls;
 mod users;
 mod vault;
@@ -30,7 +45,8 @@ use axum::routing::{any, get, post};
 use clap::Parser;
 use k8s_openapi::api::core::v1::Service;
 use kube::api::Api;
-use sloppod_contracts::{AgentAdapter, Enforcer, PlacementBackend};
+use sloppod_contracts::{Enforcer, PlacementBackend};
+use sloppod_protocol::api::Phase;
 use sqlx::PgPool;
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -38,7 +54,7 @@ use crate::config::Config;
 use crate::credentials::Credentials;
 use crate::enforcer::Cilium;
 use crate::pods::PodIndex;
-use crate::policies::{GitHubPolicy, MeminiPolicy, ModelPolicy, Policies};
+use crate::policies::{CodexPolicy, DocsPolicy, GitHubPolicy, MeminiPolicy, ModelPolicy, Policies};
 use crate::proposals::ProposalKinds;
 use crate::session::Hub;
 
@@ -58,8 +74,14 @@ pub struct Inner {
     pub cilium: Arc<Cilium>,
     pub ca: tls::Ca,
     pub authz_addr: SocketAddr,
-    pub adapter: Arc<dyn AgentAdapter>,
+    pub agents: adapter::Agents,
     pub instructions: Option<String>,
+    /// The runtime's own small model calls (ADR 26).
+    pub inference: inference::Inference,
+    /// Sessions asked to quiet down for a new session image (#230).
+    pub image_nudges: lifecycle::ImageNudges,
+    /// Pushes to heads of pull requests set to merge themselves, waiting to be rechecked (#106).
+    pub rechecks: Arc<rebases::Rechecks>,
 }
 
 #[derive(Clone)]
@@ -123,14 +145,33 @@ async fn main() -> anyhow::Result<()> {
 
     let mut policies = Policies::default();
     policies.register(Arc::new(ModelPolicy::new(credentials.clone())));
-    policies.register(Arc::new(GitHubPolicy::new(credentials.clone())));
+    policies.register(Arc::new(DocsPolicy));
+    policies.register(Arc::new(CodexPolicy::new(credentials.clone())));
+    let pushes = Arc::new(github::PushLog::default());
+    let (rechecks, pushes_to_recheck) = rebases::Rechecks::new(db.clone());
+    policies.register(Arc::new(GitHubPolicy::new(
+        credentials.clone(),
+        pushes.clone(),
+        rechecks.clone(),
+    )));
 
     let mut proposals = ProposalKinds::default();
     proposals.register(Arc::new(proposals::PullRequest::new(credentials.clone())));
+    proposals.register(Arc::new(proposals::Stack::new(credentials.clone(), pushes)));
+    proposals.register(Arc::new(proposals::Issues::new(credentials.clone())));
+    proposals.register(Arc::new(proposals::IssueUpdates::new(credentials.clone())));
+    proposals.register(Arc::new(proposals::Report::new(
+        db.clone(),
+        credentials.clone(),
+    )));
     proposals.register(Arc::new(proposals::RepoAccess::new(
         db.clone(),
         credentials.clone(),
     )));
+
+    let mut agents = adapter::Agents::default();
+    agents.register(Arc::new(adapter::ClaudeCode));
+    agents.register(Arc::new(adapter::Codex));
 
     let ca = tls::Ca::load_or_create(kube.clone(), &config.namespace, &config.ca_secret).await?;
     let service: Service = Api::namespaced(kube.clone(), &config.namespace)
@@ -146,6 +187,7 @@ async fn main() -> anyhow::Result<()> {
         &config.namespace,
         config.runtime_labels(),
         config.sessions_listen.port(),
+        &config.cluster_domain,
     ));
     let authz_addr = SocketAddr::new(cluster_ip.parse()?, config.authz_listen.port());
 
@@ -161,7 +203,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let state = AppState(Arc::new(Inner {
-        hub: Arc::new(Hub::new(db.clone())),
+        hub: Arc::new(Hub::new(Arc::new(store::PgStore(db.clone())))),
         config: config.clone(),
         db,
         kube,
@@ -175,8 +217,27 @@ async fn main() -> anyhow::Result<()> {
         cilium,
         ca,
         authz_addr,
-        adapter: Arc::new(adapter::ClaudeCode),
+        agents,
         instructions,
+        inference: inference::Inference::default(),
+        image_nudges: lifecycle::ImageNudges::default(),
+        rechecks,
+    }));
+    // A message queued for a parked session's absent agent wakes the session.
+    let waker = state.clone();
+    state.hub.set_waker(Arc::new(move |id| {
+        let state = waker.clone();
+        Box::pin(async move {
+            match db::get_session(&state.db, id).await? {
+                Some(session) => lifecycle::wake(&state, &session).await,
+                None => Ok(()),
+            }
+        })
+    }));
+    let checker = state.clone();
+    state.hub.set_turn_ended(Arc::new(move |id| {
+        let state = checker.clone();
+        Box::pin(async move { inference::check_turn_end(&state, id).await })
     }));
     state
         .install_listener()
@@ -184,7 +245,39 @@ async fn main() -> anyhow::Result<()> {
         .context("installing the egress listener")?;
 
     reconcile(&state).await;
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                every.tick().await;
+                lifecycle::purge_deleted(&state).await;
+            }
+        });
+    }
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                every.tick().await;
+                lifecycle::roll_images(&state).await;
+            }
+        });
+    }
 
+    tokio::spawn(rebases::run(state.clone(), pushes_to_recheck));
+    tokio::spawn(pulls::run(state.clone()));
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(std::time::Duration::from_secs(120));
+            loop {
+                every.tick().await;
+                inference::park_idle(&state).await;
+            }
+        });
+    }
     let authz = tokio::spawn(authz::serve(config.authz_listen, state.clone()));
     let ui =
         ServeDir::new(&config.ui_dir).fallback(ServeFile::new(config.ui_dir.join("index.html")));
@@ -193,9 +286,17 @@ async fn main() -> anyhow::Result<()> {
         .route("/acp", get(acp::handler))
         .route("/healthz", get(|| async { "ok" }))
         .fallback_service(ui)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            origin::same_origin,
+        ))
         .with_state(state.clone());
     let sessions = Router::new()
         .route(sloppod_protocol::link::PATH, get(link::handler))
+        .route(
+            &format!("{}/{{name}}", sloppod_protocol::link::TRANSCRIPT_PATH),
+            get(link::transcript),
+        )
         .route("/mcp", post(mcp::handler))
         .route(memory::PREFIX, any(memory::proxy))
         .route(&format!("{}/{{*path}}", memory::PREFIX), any(memory::proxy))
@@ -235,12 +336,62 @@ async fn reconcile(state: &AppState) {
         }
     };
     for session in sessions {
-        state
-            .hub
-            .set_phase(session.id, sloppod_protocol::api::Phase::Disconnected)
-            .await;
-        if let Err(e) = api::place(state, &session).await {
+        let interrupted = matches!(session.phase(), Phase::Working | Phase::Waiting);
+        state.hub.set_phase(session.id, Phase::Disconnected).await;
+        if let Err(e) = lifecycle::place(state, &session).await {
             tracing::error!(session = %session.id, error = %e, "reconciling session");
         }
+        if interrupted {
+            // Delivered if the agent has to be launched again; one that kept running carries on.
+            state
+                .hub
+                .set_restart_notice(session.id, restart_notice(state.config.build.as_deref()))
+                .await;
+        }
+    }
+    // Parking releases a session's egress, but one that failed to, or was parked before it did, still holds it.
+    match db::parked_sessions(&state.db).await {
+        Ok(parked) => {
+            for session in parked {
+                let id = session.id.to_string();
+                if let Err(e) = state
+                    .enforcer
+                    .release(&id, &lifecycle::pod_labels(&id))
+                    .await
+                {
+                    tracing::warn!(session = %session.id, error = %e, "releasing a parked session's egress");
+                }
+            }
+        }
+        Err(e) => tracing::error!(error = %e, "listing parked sessions"),
+    }
+    // After the pods are placed, so a queue for a running session waits for its agent and a parked one wakes for it;
+    // before anything that can queue a notice, which would otherwise replace the kept queue before it's read.
+    state.hub.restore_queues().await;
+    proposals::resume_approved(state).await;
+    reviews::resume_round_watches(state).await;
+    proposals::resume_stack_watches(state).await;
+}
+
+/// Tells an agent whose turn a runtime restart cut off what it lost, so it can carry on without the user.
+fn restart_notice(build: Option<&str>) -> String {
+    let build = build
+        .map(|b| format!(" (now running {b})"))
+        .unwrap_or_default();
+    format!(
+        "sloppod: the runtime restarted{build} while you were working, which ended your turn. The tool call that \
+         was running, any background tasks you started and any question you were waiting on are gone; your working \
+         tree and files are intact. Check what had finished, then carry on where you left off."
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restart_notice_names_the_build() {
+        assert!(restart_notice(Some("4f1a32e")).contains("restarted (now running 4f1a32e) while"));
+        assert!(restart_notice(None).contains("restarted while"));
     }
 }

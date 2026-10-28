@@ -1,4 +1,5 @@
 import {
+  mdiAlertCircleOutline,
   mdiHelpCircleOutline,
   mdiSourcePull,
   mdiSourceRepository,
@@ -26,8 +27,9 @@ export const phases: Record<Phase, { label: string; color: Color; description: s
   starting: { label: 'Starting', color: 'info', description: 'The pod is starting or the agent has not connected yet' },
   idle: { label: 'Idle', color: 'secondary', description: 'Waiting for a prompt' },
   working: { label: 'Working', color: 'primary', description: 'A turn is running' },
-  waiting: { label: 'Waiting', color: 'warning', description: 'Blocked on a permission request' },
+  waiting: { label: 'Waiting', color: 'warning', description: 'Blocked on a permission request or a question' },
   disconnected: { label: 'Disconnected', color: 'danger', description: 'The pod went away; the runtime is bringing it back' },
+  parked: { label: 'Parked', color: 'secondary', description: 'No pod; sending a message or Wake brings it back' },
   stopped: { label: 'Stopped', color: 'secondary', description: 'The session has stopped' },
 };
 
@@ -58,21 +60,33 @@ export const planStatuses: Record<PlanEntry['status'], { icon: string; class: st
 };
 
 export const proposalStatuses: Record<ProposalStatus, { label: string; color: Color }> = {
+  in_review: { label: 'In review', color: 'info' },
+  changes_requested: { label: 'Changes requested', color: 'secondary' },
   pending: { label: 'Pending review', color: 'warning' },
   approved: { label: 'Approved', color: 'info' },
   rejected: { label: 'Rejected', color: 'secondary' },
   executed: { label: 'Done', color: 'success' },
   failed: { label: 'Failed', color: 'danger' },
+  withdrawn: { label: 'Withdrawn', color: 'secondary' },
 };
 
-const executedLabels: Record<string, string> = {
-  'github.pr.create': 'Opened',
-  'sloppod.repo.grant': 'Granted',
+/**
+ * What each proposal kind is called: `title` heads its modal, `plural` names its standing approvals, and `executed`
+ * is its status once carried out. Kinds missing here show their kind name.
+ */
+export const proposalKinds: Record<string, { title: string; plural: string; executed: string }> = {
+  'github.pr.create': { title: 'Pull request proposal', plural: 'Pull requests', executed: 'Opened' },
+  'github.stack.create': { title: 'Stacked pull requests', plural: 'Stacked pull requests', executed: 'Opened' },
+  'github.issue.create': { title: 'Issues proposal', plural: 'Issues', executed: 'Filed' },
+  'github.issue.update': { title: 'Issue updates', plural: 'Issue updates', executed: 'Updated' },
+  'sloppod.repo.grant': { title: 'Repository access', plural: 'Repository access', executed: 'Granted' },
+  'sloppod.session.report': { title: 'Report to the parent session', plural: 'Reports', executed: 'Delivered' },
 };
 
 export function proposalStatus(proposal: Proposal): { label: string; color: Color } {
   const status = proposalStatuses[proposal.status] ?? { label: proposal.status, color: 'secondary' };
-  return proposal.status === 'executed' ? { ...status, label: executedLabels[proposal.kind] ?? status.label } : status;
+  const executed = proposalKinds[proposal.kind]?.executed;
+  return proposal.status === 'executed' && executed ? { ...status, label: executed } : status;
 }
 
 const payloadText = (value: unknown) => (typeof value === 'string' ? value : '');
@@ -88,6 +102,33 @@ export function proposalSummary(proposal: Proposal): { label: string; title: str
         detail: `${payloadText(payload.repo)}: ${payloadText(payload.head)} → ${payloadText(payload.base)}`,
         icon: mdiSourcePull,
       };
+    case 'github.stack.create': {
+      const layers = Array.isArray(payload.pull_requests) ? (payload.pull_requests as { title?: unknown }[]) : [];
+      return {
+        label: 'Stacked pull requests',
+        title: `${layers.length} pull requests, from “${payloadText(layers[0]?.title)}”`,
+        detail: `${payloadText(payload.repo)} → ${payloadText(payload.base)}`,
+        icon: mdiSourcePull,
+      };
+    }
+    case 'github.issue.create': {
+      const issues = Array.isArray(payload.issues) ? (payload.issues as { title?: unknown }[]) : [];
+      return {
+        label: 'Issues',
+        title: issues.length === 1 ? payloadText(issues[0].title) : `${issues.length} issues`,
+        detail: payloadText(payload.repo),
+        icon: mdiAlertCircleOutline,
+      };
+    }
+    case 'github.issue.update': {
+      const updates = Array.isArray(payload.updates) ? (payload.updates as { number?: unknown }[]) : [];
+      return {
+        label: 'Issue updates',
+        title: updates.length === 1 ? `#${String(updates[0].number)}` : `${updates.length} issues`,
+        detail: payloadText(payload.repo),
+        icon: mdiAlertCircleOutline,
+      };
+    }
     case 'sloppod.repo.grant':
       return {
         label: 'Repository access',
@@ -164,6 +205,21 @@ export const credentialKinds: CredentialKindSpec[] = [
     ],
     secret: { label: 'Admin key' },
   },
+  {
+    kind: 'chatgpt',
+    title: 'ChatGPT logins',
+    noun: 'ChatGPT login',
+    description: 'Codex, for reviewing proposals before they reach you.',
+    empty: 'No ChatGPT login yet.',
+    fields: [],
+    secret: {
+      label: 'auth.json',
+      description:
+        "Run `codex login` with a fresh `CODEX_HOME` (e.g. `CODEX_HOME=$(mktemp -d) codex login`) and paste that directory's auth.json. Use a login only sloppod has: it refreshes the tokens, and another copy would invalidate them.",
+      multiline: true,
+      placeholder: 'Paste auth.json here',
+    },
+  },
 ];
 
 /** What a grant lets a session do, in plain words. */
@@ -172,6 +228,8 @@ export function grantLabel(grant: Grant): string {
   switch (grant.capability) {
     case 'model':
       return 'the model API';
+    case 'codex':
+      return 'Codex';
     case 'github':
       return 'read GitHub';
     case 'packages':
@@ -187,11 +245,17 @@ export function grantLabel(grant: Grant): string {
   }
 }
 
+/** An option's name. The agent describes its `default` model with the model that currently is, so say which. */
+function configOptionName(option: ConfigSelectOption): string {
+  if (option.value !== 'default' || !option.description) return option.name;
+  return `${option.name.replace(/\s*\(.*\)$/, '')} · ${option.description}`;
+}
+
 /** Flattens a config select's options for a plain select; grouped options get their group's name. */
 export function configSelectOptions(options: ConfigSelectOption[] | ConfigSelectGroup[]): { value: string; label: string }[] {
   return options.flatMap((entry) =>
     'group' in entry
-      ? entry.options.map((option) => ({ value: option.value, label: `${entry.name}: ${option.name}` }))
-      : [{ value: entry.value, label: entry.name }],
+      ? entry.options.map((option) => ({ value: option.value, label: `${entry.name}: ${configOptionName(option)}` }))
+      : [{ value: entry.value, label: configOptionName(entry) }],
   );
 }

@@ -5,9 +5,7 @@ use kube::api::{
     Api, ApiResource, DeleteParams, DynamicObject, GroupVersionKind, Patch, PatchParams,
 };
 use serde_json::json;
-use sloppod_contracts::{
-    Error, Manifest, PlacementBackend, PlacementSpec, PlacementStatus, Result,
-};
+use sloppod_contracts::{Error, Manifest, PlacementBackend, PlacementSpec, Result};
 
 pub const WORKDIR: &str = "/workspace";
 pub const TOKEN_DIR: &str = "/var/run/secrets/sloppod";
@@ -18,6 +16,7 @@ pub fn sandbox_name(session_id: &str) -> String {
 
 pub struct AgentSandbox {
     api: Api<DynamicObject>,
+    pods: Api<k8s_openapi::api::core::v1::Pod>,
     service_account: String,
     pull_policy: String,
 }
@@ -32,7 +31,8 @@ impl AgentSandbox {
         let gvk = GroupVersionKind::gvk("agents.x-k8s.io", "v1beta1", "Sandbox");
         let resource = ApiResource::from_gvk_with_plural(&gvk, "sandboxes");
         Self {
-            api: Api::namespaced_with(client, namespace, &resource),
+            api: Api::namespaced_with(client.clone(), namespace, &resource),
+            pods: Api::namespaced(client, namespace),
             service_account,
             pull_policy,
         }
@@ -77,6 +77,7 @@ impl PlacementBackend for AgentSandbox {
             "kind": "Sandbox",
             "metadata": {"name": name, "labels": spec.labels},
             "spec": {
+                "operatingMode": "Running",
                 "podTemplate": {
                     "metadata": {"labels": spec.labels},
                     "spec": {
@@ -97,6 +98,13 @@ impl PlacementBackend for AgentSandbox {
                             "imagePullPolicy": self.pull_policy,
                             "env": env,
                             "resources": {"limits": limits, "requests": requests},
+                            // The supervisor keeps the agent through link drops; a link down past its grace
+                            // period (or a wedged supervisor) restarts the container (ADR 17).
+                            "livenessProbe": {
+                                "exec": {"command": ["sloppod-supervisor", "--check"]},
+                                "periodSeconds": 30,
+                                "failureThreshold": 3,
+                            },
                             "volumeMounts": [
                                 {"name": "workdir", "mountPath": WORKDIR},
                                 {"name": "sloppod-token", "mountPath": TOKEN_DIR, "readOnly": true},
@@ -130,14 +138,35 @@ impl PlacementBackend for AgentSandbox {
         Ok(())
     }
 
-    async fn status(&self, session_id: &str) -> Result<PlacementStatus> {
-        let exists = self
+    async fn suspend(&self, session_id: &str) -> Result<()> {
+        let patch = json!({"spec": {"operatingMode": "Suspended"}});
+        match self
             .api
-            .get_opt(&sandbox_name(session_id))
+            .patch(
+                &sandbox_name(session_id),
+                &PatchParams::default(),
+                &Patch::Merge(&patch),
+            )
             .await
-            .map_err(err)?
-            .is_some();
-        Ok(PlacementStatus { exists })
+        {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+            Err(e) => Err(err(e)),
+        }
+    }
+
+    async fn replace_pod(&self, session_id: &str) -> Result<()> {
+        // The Sandbox stays as it is, so its controller starts a new pod from the current spec in its place.
+        // Deleting gracefully gives the supervisor its shutdown: the report and the transcript sync.
+        let selector = format!("{}={session_id}", crate::pods::SESSION_LABEL);
+        self.pods
+            .delete_collection(
+                &DeleteParams::default(),
+                &kube::api::ListParams::default().labels(&selector),
+            )
+            .await
+            .map_err(err)?;
+        Ok(())
     }
 
     async fn delete(&self, session_id: &str) -> Result<()> {

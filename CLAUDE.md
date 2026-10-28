@@ -15,14 +15,17 @@ A runtime for coding-agent sessions on Kubernetes. The design lives in the ADRs 
 
 ## Working here
 
-- Tools come from `mise.toml`. `mise run check` runs the format check, clippy and tests, the same as CI.
-- UI: `cd ui && npm ci`, then `npm run check` and `npm run test:e2e` (Playwright against the mock runtime).
+- Tools come from `mise.toml`. `mise run check` runs the format check, clippy and tests, the same as CI. Tests run against a throwaway Postgres (`dev/with-db.sh`); database tests use `#[sqlx::test]`, which gives each test a fresh migrated database.
+- UI: `cd ui && npm ci`, then `npm run check` and `npm run test:e2e` (Playwright against the mock runtime); `mise run ui:check` runs all three.
 - End-to-end on a local cluster, where docker and kind are available:
   1. `dev/up.sh` creates a kind cluster with Cilium, agent-sandbox and Postgres, plus the `sloppod-db` and `sloppod-master-key` Secrets.
   2. `dev/deploy.sh` builds both images, loads them and installs the chart.
   3. Port-forward `svc/sloppod` (e.g. to 18080) and drive it with `sloppodctl` (`cargo build -p sloppod-cli`; set `SLOPPOD_URL`) or the UI. Requests act as the user `dev`.
   4. Add a Claude account and a GitHub App under Settings, or with `sloppodctl add-credential` (see `docs/deploy.md`); they're stored in the database, not in Secrets.
   5. `dev/smoke.sh` runs the milestone checks; it pushes a `sloppod/<id>` branch to the repository and uses a few small model calls. Set the model to Haiku in Settings first to keep them cheap.
-- Inside a sloppod session there's no container runtime, so stick to `mise run check` and the UI tests there.
+- Inside a sloppod session there's no container runtime, so stick to `mise run check` and the UI tests there. The UI tests need a browser first: `npx playwright install chromium` (its download can be slow).
+- Keep the docs in step with the code: a PR that changes behaviour described in an ADR, `docs/*.md` or this file updates them in the same PR. If a change contradicts an ADR, amend the ADR in the same PR (with a dated note under More Information) or say in the PR why it doesn't need to.
 - ADRs are MADR style. Numbers are permanent and append-only; add new ones to the README index under the right group.
+- Logic that more than one place needs is shared, not repeated, above all where it decides security: parsing request paths, building URLs from branch or repository names, minting and attaching credentials, identifying a session. A fix that reaches one copy and misses another is how the same bug comes back (#26 and #172 were one path traversal, fixed twice).
+- Dependencies are kept current by Renovate (`renovate.json`): non-breaking crate, npm and Actions updates merge themselves once CI passes; majors, the Containerfile's pins and the agent adapters come as PRs to review. A new pinned version (a Containerfile `ARG`, a tool in a script) needs a matching `customManagers` entry, or Renovate won't see it.
 - Only comment code for intent a reader couldn't infer.

@@ -19,6 +19,7 @@ async-trait = "0.1.92"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha2 = "0.11.1"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["full"] }
 tracing = "0.1.44"
@@ -37,6 +38,7 @@ k8s-openapi = { version = "0.28.0", features = ["v1_35"] }
 kube = { version = "4.2.0", default-features = false, features = ["client", "runtime", "rustls-tls", "aws-lc-rs"] }
 rand = "0.10.3"
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
+percent-encoding = "2.3.2"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "stream"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid", "chrono", "json", "migrate", "macros"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }

@@ -71,3 +71,7 @@ Prior art:
 - [AWS session policies](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies.html#policies_session)
 - [Sandstorm Powerbox](https://docs.sandstorm.io/en/latest/developing/powerbox/)
 - [CB4A draft](https://www.ietf.org/archive/id/draft-hartman-credential-broker-4-agents-00.html)
+
+2026-10-27: the `github` capability is read access to public GitHub. Each `repo` grant is what lets the session's GitHub credential reach a repository: reads at any access level, and pushes with `rw`. Tokens are minted for exactly those grants ([ADR 11](0011-enforcement-at-the-pod-boundary.md)).
+
+2026-10-28: a `docs` capability ([#195](https://github.com/bo0tzz/sloppod/issues/195)), granted to new sessions by default: agents get Context7's hosted MCP server (`mcp.context7.com`) as `docs` tools, to look up current library documentation by library and topic. Its request policy lets through only the MCP endpoint, so no other part of the web opens up, and the exfiltration surface is that one service's query API. It's used without an API key, so it's rate limited; a key from a credential can come later. A session without the grant gets neither the server nor the egress.

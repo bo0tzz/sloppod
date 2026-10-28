@@ -15,7 +15,8 @@ session:
     storageClass: ""
   cpu: ""
   memory: 4Gi
-  # Hosts sessions may reach without the authorizer, e.g. package registries. Empty keeps the built-in list.
+  # Hosts sessions may reach without the authorizer, e.g. package registries. Empty keeps the built-in list. A `*`
+  # matches within one DNS label, e.g. `productionresultssa*.blob.core.windows.net`.
   directHosts: []
 
 # Postgres connection URI, from an existing Secret (e.g. CloudNativePG's `<cluster>-app`, key `uri`).
@@ -35,6 +36,8 @@ auth:
   userHeader: x-forwarded-user
   # User for requests without that header; leave empty to refuse them.
   defaultUser: ""
+  # Origins besides sloppod's own a browser may open /acp from, e.g. https://ui.example.com.
+  allowedOrigins: []
 
 memory:
   # Prepended to every memory namespace, e.g. `dev/` for a test install.
@@ -45,6 +48,9 @@ instructions: ""
 
 # CA bundle inside Cilium's Envoy for verifying real upstreams.
 envoyTrustedCA: /etc/ssl/certs/ca-certificates.crt
+
+# The cluster's DNS domain. Sessions can look up names under it, and otherwise only the hosts they may reach.
+clusterDomain: cluster.local
 
 # The runtime's ServiceAccount; defaults to the release's full name. Override it when something else, like a
 # CloudNativePG cluster of the same name, already owns that ServiceAccount.

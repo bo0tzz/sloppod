@@ -15,14 +15,27 @@
     Text,
     Textarea,
   } from '@immich/ui';
-  import { mdiOpenInNew, mdiSourceCommit } from '@mdi/js';
-  import { onMount } from 'svelte';
-  import { api, type Proposal, type ProposalDetail, type PullRequestPayload, type RepoGrantPayload } from '#lib/api.ts';
-  import { parseUnifiedDiff } from '#lib/diff.ts';
+  import { mdiChevronRight, mdiOpenInNew } from '@mdi/js';
+  import {
+    api,
+    type IssueDraft,
+    type IssuesPayload,
+    type IssueUpdate,
+    type IssueUpdatesPayload,
+    type Proposal,
+    type ProposalDetail,
+    type ProposalEdits,
+    type PullRequestPayload,
+    type RepoGrantPayload,
+    type StackPayload,
+  } from '#lib/api.ts';
+  import { diffStats, parseUnifiedDiff } from '#lib/diff.ts';
+  import { readStored, writeStored } from '#lib/storage.ts';
   import { absoluteTime } from '#lib/format.ts';
-  import { proposalStatus, proposalSummary } from '#lib/presentation.ts';
-  import DiffView from './DiffView.svelte';
+  import { proposalKinds, proposalStatus, proposalSummary } from '#lib/presentation.ts';
   import Markdown from './Markdown.svelte';
+  import PullRequestChanges from './PullRequestChanges.svelte';
+  import ReviewHistory from './ReviewHistory.svelte';
 
   let {
     proposal,
@@ -30,10 +43,6 @@
     onClose,
   }: { proposal: Proposal; onChange: (proposal: Proposal) => void; onClose: () => void } = $props();
 
-  const kindTitles: Record<string, string> = {
-    'github.pr.create': 'Pull request proposal',
-    'sloppod.repo.grant': 'Repository access',
-  };
   // svelte-ignore state_referenced_locally
   const kind = proposal.kind;
 
@@ -43,42 +52,88 @@
   let busy = $state<'approve' | 'reject' | null>(null);
 
   let editing = $state(false);
+  // Off by default would hide most of a docs change, whose paragraphs are single long lines.
+  let wrapLines = $state(readStored('sloppod.diff.wrap') !== 'false');
+  $effect(() => writeStored('sloppod.diff.wrap', String(wrapLines)));
   let title = $state('');
   let body = $state('');
   let rejecting = $state(false);
   let autoMerge = $state(false);
   let reason = $state('');
+  let drafts = $state<(IssueDraft & { file: boolean })[]>([]);
 
   const pr = $derived(detail?.kind === 'github.pr.create' ? (detail.payload as PullRequestPayload) : null);
   const grant = $derived(detail?.kind === 'sloppod.repo.grant' ? (detail.payload as RepoGrantPayload) : null);
+  const issues = $derived(detail?.kind === 'github.issue.create' ? (detail.payload as IssuesPayload) : null);
+  const issueUpdates = $derived(
+    detail?.kind === 'github.issue.update' ? (detail.payload as IssueUpdatesPayload) : null,
+  );
+  const closeReasons = { completed: 'completed', not_planned: 'not planned', duplicate: 'a duplicate' };
+  const filing = $derived(drafts.filter((draft) => draft.file).length);
+  let updateDrafts = $state<(IssueUpdate & { make: boolean })[]>([]);
+  const making = $derived(updateDrafts.filter((draft) => draft.make).length);
   const summary = $derived(proposalSummary(detail ?? proposal));
-  const parsed = $derived(pr && detail ? parseUnifiedDiff(detail.diff ?? '') : []);
-  const files = $derived(parsed ?? []);
-  const totalLines = $derived(files.reduce((sum, file) => sum + file.lines.length, 0));
+  const stack = $derived(detail?.kind === 'github.stack.create' ? (detail.payload as StackPayload) : null);
   const pending = $derived(detail?.status === 'pending');
 
-  onMount(async () => {
-    try {
-      detail = await api.getProposal(proposal.id);
-      autoMerge = detail.kind === 'github.pr.create' && (detail.payload as PullRequestPayload).auto_merge === true;
-    } catch (error) {
-      loadError = error instanceof Error ? error.message : String(error);
-    }
+  // The proposal changes while the modal is open: it's decided in another tab, passes review, or a review round
+  // re-pins it to a new head. Fetch the detail (with its diff) again then, and put the form back to the new payload.
+  const version = $derived(`${proposal.status}\n${JSON.stringify(proposal.payload)}`);
+  let loaded = '';
+  let loads = 0;
+  $effect(() => {
+    if (version === loaded) return;
+    const payloadChanged = !detail || JSON.stringify(detail.payload) !== JSON.stringify(proposal.payload);
+    loaded = version;
+    void load(payloadChanged);
   });
 
+  async function load(resetForm: boolean) {
+    const load = ++loads;
+    try {
+      const fetched = await api.getProposal(proposal.id);
+      if (load !== loads) return;
+      detail = fetched;
+      loadError = null;
+      if (!resetForm) return;
+      editing = false;
+      autoMerge =
+        (fetched.kind === 'github.pr.create' || fetched.kind === 'github.stack.create') &&
+        (fetched.payload as { auto_merge?: boolean }).auto_merge === true;
+      resetDrafts();
+    } catch (error) {
+      if (load === loads) loadError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  const diffCounts = (diff: string) => diffStats(parseUnifiedDiff(diff) ?? []);
+
+  function resetDrafts() {
+    if (detail?.kind === 'github.issue.update') {
+      updateDrafts = (detail.payload as IssueUpdatesPayload).updates.map((update) => ({ ...update, make: true }));
+    }
+    if (detail?.kind !== 'github.issue.create') return;
+    drafts = (detail.payload as IssuesPayload).issues.map((issue) => ({ ...issue, labels: [...issue.labels], file: true }));
+  }
+
+  /** Records the decision; the modal only stays open to show a failure. */
   function applyResult(proposal: Proposal) {
     if (detail) detail = { ...detail, ...proposal };
     onChange(proposal);
+    if (proposal.status !== 'failed') onClose();
   }
 
   async function approve() {
     if (!detail) return;
     busy = 'approve';
     actionError = null;
-    const edits: { title?: string; body?: string; auto_merge?: boolean } = {};
+    const edits: ProposalEdits = {};
     if (editing && pr && title !== pr.title) edits.title = title;
     if (editing && pr && body !== pr.body) edits.body = body;
+    if (issues) edits.issues = drafts.filter((draft) => draft.file).map(({ file: _file, ...issue }) => issue);
+    if (issueUpdates) edits.updates = updateDrafts.filter((draft) => draft.make).map(({ make: _make, ...update }) => update);
     if (pr && autoMerge !== (pr.auto_merge === true)) edits.auto_merge = autoMerge;
+    if (stack && autoMerge !== (stack.auto_merge === true)) edits.auto_merge = autoMerge;
     try {
       applyResult(await api.approveProposal(detail.id, edits));
       editing = false;
@@ -104,14 +159,20 @@
   }
 
   function startEditing() {
-    if (!pr) return;
-    title = pr.title;
-    body = pr.body;
+    if (pr) {
+      title = pr.title;
+      body = pr.body;
+    }
     editing = true;
+  }
+
+  function discardEdits() {
+    resetDrafts();
+    editing = false;
   }
 </script>
 
-<Modal title={kindTitles[kind] ?? `Proposal: ${kind}`} icon={summary.icon} size={pr ? 'giant' : 'medium'} {onClose}>
+<Modal title={proposalKinds[kind]?.title ?? `Proposal: ${kind}`} icon={summary.icon} size={pr || stack ? 'giant' : issues ? 'large' : 'medium'} {onClose}>
   <ModalBody>
     <div class="flex flex-col gap-5 pb-4" data-testid="proposal-detail">
       {#if loadError}
@@ -130,6 +191,10 @@
           {/if}
           {#if pr}
             <span class="text-muted min-w-0 font-mono text-xs break-all">{pr.repo}: {pr.head} → {pr.base}</span>
+          {:else if issues}
+            <span class="text-muted min-w-0 font-mono text-xs break-all">{issues.repo}</span>
+          {:else if stack}
+            <span class="text-muted min-w-0 font-mono text-xs break-all">{stack.repo}: {stack.pull_requests.length} pull requests → {stack.base}</span>
           {/if}
         </div>
 
@@ -140,9 +205,39 @@
               <Icon icon={mdiOpenInNew} aria-hidden />
             </a>
           </Alert>
+        {:else if detail.status === 'executed' && stack && detail.result?.pull_requests}
+          <Alert color="success" size="small" title="Pull requests opened">
+            <ul class="flex flex-col gap-1">
+              {#each detail.result.pull_requests as opened (opened.number)}
+                <li>
+                  <a href={opened.url} target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-1 underline" data-testid="proposal-result">
+                    #{opened.number}
+                    <Icon icon={mdiOpenInNew} aria-hidden />
+                  </a>
+                </li>
+              {/each}
+            </ul>
+            {#if detail.result.message}<p class="mt-1">{detail.result.message}</p>{/if}
+          </Alert>
         {:else if detail.status === 'executed' && grant}
           <Alert color="success" size="small" title="Access granted">
             The session can now push to <span class="font-mono">{grant.branch}</span> on {grant.repo}.
+          </Alert>
+        {:else if detail.status === 'executed' && issues && detail.result?.issues}
+          <Alert color="success" size="small" title="Issues filed">
+            <ul class="flex flex-col gap-1">
+              {#each detail.result.issues as filed (filed.number)}
+                <li>
+                  <a href={filed.url} target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-1 underline" data-testid="filed-issue">
+                    #{filed.number} {filed.title}
+                    <Icon icon={mdiOpenInNew} aria-hidden />
+                  </a>
+                </li>
+              {/each}
+              {#each detail.result.failed ?? [] as failure, index (index)}
+                <li class="text-danger">{failure.title}: {failure.error}</li>
+              {/each}
+            </ul>
           </Alert>
         {:else if detail.status === 'failed'}
           <Alert color="danger" size="small" title="Execution failed">{detail.error ?? 'Unknown error'}</Alert>
@@ -150,8 +245,60 @@
           <Alert color="secondary" size="small" title="Rejected">{detail.reason || 'No reason given.'}</Alert>
         {/if}
 
+        {#if detail.review_session_id}
+          <ReviewHistory proposalId={detail.id} reviewSessionId={detail.review_session_id} />
+        {/if}
+
         {#if pr}
           {@render pullRequest(detail, pr)}
+        {:else if stack}
+          {@render stackedPullRequests(detail, stack)}
+        {:else if issues}
+          {@render issueList()}
+        {:else if issueUpdates}
+          <ul class="flex flex-col gap-3" data-testid="issue-updates">
+            <!-- By position: one proposal may update the same issue twice. -->
+            {#each updateDrafts as update, index (index)}
+              <li
+                class={['border-light-200 flex flex-col gap-1 rounded-xl border p-3', !update.make && 'opacity-60']}
+                data-testid="issue-update"
+              >
+                <div class="flex items-center justify-between gap-2">
+                  <Text fontWeight="semi-bold">
+                    #{update.number}
+                    {#if update.close}<span class="text-muted font-normal">· close as {closeReasons[update.close]}</span>{/if}
+                    {#if update.reopen}<span class="text-muted font-normal">· reopen</span>{/if}
+                  </Text>
+                  {#if pending}
+                    <label class="text-muted flex shrink-0 items-center gap-2 text-xs">
+                      <Checkbox bind:checked={update.make} aria-label="Make this update" size="tiny" />
+                      Make this update
+                    </label>
+                  {/if}
+                </div>
+                {#if update.title}<Text size="small">New title: {update.title}</Text>{/if}
+                {#if update.add_labels?.length}<Text size="small">Add labels: {update.add_labels.join(', ')}</Text>{/if}
+                {#if update.remove_labels?.length}
+                  <Text size="small">Remove labels: {update.remove_labels.join(', ')}</Text>
+                {/if}
+                {#if editing && update.make}
+                  <Field label="Comment">
+                    <Textarea bind:value={update.comment} />
+                  </Field>
+                {:else if update.comment}
+                  <div class="bg-light-100 rounded-lg p-2 text-sm"><Markdown text={update.comment} /></div>
+                {/if}
+                {#if update.body === ''}
+                  <Text size="small">Clears the body</Text>
+                {:else if update.body}
+                  <details>
+                    <summary class="text-muted cursor-pointer text-sm">New body</summary>
+                    <div class="bg-light-100 mt-1 rounded-lg p-2 text-sm"><Markdown text={update.body} /></div>
+                  </details>
+                {/if}
+              </li>
+            {/each}
+          </ul>
         {:else if grant}
           <div class="flex flex-col gap-3">
             <Heading tag="h2" size="tiny" data-testid="proposal-title">{summary.title}</Heading>
@@ -175,7 +322,8 @@
         {/if}
 
         <Text color="muted" size="tiny">
-          Proposed {absoluteTime(detail.created_at)}{#if detail.decided_at}, decided {absoluteTime(detail.decided_at)}{/if}
+          Proposed {absoluteTime(detail.created_at)}{#if detail.decided_at}, decided {absoluteTime(detail.decided_at)}{/if}{#if detail.decided_by?.startsWith('standing-approval:')}
+            by a standing approval{/if}
         </Text>
       {/if}
     </div>
@@ -201,28 +349,112 @@
         </div>
       {:else}
         <div class="flex flex-wrap items-center justify-end gap-2">
-          {#if pr}
+          {#if pr || stack}
             <label class="text-muted mr-auto flex items-center gap-2 text-sm">
               <Checkbox bind:checked={autoMerge} aria-label="Merge when checks pass" />
-              Merge when checks pass
+              {stack ? 'Merge the stack when checks pass' : 'Merge when checks pass'}
             </label>
           {/if}
           <Button color="danger" variant="outline" shape="round" disabled={busy !== null} onclick={() => (rejecting = true)}>
             Reject…
           </Button>
           {#if editing}
-            <Button color="secondary" variant="ghost" shape="round" onclick={() => (editing = false)}>Discard edits</Button>
-          {:else if pr}
+            <Button color="secondary" variant="ghost" shape="round" onclick={discardEdits}>Discard edits</Button>
+          {:else if pr || issues || issueUpdates}
             <Button color="secondary" variant="outline" shape="round" onclick={startEditing}>Edit</Button>
           {/if}
-          <Button color="success" shape="round" loading={busy === 'approve'} disabled={busy === 'reject'} onclick={approve}>
-            {editing ? 'Approve with edits' : 'Approve'}
+          <Button
+            color="success"
+            shape="round"
+            loading={busy === 'approve'}
+            disabled={busy === 'reject' || (issues !== null && filing === 0) || (issueUpdates !== null && making === 0)}
+            onclick={approve}
+          >
+            {#if issues}
+              File {filing} {filing === 1 ? 'issue' : 'issues'}
+            {:else if issueUpdates}
+              Make {making} {making === 1 ? 'update' : 'updates'}
+            {:else}
+              {editing ? 'Approve with edits' : 'Approve'}
+            {/if}
           </Button>
         </div>
       {/if}
     </div>
   </ModalFooter>
 </Modal>
+
+{#snippet issueList()}
+  <div class="flex flex-col gap-3">
+    {#each drafts as draft, index (index)}
+      <section
+        class="border-light-200 flex flex-col gap-2 rounded-xl border p-3 {draft.file ? '' : 'opacity-50'}"
+        data-testid="issue-draft"
+      >
+        <div class="flex items-start gap-2">
+          {#if pending}
+            <Checkbox bind:checked={draft.file} aria-label="File this issue" class="mt-0.5" />
+          {/if}
+          {#if editing && draft.file}
+            <Input bind:value={draft.title} aria-label="Issue title" class="grow" />
+          {:else}
+            <Heading tag="h3" size="tiny" data-testid="issue-title">{draft.title}</Heading>
+          {/if}
+        </div>
+        {#if draft.labels.length > 0}
+          <div class="flex flex-wrap gap-1">
+            {#each draft.labels as label (label)}
+              <Badge size="tiny" shape="round" color="secondary">{label}</Badge>
+            {/each}
+          </div>
+        {/if}
+        {#if editing && draft.file}
+          <Textarea bind:value={draft.body} rows={6} aria-label="Issue description" class="font-mono" />
+        {:else if draft.body.trim()}
+          <div class="bg-light-100 rounded-xl p-3 text-sm">
+            <Markdown text={draft.body} />
+          </div>
+        {/if}
+      </section>
+    {/each}
+  </div>
+{/snippet}
+
+{#snippet stackedPullRequests(detail: ProposalDetail, stack: StackPayload)}
+  <Text color="muted" size="small">
+    Each pull request merges into the one before it, the first into <span class="font-mono">{stack.base}</span>. Approving
+    opens them all and links them as a stack on GitHub.
+  </Text>
+  {#each stack.pull_requests as layer, index (layer.head)}
+    {@const changes = detail.layers?.[index]}
+    {@const counts = changes ? diffCounts(changes.diff) : null}
+    <details class="group/layer border-light-200 rounded-2xl border" data-testid="stack-layer">
+      <summary class="flex cursor-pointer list-none items-start gap-2 p-3">
+        <Icon icon={mdiChevronRight} size="1.25rem" class="text-muted mt-0.5 shrink-0 transition-transform group-open/layer:rotate-90" aria-hidden />
+        <div class="flex min-w-0 grow flex-col gap-1">
+          <Heading tag="h2" size="tiny">{index + 1}. {layer.title}</Heading>
+          <span class="text-muted font-mono text-xs break-all">
+            {layer.head} → {layer.base}{#if counts}
+              <span class="ms-2 font-sans">
+                <span class="text-success-600">+{counts.additions}</span>
+                <span class="text-danger-600">−{counts.deletions}</span>
+              </span>{/if}
+          </span>
+        </div>
+      </summary>
+      <div class="flex flex-col gap-3 px-3 pb-3">
+        {#if layer.body.trim()}
+          <div class="bg-light-100 rounded-xl p-3 text-sm">
+            <Markdown text={layer.body} />
+          </div>
+        {/if}
+        {#if changes}
+          <PullRequestChanges diff={changes.diff} commits={changes.commits} bind:wrap={wrapLines} />
+        {/if}
+      </div>
+    </details>
+  {/each}
+{/snippet}
 
 {#snippet pullRequest(detail: ProposalDetail, pr: PullRequestPayload)}
   {#if editing}
@@ -247,40 +479,5 @@
     </div>
   {/if}
 
-  <section class="flex flex-col gap-2">
-    <Heading tag="h3" size="tiny">Commits ({detail.commits?.length ?? 0})</Heading>
-    <ul class="border-light-200 divide-light-200 divide-y rounded-xl border text-sm">
-      {#each detail.commits ?? [] as commit (commit.sha)}
-        <li class="flex items-start gap-2 px-3 py-2">
-          <Icon icon={mdiSourceCommit} class="text-muted mt-0.5 shrink-0" aria-hidden />
-          <span class="min-w-0 grow break-words">{commit.message.split('\n')[0]}</span>
-          <code class="text-muted shrink-0 font-mono text-xs">{commit.sha.slice(0, 7)}</code>
-        </li>
-      {:else}
-        <li class="text-muted px-3 py-2">No commits.</li>
-      {/each}
-    </ul>
-  </section>
-
-  <section class="flex flex-col gap-2">
-    <Heading tag="h3" size="tiny">
-      Changes
-      {#if parsed}
-        <span class="text-muted font-normal">
-          ({files.length} {files.length === 1 ? 'file' : 'files'},
-          <span class="text-success-600">+{files.reduce((sum, file) => sum + file.additions, 0)}</span>
-          <span class="text-danger-600">−{files.reduce((sum, file) => sum + file.deletions, 0)}</span>)
-        </span>
-      {/if}
-    </Heading>
-    {#if parsed === null}
-      <pre class="bg-light-100 max-h-[60dvh] overflow-auto rounded-lg p-3 font-mono text-xs">{detail.diff}</pre>
-    {:else}
-      {#each files as file, index (index)}
-        <DiffView diff={file} open={totalLines < 1500} />
-      {:else}
-        <Text color="muted" size="small">Empty diff.</Text>
-      {/each}
-    {/if}
-  </section>
+  <PullRequestChanges diff={detail.diff ?? ''} commits={detail.commits ?? []} bind:wrap={wrapLines} />
 {/snippet}

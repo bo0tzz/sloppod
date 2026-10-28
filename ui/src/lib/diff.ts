@@ -80,6 +80,14 @@ export function diffTexts(path: string, oldText: string | null | undefined, newT
 }
 
 /** Parses a unified diff, or returns null if it's malformed so the caller can show it raw. */
+/** Lines added and removed across `files`. */
+export function diffStats(files: FileDiff[]): { additions: number; deletions: number } {
+  return {
+    additions: files.reduce((sum, file) => sum + file.additions, 0),
+    deletions: files.reduce((sum, file) => sum + file.deletions, 0),
+  };
+}
+
 export function parseUnifiedDiff(text: string): FileDiff[] | null {
   if (!text.trim()) return [];
   try {

@@ -1,3 +1,5 @@
+mod codex;
+pub mod docs;
 mod github;
 mod memini;
 mod model;
@@ -6,11 +8,13 @@ use std::sync::Arc;
 
 use sloppod_contracts::RequestPolicy;
 
+pub use codex::CodexPolicy;
+pub use docs::DocsPolicy;
 pub use github::GitHubPolicy;
 pub use memini::{MeminiPolicy, SESSION_KEY};
 pub use model::ModelPolicy;
 
-/// Request policies. Their hosts can change at runtime, e.g. when a memini credential is added.
+/// The request policies the authorizer applies, each to the hosts it names.
 #[derive(Default, Clone)]
 pub struct Policies {
     policies: Vec<Arc<dyn RequestPolicy>>,

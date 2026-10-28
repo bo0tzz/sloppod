@@ -1,23 +1,202 @@
 //! GitHub App client: installation tokens for the authorizer, and the API calls proposals need.
 
-use std::collections::HashMap;
-use std::time::Duration;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::OnceCell;
 
 const API: &str = "https://api.github.com";
 
+/// Lookups the authorizer makes while deciding a request, which Envoy gives 10 s in all.
+const AUTHZ_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a repository's installation is trusted: reinstalling the app changes it.
+const INSTALLATION_TTL: Duration = Duration::from_secs(600);
+/// How long "not installed" is trusted, so reads of public repositories don't ask GitHub every time.
+const NOT_INSTALLED_TTL: Duration = Duration::from_secs(60);
+
+/// What a session's read token may have, as far as the installation has them. A fixed list rather than
+/// every installation permission at `read`, because some (`workflows`) have no read level.
+const READ_PERMISSIONS: &[&str] = &[
+    "actions",
+    "checks",
+    "contents",
+    "issues",
+    "metadata",
+    "pull_requests",
+    "statuses",
+];
+
+/// When the authorizer let pushes to branches through. A push it admitted may still be landing, so work that needs
+/// branches to hold still checks here as well as their heads. The runtime is one process (ADR 14), so this is too.
+#[derive(Default)]
+pub struct PushLog {
+    admitted: Mutex<HashMap<(String, String), Instant>>,
+}
+
+impl PushLog {
+    pub fn admit(&self, repo: &str, branch: &str) {
+        self.admitted
+            .lock()
+            .unwrap()
+            .insert((repo.to_lowercase(), branch.to_owned()), Instant::now());
+    }
+
+    /// The first of `branches` a push was let through to since `settle` before `since`.
+    pub fn pushed_since<'a>(
+        &self,
+        repo: &str,
+        branches: &[&'a str],
+        since: Instant,
+        settle: Duration,
+    ) -> Option<&'a str> {
+        let admitted = self.admitted.lock().unwrap();
+        branches.iter().copied().find(|branch| {
+            admitted
+                .get(&(repo.to_lowercase(), (*branch).to_owned()))
+                .is_some_and(|at| *at + settle >= since)
+        })
+    }
+}
+
+/// Items per page when reading GitHub's lists.
+const PAGE: usize = 100;
+
+/// Every item of a paged GitHub list: `fetch` gets page 1, 2, … until one comes back short.
+async fn all_pages<F, Fut>(mut fetch: F) -> anyhow::Result<Vec<Value>>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<Value>>>,
+{
+    let mut all = Vec::new();
+    for page in 1.. {
+        let items = fetch(page).await?;
+        let last = items.len() < PAGE;
+        all.extend(items);
+        if last {
+            break;
+        }
+    }
+    Ok(all)
+}
+
+/// How long a push the authorizer let through may take to land, for work that needs branches to hold still.
+const PUSH_SETTLE: Duration = Duration::from_secs(10 * 60);
+
+/// What [`GitHubApp::check_merging_stack`] found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StackWatch {
+    /// Merged, closed, or no longer set to merge: nothing left to watch.
+    Done,
+    /// Every layer is still at its proposed commit.
+    Holding,
+    /// This layer moved, and the stack's auto-merge is now off.
+    Moved(u64),
+}
+
+/// A linked stack to merge: its number, its pull requests and each layer's branch and proposed commit, bottom to
+/// top, and the top pull request's node id.
+#[derive(Clone, Copy)]
+pub struct StackMerge<'a> {
+    pub stack: u64,
+    pub pulls: &'a [u64],
+    pub top_node_id: &'a str,
+    pub layers: &'a [(&'a str, &'a str)],
+}
+
+/// A query string, `?k=v&…`, with every value encoded: a branch name with `#` or `&` in it must not end the value.
+fn query(pairs: &[(&str, &str)]) -> String {
+    let pairs: Vec<String> = pairs
+        .iter()
+        .map(|(key, value)| format!("{key}={}", utf8_percent_encode(value, NON_ALPHANUMERIC)))
+        .collect();
+    format!("?{}", pairs.join("&"))
+}
+
+/// A branch as GitHub's pull request filters name it, `owner:branch`.
+fn head_ref(repo: &str, branch: &str) -> String {
+    let owner = repo.split('/').next().unwrap_or_default();
+    format!("{owner}:{branch}")
+}
+
+/// A branch name as a URL path segment: its `/`s stay, since GitHub reads them as part of the name there.
+fn branch_in_path(branch: &str) -> String {
+    const KEEP: &AsciiSet = &NON_ALPHANUMERIC
+        .remove(b'/')
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_');
+    utf8_percent_encode(branch, KEEP).to_string()
+}
+
+/// One cached token, minted by whichever caller gets the slot first; the others wait for it.
+type TokenSlot = Arc<tokio::sync::Mutex<Option<AccessToken>>>;
+
+/// What a token is minted for. `None` is everything the installation has.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TokenScope {
+    installation: u64,
+    /// Repository names without the owner, lowercase and sorted.
+    repositories: Option<Vec<String>>,
+    permissions: Option<BTreeMap<String, String>>,
+}
+
+impl TokenScope {
+    fn full(installation: u64) -> Self {
+        TokenScope {
+            installation,
+            repositories: None,
+            permissions: None,
+        }
+    }
+
+    fn body(&self) -> Value {
+        let mut body = json!({});
+        if let Some(repositories) = &self.repositories {
+            body["repositories"] = json!(repositories);
+        }
+        if let Some(permissions) = &self.permissions {
+            body["permissions"] = json!(permissions);
+        }
+        body
+    }
+}
+
+/// Repository names for a token's `repositories`, which are relative to the installation's account.
+fn repository_names<'a>(repos: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut names: Vec<String> = repos
+        .into_iter()
+        .map(|r| r.rsplit('/').next().unwrap_or(r).to_lowercase())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn read_permissions(installation: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    READ_PERMISSIONS
+        .iter()
+        .filter(|p| installation.contains_key(**p))
+        .map(|p| (p.to_string(), "read".to_owned()))
+        .collect()
+}
+
 pub struct GitHubApp {
+    api: String,
     app_id: String,
     key: EncodingKey,
     http: reqwest::Client,
-    installations: Mutex<HashMap<String, u64>>,
-    tokens: Mutex<HashMap<u64, (String, DateTime<Utc>)>>,
+    /// Repository (lowercase) to installation, or `None` for not installed, with when it was looked up.
+    installations: Mutex<HashMap<String, (Option<u64>, Instant)>>,
+    /// What each installation was granted, as `permission: level`.
+    permissions: Mutex<HashMap<u64, BTreeMap<String, String>>>,
+    tokens: Mutex<HashMap<TokenScope, TokenSlot>>,
     identity: OnceCell<GitIdentity>,
 }
 
@@ -34,15 +213,38 @@ struct AccessToken {
     expires_at: DateTime<Utc>,
 }
 
+impl AccessToken {
+    fn fresh(&self) -> bool {
+        self.expires_at - Utc::now() > chrono::Duration::minutes(5)
+    }
+}
+
+fn installation_cached(entry: (Option<u64>, Instant), now: Instant) -> Option<Option<u64>> {
+    let (id, at) = entry;
+    let ttl = if id.is_some() {
+        INSTALLATION_TTL
+    } else {
+        NOT_INSTALLED_TTL
+    };
+    (now.duration_since(at) < ttl).then_some(id)
+}
+
 pub struct Comparison {
     pub diff: String,
     pub commits: Vec<(String, String)>,
     pub ahead_by: u64,
+    /// The commit `head` resolved to.
+    pub head_sha: String,
 }
 
 impl GitHubApp {
     pub fn new(app_id: String, private_key_pem: &[u8]) -> anyhow::Result<Self> {
+        Self::with_api(API, app_id, private_key_pem)
+    }
+
+    fn with_api(api: &str, app_id: String, private_key_pem: &[u8]) -> anyhow::Result<Self> {
         Ok(Self {
+            api: api.to_owned(),
             app_id,
             key: EncodingKey::from_rsa_pem(private_key_pem)
                 .context("parsing the GitHub App private key")?,
@@ -51,6 +253,7 @@ impl GitHubApp {
                 .timeout(Duration::from_secs(60))
                 .build()?,
             installations: Mutex::default(),
+            permissions: Mutex::default(),
             tokens: Mutex::default(),
             identity: OnceCell::new(),
         })
@@ -70,7 +273,7 @@ impl GitHubApp {
                 let login = format!("{slug}[bot]");
                 let user: Value = self
                     .http
-                    .get(format!("{API}/users/{login}"))
+                    .get(self.url(&format!("/users/{login}")))
                     .bearer_auth(self.any_token().await?)
                     .header("accept", "application/vnd.github+json")
                     .send()
@@ -88,6 +291,10 @@ impl GitHubApp {
             .cloned()
     }
 
+    fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.api)
+    }
+
     fn jwt(&self) -> anyhow::Result<String> {
         let now = Utc::now().timestamp();
         let claims = json!({"iat": now - 60, "exp": now + 540, "iss": self.app_id});
@@ -101,108 +308,291 @@ impl GitHubApp {
     async fn app_get(&self, path: &str) -> anyhow::Result<reqwest::Response> {
         let response = self
             .http
-            .get(format!("{API}{path}"))
+            .get(self.url(path))
             .bearer_auth(self.jwt()?)
             .header("accept", "application/vnd.github+json")
+            .timeout(AUTHZ_TIMEOUT)
             .send()
             .await?;
         Ok(response)
     }
 
+    fn remember_installation(&self, repo: &str, installation: &Value) {
+        let id = installation["id"].as_u64();
+        if let (Some(id), Some(permissions)) = (id, installation["permissions"].as_object()) {
+            let permissions = permissions
+                .iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+                .collect();
+            self.permissions.lock().unwrap().insert(id, permissions);
+        }
+        self.installations
+            .lock()
+            .unwrap()
+            .insert(repo.to_lowercase(), (id, Instant::now()));
+    }
+
     async fn installation_for(&self, repo: &str) -> anyhow::Result<u64> {
-        if let Some(id) = self.installations.lock().await.get(repo) {
-            return Ok(*id);
-        }
-        let response = self.app_get(&format!("/repos/{repo}/installation")).await?;
-        if !response.status().is_success() {
-            bail!(
-                "the GitHub App is not installed on {repo} ({})",
-                response.status()
-            );
-        }
-        let id = response.json::<Value>().await?["id"]
-            .as_u64()
-            .context("installation without id")?;
-        self.installations.lock().await.insert(repo.to_owned(), id);
-        Ok(id)
-    }
-
-    async fn installation_token(&self, installation: u64) -> anyhow::Result<String> {
-        let mut tokens = self.tokens.lock().await;
-        if let Some((token, expires)) = tokens.get(&installation)
-            && *expires - Utc::now() > chrono::Duration::minutes(5)
-        {
-            return Ok(token.clone());
-        }
-        let response = self
-            .http
-            .post(format!(
-                "{API}/app/installations/{installation}/access_tokens"
-            ))
-            .bearer_auth(self.jwt()?)
-            .header("accept", "application/vnd.github+json")
-            .send()
-            .await?
-            .error_for_status()?;
-        let token: AccessToken = response.json().await?;
-        tokens.insert(installation, (token.token.clone(), token.expires_at));
-        Ok(token.token)
-    }
-
-    /// An installation token that can act on `repo`.
-    pub async fn token_for(&self, repo: &str) -> anyhow::Result<String> {
-        let installation = self.installation_for(repo).await?;
-        self.installation_token(installation).await
-    }
-
-    /// A token from any of the app's installations, for reads that aren't tied to one repository.
-    pub async fn any_token(&self) -> anyhow::Result<String> {
-        let cached = self.installations.lock().await.values().next().copied();
-        let installation = match cached {
+        let cached = self
+            .installations
+            .lock()
+            .unwrap()
+            .get(&repo.to_lowercase())
+            .copied();
+        let id = match cached.and_then(|entry| installation_cached(entry, Instant::now())) {
             Some(id) => id,
             None => {
-                let installations: Vec<Value> = self
-                    .app_get("/app/installations")
-                    .await?
-                    .error_for_status()?
-                    .json()
+                let response = self
+                    .http
+                    .get(self.url(&format!("/repos/{repo}/installation")))
+                    .bearer_auth(self.jwt()?)
+                    .header("accept", "application/vnd.github+json")
+                    .timeout(AUTHZ_TIMEOUT)
+                    .send()
                     .await?;
-                installations
-                    .first()
-                    .and_then(|i| i["id"].as_u64())
-                    .context("the GitHub App has no installations")?
+                let installation = match response.status() {
+                    reqwest::StatusCode::NOT_FOUND => Value::Null,
+                    status if !status.is_success() => {
+                        bail!(
+                            "looking up the GitHub App's installation on {repo} failed ({status})"
+                        )
+                    }
+                    _ => response.json::<Value>().await?,
+                };
+                self.remember_installation(repo, &installation);
+                installation["id"].as_u64()
             }
         };
-        self.installation_token(installation).await
+        id.with_context(|| format!("the GitHub App is not installed on {repo}"))
+    }
+
+    /// What `installation` was granted, or `None` if it's gone.
+    async fn installation_permissions(
+        &self,
+        installation: u64,
+    ) -> anyhow::Result<Option<BTreeMap<String, String>>> {
+        if let Some(permissions) = self.permissions.lock().unwrap().get(&installation) {
+            return Ok(Some(permissions.clone()));
+        }
+        let response = self
+            .app_get(&format!("/app/installations/{installation}"))
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            self.forget_installation(installation);
+            return Ok(None);
+        }
+        let info: Value = response.error_for_status()?.json().await?;
+        let permissions: BTreeMap<String, String> = info["permissions"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+            .collect();
+        self.permissions
+            .lock()
+            .unwrap()
+            .insert(installation, permissions.clone());
+        Ok(Some(permissions))
+    }
+
+    /// Drops everything cached about an installation that no longer exists, e.g. after the app was reinstalled.
+    fn forget_installation(&self, installation: u64) {
+        self.installations
+            .lock()
+            .unwrap()
+            .retain(|_, (id, _)| *id != Some(installation));
+        self.permissions.lock().unwrap().remove(&installation);
+        self.tokens
+            .lock()
+            .unwrap()
+            .retain(|scope, _| scope.installation != installation);
+    }
+
+    /// A token for `scope`, or `None` if its installation is gone.
+    async fn mint(&self, scope: TokenScope) -> anyhow::Result<Option<String>> {
+        let slot = self
+            .tokens
+            .lock()
+            .unwrap()
+            .entry(scope.clone())
+            .or_default()
+            .clone();
+        let mut slot = slot.lock().await;
+        if let Some(token) = slot.as_ref().filter(|t| t.fresh()) {
+            return Ok(Some(token.token.clone()));
+        }
+        let installation = scope.installation;
+        let response = self
+            .http
+            .post(self.url(&format!("/app/installations/{installation}/access_tokens")))
+            .bearer_auth(self.jwt()?)
+            .header("accept", "application/vnd.github+json")
+            .timeout(AUTHZ_TIMEOUT)
+            .json(&scope.body())
+            .send()
+            .await?;
+        match response.status() {
+            reqwest::StatusCode::NOT_FOUND => {
+                drop(slot);
+                self.forget_installation(installation);
+                return Ok(None);
+            }
+            status if !status.is_success() => {
+                let body: Value = response.json().await.unwrap_or(Value::Null);
+                bail!(
+                    "GitHub refused a token for installation {installation} ({status}): {}",
+                    body["message"].as_str().unwrap_or("no message")
+                );
+            }
+            _ => {}
+        }
+        let token: AccessToken = response.json().await?;
+        let value = token.token.clone();
+        *slot = Some(token);
+        Ok(Some(value))
+    }
+
+    /// Mints a token for the scope `scope` works out, or `None` if its installation is gone. A second try works the
+    /// scope out afresh, since a gone installation is forgotten.
+    async fn mint_scoped<F, Fut>(&self, scope: F) -> anyhow::Result<Option<String>>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = anyhow::Result<Option<TokenScope>>>,
+    {
+        for _ in 0..2 {
+            let Some(scope) = scope().await? else {
+                continue;
+            };
+            if let Some(token) = self.mint(scope).await? {
+                return Ok(Some(token));
+            }
+        }
+        Ok(None)
+    }
+
+    /// A token with everything the installation on `repo` has. Only for the runtime's own calls, never sessions.
+    pub async fn token_for(&self, repo: &str) -> anyhow::Result<String> {
+        self.mint_scoped(|| async move {
+            Ok(Some(TokenScope::full(self.installation_for(repo).await?)))
+        })
+        .await?
+        .with_context(|| format!("the GitHub App's installation on {repo} keeps disappearing"))
+    }
+
+    /// A session's read-only token, through the installation on `repo`: it covers the repositories in `granted`
+    /// that share that installation (`repo` among them), with [`READ_PERMISSIONS`].
+    pub async fn read_token(&self, repo: &str, granted: &[&str]) -> anyhow::Result<String> {
+        self.mint_scoped(|| async move {
+            let installation = self.installation_for(repo).await?;
+            let mut covered = vec![repo];
+            for other in granted {
+                if !sloppod_contracts::same_repo(other, repo)
+                    && self.installation_for(other).await.ok() == Some(installation)
+                {
+                    covered.push(other);
+                }
+            }
+            let Some(permissions) = self.installation_permissions(installation).await? else {
+                return Ok(None);
+            };
+            Ok(Some(TokenScope {
+                installation,
+                repositories: Some(repository_names(covered)),
+                permissions: Some(read_permissions(&permissions)),
+            }))
+        })
+        .await?
+        .with_context(|| format!("the GitHub App's installation on {repo} keeps disappearing"))
+    }
+
+    /// A session's token for pushing to `repo`: that repository only, with `contents: write`.
+    pub async fn push_token(&self, repo: &str) -> anyhow::Result<String> {
+        self.mint_scoped(|| async move {
+            Ok(Some(TokenScope {
+                installation: self.installation_for(repo).await?,
+                repositories: Some(repository_names([repo])),
+                permissions: Some(BTreeMap::from([
+                    ("contents".to_owned(), "write".to_owned()),
+                    ("metadata".to_owned(), "read".to_owned()),
+                ])),
+            }))
+        })
+        .await?
+        .with_context(|| format!("the GitHub App's installation on {repo} keeps disappearing"))
+    }
+
+    /// A token from any of the app's installations, for the runtime's reads that aren't tied to one repository.
+    pub async fn any_token(&self) -> anyhow::Result<String> {
+        self.mint_scoped(|| async move {
+            let cached = self
+                .installations
+                .lock()
+                .unwrap()
+                .values()
+                .find_map(|(id, _)| *id);
+            let installation = match cached {
+                Some(id) => id,
+                None => {
+                    let installations: Vec<Value> = self
+                        .app_get("/app/installations")
+                        .await?
+                        .error_for_status()?
+                        .json()
+                        .await?;
+                    installations
+                        .first()
+                        .and_then(|i| i["id"].as_u64())
+                        .context("the GitHub App has no installations")?
+                }
+            };
+            Ok(Some(TokenScope::full(installation)))
+        })
+        .await?
+        .context("the GitHub App's installations keep disappearing")
     }
 
     /// Repositories the app is installed on.
     pub async fn repos(&self) -> anyhow::Result<Vec<String>> {
-        let installations: Vec<Value> = self
-            .app_get("/app/installations")
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let installations = all_pages(|page| async move {
+            Ok(self
+                .app_get(&format!("/app/installations?per_page={PAGE}&page={page}"))
+                .await?
+                .error_for_status()?
+                .json()
+                .await?)
+        })
+        .await?;
         let mut repos = Vec::new();
         for installation in installations {
             let Some(id) = installation["id"].as_u64() else {
                 continue;
             };
-            let token = self.installation_token(id).await?;
-            let page: Value = self
-                .http
-                .get(format!("{API}/installation/repositories?per_page=100"))
-                .bearer_auth(token)
-                .header("accept", "application/vnd.github+json")
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            for repo in page["repositories"].as_array().into_iter().flatten() {
+            let Some(token) = self.mint(TokenScope::full(id)).await? else {
+                continue;
+            };
+            let token = &token;
+            let accessible = all_pages(|page| async move {
+                let listed: Value = self
+                    .http
+                    .get(self.url(&format!(
+                        "/installation/repositories?per_page={PAGE}&page={page}"
+                    )))
+                    .bearer_auth(token)
+                    .header("accept", "application/vnd.github+json")
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                Ok(listed["repositories"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default())
+            })
+            .await?;
+            for repo in &accessible {
                 if let Some(name) = repo["full_name"].as_str() {
-                    self.installations.lock().await.insert(name.to_owned(), id);
+                    self.remember_installation(name, &installation);
                     repos.push(name.to_owned());
                 }
             }
@@ -220,7 +610,7 @@ impl GitHubApp {
         let token = self.token_for(repo).await?;
         Ok(self
             .http
-            .get(format!("{API}/repos/{repo}{path}"))
+            .get(self.url(&format!("/repos/{repo}{path}")))
             .bearer_auth(token)
             .header("accept", accept)
             .send()
@@ -241,14 +631,31 @@ impl GitHubApp {
     }
 
     pub async fn compare(&self, repo: &str, base: &str, head: &str) -> anyhow::Result<Comparison> {
-        let range = format!("/compare/{base}...{head}");
+        self.compare_if_found(repo, base, head)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("branch {head} not found on {repo}; push it first"))
+    }
+
+    /// Compares `head` with `base`; `None` when either isn't on GitHub, e.g. a branch that was never pushed.
+    pub async fn compare_if_found(
+        &self,
+        repo: &str,
+        base: &str,
+        head: &str,
+    ) -> anyhow::Result<Option<Comparison>> {
+        let range = format!(
+            "/compare/{}...{}",
+            branch_in_path(base),
+            branch_in_path(head)
+        );
         let response = self
             .repo_get(repo, &range, "application/vnd.github+json")
             .await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            bail!("branch {head} not found on {repo}; push it first");
+            return Ok(None);
         }
         let info: Value = response.error_for_status()?.json().await?;
+        let head_sha = self.branch_sha(repo, head).await?;
         let commits = info["commits"]
             .as_array()
             .into_iter()
@@ -269,36 +676,157 @@ impl GitHubApp {
             .error_for_status()?
             .text()
             .await?;
-        Ok(Comparison {
+        Ok(Some(Comparison {
             diff,
             commits,
             ahead_by: info["ahead_by"].as_u64().unwrap_or(0),
-        })
+            head_sha,
+        }))
     }
 
-    pub async fn create_pull(&self, repo: &str, payload: &Value) -> anyhow::Result<Value> {
-        let token = self.token_for(repo).await?;
-        let response = self
-            .http
-            .post(format!("{API}/repos/{repo}/pulls"))
-            .bearer_auth(token)
-            .header("accept", "application/vnd.github+json")
-            .json(payload)
-            .send()
+    /// The commit a branch (or commit) points to.
+    pub async fn branch_sha(&self, repo: &str, reference: &str) -> anyhow::Result<String> {
+        let commit: Value = self
+            .repo_json(repo, &format!("/commits/{}", branch_in_path(reference)))
             .await?;
+        commit["sha"]
+            .as_str()
+            .map(str::to_owned)
+            .context("commit without sha")
+    }
+
+    /// Turns auto-merge off on open pull requests from `branch`, returning their numbers.
+    pub async fn disable_auto_merge(&self, repo: &str, branch: &str) -> anyhow::Result<Vec<u64>> {
+        let headed: Vec<Value> = self
+            .repo_json(
+                repo,
+                &format!(
+                    "/pulls{}",
+                    query(&[("state", "open"), ("head", &head_ref(repo, branch))])
+                ),
+            )
+            .await?;
+        // A stack merges through auto-merge on its top pull request, so a push to any layer turns that off too.
+        let mut numbers: Vec<u64> = Vec::new();
+        for pull in headed.iter().filter_map(|p| p["number"].as_u64()) {
+            numbers.push(pull);
+            if let Some(stack) = self.stack_of(repo, pull).await? {
+                numbers.extend(self.stack_members(repo, stack).await?);
+            }
+        }
+        numbers.sort_unstable();
+        numbers.dedup();
+        let mut disabled = Vec::new();
+        for number in numbers {
+            let pull: Value = self.repo_json(repo, &format!("/pulls/{number}")).await?;
+            if pull["state"] != "open" || pull["auto_merge"].is_null() {
+                continue;
+            }
+            self.disable_pull_auto_merge_in(repo, pull["node_id"].as_str().unwrap_or_default())
+                .await?;
+            disabled.push(number);
+        }
+        Ok(disabled)
+    }
+
+    pub async fn disable_pull_auto_merge_in(
+        &self,
+        repo: &str,
+        node_id: &str,
+    ) -> anyhow::Result<()> {
+        self.graphql(
+            repo,
+            "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }",
+            json!({"id": node_id}),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Runs a GraphQL query or mutation with the repository's token; GraphQL errors come back as errors.
+    pub(crate) async fn graphql(
+        &self,
+        repo: &str,
+        query: &str,
+        variables: Value,
+    ) -> anyhow::Result<Value> {
+        let token = self.token_for(repo).await?;
+        let response: Value = self
+            .http
+            .post(self.url("/graphql"))
+            .bearer_auth(token)
+            .json(&json!({"query": query, "variables": variables}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if let Some(error) = response["errors"].as_array().and_then(|e| e.first()) {
+            bail!("{}", error["message"].as_str().unwrap_or("unknown error"));
+        }
+        Ok(response)
+    }
+
+    /// A GET of the repository's REST API, as JSON.
+    async fn repo_json<T: serde::de::DeserializeOwned>(
+        &self,
+        repo: &str,
+        path: &str,
+    ) -> anyhow::Result<T> {
+        Ok(self
+            .repo_get(repo, path, "application/vnd.github+json")
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    async fn repo_post(&self, repo: &str, path: &str, payload: &Value) -> anyhow::Result<Value> {
+        self.repo_send(reqwest::Method::POST, repo, path, Some(payload))
+            .await
+    }
+
+    /// A write to the repository's REST API with its installation's token; GitHub's refusal comes back as an error.
+    async fn repo_send(
+        &self,
+        method: reqwest::Method,
+        repo: &str,
+        path: &str,
+        payload: Option<&Value>,
+    ) -> anyhow::Result<Value> {
+        let token = self.token_for(repo).await?;
+        let mut request = self
+            .http
+            .request(method, self.url(&format!("/repos/{repo}{path}")))
+            .bearer_auth(token)
+            .header("accept", "application/vnd.github+json");
+        if let Some(payload) = payload {
+            request = request.json(payload);
+        }
+        let response = request.send().await?;
         let status = response.status();
         let body: Value = response.json().await.unwrap_or(Value::Null);
         if !status.is_success() {
             bail!(
-                "GitHub refused the pull request ({status}): {}",
+                "GitHub refused it ({status}): {}",
                 body["message"].as_str().unwrap_or("no message")
             );
         }
+        Ok(body)
+    }
+
+    pub async fn create_pull(&self, repo: &str, payload: &Value) -> anyhow::Result<Value> {
+        let body = self.repo_post(repo, "/pulls", payload).await?;
         Ok(json!({"url": body["html_url"], "number": body["number"], "node_id": body["node_id"]}))
     }
 
     /// Has GitHub merge a pull request once its required checks pass, with a merge method the repository allows.
-    pub async fn enable_auto_merge(&self, repo: &str, pull_node_id: &str) -> anyhow::Result<()> {
+    pub async fn enable_auto_merge(
+        &self,
+        repo: &str,
+        pull_node_id: &str,
+        expected_head: &str,
+    ) -> anyhow::Result<()> {
         let info: Value = self
             .repo_get(repo, "", "application/vnd.github+json")
             .await?
@@ -314,24 +842,926 @@ impl GitHubApp {
         .find(|(setting, _)| info[*setting].as_bool() == Some(true))
         .map(|(_, method)| method)
         .context("the repository allows no merge method")?;
-        let token = self.token_for(repo).await?;
-        let response: Value = self
-            .http
-            .post(format!("{API}/graphql"))
-            .bearer_auth(token)
-            .json(&json!({
-                "query": "mutation($id: ID!, $method: PullRequestMergeMethod!) { \
-                          enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: $method}) { clientMutationId } }",
-                "variables": {"id": pull_node_id, "method": method},
-            }))
-            .send()
+        self.graphql(
+            repo,
+            "mutation($id: ID!, $method: PullRequestMergeMethod!, $head: GitObjectID!) { \
+             enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: $method, expectedHeadOid: $head}) \
+             { clientMutationId } }",
+            json!({"id": pull_node_id, "method": method, "head": expected_head}),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// An open pull request from `head` into `base`, if there is one, in `create_pull`'s result shape.
+    pub async fn open_pull(
+        &self,
+        repo: &str,
+        head: &str,
+        base: &str,
+    ) -> anyhow::Result<Option<Value>> {
+        let pulls: Vec<Value> = self
+            .repo_json(
+                repo,
+                &format!(
+                    "/pulls{}",
+                    query(&[
+                        ("state", "open"),
+                        ("head", &head_ref(repo, head)),
+                        ("base", base)
+                    ])
+                ),
+            )
+            .await?;
+        Ok(pulls.first().map(|body| {
+            json!({"url": body["html_url"], "number": body["number"], "node_id": body["node_id"]})
+        }))
+    }
+
+    /// The number of the stack a pull request is in, if any (GitHub's stacked pull requests).
+    /// None too when the repository doesn't have stacked pull requests, which GitHub answers with a 404.
+    pub async fn stack_of(&self, repo: &str, pull: u64) -> anyhow::Result<Option<u64>> {
+        let response = self
+            .repo_get(
+                repo,
+                &format!("/stacks?pull_request={pull}"),
+                "application/vnd.github+json",
+            )
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let stacks: Vec<Value> = response.error_for_status()?.json().await?;
+        Ok(stacks.first().and_then(|stack| stack["number"].as_u64()))
+    }
+
+    /// Has a stack merge itself once its required checks pass, through auto-merge on its top pull request, at
+    /// `top_sha`. Refused unless the stack holds exactly `pulls`, bottom to top: others in it would merge unreviewed.
+    ///
+    /// `layers` are each layer's branch and the commit it was proposed at, bottom to top. After turning auto-merge
+    /// on, every layer must still be there with no push let through to it since `since`, or it's turned off again:
+    /// the push guard only turns off auto-merge that's already on, and a push it let through earlier may land late.
+    pub async fn auto_merge_stack(
+        &self,
+        repo: &str,
+        merge: &StackMerge<'_>,
+        pushes: &PushLog,
+        since: Instant,
+    ) -> anyhow::Result<()> {
+        let StackMerge {
+            stack,
+            pulls,
+            top_node_id,
+            layers,
+        } = *merge;
+        let members = self.stack_members(repo, stack).await?;
+        if members != pulls {
+            bail!("stack #{stack} holds other pull requests than these");
+        }
+        let Some((_, top_sha)) = layers.last() else {
+            bail!("the stack has no layers");
+        };
+        let branches: Vec<&str> = layers.iter().map(|(branch, _)| *branch).collect();
+        // The authorizer sees a push start, not land, so a push it let through lately may still be on its way.
+        if let Some(branch) = pushes.pushed_since(repo, &branches, since, PUSH_SETTLE) {
+            bail!(
+                "`{branch}` was pushed to in the last few minutes, and that push may still be landing"
+            );
+        }
+        if let Some(branch) = self.moved_layer(repo, layers).await? {
+            bail!("`{branch}` moved since it was proposed");
+        }
+        self.enable_auto_merge(repo, top_node_id, top_sha).await?;
+        // A push let through in the meantime: GitHub can't merge its commits before their required checks pass, so
+        // turning auto-merge off again in time is enough. Any doubt turns it off.
+        let doubt = match self.moved_layer(repo, layers).await {
+            Ok(Some(branch)) => Some(format!("`{branch}` moved while the stack was being opened")),
+            Ok(None) => pushes
+                .pushed_since(repo, &branches, since, Duration::ZERO)
+                .map(|branch| format!("`{branch}` was pushed to while the stack was being opened")),
+            Err(e) => Some(format!("its layers couldn't be checked ({e})")),
+        };
+        let Some(doubt) = doubt else {
+            return Ok(());
+        };
+        match self.disable_pull_auto_merge_in(repo, top_node_id).await {
+            Ok(()) => bail!("{doubt}"),
+            Err(e) => bail!(
+                "{doubt}, and auto-merge couldn't be turned off again ({e}): turn it off by hand"
+            ),
+        }
+    }
+
+    /// The first layer not at the commit it was proposed at.
+    async fn moved_layer<'a>(
+        &self,
+        repo: &str,
+        layers: &[(&'a str, &str)],
+    ) -> anyhow::Result<Option<&'a str>> {
+        for (branch, sha) in layers {
+            if self.branch_sha(repo, branch).await? != *sha {
+                return Ok(Some(branch));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Checks on a stack that's set to merge itself: `Done` once its top pull request is closed, merged or no longer
+    /// set to merge, or the number of the first layer whose head moved from the commit it was proposed at, after
+    /// turning the top's auto-merge off.
+    pub async fn check_merging_stack(
+        &self,
+        repo: &str,
+        top_node_id: &str,
+        layers: &[(u64, &str)],
+    ) -> anyhow::Result<StackWatch> {
+        let Some((top, _)) = layers.last() else {
+            return Ok(StackWatch::Done);
+        };
+        let top_pull = self.pull(repo, *top).await?;
+        if top_pull["state"] != "open" || top_pull["auto_merge"].is_null() {
+            return Ok(StackWatch::Done);
+        }
+        // A layer seen to have moved turns auto-merge off even if another couldn't be read: a lookup that fails only
+        // matters when nothing moved.
+        let mut unread = None;
+        for (number, sha) in layers {
+            let pull = if number == top {
+                top_pull.clone()
+            } else {
+                match self.pull(repo, *number).await {
+                    Ok(pull) => pull,
+                    Err(e) => {
+                        unread.get_or_insert(e);
+                        continue;
+                    }
+                }
+            };
+            if pull["state"] == "open" && pull["head"]["sha"].as_str() != Some(*sha) {
+                self.disable_pull_auto_merge_in(repo, top_node_id).await?;
+                return Ok(StackWatch::Moved(*number));
+            }
+        }
+        unread.map_or(Ok(StackWatch::Holding), Err)
+    }
+
+    /// The diff from `base` to the commit `sha`, as of their merge base. A commit, unlike a branch, can't move
+    /// between being named and being read.
+    pub async fn diff_to(&self, repo: &str, base: &str, sha: &str) -> anyhow::Result<String> {
+        let range = format!("/compare/{}...{sha}", branch_in_path(base));
+        Ok(self
+            .repo_get(repo, &range, "application/vnd.github.diff")
             .await?
             .error_for_status()?
-            .json()
+            .text()
+            .await?)
+    }
+
+    /// A pull request as GitHub's REST API has it: its state, head and base, and node id.
+    pub async fn pull(&self, repo: &str, number: u64) -> anyhow::Result<Value> {
+        self.repo_json(repo, &format!("/pulls/{number}")).await
+    }
+
+    /// A stack's pull requests, bottom to top.
+    pub async fn stack_members(&self, repo: &str, stack: u64) -> anyhow::Result<Vec<u64>> {
+        let stack: Value = self.repo_json(repo, &format!("/stacks/{stack}")).await?;
+        Ok(stack["pull_requests"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|pull| pull["number"].as_u64())
+            .collect())
+    }
+
+    /// Links pull requests, bottom to top, into a stack; returns its number.
+    pub async fn link_stack(&self, repo: &str, pulls: &[u64]) -> anyhow::Result<u64> {
+        let body = self
+            .repo_post(repo, "/stacks", &json!({"pull_requests": pulls}))
             .await?;
-        if let Some(error) = response["errors"].as_array().and_then(|e| e.first()) {
-            bail!("{}", error["message"].as_str().unwrap_or("unknown error"));
+        body["number"]
+            .as_u64()
+            .context("GitHub returned no stack number")
+    }
+
+    /// Issues created in the last day, by title, in `create_issue`'s result shape.
+    pub async fn recent_issues(&self, repo: &str) -> anyhow::Result<HashMap<String, Value>> {
+        let since = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        let since = &since;
+        let issues = all_pages(|page| async move {
+            self.repo_json(
+                repo,
+                &format!("/issues?state=all&since={since}&per_page={PAGE}&page={page}"),
+            )
+            .await
+        })
+        .await?;
+        Ok(issues
+            .into_iter()
+            .filter(|issue| {
+                issue["pull_request"].is_null()
+                    && issue["created_at"]
+                        .as_str()
+                        .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+                        .is_some_and(|at| at > Utc::now() - chrono::Duration::days(1))
+            })
+            .filter_map(|issue| {
+                let title = issue["title"].as_str()?.to_owned();
+                Some((
+                    title,
+                    json!({"url": issue["html_url"], "number": issue["number"]}),
+                ))
+            })
+            .collect())
+    }
+
+    pub async fn create_issue(&self, repo: &str, payload: &Value) -> anyhow::Result<Value> {
+        let body = self.repo_post(repo, "/issues", payload).await?;
+        Ok(json!({"url": body["html_url"], "number": body["number"]}))
+    }
+
+    /// Changes an issue's fields: `title`, `body`, `state`, `state_reason`, as given.
+    pub async fn update_issue(&self, repo: &str, number: u64, patch: &Value) -> anyhow::Result<()> {
+        self.repo_send(
+            reqwest::Method::PATCH,
+            repo,
+            &format!("/issues/{number}"),
+            Some(patch),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn comment_on_issue(
+        &self,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> anyhow::Result<()> {
+        self.repo_post(
+            repo,
+            &format!("/issues/{number}/comments"),
+            &json!({"body": body}),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// The bodies of an issue's comments, oldest first.
+    pub async fn issue_comments(&self, repo: &str, number: u64) -> anyhow::Result<Vec<String>> {
+        let comments = all_pages(|page| async move {
+            self.repo_json(
+                repo,
+                &format!("/issues/{number}/comments?per_page={PAGE}&page={page}"),
+            )
+            .await
+        })
+        .await?;
+        Ok(comments
+            .iter()
+            .filter_map(|c| c["body"].as_str().map(str::to_owned))
+            .collect())
+    }
+
+    pub async fn add_labels(&self, repo: &str, number: u64, labels: &[&str]) -> anyhow::Result<()> {
+        self.repo_post(
+            repo,
+            &format!("/issues/{number}/labels"),
+            &json!({"labels": labels}),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Takes a label off an issue; one it doesn't have is fine.
+    pub async fn remove_label(&self, repo: &str, number: u64, label: &str) -> anyhow::Result<()> {
+        let path = format!("/issues/{number}/labels/{}", branch_in_path(label));
+        match self
+            .repo_send(reqwest::Method::DELETE, repo, &path, None)
+            .await
+        {
+            Err(e) if e.to_string().contains("404") => Ok(()),
+            other => other.map(|_| ()),
+        }
+    }
+
+    /// Creates the labels in `names` that `repo` doesn't have yet.
+    pub async fn ensure_labels(&self, repo: &str, names: &[&str]) -> anyhow::Result<()> {
+        let mut existing: Vec<String> = all_pages(|page| async move {
+            self.repo_json(repo, &format!("/labels?per_page={PAGE}&page={page}"))
+                .await
+        })
+        .await?
+        .iter()
+        .filter_map(|l| l["name"].as_str().map(str::to_lowercase))
+        .collect();
+        for name in names {
+            if !existing.contains(&name.to_lowercase()) {
+                self.repo_post(repo, "/labels", &json!({"name": name, "color": "ededed"}))
+                    .await
+                    .with_context(|| format!("creating the label {name}"))?;
+                existing.push(name.to_lowercase());
+            }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    use axum::extract::{Path, State};
+    use axum::http::StatusCode;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+
+    use super::*;
+
+    /// Installation of `o/other`, which never changes.
+    const OTHER: u64 = 10;
+
+    /// A fake GitHub: `o/r` and `o/r2` are on the current installation, `o/other` on [`OTHER`], other
+    /// repositories have none.
+    #[derive(Default)]
+    struct Fake {
+        installation: AtomicU64,
+        lookups: AtomicUsize,
+        mints: AtomicUsize,
+        /// Each mint's installation and request body.
+        minted: Mutex<Vec<(u64, Value)>>,
+        /// Holds each mint until this many are in flight at once.
+        rendezvous: Option<tokio::sync::Barrier>,
+        /// Open pull requests of `o/r`: number, head branch, and whether auto-merge is on.
+        pulls: Mutex<Vec<(u64, &'static str, bool)>>,
+        /// Stacks of `o/r` by number, with their pull requests bottom to top; None for a repository without them.
+        stacks: Option<Vec<(u64, Vec<u64>)>>,
+        /// Branch heads of `o/r`.
+        heads: Mutex<HashMap<String, String>>,
+        /// Head lookups fail while any pull request has auto-merge on.
+        heads_fail_once_merging: bool,
+        /// Pull requests of `o/r` that are merged.
+        merged: Mutex<Vec<u64>>,
+        /// Pull requests whose lookup fails.
+        failing: Mutex<Vec<u64>>,
+    }
+
+    async fn commit(
+        State(fake): State<Arc<Fake>>,
+        Path((_, _, reference)): Path<(String, String, String)>,
+    ) -> Result<Json<Value>, StatusCode> {
+        if fake.heads_fail_once_merging && fake.pulls.lock().unwrap().iter().any(|p| p.2) {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        let heads = fake.heads.lock().unwrap();
+        heads
+            .get(&reference)
+            .map(|sha| Json(json!({"sha": sha})))
+            .ok_or(StatusCode::NOT_FOUND)
+    }
+
+    fn pull_json(&(number, head, auto_merge): &(u64, &str, bool)) -> Value {
+        json!({
+            "number": number,
+            "state": "open",
+            "node_id": format!("PR{number}"),
+            "head": {"ref": head},
+            "auto_merge": if auto_merge { json!({"merge_method": "squash"}) } else { Value::Null },
+        })
+    }
+
+    async fn pulls(
+        State(fake): State<Arc<Fake>>,
+        axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        let head = query
+            .get("head")
+            .and_then(|h| h.split_once(':'))
+            .map(|(_, b)| b.to_owned());
+        let pulls = fake.pulls.lock().unwrap();
+        Json(json!(
+            pulls
+                .iter()
+                .filter(|p| head.as_deref().is_none_or(|h| h == p.1))
+                .map(pull_json)
+                .collect::<Vec<_>>()
+        ))
+    }
+
+    async fn pull(
+        State(fake): State<Arc<Fake>>,
+        Path((_, _, number)): Path<(String, String, u64)>,
+    ) -> Result<Json<Value>, StatusCode> {
+        if fake.failing.lock().unwrap().contains(&number) {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        let mut pull = {
+            let pulls = fake.pulls.lock().unwrap();
+            pulls
+                .iter()
+                .find(|p| p.0 == number)
+                .map(pull_json)
+                .ok_or(StatusCode::NOT_FOUND)?
+        };
+        let branch = pull["head"]["ref"].as_str().unwrap_or_default().to_owned();
+        if let Some(sha) = fake.heads.lock().unwrap().get(&branch) {
+            pull["head"]["sha"] = json!(sha);
+        }
+        if fake.merged.lock().unwrap().contains(&number) {
+            pull["state"] = json!("closed");
+        }
+        Ok(Json(pull))
+    }
+
+    fn stack_json(number: u64, members: &[u64]) -> Value {
+        json!({"number": number, "pull_requests": members.iter().map(|n| json!({"number": n})).collect::<Vec<_>>()})
+    }
+
+    async fn stacks(
+        State(fake): State<Arc<Fake>>,
+        axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+    ) -> Result<Json<Value>, StatusCode> {
+        let stacks = fake.stacks.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+        let pull: Option<u64> = query.get("pull_request").and_then(|p| p.parse().ok());
+        Ok(Json(json!(
+            stacks
+                .iter()
+                .filter(|(_, members)| pull.is_none_or(|p| members.contains(&p)))
+                .map(|(number, members)| stack_json(*number, members))
+                .collect::<Vec<_>>()
+        )))
+    }
+
+    async fn stack(
+        State(fake): State<Arc<Fake>>,
+        Path((_, _, number)): Path<(String, String, u64)>,
+    ) -> Result<Json<Value>, StatusCode> {
+        let stacks = fake.stacks.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+        stacks
+            .iter()
+            .find(|(n, _)| *n == number)
+            .map(|(n, members)| Json(stack_json(*n, members)))
+            .ok_or(StatusCode::NOT_FOUND)
+    }
+
+    async fn repository() -> Json<Value> {
+        Json(json!({"allow_squash_merge": true}))
+    }
+
+    /// Turns auto-merge on or off for the pull request whose node id the mutation names.
+    async fn graphql(State(fake): State<Arc<Fake>>, Json(body): Json<Value>) -> Json<Value> {
+        let on = body["query"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("enablePullRequestAutoMerge");
+        let id = body["variables"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        for pull in fake.pulls.lock().unwrap().iter_mut() {
+            if format!("PR{}", pull.0) == id {
+                pull.2 = on;
+            }
+        }
+        Json(json!({"data": {}}))
+    }
+
+    async fn installation(
+        State(fake): State<Arc<Fake>>,
+        Path((owner, name)): Path<(String, String)>,
+    ) -> Result<Json<Value>, StatusCode> {
+        fake.lookups.fetch_add(1, Ordering::SeqCst);
+        let id = match (owner.to_lowercase().as_str(), name.to_lowercase().as_str()) {
+            ("o", "r" | "r2") => fake.installation.load(Ordering::SeqCst),
+            ("o", "other") => OTHER,
+            _ => return Err(StatusCode::NOT_FOUND),
+        };
+        let permissions = json!({
+            "contents": "write",
+            "issues": "write",
+            "metadata": "read",
+            "pull_requests": "write",
+            "workflows": "write",
+        });
+        Ok(Json(json!({"id": id, "permissions": permissions})))
+    }
+
+    async fn mint(
+        State(fake): State<Arc<Fake>>,
+        Path(id): Path<u64>,
+        Json(body): Json<Value>,
+    ) -> Result<Json<Value>, StatusCode> {
+        fake.mints.fetch_add(1, Ordering::SeqCst);
+        fake.minted.lock().unwrap().push((id, body));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Some(rendezvous) = &fake.rendezvous {
+            tokio::time::timeout(Duration::from_secs(2), rendezvous.wait())
+                .await
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        }
+        if id != fake.installation.load(Ordering::SeqCst) && id != OTHER {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        let expires = Utc::now() + chrono::Duration::hours(1);
+        Ok(Json(
+            json!({"token": format!("token-{id}"), "expires_at": expires}),
+        ))
+    }
+
+    async fn fake_github() -> (Arc<Fake>, GitHubApp) {
+        serve(Fake::default()).await
+    }
+
+    async fn serve(fake: Fake) -> (Arc<Fake>, GitHubApp) {
+        let fake = Arc::new(fake);
+        fake.installation.store(1, Ordering::SeqCst);
+        let router = Router::new()
+            .route("/repos/{owner}/{name}/installation", get(installation))
+            .route("/app/installations/{id}/access_tokens", post(mint))
+            .route("/repos/{owner}/{name}", get(repository))
+            .route("/repos/{owner}/{name}/pulls", get(pulls))
+            .route("/repos/{owner}/{name}/pulls/{number}", get(pull))
+            .route("/repos/{owner}/{name}/stacks", get(stacks))
+            .route("/repos/{owner}/{name}/stacks/{number}", get(stack))
+            .route("/repos/{owner}/{name}/commits/{reference}", get(commit))
+            .route("/graphql", post(graphql))
+            .with_state(fake.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).unwrap();
+        let app = GitHubApp::with_api(&api, "1".into(), key.serialize_pem().as_bytes()).unwrap();
+        (fake, app)
+    }
+
+    /// The stack #7 of three layers, the top one set to merge the stack.
+    fn stacked() -> Fake {
+        Fake {
+            pulls: Mutex::new(vec![
+                (1, "s-1", false),
+                (2, "s-2", false),
+                (3, "s-3", true),
+                (4, "other", true),
+            ]),
+            stacks: Some(vec![(7, vec![1, 2, 3])]),
+            ..Fake::default()
+        }
+    }
+
+    fn auto_merging(fake: &Fake) -> Vec<u64> {
+        fake.pulls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.2)
+            .map(|p| p.0)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_push_to_any_layer_stops_the_stack_merging() {
+        let (fake, app) = serve(stacked()).await;
+        assert_eq!(app.disable_auto_merge("o/r", "s-1").await.unwrap(), [3]);
+        assert_eq!(auto_merging(&fake), [4]);
+    }
+
+    #[tokio::test]
+    async fn a_push_without_stacks_stops_its_own_pull_request() {
+        let fake = Fake {
+            pulls: Mutex::new(vec![(1, "s-1", true), (4, "other", true)]),
+            stacks: None,
+            ..Fake::default()
+        };
+        let (fake, app) = serve(fake).await;
+        assert_eq!(app.disable_auto_merge("o/r", "s-1").await.unwrap(), [1]);
+        assert_eq!(auto_merging(&fake), [4]);
+    }
+
+    #[tokio::test]
+    async fn a_push_finds_its_pull_request_whatever_the_branch_is_called() {
+        // Session branches can't have these characters, but the lookup must still ask about the branch pushed: an
+        // unencoded `+` reads as a space and a `#` ends the URL, so the pull request would be missed.
+        let fake = Fake {
+            pulls: Mutex::new(vec![
+                (1, "a+b", true),
+                (2, "a b", true),
+                (3, "c#d", true),
+                (4, "c", true),
+            ]),
+            stacks: None,
+            ..Fake::default()
+        };
+        let (fake, app) = serve(fake).await;
+        assert_eq!(app.disable_auto_merge("o/r", "a+b").await.unwrap(), [1]);
+        assert_eq!(app.disable_auto_merge("o/r", "c#d").await.unwrap(), [3]);
+        assert_eq!(auto_merging(&fake), [2, 4]);
+    }
+
+    /// The unmerged stack #7 of three layers, each at the commit it was proposed at.
+    fn unmerged() -> Fake {
+        Fake {
+            pulls: Mutex::new(vec![
+                (1, "s-1", false),
+                (2, "s-2", false),
+                (3, "s-3", false),
+            ]),
+            stacks: Some(vec![(7, vec![1, 2, 3])]),
+            heads: Mutex::new(
+                [("s-1", "a"), ("s-2", "b"), ("s-3", "c")]
+                    .into_iter()
+                    .map(|(b, s)| (b.to_owned(), s.to_owned()))
+                    .collect(),
+            ),
+            ..Fake::default()
+        }
+    }
+
+    const LAYERS: &[(&str, &str)] = &[("s-1", "a"), ("s-2", "b"), ("s-3", "c")];
+
+    fn merge<'a>(pulls: &'a [u64]) -> StackMerge<'a> {
+        StackMerge {
+            stack: 7,
+            pulls,
+            top_node_id: "PR3",
+            layers: LAYERS,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stack_merges_only_with_exactly_its_proposed_layers() {
+        let (fake, app) = serve(unmerged()).await;
+        let pushes = PushLog::default();
+        let since = Instant::now();
+        // The upper two of an existing three-layer stack.
+        assert!(
+            app.auto_merge_stack("o/r", &merge(&[2, 3]), &pushes, since)
+                .await
+                .is_err()
+        );
+        assert!(auto_merging(&fake).is_empty());
+        app.auto_merge_stack("o/r", &merge(&[1, 2, 3]), &pushes, since)
+            .await
+            .unwrap();
+        assert_eq!(auto_merging(&fake), [3]);
+    }
+
+    #[tokio::test]
+    async fn a_layer_that_moved_meanwhile_stops_the_stack_merging() {
+        let (fake, app) = serve(unmerged()).await;
+        let since = Instant::now();
+        fake.heads.lock().unwrap().insert("s-1".into(), "a2".into());
+        let refused = app
+            .auto_merge_stack("o/r", &merge(&[1, 2, 3]), &PushLog::default(), since)
+            .await;
+        assert!(refused.unwrap_err().to_string().contains("s-1"));
+        assert!(auto_merging(&fake).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_push_let_through_meanwhile_stops_the_stack_merging() {
+        let (fake, app) = serve(unmerged()).await;
+        let pushes = PushLog::default();
+        let since = Instant::now();
+        // Let through after the stack started opening, its commits not on the branch yet.
+        pushes.admit("O/R", "s-2");
+        let refused = app
+            .auto_merge_stack("o/r", &merge(&[1, 2, 3]), &pushes, since)
+            .await;
+        assert!(refused.unwrap_err().to_string().contains("s-2"));
+        assert!(auto_merging(&fake).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_recent_push_that_may_still_land_keeps_auto_merge_off() {
+        let (fake, app) = serve(unmerged()).await;
+        let pushes = PushLog::default();
+        // Let through before the stack started opening, and maybe still landing.
+        pushes.admit("o/r", "s-1");
+        let since = Instant::now();
+        let refused = app
+            .auto_merge_stack("o/r", &merge(&[1, 2, 3]), &pushes, since)
+            .await;
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("may still be landing")
+        );
+        assert!(auto_merging(&fake).is_empty());
+
+        // Long enough ago, with every layer at its proposed commit, it's fine.
+        let settled = since + PUSH_SETTLE + Duration::from_secs(1);
+        app.auto_merge_stack("o/r", &merge(&[1, 2, 3]), &pushes, settled)
+            .await
+            .unwrap();
+        assert_eq!(auto_merging(&fake), [3]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_check_after_turning_auto_merge_on_turns_it_off() {
+        let fake = Fake {
+            heads_fail_once_merging: true,
+            ..unmerged()
+        };
+        let (fake, app) = serve(fake).await;
+        let refused = app
+            .auto_merge_stack(
+                "o/r",
+                &merge(&[1, 2, 3]),
+                &PushLog::default(),
+                Instant::now(),
+            )
+            .await;
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("couldn't be checked")
+        );
+        assert!(auto_merging(&fake).is_empty());
+    }
+
+    const WATCHED: &[(u64, &str)] = &[(1, "a"), (2, "b"), (3, "c")];
+
+    /// The stack #7, its top set to merge it.
+    fn merging() -> Fake {
+        let fake = unmerged();
+        fake.pulls.lock().unwrap()[2].2 = true;
+        fake
+    }
+
+    #[tokio::test]
+    async fn a_merging_stack_holds_while_its_layers_do() {
+        let (_, app) = serve(merging()).await;
+        assert_eq!(
+            app.check_merging_stack("o/r", "PR3", WATCHED)
+                .await
+                .unwrap(),
+            StackWatch::Holding
+        );
+    }
+
+    #[tokio::test]
+    async fn a_moved_layer_stops_the_stack_merging() {
+        let (fake, app) = serve(merging()).await;
+        fake.heads.lock().unwrap().insert("s-1".into(), "a2".into());
+        assert_eq!(
+            app.check_merging_stack("o/r", "PR3", WATCHED)
+                .await
+                .unwrap(),
+            StackWatch::Moved(1)
+        );
+        assert!(auto_merging(&fake).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_moved_layer_stops_the_stack_merging_though_another_cant_be_read() {
+        let (fake, app) = serve(merging()).await;
+        fake.heads.lock().unwrap().insert("s-2".into(), "b2".into());
+        fake.failing.lock().unwrap().push(1);
+        assert_eq!(
+            app.check_merging_stack("o/r", "PR3", WATCHED)
+                .await
+                .unwrap(),
+            StackWatch::Moved(2)
+        );
+        assert!(auto_merging(&fake).is_empty());
+
+        // With nothing seen to move, an unread layer is an error, and auto-merge stays on until the next look.
+        let (fake, app) = serve(merging()).await;
+        fake.failing.lock().unwrap().push(1);
+        assert!(
+            app.check_merging_stack("o/r", "PR3", WATCHED)
+                .await
+                .is_err()
+        );
+        assert_eq!(auto_merging(&fake), [3]);
+    }
+
+    #[tokio::test]
+    async fn watching_ends_once_the_stack_merged_or_stopped_merging() {
+        let (fake, app) = serve(merging()).await;
+        fake.merged.lock().unwrap().extend([1, 2, 3]);
+        assert_eq!(
+            app.check_merging_stack("o/r", "PR3", WATCHED)
+                .await
+                .unwrap(),
+            StackWatch::Done
+        );
+
+        let (fake, app) = serve(unmerged()).await;
+        fake.heads.lock().unwrap().insert("s-1".into(), "a2".into());
+        assert_eq!(
+            app.check_merging_stack("o/r", "PR3", WATCHED)
+                .await
+                .unwrap(),
+            StackWatch::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_every_page_of_a_list() {
+        let pages = [PAGE, PAGE, 5];
+        let fetched = std::sync::Mutex::new(Vec::new());
+        let items = all_pages(|page| {
+            fetched.lock().unwrap().push(page);
+            async move { Ok(vec![json!(page); pages[page - 1]]) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(items.len(), 2 * PAGE + 5);
+        assert_eq!(*fetched.lock().unwrap(), [1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_share_one_mint() {
+        let (fake, app) = fake_github().await;
+        let tokens = futures::future::join_all((0..10).map(|_| app.token_for("o/r"))).await;
+        assert!(tokens.iter().all(|t| t.as_deref().ok() == Some("token-1")));
+        assert_eq!(fake.mints.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn branches_keep_their_meaning_in_urls() {
+        assert_eq!(
+            branch_in_path("sloppod/abcd1234-v1.2_x"),
+            "sloppod/abcd1234-v1.2_x"
+        );
+        assert_eq!(branch_in_path("a#b+c d"), "a%23b%2Bc%20d");
+        assert_eq!(
+            query(&[("head", &head_ref("o/r", "a#b")), ("base", "m&x=1")]),
+            "?head=o%3Aa%23b&base=m%26x%3D1"
+        );
+    }
+
+    #[tokio::test]
+    async fn installations_mint_independently() {
+        let (_, app) = serve(Fake {
+            rendezvous: Some(tokio::sync::Barrier::new(2)),
+            ..Fake::default()
+        })
+        .await;
+        let (r, other) = tokio::join!(app.token_for("o/r"), app.token_for("o/other"));
+        assert_eq!(r.unwrap(), "token-1");
+        assert_eq!(other.unwrap(), format!("token-{OTHER}"));
+    }
+
+    #[tokio::test]
+    async fn remembers_repositories_without_an_installation() {
+        let (fake, app) = fake_github().await;
+        assert!(app.token_for("someone/public").await.is_err());
+        assert!(app.token_for("someone/public").await.is_err());
+        assert_eq!(fake.lookups.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn follows_a_reinstall() {
+        let (fake, app) = fake_github().await;
+        assert_eq!(app.token_for("o/r").await.unwrap(), "token-1");
+        fake.installation.store(2, Ordering::SeqCst);
+        app.tokens.lock().unwrap().clear();
+        assert_eq!(app.token_for("o/r").await.unwrap(), "token-2");
+    }
+
+    #[tokio::test]
+    async fn session_tokens_cover_only_their_grants() {
+        let (fake, app) = fake_github().await;
+        app.read_token("O/R", &["O/R", "o/other", "o/r2"])
+            .await
+            .unwrap();
+        app.push_token("o/r").await.unwrap();
+        // Same scope as the first read, so it comes from the cache.
+        app.read_token("o/r", &["o/r2", "o/r"]).await.unwrap();
+        let minted = fake.minted.lock().unwrap().clone();
+        assert_eq!(
+            minted,
+            vec![
+                (
+                    1,
+                    json!({
+                        "repositories": ["r", "r2"],
+                        "permissions": {
+                            "contents": "read",
+                            "issues": "read",
+                            "metadata": "read",
+                            "pull_requests": "read",
+                        },
+                    })
+                ),
+                (
+                    1,
+                    json!({
+                        "repositories": ["r"],
+                        "permissions": {"contents": "write", "metadata": "read"},
+                    })
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_tokens_have_the_whole_installation() {
+        let (fake, app) = fake_github().await;
+        app.token_for("o/r").await.unwrap();
+        assert_eq!(*fake.minted.lock().unwrap(), vec![(1, json!({}))]);
     }
 }

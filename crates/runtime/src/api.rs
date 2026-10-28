@@ -1,27 +1,25 @@
 //! REST API (`docs/api.md`).
 
-use std::collections::BTreeMap;
-
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use serde::Deserialize;
 use serde_json::json;
-use sloppod_contracts::{EgressSpec, Grant, PlacementSpec};
-use sloppod_protocol::api::{Decision, NewCredential, NewSession, Phase};
+use sloppod_contracts::capability;
+use sloppod_contracts::{Grant, READ_WRITE, find_repo};
+use sloppod_protocol::api::{
+    Decision, NewCredential, NewSession, NewStandingApproval, ProposalStatus, ReviewPolicy,
+};
 use uuid::Uuid;
 
-use crate::credentials::CLAUDE;
-use crate::memini::MeminiAdmin;
-use crate::placement::{TOKEN_DIR, WORKDIR};
-use crate::pods::SESSION_LABEL;
-use crate::policies::SESSION_KEY;
-use crate::proposals::{self, Verdict};
+use crate::credentials::CHATGPT;
+use crate::proposals::{self, DecideError, Verdict};
+use crate::session::ParkError;
 use crate::users::User;
-use crate::{AppState, db};
+use crate::{AppState, db, lifecycle, reviews, subsessions};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -30,6 +28,11 @@ pub fn routes() -> Router<AppState> {
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}", get(get_session).delete(delete_session))
         .route("/sessions/{id}/repos", post(add_repo))
+        .route("/sessions/deleted", get(list_deleted_sessions))
+        .route("/sessions/{id}/restore", post(restore_session))
+        .route("/sessions/{id}/park", post(park_session))
+        .route("/sessions/{id}/wake", post(wake_session))
+        .route("/sessions/{id}/review", put(set_review))
         .route("/repos", get(repos))
         .route(
             "/credentials",
@@ -37,8 +40,14 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/default", post(default_credential))
+        .route(
+            "/standing-approvals",
+            get(list_standing_approvals).post(create_standing_approval),
+        )
+        .route("/standing-approvals/{id}", delete(revoke_standing_approval))
         .route("/proposals", get(list_proposals))
         .route("/proposals/{id}", get(get_proposal))
+        .route("/proposals/{id}/reviews", get(list_reviews))
         .route("/proposals/{id}/approve", post(approve))
         .route("/proposals/{id}/reject", post(reject))
 }
@@ -58,6 +67,23 @@ impl<E: std::fmt::Display> From<E> for ApiError {
     }
 }
 
+/// Edits that don't apply are the request's fault, a decided proposal is a conflict, and the rest is ours.
+fn decide_error(e: DecideError) -> ApiError {
+    match e {
+        DecideError::Invalid(message) => bad_request(message),
+        DecideError::Decided => ApiError(StatusCode::CONFLICT, e.to_string()),
+        DecideError::Failed(e) => e.into(),
+    }
+}
+
+/// A session that's in a turn or deleted can't be parked: a conflict, not a failure.
+fn park_error(e: ParkError) -> ApiError {
+    match e {
+        ParkError::InTurn | ParkError::Stopped => ApiError(StatusCode::CONFLICT, e.to_string()),
+        ParkError::Failed(e) => e.into(),
+    }
+}
+
 fn not_found() -> ApiError {
     ApiError(StatusCode::NOT_FOUND, "not found".into())
 }
@@ -68,8 +94,8 @@ fn bad_request(message: impl Into<String>) -> ApiError {
 
 type ApiResult<T> = Result<T, ApiError>;
 
-async fn me(User(user): User) -> impl IntoResponse {
-    Json(json!({"user": user}))
+async fn me(State(state): State<AppState>, User(user): User) -> impl IntoResponse {
+    Json(json!({"user": user, "build": state.config.build}))
 }
 
 /// The models the agent offered, from a `configOptions` list; options may be grouped.
@@ -100,7 +126,22 @@ async fn settings(state: &AppState, user: &str) -> ApiResult<serde_json::Value> 
         .await?
         .map(|s| offered_models(&s))
         .unwrap_or_default();
-    Ok(json!({"model": model, "models": models}))
+    let review = db::user_review(&state.db, user).await?;
+    Ok(json!({"model": model, "models": models, "review": review}))
+}
+
+/// Deserializes a field that's present, so `Option<Option<T>>` tells an absent field from a null one.
+fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
+}
+
+fn review_policy(review: &str) -> ApiResult<ReviewPolicy> {
+    review.parse().map_err(|_| {
+        let policies: Vec<_> = ReviewPolicy::ALL.iter().map(|p| p.as_str()).collect();
+        bad_request(format!("review must be one of {}", policies.join(", ")))
+    })
 }
 
 async fn get_settings(
@@ -110,9 +151,12 @@ async fn get_settings(
     Ok(Json(settings(&state, &user).await?))
 }
 
+/// Fields left out stay as they are.
 #[derive(Deserialize)]
 struct SettingsUpdate {
-    model: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    model: Option<Option<String>>,
+    review: Option<String>,
 }
 
 async fn put_settings(
@@ -120,12 +164,15 @@ async fn put_settings(
     User(user): User,
     Json(update): Json<SettingsUpdate>,
 ) -> ApiResult<impl IntoResponse> {
-    let model = update
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|m| !m.is_empty());
-    db::set_user_model(&state.db, &user, model).await?;
+    // Checked before anything is written, so a bad field doesn't leave the others half applied.
+    let review = update.review.as_deref().map(review_policy).transpose()?;
+    if let Some(model) = &update.model {
+        let model = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+        db::set_user_model(&state.db, &user, model).await?;
+    }
+    if let Some(review) = review {
+        db::set_user_review(&state.db, &user, review).await?;
+    }
     Ok(Json(settings(&state, &user).await?))
 }
 
@@ -158,6 +205,29 @@ struct AddRepo {
     repo: String,
 }
 
+#[derive(Deserialize)]
+struct SetReview {
+    review: String,
+}
+
+/// Sets whether a session's proposals are reviewed by another model first (ADR 24).
+async fn set_review(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetReview>,
+) -> ApiResult<impl IntoResponse> {
+    db::owned_session(&state.db, id, &user)
+        .await?
+        .ok_or_else(not_found)?;
+    db::set_session_review(&state.db, id, review_policy(&body.review)?).await?;
+    state.hub.broadcast_session(id).await;
+    let session = db::get_session(&state.db, id)
+        .await?
+        .ok_or_else(not_found)?;
+    Ok(Json(session.to_api()))
+}
+
 /// Gives a session write access to another repository and tells its agent.
 async fn add_repo(
     State(state): State<AppState>,
@@ -169,10 +239,9 @@ async fn add_repo(
         .await?
         .ok_or_else(not_found)?;
     let wanted = body.repo.trim();
-    let repo = accessible_repos(&state, &user)
-        .await
-        .into_iter()
-        .find(|r| r.eq_ignore_ascii_case(wanted))
+    let accessible = accessible_repos(&state, &user).await;
+    let repo = find_repo(&accessible, wanted)
+        .cloned()
         .ok_or_else(|| bad_request(format!("{wanted} isn't accessible to your GitHub App")))?;
     if proposals::grant_repo(&state.db, &session.context(), &repo).await? {
         state.hub.broadcast_session(id).await;
@@ -207,7 +276,7 @@ async fn repos(State(state): State<AppState>, User(user): User) -> impl IntoResp
     Json(accessible_repos(&state, &user).await)
 }
 
-fn default_title(prompt: &str) -> String {
+pub(crate) fn default_title(prompt: &str) -> String {
     let line = prompt
         .lines()
         .find(|l| !l.trim().is_empty())
@@ -262,40 +331,46 @@ async fn create_session(
     if prompt.is_empty() {
         return Err(bad_request("a session starts from a message"));
     }
-    if state.credentials.secret(&user, CLAUDE).await?.is_none() {
+    let agent = new.agent.as_deref().unwrap_or("claude-code");
+    let Some(adapter) = state.agents.get(agent) else {
+        return Err(bad_request(format!("there's no agent called {agent}")));
+    };
+    let needed = adapter.credential();
+    let (kind, account) = (needed.kind.as_str(), needed.name.as_str());
+    if !state.credentials.has_default(&user, kind).await? {
         return Err(ApiError(
             StatusCode::CONFLICT,
-            "add a Claude account in settings before starting a session".into(),
+            format!("add {account} in settings before starting a session"),
         ));
     }
     let repos = accessible_repos(&state, &user).await;
-    let repo = match &new.repo {
-        Some(wanted) => Some(
-            repos
-                .iter()
-                .find(|r| r.eq_ignore_ascii_case(wanted.trim()))
-                .cloned()
-                .ok_or_else(|| {
-                    bad_request(format!("{wanted} isn't accessible to your GitHub App"))
-                })?,
-        ),
-        None => derive_repo(prompt, &repos),
-    };
+    let repo =
+        match &new.repo {
+            Some(wanted) => Some(find_repo(&repos, wanted.trim()).cloned().ok_or_else(|| {
+                bad_request(format!("{wanted} isn't accessible to your GitHub App"))
+            })?),
+            None => derive_repo(prompt, &repos),
+        };
 
     let id = Uuid::new_v4();
     let mut grants = vec![
-        Grant::new("model", json!({})),
-        Grant::new("github", json!({})),
-        Grant::new("packages", json!({})),
+        Grant::new(capability::MODEL, json!({})),
+        Grant::new(capability::GITHUB, json!({})),
+        Grant::new(capability::PACKAGES, json!({})),
+        Grant::new(capability::DOCS, json!({})),
     ];
+    if state.credentials.has_default(&user, CHATGPT).await? {
+        grants.push(Grant::new(capability::CODEX, json!({})));
+    }
     if let Some(repo) = &repo {
         let branch = proposals::session_branch(id);
         grants.push(Grant::new(
-            "repo",
-            json!({"repo": repo, "access": "rw", "branch": branch}),
+            capability::REPO,
+            json!({"repo": repo, "access": READ_WRITE, "branch": branch}),
         ));
     }
     let model = db::user_model(&state.db, &user).await?;
+    let review = db::user_review(&state.db, &user).await?;
     let custom = new
         .title
         .as_deref()
@@ -304,108 +379,25 @@ async fn create_session(
     let title = custom
         .map(str::to_owned)
         .unwrap_or_else(|| default_title(prompt));
-    db::insert_session(
-        &state.db,
-        db::NewSessionRow {
-            id,
+    let row = lifecycle::start_session(
+        &state,
+        id,
+        lifecycle::NewSession {
             owner: &user,
+            prompt,
             title: &title,
             custom_title: custom.is_some(),
-            pending_prompt: prompt,
+            agent,
             model: model.as_deref(),
+            review,
             repo: repo.as_deref(),
             grants: &grants,
+            parent: None,
         },
     )
-    .await?;
-
-    if let Some((admin, memini)) = state.credentials.memini(&user).await? {
-        let home = memini
-            .config("home")
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("personal/{user}"));
-        let namespace = state.memory_namespace(repo.as_deref(), &home);
-        match admin
-            .create_session_key(&id.to_string(), memini.config("home"), &namespace, false)
-            .await
-        {
-            Ok(key) => {
-                state
-                    .credentials
-                    .put_session_secret(id, SESSION_KEY, &key.secret)
-                    .await?;
-                let grant = Grant::new(
-                    "memory",
-                    json!({"namespace": namespace, "access": "rw", "key": key.name}),
-                );
-                db::add_grant(&state.db, id, &grant).await?;
-            }
-            Err(e) => {
-                tracing::warn!(session = %id, error = %e, "minting the session's memini key; no memory")
-            }
-        }
-    }
-
-    state
-        .hub
-        .record_user_message(id, &json!([{"type": "text", "text": prompt}]), false)
-        .await;
-    let row = db::get_session(&state.db, id)
-        .await?
-        .ok_or_else(not_found)?;
-    if let Err(e) = place(&state, &row).await {
-        state.hub.set_phase(id, Phase::Stopped).await;
-        return Err(ApiError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("starting the session pod: {e}"),
-        ));
-    }
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok((StatusCode::CREATED, Json(row.to_api())))
-}
-
-/// Makes sure a session's pod and egress policy exist.
-pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
-    let id = session.id.to_string();
-    let context = session.context();
-    let labels = BTreeMap::from([
-        (SESSION_LABEL.to_owned(), id.clone()),
-        ("app.kubernetes.io/part-of".to_owned(), "sloppod".to_owned()),
-        (
-            "app.kubernetes.io/component".to_owned(),
-            "session".to_owned(),
-        ),
-    ]);
-    state
-        .enforcer
-        .apply(&EgressSpec {
-            session_id: id.clone(),
-            pod_labels: BTreeMap::from([(SESSION_LABEL.to_owned(), id.clone())]),
-            intercepted_hosts: state.policies.hosts(),
-            direct_hosts: if context.has("packages") {
-                state.config.direct_hosts.clone()
-            } else {
-                Vec::new()
-            },
-        })
-        .await?;
-    state
-        .placement
-        .ensure(&PlacementSpec {
-            session_id: id,
-            image: state.config.session_image.clone(),
-            labels,
-            env: vec![
-                ("SLOPPOD_URL".into(), state.config.runtime_url()),
-                ("SLOPPOD_TOKEN_FILE".into(), format!("{TOKEN_DIR}/token")),
-                ("HOME".into(), format!("{WORKDIR}/home")),
-            ],
-            cpu: state.config.session_cpu.clone(),
-            memory: state.config.session_memory.clone(),
-            storage_size: state.config.session_storage_size.clone(),
-            storage_class: state.config.session_storage_class.clone(),
-        })
-        .await?;
-    Ok(())
 }
 
 async fn delete_session(
@@ -416,22 +408,119 @@ async fn delete_session(
     let session = db::owned_session(&state.db, id, &user)
         .await?
         .ok_or_else(not_found)?;
-    state.hub.stop(id).await;
-    state.placement.delete(&id.to_string()).await?;
-    state.enforcer.remove(&id.to_string()).await?;
-    if session.context().has("memory")
-        && let Some((admin, _)) = state.credentials.memini(&user).await?
-        && let Err(e) = admin
-            .delete_key(&MeminiAdmin::key_name(&id.to_string()))
-            .await
-    {
-        tracing::warn!(session = %id, error = %e, "deleting the session's memini key");
+    // Its sub-sessions stop with it (ADR 27), at any depth, including any restored below one already deleted. Spawning
+    // waits while the root is marked and the tree listed, and refuses below a deleted session after.
+    let mut pending = {
+        let _spawning = subsessions::SPAWNING.lock().await;
+        db::mark_deleted(&state.db, id).await?;
+        db::live_descendants(&state.db, id).await?
+    };
+    pending.push(session);
+    while let Some(session) = pending.pop() {
+        let id = session.id;
+        // Marked first, so nothing wakes it between parking and marking.
+        db::mark_deleted(&state.db, id).await?;
+        if let Err(e) = park_ending_turn(&state, &session).await {
+            db::restore(&state.db, id).await?;
+            return Err(e);
+        }
+        reviews::abandon(&state, id).await?;
+        state.hub.broadcast_session(id).await;
     }
-    state
-        .credentials
-        .delete_session_secret(id, SESSION_KEY)
-        .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_deleted_sessions(
+    State(state): State<AppState>,
+    User(user): User,
+) -> ApiResult<impl IntoResponse> {
+    let sessions: Vec<_> = db::deleted_sessions(&state.db, &user)
+        .await?
+        .iter()
+        .map(db::SessionRow::to_api)
+        .collect();
+    Ok(Json(sessions))
+}
+
+/// Brings a deleted session back, parked; waking it is a separate step.
+async fn restore_session(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    let session = db::owned_session(&state.db, id, &user)
+        .await?
+        .ok_or_else(not_found)?;
+    if !db::restore(&state.db, session.id).await? {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "it isn't deleted, or it's being purged".into(),
+        ));
+    }
+    state.hub.broadcast_session(id).await;
+    let session = db::get_session(&state.db, id)
+        .await?
+        .ok_or_else(not_found)?;
+    Ok(Json(session.to_api()))
+}
+
+/// Parks a session for deletion, cancelling its turn first if it's in one.
+async fn park_ending_turn(state: &AppState, session: &db::SessionRow) -> ApiResult<()> {
+    for attempt in 0..30 {
+        match lifecycle::park(state, session).await {
+            // A stopped session, e.g. one whose pod never started, has nothing to park.
+            Ok(()) | Err(ParkError::Stopped) => return Ok(()),
+            Err(ParkError::InTurn) => {
+                if attempt == 0 {
+                    state.hub.cancel(session.id).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            Err(e) => return Err(park_error(e)),
+        }
+    }
+    Err(ApiError(
+        StatusCode::CONFLICT,
+        "the session's turn didn't stop; try again".into(),
+    ))
+}
+
+async fn park_session(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    let session = db::owned_session(&state.db, id, &user)
+        .await?
+        .ok_or_else(not_found)?;
+    lifecycle::park(&state, &session)
+        .await
+        .map_err(park_error)?;
+    let session = db::get_session(&state.db, id)
+        .await?
+        .ok_or_else(not_found)?;
+    Ok(Json(session.to_api()))
+}
+
+async fn wake_session(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    let session = db::owned_session(&state.db, id, &user)
+        .await?
+        .ok_or_else(not_found)?;
+    if session.deleted_at.is_some() {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "the session is deleted; restore it first".into(),
+        ));
+    }
+    lifecycle::wake(&state, &session).await?;
+    let session = db::get_session(&state.db, id)
+        .await?
+        .ok_or_else(not_found)?;
+    Ok(Json(session.to_api()))
 }
 
 async fn list_credentials(
@@ -456,6 +545,88 @@ async fn create_credential(
     match state.credentials.create(&user, new).await? {
         Ok(row) => Ok((StatusCode::CREATED, Json(row.to_api()))),
         Err(invalid) => Err(bad_request(invalid.0)),
+    }
+}
+
+async fn list_standing_approvals(
+    State(state): State<AppState>,
+    User(user): User,
+) -> ApiResult<impl IntoResponse> {
+    let rows = db::standing_approvals(&state.db, &user).await?;
+    Ok(Json(rows.iter().map(|r| r.to_api()).collect::<Vec<_>>()))
+}
+
+async fn create_standing_approval(
+    State(state): State<AppState>,
+    User(user): User,
+    Json(new): Json<NewStandingApproval>,
+) -> ApiResult<impl IntoResponse> {
+    if state.proposals.get(&new.kind).is_none() {
+        return Err(bad_request(format!("unknown proposal kind {}", new.kind)));
+    }
+    let target = new
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    if target.is_some_and(|t| t.split('/').count() != 2) {
+        return Err(bad_request("give the target repository as owner/name"));
+    }
+    // Each session's autonomy is its own call, so a standing approval covers one session.
+    let Some(session) = new.session_id else {
+        return Err(bad_request(
+            "a standing approval is for one session; give its session_id",
+        ));
+    };
+    if db::owned_session(&state.db, session, &user)
+        .await?
+        .is_none()
+    {
+        return Err(bad_request("unknown session"));
+    }
+    // Only edits that make sense for every matching proposal; per-proposal edits stay with a human.
+    let edits = new.edits.unwrap_or_else(|| json!({}));
+    let Some(fields) = edits.as_object() else {
+        return Err(bad_request("edits must be an object"));
+    };
+    if fields
+        .iter()
+        .any(|(k, v)| k != "auto_merge" || !v.is_boolean())
+    {
+        return Err(bad_request(
+            "the only edit a standing approval can make is auto_merge: true or false",
+        ));
+    }
+    let expires_at = match new.expires_at.as_deref() {
+        Some(at) => Some(
+            chrono::DateTime::parse_from_rfc3339(at)
+                .map_err(|_| bad_request("expires_at must be an RFC 3339 time"))?
+                .with_timezone(&chrono::Utc),
+        ),
+        None => None,
+    };
+    let row = db::insert_standing_approval(
+        &state.db,
+        &user,
+        &new.kind,
+        target,
+        new.session_id,
+        &edits,
+        expires_at,
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(row.to_api())))
+}
+
+async fn revoke_standing_approval(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    if db::revoke_standing_approval(&state.db, &user, id).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(not_found())
     }
 }
 
@@ -495,12 +666,17 @@ async fn list_proposals(
     User(user): User,
     Query(filter): Query<ProposalFilter>,
 ) -> ApiResult<impl IntoResponse> {
-    let proposals: Vec<_> =
-        db::list_proposals(&state.db, &user, filter.session, filter.status.as_deref())
-            .await?
-            .iter()
-            .map(|p| p.to_api())
-            .collect();
+    let status = filter
+        .status
+        .as_deref()
+        .map(str::parse::<ProposalStatus>)
+        .transpose()
+        .map_err(bad_request)?;
+    let proposals: Vec<_> = db::list_proposals(&state.db, &user, filter.session, status)
+        .await?
+        .iter()
+        .map(|p| p.to_api())
+        .collect();
     Ok(Json(proposals))
 }
 
@@ -516,22 +692,35 @@ async fn get_proposal(
     ))
 }
 
+async fn list_reviews(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    proposals::owned_proposal(&state, id, &user)
+        .await?
+        .ok_or_else(not_found)?;
+    let reviews: Vec<_> = db::reviews(&state.db, id)
+        .await?
+        .iter()
+        .map(db::ReviewRow::to_api)
+        .collect();
+    Ok(Json(reviews))
+}
+
 async fn approve(
     State(state): State<AppState>,
     User(user): User,
     Path(id): Path<Uuid>,
-    body: Option<Json<Decision>>,
+    body: Option<Json<serde_json::Value>>,
 ) -> ApiResult<impl IntoResponse> {
-    let decision = body.map(|Json(d)| d).unwrap_or_default();
     let verdict = Verdict::Approve {
-        title: decision.title,
-        body: decision.body,
-        auto_merge: decision.auto_merge,
+        edits: body.map(|Json(edits)| edits).unwrap_or_default(),
     };
-    match proposals::decide(&state, id, verdict, &user).await {
+    match proposals::decide(&state, id, verdict, &user, &user).await {
         Ok(Some(proposal)) => Ok(Json(proposal)),
         Ok(None) => Err(not_found()),
-        Err(e) => Err(ApiError(StatusCode::CONFLICT, e.to_string())),
+        Err(e) => Err(decide_error(e)),
     }
 }
 
@@ -549,18 +738,42 @@ async fn reject(
             reason: decision.reason,
         },
         &user,
+        &user,
     )
     .await
     {
         Ok(Some(proposal)) => Ok(Json(proposal)),
         Ok(None) => Err(not_found()),
-        Err(e) => Err(ApiError(StatusCode::CONFLICT, e.to_string())),
+        Err(e) => Err(decide_error(e)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parking_conflicts_are_409s() {
+        assert_eq!(park_error(ParkError::InTurn).0, StatusCode::CONFLICT);
+        assert_eq!(park_error(ParkError::Stopped).0, StatusCode::CONFLICT);
+        assert_eq!(
+            park_error(ParkError::Failed(anyhow::anyhow!("no"))).0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn decisions_fail_by_whose_fault_it_is() {
+        assert_eq!(
+            decide_error(DecideError::Invalid("bad edit".into())).0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(decide_error(DecideError::Decided).0, StatusCode::CONFLICT);
+        assert_eq!(
+            decide_error(DecideError::Failed(anyhow::anyhow!("db down"))).0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 
     fn repos() -> Vec<String> {
         [
