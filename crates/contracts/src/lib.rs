@@ -314,6 +314,9 @@ pub trait PlacementBackend: Send + Sync {
     async fn ensure(&self, spec: &PlacementSpec) -> Result<()>;
     /// Ends the session's pod and keeps its volume, for a parked session (ADR 5); `ensure` brings it back.
     async fn suspend(&self, session_id: &str) -> Result<()>;
+    /// Ends the session's pod so that a new one starts from the current spec, keeping its volume; e.g. to move a
+    /// running session onto a new image.
+    async fn replace_pod(&self, session_id: &str) -> Result<()>;
     async fn delete(&self, session_id: &str) -> Result<()>;
 }
 

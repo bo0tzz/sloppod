@@ -37,13 +37,31 @@ fn sole_session(pods: &[std::sync::Arc<Pod>], ip: &str) -> Option<Uuid> {
     sessions.all(|other| other == session).then_some(session)
 }
 
-fn live_with_ip(pod: &Pod, ip: &str) -> bool {
-    let Some(status) = &pod.status else {
-        return false;
-    };
+/// The image the session's live pod runs, if it has one.
+fn session_image(pods: &[std::sync::Arc<Pod>], session: Uuid) -> Option<String> {
+    pods.iter()
+        .filter(|pod| session_of(pod) == Some(session) && is_live(pod))
+        .find_map(|pod| {
+            pod.spec
+                .as_ref()?
+                .containers
+                .iter()
+                .find(|c| c.name == "session")?
+                .image
+                .clone()
+        })
+}
+
+fn is_live(pod: &Pod) -> bool {
     pod.metadata.deletion_timestamp.is_none()
-        && !matches!(status.phase.as_deref(), Some("Succeeded" | "Failed"))
-        && status.pod_ip.as_deref() == Some(ip)
+        && !matches!(
+            pod.status.as_ref().and_then(|s| s.phase.as_deref()),
+            Some("Succeeded" | "Failed")
+        )
+}
+
+fn live_with_ip(pod: &Pod, ip: &str) -> bool {
+    is_live(pod) && pod.status.as_ref().and_then(|s| s.pod_ip.as_deref()) == Some(ip)
 }
 
 impl PodIndex {
@@ -69,6 +87,11 @@ impl PodIndex {
 
     /// The session whose live pod has `ip`. A pod that has finished (evicted, say) keeps its IP in its status while
     /// the IP goes to another pod, so only live ones count; if two still claim it, neither gets it.
+    /// The image the session's live pod runs, if it has one.
+    pub fn session_image(&self, session: Uuid) -> Option<String> {
+        session_image(&self.store.state(), session)
+    }
+
     pub fn session_for_ip(&self, ip: &str) -> Option<Uuid> {
         sole_session(&self.store.state(), ip)
     }
@@ -116,6 +139,35 @@ mod tests {
             }),
             ..Default::default()
         })
+    }
+
+    fn with_image(pod: Arc<Pod>, image: &str) -> Arc<Pod> {
+        let mut pod = (*pod).clone();
+        pod.spec = Some(k8s_openapi::api::core::v1::PodSpec {
+            containers: vec![k8s_openapi::api::core::v1::Container {
+                name: "session".into(),
+                image: Some(image.into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        Arc::new(pod)
+    }
+
+    #[test]
+    fn a_session_runs_its_live_pods_image() {
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        let old = with_image(deleting(pod(a, "Running", IP)), "session:old");
+        let new = with_image(pod(a, "Running", IP), "session:new");
+        assert_eq!(
+            session_image(&[old.clone(), new], a).as_deref(),
+            Some("session:new")
+        );
+        assert_eq!(session_image(&[old], a), None);
+        assert_eq!(
+            session_image(&[with_image(pod(b, "Running", IP), "x")], a),
+            None
+        );
     }
 
     fn deleting(pod: Arc<Pod>) -> Arc<Pod> {

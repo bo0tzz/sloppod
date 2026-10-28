@@ -286,6 +286,20 @@ impl Hub {
         }
     }
 
+    /// Whether anything is going on in the session: a turn, messages waiting, a question or permission request the
+    /// user hasn't answered, or commands of the agent's still running. `None` when its supervisor doesn't say
+    /// what's running, so only the rest is known.
+    pub async fn busy(&self, id: Uuid) -> Option<bool> {
+        let live = self.live(id);
+        let state = live.state.lock().await;
+        let busy = state.turn_running || !state.queue.is_empty() || !state.permissions.is_empty();
+        match state.commands {
+            _ if busy => Some(true),
+            Some(running) => Some(running > 0),
+            None => None,
+        }
+    }
+
     /// How many of the agent's commands are running, if its supervisor says.
     pub async fn commands(&self, id: Uuid) -> Option<usize> {
         self.live(id).state.lock().await.commands
