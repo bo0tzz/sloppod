@@ -931,6 +931,14 @@ test("adds a repository as one of the user's GitHub tokens", async ({ page }) =>
   await picker.getByRole('combobox', { name: 'Repository' }).click();
   await expect(page.getByRole('option', { name: 'bo0tzz/sloppod' })).toBeVisible();
   await expect(page.getByRole('option', { name: 'bo0tzz/dotfiles' })).toHaveCount(0);
+  await page.keyboard.press('Escape');
+
+  // Nor is it offered to the App: adding it without the token would leave the grant acting as the person.
+  await picker.getByRole('combobox', { name: 'Act as' }).click();
+  await page.getByRole('option', { name: 'The GitHub App' }).click();
+  await picker.getByRole('combobox', { name: 'Repository' }).click();
+  await expect(page.getByRole('option', { name: 'bo0tzz/sloppod' })).toBeVisible();
+  await expect(page.getByRole('option', { name: 'bo0tzz/dotfiles' })).toHaveCount(0);
 
   // The mock is shared by the other tests, which expect no GitHub account.
   const credentials: { id: string; kind: string }[] = await (await page.request.get('/api/v1/credentials')).json();

@@ -24,11 +24,12 @@
     { value: APP, label: 'The GitHub App' },
     ...tokens.map((entry) => ({ value: entry.id, label: entry.label })),
   ]);
-  // The session can act on a repository as the App and as each token, so what it already has depends on who it acts as.
+  // A repository the session has as the App can be switched to a token, but a token's can't go back to the App: adding
+  // it without a credential would leave the grant acting as the person.
   const granted = $derived(
     new Set(
       session.grants
-        .filter((grant) => grant.capability === 'repo' && (grant.params.credential ?? APP) === actAs)
+        .filter((grant) => grant.capability === 'repo' && (!token || grant.params.credential === token.id))
         .map((grant) => String(grant.params.repo)),
     ),
   );
