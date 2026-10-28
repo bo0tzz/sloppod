@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page, type WebSocketRoute } from '@playwright/test';
 import type { Proposal } from '../src/lib/api.ts';
 
 const FINAL = /Done\. The tests pass/;
@@ -1178,6 +1178,43 @@ test('shows an open question again after a reload', async ({ page }) => {
   await questionCard(page).getByRole('button', { name: 'Next' }).click();
   await questionCard(page).getByRole('button', { name: 'Answer' }).click();
   await expect(agentMessages(page).filter({ hasText: 'Backoff: Whatever you think is best.' })).toBeVisible();
+});
+
+test('a half-given answer stays through a dropped connection and a reload', async ({ page }) => {
+  // Every connection goes through here, so the test can drop one, as a flaky network would.
+  const sockets: WebSocketRoute[] = [];
+  await page.routeWebSocket(/\/acp$/, (socket) => {
+    socket.connectToServer();
+    sockets.push(socket);
+  });
+  await createSession(page, 'Please ask me how to do it');
+  await expect(questionCard(page)).toBeVisible();
+  await questionField(page, 'question_0').getByRole('radio', { name: /Exponential/ }).check();
+  await questionCard(page).getByRole('button', { name: 'Next' }).click();
+  await questionField(page, 'question_1').getByRole('checkbox', { name: /Unit/ }).check();
+
+  // While the connection is down the question stays, greyed out, and can't be answered.
+  await sockets.at(-1)!.close();
+  await expect(questionCard(page)).toHaveAttribute('data-stale', 'true');
+  await expect(questionCard(page).getByTestId('question-reconnecting')).toBeVisible();
+  await expect(questionCard(page).getByRole('button', { name: 'Answer' })).toBeDisabled();
+  // Once it's back, it's the same question, answer and step included.
+  await expect(questionCard(page)).not.toHaveAttribute('data-stale', 'true');
+  await expect(questionCard(page).getByTestId('question-step')).toHaveText('Question 2 of 2');
+  await expect(questionField(page, 'question_1').getByRole('checkbox', { name: /Unit/ })).toBeChecked();
+
+  await page.reload();
+  await expect(questionCard(page).getByTestId('question-step')).toHaveText('Question 2 of 2');
+  await expect(questionField(page, 'question_1').getByRole('checkbox', { name: /Unit/ })).toBeChecked();
+  await questionCard(page).getByRole('button', { name: 'Back' }).click();
+  await expect(questionField(page, 'question_0').getByRole('radio', { name: /Exponential/ })).toBeChecked();
+  await questionCard(page).getByRole('button', { name: 'Next' }).click();
+  await questionCard(page).getByRole('button', { name: 'Answer' }).click();
+  await expect(agentMessages(page).filter({ hasText: 'Backoff: Exponential.' })).toContainText('Tests: Unit.');
+
+  // Answered, it's forgotten: nothing is kept for the next question.
+  const kept = await page.evaluate(() => Object.keys(localStorage).filter((key) => key.startsWith('sloppod.answer.')));
+  expect(kept).toEqual([]);
 });
 
 // Last, because it changes the mock's credentials; it puts them back at the end.

@@ -27,7 +27,7 @@
   import { onMount } from 'svelte';
   import { api } from '#lib/api.ts';
   import { absoluteTime, clockTime, countdown } from '#lib/format.ts';
-  import { SessionView } from '#lib/session.svelte.ts';
+  import { questionKey, SessionView } from '#lib/session.svelte.ts';
   import { sessions } from '#lib/sessions.svelte.ts';
   import AddRepoModal from './AddRepoModal.svelte';
   import ChatHeader from './ChatHeader.svelte';
@@ -248,7 +248,7 @@
 
 {#snippet waitingItems()}
       <!-- One request at a time; the rest wait their turn behind it. -->
-      {#each view.questions.slice(0, 1) as question (question.rpcId)}
+      {#each view.questions.slice(0, 1) as question (questionKey(question))}
         <QuestionCard
           request={question}
           queued={view.questions.length - 1}
