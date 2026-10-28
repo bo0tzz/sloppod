@@ -663,11 +663,6 @@ pub async fn submit(state: &AppState, session: Uuid, arguments: &Value) -> Resul
     };
     state.hub.notify(proposal.session_id, notice).await;
     end(state, session);
-    // Only a proposal that passed review can be approved without the user (ADR 24); one still with findings after
-    // the last round waits for them, like a stalled one.
-    if verdict != "pass" {
-        return Ok("Review recorded. That's the end of this review.".into());
-    }
     let author = db::get_session(&state.db, proposal.session_id)
         .await
         .map_err(|e| e.to_string())?
