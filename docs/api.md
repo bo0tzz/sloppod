@@ -200,7 +200,7 @@ type StandingApproval = {
 
 ## ACP at `/acp`
 
-A WebSocket carrying [ACP](https://agentclientprotocol.com) JSON-RPC 2.0, one message per text frame. The runtime is the agent from the UI's point of view. ACP `sessionId`s are runtime session IDs. Sessions are created through REST, not `session/new`.
+A WebSocket carrying [ACP](https://agentclientprotocol.com) JSON-RPC 2.0, one message per text frame. The runtime is the agent from the UI's point of view. ACP `sessionId`s are runtime session IDs. Sessions are created through REST, not `session/new`. A browser may open it only from sloppod's own pages: an `Origin` that names neither the requested host (`Host` or `X-Forwarded-Host`) nor one of `SLOPPOD_ALLOWED_ORIGINS` gets 403. Clients that send no `Origin`, like `sloppodctl`, are unaffected.
 
 UI → runtime:
 

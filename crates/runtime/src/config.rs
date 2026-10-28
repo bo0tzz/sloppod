@@ -93,6 +93,10 @@ pub struct Config {
     #[arg(long, env = "SLOPPOD_USER_HEADER", default_value = "x-forwarded-user")]
     pub user_header: String,
 
+    /// Origins besides the runtime's own a browser may open `/acp` from, e.g. `https://ui.example.com`.
+    #[arg(long, env = "SLOPPOD_ALLOWED_ORIGINS", value_delimiter = ',')]
+    pub allowed_origins: Vec<String>,
+
     /// User for requests without the header; unset, such requests are refused.
     #[arg(long, env = "SLOPPOD_DEFAULT_USER")]
     pub default_user: Option<String>,

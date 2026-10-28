@@ -77,7 +77,7 @@ The release name decides resource names. With release `sloppod`, the runtime Ser
 
 ## Exposing the UI
 
-The runtime has **no authentication of its own**. Every request acts as the user named in the `X-Forwarded-User` header (`auth.userHeader`), so put sloppod behind an authenticating proxy that sets it and strips it from client requests; with Envoy Gateway, an OIDC `SecurityPolicy` whose `jwt.claimToHeaders` maps `preferred_username` to that header. Users only see their own sessions and credentials ([ADR 23](adr/0023-users-and-ownership.md)). The UI needs WebSockets (`/acp`).
+The runtime has **no authentication of its own**. Every request acts as the user named in the `X-Forwarded-User` header (`auth.userHeader`), so put sloppod behind an authenticating proxy that sets it and strips it from client requests; with Envoy Gateway, an OIDC `SecurityPolicy` whose `jwt.claimToHeaders` maps `preferred_username` to that header. Users only see their own sessions and credentials ([ADR 23](adr/0023-users-and-ownership.md)). The UI needs WebSockets (`/acp`). A browser may only open `/acp` from sloppod's own pages: its `Origin` must name the host the request was made to (`Host`, or `X-Forwarded-Host` from the proxy), so another site can't use the proxy's cookie to connect as the user. Serve the UI from another origin only by adding it to `auth.allowedOrigins`.
 
 Route only port 8080 (`http`). Port 8081 (`sessions`) serves the supervisor link and the MCP endpoint for session pods, which can reach nothing else on the runtime; port 9001 is Envoy's authorizer. The chart's network policy enforces this inside the cluster.
 

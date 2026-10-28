@@ -36,6 +36,8 @@ auth:
   userHeader: x-forwarded-user
   # User for requests without that header; leave empty to refuse them.
   defaultUser: ""
+  # Origins besides sloppod's own a browser may open /acp from, e.g. https://ui.example.com.
+  allowedOrigins: []
 
 memory:
   # Prepended to every memory namespace, e.g. `dev/` for a test install.
