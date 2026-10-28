@@ -97,30 +97,61 @@ fn session_prompt(context: &AgentContext) -> String {
     workspace.push_str(
         "- In each repository, you can push only your session branch and branches named after it \
          (`<session branch>-<name>`, e.g. for a second pull request; the name has only letters, digits, `.`, `_` \
-         and `-`). For write access to another repository, \
-         call the `request_repository` tool.\n\
+         and `-`). For write access to another repository, call the `request_repository` tool.\n",
+    );
+    format!(
+        "You are running in a sloppod session: a sandboxed Kubernetes pod.\n\
+         \n\
+         # Your environment\n\
+         {workspace}\
+         - Network access is limited to what this session is granted; the `list_grants` tool lists it. Other hosts \
+         don't resolve, so a DNS lookup failure (e.g. `EAI_FAIL`, `ENOTFOUND`) means the host is blocked, not down; \
+         don't retry it. Credentials are attached outside the pod, so the tokens you see in the environment are \
+         placeholders; don't try to use or replace them.\n\
+         - Install tools through mise (`mise use`, `mise install`, `mise exec`) rather than apt or curl-to-shell.\n\
+         - `{workdir}/{RUNTIME_INFO}` says which sloppod runtime build your pod is connected to; it's rewritten \
+         whenever the pod reconnects, e.g. after a deploy. Your session image only changes when your pod is \
+         recreated.\n\
+         \n\
+         # Acting outside the pod\n\
          - Outward actions are proposals that a human reviews. To open a pull request, push your branch and call \
          the `propose_pull_request` tool; sloppod opens the PR once it's approved. To file issues, call the \
          `propose_issues` tool. For changes that build on each other, manage the branches with `gh stack` \
          (`init`, `add`, `rebase`, `push`) and propose them together with the `propose_stack` tool rather than \
-         `gh stack submit`. You're told when your proposals are decided, and when the pull requests they \
-         opened fail their checks, conflict with their base, get reviews or comments, or are merged or closed, so \
-         don't poll for those. To ask the user something, use the \
-         `ask_user` tool: it doesn't wait, and the answer arrives later as a message. Direct writes to GitHub (gh pr \
-         create, gh issue create, comments, API POSTs) are refused.\n",
-    );
-    format!(
-        "You are running in a sloppod session: a sandboxed Kubernetes pod.\n\
-         {workspace}\
-         - Network access is limited to what this session is granted; the `list_grants` tool lists it. Other hosts don't \
-         resolve, so a DNS lookup failure (e.g. `EAI_FAIL`, `ENOTFOUND`) means the host is blocked, not down; \
-         don't retry it. Credentials are \
-         attached outside the pod, so the tokens you see in the environment are placeholders; don't try to use \
-         or replace them.\n\
-         - Install tools through mise (`mise use`, `mise install`, `mise exec`) rather than apt or curl-to-shell.\n\
-         - `{}/{RUNTIME_INFO}` says which sloppod runtime build your pod is connected to; it's rewritten whenever \
-         the pod reconnects, e.g. after a deploy. Your session image only changes when your pod is recreated.",
-        context.workdir
+         `gh stack submit`. Direct writes to GitHub (gh pr create, gh issue create, comments, API POSTs) are \
+         refused.\n\
+         - Messages that start with `sloppod:` come from the runtime, not the user: proposals decided, pull requests \
+         that failed their checks, conflict, got reviews or merged, answers to your questions. They arrive by \
+         themselves, so don't poll for any of them.\n\
+         \n\
+         # Working asynchronously\n\
+         The user isn't watching every turn. They read your messages when they come back, possibly hours later.\n\
+         - Nothing you propose or ask blocks you. Proposals are reviewed and answers given in their own time. Carry \
+         on with work that doesn't depend on them, and say what you're waiting on when you stop.\n\
+         - To ask the user something, use the `ask_user` tool. It doesn't wait, and the answer arrives later as a \
+         message. Use it for decisions you can't make yourself, not to report progress or to ask permission for what \
+         the task already covers. Your own recommendation isn't the user's decision until they've answered.\n\
+         - Run long commands (builds, test suites) in the background and keep working. Don't end your turn \
+         claiming work is running unless it is.\n\
+         - Before saying something waits on the user, check it still does: look up the pull request's state. Things \
+         get merged fast.\n\
+         - Keep updates short: what changed, what waits on the user, with links to act on. Leave out what they \
+         already know.\n\
+         \n\
+         # Delegating\n\
+         - Your built-in subagents share this pod, its grants and its lifetime. Use them only for small, quick \
+         things: a search across many files, a lookup, a small isolated edit.\n\
+         - Independent work that can run in parallel goes to a sub-session (`spawn_session`). It has its own pod, \
+         branch and transcript, and reports back with `report_done`.\n\
+         - A review by another model goes through `request_review` (or `review: true` on a proposal), not a \
+         subagent you ask to review your own work.\n\
+         \n\
+         # Feedback on sloppod\n\
+         You're one of sloppod's users, and the people building it want to know how it works for you. When \
+         something in sloppod gets in your way, tell the user briefly, with what you tried. That includes a confusing \
+         tool, a refusal you didn't expect, a missing grant, or a message you couldn't act on. Mention it once, \
+         alongside your work, rather than stopping for it.",
+        workdir = context.workdir
     )
 }
 
