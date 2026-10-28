@@ -189,7 +189,8 @@ pub async fn handler(
         .on_upgrade(move |socket| run(state, session, socket))
 }
 
-async fn authenticate(state: &AppState, token: &str) -> anyhow::Result<Uuid> {
+/// The session whose pod a ServiceAccount token was issued to, checked by the Kubernetes API.
+pub(crate) async fn authenticate(state: &AppState, token: &str) -> anyhow::Result<Uuid> {
     let review = TokenReview {
         spec: TokenReviewSpec {
             token: Some(token.to_owned()),
@@ -326,7 +327,18 @@ async fn launch_for(
     Ok((launch, agent))
 }
 
-pub async fn agent_context(state: &AppState, session: &db::SessionRow) -> AgentContext {
+/// The agent's view of its session. With `local_proxy`, its supervisor serves the runtime's endpoints on localhost
+/// and attaches the pod's identity; an older supervisor's agent calls the runtime directly.
+pub async fn agent_context(
+    state: &AppState,
+    session: &db::SessionRow,
+    local_proxy: bool,
+) -> AgentContext {
+    let endpoints = if local_proxy {
+        format!("http://{}", sloppod_protocol::link::LOCAL_PROXY)
+    } else {
+        state.config.runtime_url()
+    };
     let context = session.context();
     let namespace = context
         .grant(capability::MEMORY)
@@ -335,7 +347,7 @@ pub async fn agent_context(state: &AppState, session: &db::SessionRow) -> AgentC
     let memory = match namespace {
         Some(namespace) => match state.credentials.memini(&session.owner).await {
             Ok(Some(_)) => Some(MemoryContext {
-                base_url: format!("{}{}", state.config.runtime_url(), crate::memory::PREFIX),
+                base_url: format!("{endpoints}{}", crate::memory::PREFIX),
                 namespace,
             }),
             _ => None,
@@ -348,7 +360,7 @@ pub async fn agent_context(state: &AppState, session: &db::SessionRow) -> AgentC
         repo: session.repo.clone(),
         repo_dir: work_dir(session).to_owned(),
         repos_dir: REPOS_DIR.to_owned(),
-        tools_url: format!("{}/mcp", state.config.runtime_url()),
+        tools_url: format!("{endpoints}/mcp"),
         // A review session's instructions are the reviewer's own, not the ones the owner's sessions work by.
         instructions: match session.kind {
             SessionKind::Review => Some(crate::reviews::INSTRUCTIONS.to_owned()),
@@ -388,7 +400,7 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
             }
         }
     });
-    let Some((version, running)) = hello(&mut stream).await else {
+    let Some((version, running, local_proxy)) = hello(&mut stream).await else {
         tracing::warn!(session = %session_id, "supervisor connected without a hello");
         writer.abort();
         return;
@@ -414,7 +426,7 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
             if let Some(notice) = restart_notice {
                 state.hub.notify(session_id, notice).await;
             }
-            let context = agent_context(&state, &session).await;
+            let context = agent_context(&state, &session, local_proxy).await;
             match launch_for(&state, &session, &context).await {
                 Ok((launch, agent_launch)) => {
                     let _ = tx.send(ToSupervisor::Launch(Box::new(launch)));
@@ -477,7 +489,10 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
                 from_agent(&state.hub, session_id, &agent, message).await
             }
             FromSupervisor::Transcript { files } => {
-                for file in files {
+                for file in files
+                    .into_iter()
+                    .filter(|f| transcript_name_ok(session_id, &f.name))
+                {
                     let Ok(content) =
                         base64::engine::general_purpose::STANDARD.decode(&file.content_b64)
                     else {
@@ -494,7 +509,7 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
                 name,
                 offset,
                 content_b64,
-            } => {
+            } if transcript_name_ok(session_id, &name) => {
                 let Ok(content) = base64::engine::general_purpose::STANDARD.decode(&content_b64)
                 else {
                     tracing::warn!(session = %session_id, file = %name, "undecodable transcript sync");
@@ -518,6 +533,8 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
                     }
                 }
             }
+            // Its name was refused above.
+            FromSupervisor::TranscriptAppend { .. } => {}
             FromSupervisor::AgentExited { code } => {
                 tracing::warn!(session = %session_id, ?code, "agent exited");
             }
@@ -530,6 +547,15 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
     agent.close();
     state.hub.detach_agent(session_id, &agent).await;
     writer.abort();
+}
+
+/// A transcript file name the session's pod can be given back; one that isn't is dropped and logged.
+fn transcript_name_ok(session: Uuid, name: &str) -> bool {
+    let ok = sloppod_protocol::link::is_transcript_file_name(name);
+    if !ok {
+        tracing::warn!(%session, file = %name, "not storing a transcript file with that name");
+    }
+    ok
 }
 
 async fn start_agent_session(
@@ -658,7 +684,7 @@ const LINK_TIMEOUT: Duration = Duration::from_secs(60);
 /// The supervisor's first message: its version, and the agent it kept running if there is one.
 async fn hello(
     stream: &mut futures::stream::SplitStream<WebSocket>,
-) -> Option<(String, Option<RunningAgent>)> {
+) -> Option<(String, Option<RunningAgent>, bool)> {
     loop {
         let message = tokio::time::timeout(LINK_TIMEOUT, stream.next())
             .await
@@ -667,7 +693,11 @@ async fn hello(
         match message {
             Message::Text(text) => {
                 return match serde_json::from_str(&text).ok()? {
-                    FromSupervisor::Hello { version, agent } => Some((version, agent)),
+                    FromSupervisor::Hello {
+                        version,
+                        agent,
+                        local_proxy,
+                    } => Some((version, agent, local_proxy)),
                     _ => None,
                 };
             }

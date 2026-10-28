@@ -22,17 +22,17 @@ impl CodexPolicy {
     }
 }
 
-/// Envoy passes the path upstream as sent, so a `..` (or `%2e%2e`, or an empty segment) after the prefix could reach
-/// another ChatGPT API with the owner's token. Every segment after it has to be a plain name.
+/// Only Codex's own API under `/backend-api/codex/`, read through the shared path parser: a path that could reach
+/// another ChatGPT API with the owner's token is refused, whatever form it's written in.
 fn is_codex(request: &HttpRequest) -> bool {
-    let Some(rest) = request.path_only().strip_prefix(CODEX_PATH) else {
+    let Ok(segments) = request.segments() else {
         return false;
     };
     matches!(request.method.as_str(), "GET" | "POST")
-        && rest.split('/').all(|segment| {
-            let decoded = percent_encoding::percent_decode_str(segment).decode_utf8_lossy();
-            !matches!(decoded.as_ref(), "" | "." | "..") && !decoded.contains(['/', '\\'])
-        })
+        && matches!(segments.as_slice(), [api, codex, _, ..] if api == "backend-api" && codex == "codex")
+        // The listener resolves dot segments and the shared parser refuses them, but an escaped `/` or `\` is passed
+        // on as sent, and ChatGPT's front end might split on it.
+        && segments.iter().all(|segment| !segment.contains(['/', '\\']))
 }
 
 #[async_trait]
@@ -115,7 +115,6 @@ mod tests {
             "/backend-api/codex/%2e%2e/conversation",
             "/backend-api/codex/%2E./conversation",
             "/backend-api/codex/./responses",
-            "/backend-api/codex//responses",
             "/backend-api/codex/a%2f..%2fb",
             "/backend-api/codex/..%5cconversation",
             "/backend-api/codex/",

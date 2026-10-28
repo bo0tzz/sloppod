@@ -429,6 +429,23 @@ test('saves the default model for new sessions', async ({ page }) => {
   await expect(defaults.getByRole('combobox', { name: 'Model' })).toContainText('Agent default');
 });
 
+test('saves a model id the agent does not list', async ({ page }) => {
+  const defaults = page.getByTestId('session-defaults');
+  await page.goto('/settings');
+  await defaults.getByRole('combobox', { name: 'Model' }).click();
+  await page.getByRole('option', { name: 'Other…', exact: true }).click();
+  await defaults.getByRole('textbox', { name: 'Model id' }).fill('claude-mythos-5-1');
+  await defaults.getByRole('button', { name: 'Save' }).click();
+  await expect(defaults.getByRole('button', { name: 'Save' })).toBeDisabled();
+
+  await page.reload();
+  await expect(defaults.getByRole('combobox', { name: 'Model' })).toContainText('Other…');
+  await expect(defaults.getByRole('textbox', { name: 'Model id' })).toHaveValue('claude-mythos-5-1');
+  const settings: { model: string } = await (await page.request.get('/api/v1/settings')).json();
+  expect(settings.model).toBe('claude-mythos-5-1');
+  await page.request.put('/api/v1/settings', { data: { model: null } });
+});
+
 test('requires review by default, or per session', async ({ page }) => {
   const defaults = page.getByTestId('session-defaults');
   const policy = defaults.getByRole('combobox', { name: 'Review by Codex' });
@@ -1008,4 +1025,52 @@ test('lists the session grants from the session menu', async ({ page }) => {
   const grants = page.getByTestId('grants');
   await expect(grants.getByText("Claude's API, with the owner's Claude account.")).toBeVisible();
   await expect(grants.getByText(/^bo0tzz\/sloppod: read, and push the session branch `sloppod\//)).toBeVisible();
+});
+
+test('a draft survives a page reload', async ({ page }) => {
+  await createSession(page, 'Keep my draft in sloppod');
+  await finishTurn(page);
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Half a thought');
+  await page.reload();
+  await expect(box).toHaveValue('Half a thought');
+  await box.fill('');
+  await page.reload();
+  await expect(box).toHaveValue('');
+});
+
+test('a message a reload cut off is sent once the session loads', async ({ page }) => {
+  const id = await createSession(page, 'Send what I left unconfirmed in sloppod');
+  await finishTurn(page);
+  // As if the page reloaded after sending, before the runtime answered.
+  await page.evaluate(
+    ([session, messageId]) =>
+      localStorage.setItem(
+        `sloppod.unconfirmed.${session}`,
+        JSON.stringify([{ id: messageId, text: 'Sent just before the reload' }]),
+      ),
+    [id, crypto.randomUUID()],
+  );
+  await page.reload();
+  await expect(userMessages(page).filter({ hasText: 'Sent just before the reload' })).toHaveCount(1);
+  await finishTurn(page);
+  // Settled: not sent again after the next reload.
+  await page.reload();
+  await expect(userMessages(page).filter({ hasText: 'Sent just before the reload' })).toHaveCount(1);
+  expect(await page.evaluate((session) => localStorage.getItem(`sloppod.unconfirmed.${session}`), id)).toBeNull();
+});
+
+test('a browser whose storage is full still sends', async ({ page }) => {
+  await page.addInitScript(() => {
+    Storage.prototype.setItem = () => {
+      throw new DOMException('full', 'QuotaExceededError');
+    };
+  });
+  await createSession(page, 'Work without storage in sloppod');
+  await finishTurn(page);
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Sent anyway');
+  await box.press('Enter');
+  await expect(userMessages(page).filter({ hasText: 'Sent anyway' })).toHaveCount(1);
+  await finishTurn(page);
 });

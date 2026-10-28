@@ -89,6 +89,17 @@ where
 /// How long a push the authorizer let through may take to land, for work that needs branches to hold still.
 const PUSH_SETTLE: Duration = Duration::from_secs(10 * 60);
 
+/// What [`GitHubApp::check_merging_stack`] found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StackWatch {
+    /// Merged, closed, or no longer set to merge: nothing left to watch.
+    Done,
+    /// Every layer is still at its proposed commit.
+    Holding,
+    /// This layer moved, and the stack's auto-merge is now off.
+    Moved(u64),
+}
+
 /// A linked stack to merge: its number, its pull requests and each layer's branch and proposed commit, bottom to
 /// top, and the top pull request's node id.
 #[derive(Clone, Copy)]
@@ -706,7 +717,11 @@ impl GitHubApp {
         Ok(disabled)
     }
 
-    async fn disable_pull_auto_merge_in(&self, repo: &str, node_id: &str) -> anyhow::Result<()> {
+    pub async fn disable_pull_auto_merge_in(
+        &self,
+        repo: &str,
+        node_id: &str,
+    ) -> anyhow::Result<()> {
         self.graphql(
             repo,
             "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }",
@@ -921,6 +936,49 @@ impl GitHubApp {
         Ok(None)
     }
 
+    /// Checks on a stack that's set to merge itself: `Done` once its top pull request is closed, merged or no longer
+    /// set to merge, or the number of the first layer whose head moved from the commit it was proposed at, after
+    /// turning the top's auto-merge off.
+    pub async fn check_merging_stack(
+        &self,
+        repo: &str,
+        top_node_id: &str,
+        layers: &[(u64, &str)],
+    ) -> anyhow::Result<StackWatch> {
+        let Some((top, _)) = layers.last() else {
+            return Ok(StackWatch::Done);
+        };
+        let top_pull = self.pull(repo, *top).await?;
+        if top_pull["state"] != "open" || top_pull["auto_merge"].is_null() {
+            return Ok(StackWatch::Done);
+        }
+        // A layer seen to have moved turns auto-merge off even if another couldn't be read: a lookup that fails only
+        // matters when nothing moved.
+        let mut unread = None;
+        for (number, sha) in layers {
+            let pull = if number == top {
+                top_pull.clone()
+            } else {
+                match self.pull(repo, *number).await {
+                    Ok(pull) => pull,
+                    Err(e) => {
+                        unread.get_or_insert(e);
+                        continue;
+                    }
+                }
+            };
+            if pull["state"] == "open" && pull["head"]["sha"].as_str() != Some(*sha) {
+                self.disable_pull_auto_merge_in(repo, top_node_id).await?;
+                return Ok(StackWatch::Moved(*number));
+            }
+        }
+        unread.map_or(Ok(StackWatch::Holding), Err)
+    }
+
+    async fn pull(&self, repo: &str, number: u64) -> anyhow::Result<Value> {
+        self.repo_json(repo, &format!("/pulls/{number}")).await
+    }
+
     /// A stack's pull requests, bottom to top.
     pub async fn stack_members(&self, repo: &str, stack: u64) -> anyhow::Result<Vec<u64>> {
         let stack: Value = self.repo_json(repo, &format!("/stacks/{stack}")).await?;
@@ -1033,6 +1091,10 @@ mod tests {
         heads: Mutex<HashMap<String, String>>,
         /// Head lookups fail while any pull request has auto-merge on.
         heads_fail_once_merging: bool,
+        /// Pull requests of `o/r` that are merged.
+        merged: Mutex<Vec<u64>>,
+        /// Pull requests whose lookup fails.
+        failing: Mutex<Vec<u64>>,
     }
 
     async fn commit(
@@ -1081,12 +1143,25 @@ mod tests {
         State(fake): State<Arc<Fake>>,
         Path((_, _, number)): Path<(String, String, u64)>,
     ) -> Result<Json<Value>, StatusCode> {
-        let pulls = fake.pulls.lock().unwrap();
-        pulls
-            .iter()
-            .find(|p| p.0 == number)
-            .map(|p| Json(pull_json(p)))
-            .ok_or(StatusCode::NOT_FOUND)
+        if fake.failing.lock().unwrap().contains(&number) {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        let mut pull = {
+            let pulls = fake.pulls.lock().unwrap();
+            pulls
+                .iter()
+                .find(|p| p.0 == number)
+                .map(pull_json)
+                .ok_or(StatusCode::NOT_FOUND)?
+        };
+        let branch = pull["head"]["ref"].as_str().unwrap_or_default().to_owned();
+        if let Some(sha) = fake.heads.lock().unwrap().get(&branch) {
+            pull["head"]["sha"] = json!(sha);
+        }
+        if fake.merged.lock().unwrap().contains(&number) {
+            pull["state"] = json!("closed");
+        }
+        Ok(Json(pull))
     }
 
     fn stack_json(number: u64, members: &[u64]) -> Value {
@@ -1395,6 +1470,84 @@ mod tests {
                 .contains("couldn't be checked")
         );
         assert!(auto_merging(&fake).is_empty());
+    }
+
+    const WATCHED: &[(u64, &str)] = &[(1, "a"), (2, "b"), (3, "c")];
+
+    /// The stack #7, its top set to merge it.
+    fn merging() -> Fake {
+        let fake = unmerged();
+        fake.pulls.lock().unwrap()[2].2 = true;
+        fake
+    }
+
+    #[tokio::test]
+    async fn a_merging_stack_holds_while_its_layers_do() {
+        let (_, app) = serve(merging()).await;
+        assert_eq!(
+            app.check_merging_stack("o/r", "PR3", WATCHED)
+                .await
+                .unwrap(),
+            StackWatch::Holding
+        );
+    }
+
+    #[tokio::test]
+    async fn a_moved_layer_stops_the_stack_merging() {
+        let (fake, app) = serve(merging()).await;
+        fake.heads.lock().unwrap().insert("s-1".into(), "a2".into());
+        assert_eq!(
+            app.check_merging_stack("o/r", "PR3", WATCHED)
+                .await
+                .unwrap(),
+            StackWatch::Moved(1)
+        );
+        assert!(auto_merging(&fake).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_moved_layer_stops_the_stack_merging_though_another_cant_be_read() {
+        let (fake, app) = serve(merging()).await;
+        fake.heads.lock().unwrap().insert("s-2".into(), "b2".into());
+        fake.failing.lock().unwrap().push(1);
+        assert_eq!(
+            app.check_merging_stack("o/r", "PR3", WATCHED)
+                .await
+                .unwrap(),
+            StackWatch::Moved(2)
+        );
+        assert!(auto_merging(&fake).is_empty());
+
+        // With nothing seen to move, an unread layer is an error, and auto-merge stays on until the next look.
+        let (fake, app) = serve(merging()).await;
+        fake.failing.lock().unwrap().push(1);
+        assert!(
+            app.check_merging_stack("o/r", "PR3", WATCHED)
+                .await
+                .is_err()
+        );
+        assert_eq!(auto_merging(&fake), [3]);
+    }
+
+    #[tokio::test]
+    async fn watching_ends_once_the_stack_merged_or_stopped_merging() {
+        let (fake, app) = serve(merging()).await;
+        fake.merged.lock().unwrap().extend([1, 2, 3]);
+        assert_eq!(
+            app.check_merging_stack("o/r", "PR3", WATCHED)
+                .await
+                .unwrap(),
+            StackWatch::Done
+        );
+
+        let (fake, app) = serve(unmerged()).await;
+        fake.heads.lock().unwrap().insert("s-1".into(), "a2".into());
+        assert_eq!(
+            app.check_merging_stack("o/r", "PR3", WATCHED)
+                .await
+                .unwrap(),
+            StackWatch::Done
+        );
     }
 
     #[tokio::test]

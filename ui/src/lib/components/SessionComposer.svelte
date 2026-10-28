@@ -4,11 +4,15 @@
   import { configSelectOptions } from '#lib/presentation.ts';
   import { ConnectionClosedError } from '#lib/acp/connection.ts';
   import { queuedText, type SessionView } from '#lib/session.svelte.ts';
+  import { loadDraft, saveDraft } from '#lib/drafts.ts';
   import Composer from './Composer.svelte';
 
   let { view }: { view: SessionView } = $props();
 
-  let text = $state('');
+  // Kept across a page reload, per session. The route remounts this per session, so the first id is the one.
+  // svelte-ignore state_referenced_locally
+  let text = $state(loadDraft(view.id));
+  $effect(() => saveDraft(view.id, text));
   let textarea = $state<HTMLTextAreaElement | null>(null);
 
   const phase = $derived(view.session?.phase);

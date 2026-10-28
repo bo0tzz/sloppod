@@ -3229,6 +3229,7 @@ name = "sloppod-contracts"
 version = "0.1.1"
 dependencies = [
  "async-trait",
+ "percent-encoding",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -3286,9 +3287,11 @@ name = "sloppod-supervisor"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "axum",
  "base64 0.23.1",
  "clap",
  "futures",
+ "reqwest",
  "rustls",
  "serde_json",
  "sloppod-protocol",
