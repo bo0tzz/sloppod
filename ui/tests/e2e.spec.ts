@@ -497,6 +497,44 @@ test('queues messages while the agent starts', async ({ page }) => {
   await expect(page.getByTestId('composer-hint')).toBeHidden();
 });
 
+test('follows new output while the reader is at the bottom, across a reconnect', async ({ page }) => {
+  await page.setViewportSize({ width: 1000, height: 500 });
+  await createSession(page, 'Give me a long answer in sloppod');
+  const end = page.getByText('The end.');
+  await expect(end).toBeInViewport({ timeout: 20_000 });
+
+  await page.request.post('/_mock/drop');
+  await expect(page.getByTestId('reconnecting')).toBeHidden();
+  await expect(end).toBeInViewport();
+
+  // Scrolling up stops the following; new output then leaves the view where it is.
+  const scroller = page.getByTestId('transcript-scroller');
+  const scrollTop = () => scroller.evaluate((element) => element.scrollTop);
+  await end.hover();
+  await page.mouse.wheel(0, -2000);
+  await expect(end).not.toBeInViewport();
+  const kept = await scrollTop();
+  await page.request.post('/_mock/say?text=One%20more%20thing.');
+  await expect(page.getByText('One more thing.')).toBeAttached();
+  expect(await scrollTop()).toBe(kept);
+
+  // So does dragging the scrollbar, however long the drag is held before it moves.
+  await scroller.evaluate((element) => element.scrollTo({ top: element.scrollHeight }));
+  await page.request.post('/_mock/say?text=Back%20at%20the%20bottom.');
+  await expect(page.getByText('Back at the bottom.')).toBeInViewport();
+  // A scrollbar drag scrolls with the pointer held and no wheel, touch or key.
+  await page.getByText('Back at the bottom.').hover();
+  await page.mouse.down();
+  await page.waitForTimeout(1500);
+  await scroller.evaluate((element) => element.scrollTo({ top: 0 }));
+  const dragged = await scrollTop();
+  await page.request.post('/_mock/say?text=Still%20held.');
+  await expect(page.getByText('Still held.')).toBeAttached();
+  expect(await scrollTop()).toBe(dragged);
+  await page.mouse.up();
+  await expect(page.getByText('Still held.')).not.toBeInViewport();
+});
+
 test('says what the pod is doing while the agent starts, and why a start failed', async ({ page }) => {
   await createSession(page, 'failing start: fix the build in bo0tzz/sloppod');
   const activity = page.getByTestId('activity');
