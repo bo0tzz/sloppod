@@ -38,7 +38,7 @@ The parent session manages, and sub-sessions ([ADR 27](adr/0027-sub-sessions.md)
 - **Branches:** a sub-session's branches are named after the parent's, so the parent proposes them as pull requests directly; no copying commits. Sub-sessions rebase onto main and resolve conflicts themselves, since they know their change best. Force pushes aren't allowed, so a rebased branch gets a new name (`-2`).
 - **Review findings go back to the sub-session that wrote the change.** It builds on the pull request's branch and pushes its own branch; the parent fast-forwards the PR branch and asks for the next round.
 - **Sub-sessions can't message each other;** the parent passes on what one needs from another, word for word where it's a design.
-- **The parent allocates migration numbers** across sub-sessions working at the same time, so no two pending migrations share one. Order doesn't matter: sqlx applies any migration not yet applied, whatever its number.
+- **The parent allocates migration numbers** across sub-sessions working at the same time, so no two pending migrations share one. A migration that depends on another (alters its table, say) gets a higher number, since a fresh database runs them in numeric order, and the two changes are proposed as a stack so the prerequisite merges first. Independent migrations don't need renumbering above ones already shipped: sqlx applies any migration not yet applied, whatever its number.
 
 ## Proposals and merging
 
