@@ -137,6 +137,8 @@ pub mod capability {
     pub const PACKAGES: &str = "packages";
     /// Long-term memory (memini).
     pub const MEMORY: &str = "memory";
+    /// Library documentation through a docs MCP server (Context7).
+    pub const DOCS: &str = "docs";
     /// A repository: `{repo, access, branch?, commit?}`.
     pub const REPO: &str = "repo";
 }

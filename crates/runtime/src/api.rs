@@ -358,6 +358,7 @@ async fn create_session(
         Grant::new(capability::MODEL, json!({})),
         Grant::new(capability::GITHUB, json!({})),
         Grant::new(capability::PACKAGES, json!({})),
+        Grant::new(capability::DOCS, json!({})),
     ];
     if state.credentials.has_default(&user, CHATGPT).await? {
         grants.push(Grant::new(capability::CODEX, json!({})));
