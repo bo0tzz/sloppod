@@ -1274,7 +1274,7 @@ impl Hub {
                 .await;
             (state.agent.clone(), held)
         };
-        self.record_notice(id, &notice.blocks[0]).await;
+        self.record_notice(id, &notice.blocks[0], None).await;
         if let Some(agent) = agent {
             tokio::spawn(self.clone().run_queued(id, agent, None, vec![notice], held));
         }
@@ -1284,6 +1284,16 @@ impl Hub {
     /// Tells the agent something: a new turn when it's idle, steered into the running one, or queued until it's
     /// up. Kept in the stored queue until it reaches the agent, so a restart doesn't lose it (#237).
     pub async fn notify(self: &Arc<Self>, id: Uuid, text: String) {
+        self.notify_summarised(id, text, None).await;
+    }
+
+    /// A notice the UI shows folded as `summary`, e.g. a message from another session; the agent gets all of it.
+    pub async fn notify_summarised(
+        self: &Arc<Self>,
+        id: Uuid,
+        text: String,
+        summary: Option<String>,
+    ) {
         let notice = notice_queued(&text);
         let blocks = notice.blocks.clone();
         let delivery = {
@@ -1306,7 +1316,7 @@ impl Hub {
                 Delivery::Turn(state.agent.clone(), notice, held)
             }
         };
-        self.record_notice(id, &blocks[0]).await;
+        self.record_notice(id, &blocks[0], summary.as_deref()).await;
         match delivery {
             Delivery::Queued => {}
             Delivery::Turn(agent, notice, held) => {
@@ -1329,14 +1339,18 @@ impl Hub {
     }
 
     /// Shows a notice in the session's log as a message to the agent.
-    async fn record_notice(&self, id: Uuid, block: &Value) {
+    async fn record_notice(&self, id: Uuid, block: &Value, summary: Option<&str>) {
+        let mut sloppod = json!({"notice": true});
+        if let Some(summary) = summary {
+            sloppod["summary"] = json!(summary);
+        }
         self.record(
             id,
             json!({
                 "sessionUpdate": "user_message_chunk",
                 "messageId": Uuid::new_v4(),
                 "content": block,
-                "_meta": {"sloppod": {"notice": true}},
+                "_meta": {"sloppod": sloppod},
             }),
         )
         .await;

@@ -212,7 +212,11 @@ impl ProposalKind for Report {
         );
         Ok(json!({
             "message": "Your parent session has your report.",
-            "notify": [{"session": payload["parent"], "text": report_text(&child, payload)}],
+            "notify": [{
+                "session": payload["parent"],
+                "text": report_text(&child, payload),
+                "summary": format!("Sub-session \"{}\" reports it's done", payload["title"].as_str().unwrap_or_default()),
+            }],
         }))
     }
 }
