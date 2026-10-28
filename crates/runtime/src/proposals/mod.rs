@@ -13,10 +13,12 @@ use sloppod_contracts::{Error, ProposalKind, RepoGrant, Result, SessionContext, 
 use sloppod_protocol::api::{Proposal, ProposalStatus, ReviewPolicy};
 use uuid::Uuid;
 
+use crate::github::StackWatch;
 use crate::{AppState, db, reviews};
 
 pub use issue_updates::IssueUpdates;
 pub use issues::Issues;
+use pull_request::stack_layers;
 pub use pull_request::{PullRequest, Stack};
 pub use repo_access::{RepoAccess, grant_repo, repo_granted};
 
@@ -382,7 +384,88 @@ async fn carry_out(
             format!("sloppod: your proposal ({summary}) was {outcome}"),
         )
         .await;
+    watch_stack(state, &finished);
     Ok(())
+}
+
+/// How often a stack that's set to merge itself is checked.
+const STACK_WATCH_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Watches a stack that's set to merge itself until it has: if a layer moves from the commit that was proposed,
+/// however it got there, its auto-merge goes off and the session hears why. Polling narrows the time a moved layer
+/// could merge to a check's interval; it doesn't rule it out. Other proposals are left alone.
+pub fn watch_stack(state: &AppState, proposal: &db::ProposalRow) {
+    let result = proposal.result.clone().unwrap_or_default();
+    if proposal.kind != "github.stack.create" || result["auto_merge"] != true {
+        return;
+    }
+    let pulls = result["pull_requests"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let layers: Vec<(u64, String)> = pulls
+        .iter()
+        .zip(stack_layers(&proposal.payload))
+        .filter_map(|(pull, layer)| {
+            Some((
+                pull["number"].as_u64()?,
+                layer["head_sha"].as_str()?.to_owned(),
+            ))
+        })
+        .collect();
+    let top_node_id = pulls
+        .last()
+        .and_then(|pull| pull["node_id"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let repo = proposal.payload["repo"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let (state, id, session_id) = (state.clone(), proposal.id, proposal.session_id);
+    tokio::spawn(async move {
+        let layers: Vec<(u64, &str)> = layers.iter().map(|(n, sha)| (*n, sha.as_str())).collect();
+        loop {
+            tokio::time::sleep(STACK_WATCH_EVERY).await;
+            let app = match db::get_session(&state.db, session_id).await {
+                Ok(Some(session)) => state.credentials.github(&session.owner).await,
+                Ok(None) => return,
+                Err(e) => Err(e.into()),
+            };
+            let checked = match app {
+                Ok(app) => app.check_merging_stack(&repo, &top_node_id, &layers).await,
+                Err(e) => Err(e),
+            };
+            match checked {
+                Ok(StackWatch::Done) => return,
+                Ok(StackWatch::Holding) => {}
+                Ok(StackWatch::Moved(number)) => {
+                    state
+                        .hub
+                        .notify(
+                            session_id,
+                            format!(
+                                "sloppod: #{number} in your stack on {repo} has new commits since it was approved, so \
+                                 the stack's auto-merge is now off and it needs merging by hand."
+                            ),
+                        )
+                        .await;
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(proposal = %id, error = %e, "checking a stack that's set to merge")
+                }
+            }
+        }
+    });
+}
+
+/// Watches the stacks still set to merge themselves, e.g. after the runtime restarted.
+pub async fn resume_stack_watches(state: &AppState) {
+    match db::merging_stacks(&state.db).await {
+        Ok(rows) => rows.iter().for_each(|row| watch_stack(state, row)),
+        Err(e) => tracing::error!(error = %e, "listing stacks set to merge"),
+    }
 }
 
 pub async fn detail(state: &AppState, id: Uuid, owner: &str) -> anyhow::Result<Option<Value>> {

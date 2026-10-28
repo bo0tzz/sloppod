@@ -30,6 +30,7 @@
     type StackPayload,
   } from '#lib/api.ts';
   import { diffStats, parseUnifiedDiff } from '#lib/diff.ts';
+  import { readStored, writeStored } from '#lib/storage.ts';
   import { absoluteTime } from '#lib/format.ts';
   import { proposalKinds, proposalStatus, proposalSummary } from '#lib/presentation.ts';
   import Markdown from './Markdown.svelte';
@@ -52,8 +53,8 @@
 
   let editing = $state(false);
   // Off by default would hide most of a docs change, whose paragraphs are single long lines.
-  let wrapLines = $state(localStorage.getItem('sloppod.diff.wrap') !== 'false');
-  $effect(() => localStorage.setItem('sloppod.diff.wrap', String(wrapLines)));
+  let wrapLines = $state(readStored('sloppod.diff.wrap') !== 'false');
+  $effect(() => writeStored('sloppod.diff.wrap', String(wrapLines)));
   let title = $state('');
   let body = $state('');
   let rejecting = $state(false);

@@ -1053,3 +1053,51 @@ test('reviews and approves updates to existing issues', async ({ page }) => {
   expect(made.payload.updates.map((u) => u.number)).toEqual([100, 59]);
   expect(made.payload.updates[0].comment).toBe('Fixed by #148, closing.');
 });
+
+test('a draft survives a page reload', async ({ page }) => {
+  await createSession(page, 'Keep my draft in sloppod');
+  await finishTurn(page);
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Half a thought');
+  await page.reload();
+  await expect(box).toHaveValue('Half a thought');
+  await box.fill('');
+  await page.reload();
+  await expect(box).toHaveValue('');
+});
+
+test('a message a reload cut off is sent once the session loads', async ({ page }) => {
+  const id = await createSession(page, 'Send what I left unconfirmed in sloppod');
+  await finishTurn(page);
+  // As if the page reloaded after sending, before the runtime answered.
+  await page.evaluate(
+    ([session, messageId]) =>
+      localStorage.setItem(
+        `sloppod.unconfirmed.${session}`,
+        JSON.stringify([{ id: messageId, text: 'Sent just before the reload' }]),
+      ),
+    [id, crypto.randomUUID()],
+  );
+  await page.reload();
+  await expect(userMessages(page).filter({ hasText: 'Sent just before the reload' })).toHaveCount(1);
+  await finishTurn(page);
+  // Settled: not sent again after the next reload.
+  await page.reload();
+  await expect(userMessages(page).filter({ hasText: 'Sent just before the reload' })).toHaveCount(1);
+  expect(await page.evaluate((session) => localStorage.getItem(`sloppod.unconfirmed.${session}`), id)).toBeNull();
+});
+
+test('a browser whose storage is full still sends', async ({ page }) => {
+  await page.addInitScript(() => {
+    Storage.prototype.setItem = () => {
+      throw new DOMException('full', 'QuotaExceededError');
+    };
+  });
+  await createSession(page, 'Work without storage in sloppod');
+  await finishTurn(page);
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Sent anyway');
+  await box.press('Enter');
+  await expect(userMessages(page).filter({ hasText: 'Sent anyway' })).toHaveCount(1);
+  await finishTurn(page);
+});
