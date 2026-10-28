@@ -42,7 +42,10 @@ fn report_text(child: &str, payload: &Value) -> String {
     };
     let review = &payload["review"];
     let review = match review["verdict"].as_str() {
-        Some("pass") => format!("Its review passed: {}", review["summary"].as_str().unwrap_or_default()),
+        Some("pass") => format!(
+            "Its review passed: {}",
+            review["summary"].as_str().unwrap_or_default()
+        ),
         Some("changes") => format!(
             "Its review still had findings after the last round:\n\n{}",
             review["findings"].as_str().unwrap_or_default()
@@ -125,9 +128,10 @@ impl ProposalKind for Report {
             .ok_or_else(|| Error::new("only a sub-session reports to a parent"))?;
         let mut payload = json!({"parent": parent, "summary": summary, "title": row.title});
         // The branch the child was given, from the parent's that it started from.
-        let branch = session.grants.iter().find_map(|g| {
-            Some((g.param("repo")?, g.param("branch")?, g.param("from")?))
-        });
+        let branch = session
+            .grants
+            .iter()
+            .find_map(|g| Some((g.param("repo")?, g.param("branch")?, g.param("from")?)));
         if let Some((repo, head, base)) = branch {
             let app = self.credentials.github(&session.owner).await.map_err(err)?;
             // A branch that was never pushed has nothing to hand over.
@@ -200,7 +204,9 @@ mod tests {
         });
         let text = report_text("\"Fix\" (x)", &payload);
         assert!(text.contains("reports that it's done: Fixed it."));
-        assert!(text.contains("`sloppod/abcd1234-01234567` in o/r, at f00, from `sloppod/abcd1234`"));
+        assert!(
+            text.contains("`sloppod/abcd1234-01234567` in o/r, at f00, from `sloppod/abcd1234`")
+        );
         assert!(text.contains("still had findings after the last round:\n\n- [1.1] p1 a bug"));
 
         let bare = report_text("\"Look\" (y)", &json!({"summary": "Nothing to change."}));

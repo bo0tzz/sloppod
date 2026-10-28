@@ -4,6 +4,7 @@ mod issue_updates;
 mod issues;
 mod pull_request;
 mod repo_access;
+mod report;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ pub use issues::Issues;
 use pull_request::stack_layers;
 pub use pull_request::{PullRequest, Stack};
 pub use repo_access::{RepoAccess, grant_repo, repo_granted};
+pub use report::Report;
 
 #[derive(Default, Clone)]
 pub struct ProposalKinds {
@@ -150,7 +152,7 @@ pub async fn propose(
     let proposal = row.to_api();
     state.hub.broadcast_proposal(&proposal);
     let Some(subject) = subject else {
-        return apply_standing_approval(state, &session, kind.as_ref(), proposal)
+        return settle(state, &session, kind.as_ref(), proposal, None)
             .await
             .map_err(|e| e.to_string());
     };
@@ -175,8 +177,41 @@ pub async fn propose(
     Ok(proposal)
 }
 
+/// What happens to a proposal once it's out of review, or wasn't reviewed: `review` is how its review ended,
+/// `{verdict: "pass" | "changes" | "stalled", summary?, findings?}`. One that isn't outward is carried out, with the
+/// review's outcome added. Otherwise a standing approval may approve it, but only one that passed review or wasn't
+/// reviewed (ADR 24); the rest wait for the user.
+pub async fn settle(
+    state: &AppState,
+    session: &db::SessionRow,
+    kind: &dyn ProposalKind,
+    proposal: Proposal,
+    review: Option<Value>,
+) -> anyhow::Result<Proposal> {
+    if !kind.outward() {
+        let edits = review.map_or_else(|| json!({}), |review| json!({"review": review}));
+        return match decide(
+            state,
+            proposal.id,
+            Verdict::Approve { edits },
+            &session.owner,
+            "sloppod",
+        )
+        .await
+        {
+            Ok(Some(approved)) => Ok(approved),
+            Ok(None) | Err(DecideError::Decided) => Ok(proposal),
+            Err(e) => Err(anyhow::anyhow!("{e}")),
+        };
+    }
+    if review.is_some_and(|review| review["verdict"] != "pass") {
+        return Ok(proposal);
+    }
+    apply_standing_approval(state, session, kind, proposal).await
+}
+
 /// Approves a proposal that's waiting for a human when one of the owner's standing approvals covers it.
-pub async fn apply_standing_approval(
+async fn apply_standing_approval(
     state: &AppState,
     session: &db::SessionRow,
     kind: &dyn ProposalKind,
@@ -367,6 +402,17 @@ async fn carry_out(
     };
     let proposal = finished.to_api();
     state.hub.broadcast_proposal(&proposal);
+    // What it has to tell other sessions, e.g. a report for a sub-session's parent.
+    if let Some(result) = &proposal.result {
+        for notice in result["notify"].as_array().into_iter().flatten() {
+            if let (Some(to), Some(text)) = (
+                notice["session"].as_str().and_then(|s| s.parse().ok()),
+                notice["text"].as_str(),
+            ) {
+                state.hub.notify(to, text.to_owned()).await;
+            }
+        }
+    }
     state.hub.broadcast_session(session_id).await;
     let outcome = match (&proposal.result, &proposal.error) {
         (Some(result), _) => match (result["message"].as_str(), result["url"].as_str()) {

@@ -452,6 +452,11 @@ pub trait ProposalKind: Send + Sync {
     fn review_subject(&self, _payload: &Value) -> Option<ReviewSubject> {
         None
     }
+    /// Whether carrying it out acts outside sloppod. One that doesn't, like a sub-session's report to its parent, is
+    /// carried out by the runtime once its review is over, without waiting for a person (ADR 27).
+    fn outward(&self) -> bool {
+        true
+    }
     /// Applies the reviewer's edits, sent along with the approval, to the payload.
     fn edit(&self, payload: &Value, edits: &Value) -> Result<Value> {
         match edits.as_object() {
