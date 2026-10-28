@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::http::{HeaderMap, header};
 use axum::response::Response;
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -20,14 +21,22 @@ use crate::{AppState, db};
 pub async fn handler(
     State(state): State<AppState>,
     User(user): User,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    let agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
     ws.max_message_size(64 << 20)
-        .on_upgrade(move |socket| run(state, user, socket))
+        .on_upgrade(move |socket| run(state, user, agent, socket))
 }
 
 /// One UI connection.
 struct Conn {
+    /// Names the connection in the log, e.g. as the one that cancelled a turn or answered a permission request.
+    id: Uuid,
     state: AppState,
     /// Every session this connection touches must be theirs (ADR 23).
     user: String,
@@ -267,7 +276,10 @@ impl Conn {
             )),
             None => Ok(message["result"].clone()),
         };
-        self.state.hub.answer_permission(session, pid, result).await;
+        self.state
+            .hub
+            .answer_permission(session, pid, result, &format!("UI connection {}", self.id))
+            .await;
     }
 }
 
@@ -283,7 +295,7 @@ fn internal(e: impl std::fmt::Display) -> RpcError {
     RpcError::new(-32603, e.to_string())
 }
 
-async fn run(state: AppState, user: String, socket: WebSocket) {
+async fn run(state: AppState, user: String, agent: String, socket: WebSocket) {
     let (mut sink, mut stream) = socket.split();
     let (out, mut rx) = mpsc::channel::<Value>(64);
     let writer = tokio::spawn(async move {
@@ -297,7 +309,10 @@ async fn run(state: AppState, user: String, socket: WebSocket) {
             }
         }
     });
+    let id = Uuid::new_v4();
+    tracing::info!(connection = %id, %user, user_agent = %agent, "UI connected");
     let conn = Arc::new(Conn {
+        id,
         state,
         user,
         out,
@@ -339,7 +354,10 @@ async fn run(state: AppState, user: String, socket: WebSocket) {
                     .and_then(|s| s.parse().ok())
                     && conn.loaded.lock().await.contains_key(&session)
                 {
-                    conn.state.hub.cancel(session).await;
+                    conn.state
+                        .hub
+                        .cancel(session, &format!("UI connection {}", conn.id))
+                        .await;
                 }
             }
             (Some(_), None) => {}
@@ -351,4 +369,5 @@ async fn run(state: AppState, user: String, socket: WebSocket) {
         task.abort();
     }
     writer.abort();
+    tracing::info!(connection = %conn.id, "UI disconnected");
 }
