@@ -158,7 +158,7 @@ async fn forward(state: &AppState, peer: SocketAddr, request: Request) -> anyhow
         Decision::Allow {
             set_headers,
             remove_headers,
-        } => (set_headers, remove_headers),
+        } => sloppod_contracts::header_ops(set_headers, remove_headers),
         Decision::Deny {
             status,
             message,
