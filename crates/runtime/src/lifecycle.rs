@@ -68,6 +68,70 @@ pub fn pod_labels(session_id: &str) -> BTreeMap<String, String> {
     BTreeMap::from([(SESSION_LABEL.to_owned(), session_id.to_owned())])
 }
 
+/// A session to start: what `start_session` needs besides its id.
+pub struct NewSession<'a> {
+    pub owner: &'a str,
+    pub prompt: &'a str,
+    pub title: &'a str,
+    pub custom_title: bool,
+    pub agent: &'a str,
+    pub model: Option<&'a str>,
+    pub review: sloppod_protocol::api::ReviewPolicy,
+    pub repo: Option<&'a str>,
+    pub grants: &'a [Grant],
+    /// The session that spawned it, for a sub-session (ADR 27).
+    pub parent: Option<Uuid>,
+}
+
+/// Starts a work session: records it and its first message, and places its pod. A session whose pod can't be
+/// placed is stopped, and the error says why.
+pub async fn start_session(
+    state: &AppState,
+    id: Uuid,
+    new: NewSession<'_>,
+) -> anyhow::Result<db::SessionRow> {
+    db::insert_session(
+        &state.db,
+        db::NewSessionRow {
+            id,
+            owner: new.owner,
+            title: new.title,
+            custom_title: new.custom_title,
+            pending_prompt: new.prompt,
+            agent: new.agent,
+            kind: sloppod_protocol::api::SessionKind::Work,
+            review: new.review,
+            model: new.model,
+            repo: new.repo,
+            grants: new.grants,
+        },
+    )
+    .await?;
+    if let Some(parent) = new.parent {
+        db::set_parent(&state.db, id, parent).await?;
+    }
+    state
+        .hub
+        .record_user_message(
+            id,
+            &json!([{"type": "text", "text": new.prompt}]),
+            false,
+            None,
+        )
+        .await;
+    let row = db::get_session(&state.db, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("session {id} vanished"))?;
+    if let Err(e) = place(state, &row).await {
+        state
+            .hub
+            .set_phase(id, sloppod_protocol::api::Phase::Stopped)
+            .await;
+        anyhow::bail!("starting the session pod: {e}");
+    }
+    Ok(row)
+}
+
 /// Makes sure a session's pod and egress policy exist.
 pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
     if let Err(e) = ensure_memini_key(state, session).await {

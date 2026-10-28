@@ -63,6 +63,7 @@ type Session = {
   deleted_at?: string;   // when it was deleted; `GET /sessions` leaves deleted sessions out
   agent_status?: string; // what the pod is doing while the agent starts, e.g. "cloning https://github.com/…"
   agent_error?: string;  // why the agent last failed to start or exited; it's started again meanwhile. Both clear once it's ready
+  parent_id?: string;    // the session that spawned it, for a sub-session (ADR 27)
 };
 
 // What the session may do (ADR 2). Capabilities so far: "model", "github" (read: public data, plus the "repo"
@@ -251,6 +252,8 @@ Session pods use three more endpoints, on their own port (8081, `sessions`); tha
   - `request_repository {repo, reason}` creates a `sloppod.repo.grant` proposal.
   - `get_proposal {id}` returns a proposal's status and result. The agent is also told when its proposals are decided.
   - `withdraw_proposal {id, reason?}` withdraws one of the session's pending proposals: it becomes `withdrawn` (with the reason) and nothing is carried out.
+  - `spawn_session {task, title?, repo?, grants?, agent?, model?}` starts a sub-session ([ADR 27](adr/0027-sub-sessions.md)) with `task` as its first message, and returns its `{id, title, branch}`. It has the session's grants, or only the capabilities named in `grants` (model access always stays), and the session's owner, review policy and, unless given, agent and model. It works in `repo`, one the session can push to (by default the session's), on `<session branch>-<first 8 of its id>`, which starts from the session branch as pushed (from the default branch if it isn't pushed yet). A tree of sessions has at most 5 sub-sessions running at once. Work sessions only.
+  - `list_sessions` lists the session's sub-sessions: `{id, title, phase, repo, branch}` each.
 - `/memini/*`: memini, for sessions with a `memory` grant, identified like `/mcp`. The runtime forwards each request to the owner's memini with the session's own key and namespace, and refuses memini's administration endpoints. The memini plugin's `MEMINI_BASE_URL` points here.
 
 A session that's stopped, parked or deleted can't act, even if its pod is still up: the authorizer refuses its egress, `/mcp` gives it no tools, and `/memini/*` answers 403.

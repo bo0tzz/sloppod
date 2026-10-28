@@ -46,6 +46,8 @@ pub struct SessionRow {
     pub deleted_at: Option<DateTime<Utc>>,
     pub agent_status: Option<String>,
     pub agent_error: Option<String>,
+    /// The session that spawned this one, for a sub-session (ADR 27).
+    pub parent_id: Option<Uuid>,
 }
 
 impl SessionRow {
@@ -71,6 +73,7 @@ impl SessionRow {
             deleted_at: None,
             agent_status: None,
             agent_error: None,
+            parent_id: None,
         }
     }
 
@@ -119,6 +122,7 @@ impl SessionRow {
             deleted_at: self.deleted_at.map(|d| d.to_rfc3339()),
             agent_status: self.agent_status.clone(),
             agent_error: self.agent_error.clone(),
+            parent_id: self.parent_id,
         }
     }
 
@@ -140,7 +144,7 @@ impl SessionRow {
     }
 }
 
-const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, repo, created_at, updated_at, active_at, deleted_at, agent_status, agent_error, \
+const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, repo, created_at, updated_at, active_at, deleted_at, agent_status, agent_error, parent_id, \
      coalesce((select jsonb_agg(jsonb_build_object('capability', g.capability, 'params', g.params) order by g.created_at) \
      from session_grants g where g.session_id = sessions.id), '[]'::jsonb) as grants";
 
@@ -156,6 +160,41 @@ pub struct NewSessionRow<'a> {
     pub model: Option<&'a str>,
     pub repo: Option<&'a str>,
     pub grants: &'a [Grant],
+}
+
+/// Makes `child` a sub-session of `parent` (ADR 27).
+pub async fn set_parent(db: &PgPool, child: Uuid, parent: Uuid) -> sqlx::Result<()> {
+    sqlx::query("update sessions set parent_id = $2 where id = $1")
+        .bind(child)
+        .bind(parent)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// A session's sub-sessions, oldest first.
+pub async fn children(db: &PgPool, parent: Uuid) -> sqlx::Result<Vec<SessionRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "select {SESSION_COLUMNS} from sessions where parent_id = $1 and deleted_at is null order by created_at"
+    )))
+    .bind(parent)
+    .fetch_all(db)
+    .await
+}
+
+/// How many sub-sessions of `session`'s tree, its root's descendants, are running: what ADR 27's limit counts.
+pub async fn running_in_tree(db: &PgPool, session: Uuid) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "with recursive up as (select id, parent_id from sessions where id = $1 \
+           union all select s.id, s.parent_id from sessions s join up on s.id = up.parent_id), \
+         down as (select id from up where parent_id is null \
+           union all select s.id from sessions s join down on s.parent_id = down.id) \
+         select count(*) from sessions where id in (select id from down) and parent_id is not null \
+           and deleted_at is null and phase not in ('stopped', 'parked')",
+    )
+    .bind(session)
+    .fetch_one(db)
+    .await
 }
 
 pub async fn insert_session(db: &PgPool, new: NewSessionRow<'_>) -> sqlx::Result<SessionRow> {

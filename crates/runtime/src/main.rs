@@ -28,6 +28,7 @@ mod session;
 #[cfg(test)]
 mod session_tests;
 mod store;
+mod subsessions;
 mod tls;
 mod users;
 mod vault;

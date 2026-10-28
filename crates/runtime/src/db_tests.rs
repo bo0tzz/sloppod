@@ -2,7 +2,7 @@
 
 use chrono::{Duration, Utc};
 use serde_json::json;
-use sloppod_protocol::api::{ProposalStatus, ReviewPolicy, SessionKind};
+use sloppod_protocol::api::{Phase, ProposalStatus, ReviewPolicy, SessionKind};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -373,8 +373,6 @@ async fn an_agent_failure_is_news_once_until_the_agent_is_ready(db: PgPool) {
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
 async fn parked_sessions_are_left_alone_on_startup(db: PgPool) {
-    use sloppod_protocol::api::Phase;
-
     let running = session(&db, "dev").await;
     let parked = session(&db, "dev").await;
     let deleted = session(&db, "dev").await;
@@ -723,4 +721,30 @@ async fn only_a_live_session_acts(db: PgPool) {
     db::mark_deleted(&db, deleted).await.unwrap();
     let row = db::get_session(&db, deleted).await.unwrap().unwrap();
     assert_eq!(row.not_acting(), Some("deleted"));
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_tree_counts_its_running_sub_sessions_at_any_depth(db: PgPool) {
+    let root = session(&db, "alice").await;
+    let child = session(&db, "alice").await;
+    let grandchild = session(&db, "alice").await;
+    let parked = session(&db, "alice").await;
+    let elsewhere = session(&db, "alice").await;
+    db::set_parent(&db, child, root).await.unwrap();
+    db::set_parent(&db, grandchild, child).await.unwrap();
+    db::set_parent(&db, parked, root).await.unwrap();
+    db::set_phase(&db, parked, Phase::Parked).await.unwrap();
+
+    // The same count from anywhere in the tree; the root itself and other trees don't count.
+    for member in [root, child, grandchild] {
+        assert_eq!(db::running_in_tree(&db, member).await.unwrap(), 2);
+    }
+    assert_eq!(db::running_in_tree(&db, elsewhere).await.unwrap(), 0);
+    let children: Vec<Uuid> = db::children(&db, root)
+        .await
+        .unwrap()
+        .iter()
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(children, [child, parked]);
 }
