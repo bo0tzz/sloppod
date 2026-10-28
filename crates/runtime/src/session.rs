@@ -118,7 +118,7 @@ enum Start {
 pub enum ParkError {
     #[error("the session is in a turn; stop it or let it finish before parking")]
     InTurn,
-    #[error("the session is deleted")]
+    #[error("the session is stopped")]
     Stopped,
     #[error(transparent)]
     Failed(#[from] anyhow::Error),
