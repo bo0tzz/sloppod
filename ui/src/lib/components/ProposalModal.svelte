@@ -55,7 +55,9 @@
   let editing = $state(false);
   // Off by default would hide most of a docs change, whose paragraphs are single long lines.
   let wrapLines = $state(readStored('sloppod.diff.wrap') !== 'false');
-  $effect(() => writeStored('sloppod.diff.wrap', String(wrapLines)));
+  $effect(() => {
+    writeStored('sloppod.diff.wrap', String(wrapLines));
+  });
   let title = $state('');
   let body = $state('');
   let rejecting = $state(false);
