@@ -333,6 +333,34 @@ async fn a_turn_that_ends_mid_compaction_lets_waiting_steers_go() {
 }
 
 #[tokio::test]
+async fn stopping_a_session_mid_compaction_fails_waiting_steers() {
+    let mut h = Harness::ready().await;
+    let _turn = h.prompt("First");
+    h.next().await;
+    let compacting = json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "agent-session", "update": {
+        "sessionUpdate": "compaction_update", "compactionId": "c1", "status": "in_progress",
+    }}});
+    from_agent(&h.hub, h.id, &h.agent, compacting).await;
+    let (hub, id) = (h.hub.clone(), h.id);
+    let steer = tokio::spawn(async move {
+        hub.steer(
+            id,
+            json!({"sessionId": id, "prompt": [{"type": "text", "text": "Also this"}]}),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!steer.is_finished());
+
+    h.hub.stop(h.id).await;
+    let result = tokio::time::timeout(Duration::from_secs(5), steer)
+        .await
+        .expect("the steer is still waiting")
+        .unwrap();
+    assert!(result.is_err());
+}
+
+#[tokio::test]
 async fn a_notice_waits_for_the_agent_to_be_up() {
     let mut h = Harness::starting().await;
     h.hub

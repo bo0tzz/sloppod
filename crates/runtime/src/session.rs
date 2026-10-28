@@ -1141,6 +1141,7 @@ impl Hub {
             if state.turn_running {
                 return Err(ParkError::InTurn);
             }
+            live.end_compaction(&mut state);
             (state.agent.take(), state.agent_session_id.take())
         };
         // Parked before the pod ends, so its supervisor's attempts to reconnect meanwhile are turned away.
@@ -1209,6 +1210,7 @@ impl Hub {
             let live = self.live(id);
             let mut state = live.state.lock().await;
             state.stopped = true;
+            live.end_compaction(&mut state);
             (state.agent.take(), std::mem::take(&mut state.queue))
         };
         for reply in queued.into_iter().filter_map(|q| q.reply) {
