@@ -26,4 +26,5 @@ A runtime for coding-agent sessions on Kubernetes. The design lives in the ADRs 
 - Inside a sloppod session there's no container runtime, so stick to `mise run check` and the UI tests there. The UI tests need a browser first: `npx playwright install chromium` (its download can be slow).
 - Keep the docs in step with the code: a PR that changes behaviour described in an ADR, `docs/*.md` or this file updates them in the same PR. If a change contradicts an ADR, amend the ADR in the same PR (with a dated note under More Information) or say in the PR why it doesn't need to.
 - ADRs are MADR style. Numbers are permanent and append-only; add new ones to the README index under the right group.
+- Logic that more than one place needs is shared, not repeated, above all where it decides security: parsing request paths, building URLs from branch or repository names, minting and attaching credentials, identifying a session. A fix that reaches one copy and misses another is how the same bug comes back (#26 and #172 were one path traversal, fixed twice).
 - Only comment code for intent a reader couldn't infer.
