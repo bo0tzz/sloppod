@@ -9,7 +9,7 @@ use axum::routing::{delete, get, post, put};
 use serde::Deserialize;
 use serde_json::json;
 use sloppod_contracts::capability;
-use sloppod_contracts::{Grant, READ_WRITE};
+use sloppod_contracts::{Grant, READ_WRITE, find_repo};
 use sloppod_protocol::api::{
     Decision, NewCredential, NewSession, NewStandingApproval, Phase, ProposalStatus, ReviewPolicy,
     SessionKind,
@@ -240,10 +240,9 @@ async fn add_repo(
         .await?
         .ok_or_else(not_found)?;
     let wanted = body.repo.trim();
-    let repo = accessible_repos(&state, &user)
-        .await
-        .into_iter()
-        .find(|r| r.eq_ignore_ascii_case(wanted))
+    let accessible = accessible_repos(&state, &user).await;
+    let repo = find_repo(&accessible, wanted)
+        .cloned()
         .ok_or_else(|| bad_request(format!("{wanted} isn't accessible to your GitHub App")))?;
     if proposals::grant_repo(&state.db, &session.context(), &repo).await? {
         state.hub.broadcast_session(id).await;
@@ -346,18 +345,13 @@ async fn create_session(
         ));
     }
     let repos = accessible_repos(&state, &user).await;
-    let repo = match &new.repo {
-        Some(wanted) => Some(
-            repos
-                .iter()
-                .find(|r| r.eq_ignore_ascii_case(wanted.trim()))
-                .cloned()
-                .ok_or_else(|| {
-                    bad_request(format!("{wanted} isn't accessible to your GitHub App"))
-                })?,
-        ),
-        None => derive_repo(prompt, &repos),
-    };
+    let repo =
+        match &new.repo {
+            Some(wanted) => Some(find_repo(&repos, wanted.trim()).cloned().ok_or_else(|| {
+                bad_request(format!("{wanted} isn't accessible to your GitHub App"))
+            })?),
+            None => derive_repo(prompt, &repos),
+        };
 
     let id = Uuid::new_v4();
     let mut grants = vec![

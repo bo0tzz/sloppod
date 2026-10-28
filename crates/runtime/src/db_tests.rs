@@ -543,6 +543,91 @@ async fn finds_stacks_set_to_merge(db: PgPool) {
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_transcript_reads_a_chunk_at_a_time(db: PgPool) {
+    let s = session(&db, "dev").await;
+    db::upsert_transcript(&db, s, "b.jsonl", b"0123456789")
+        .await
+        .unwrap();
+    db::upsert_transcript(&db, s, "a.jsonl", b"x")
+        .await
+        .unwrap();
+    assert_eq!(
+        db::transcript_lens(&db, s).await.unwrap(),
+        [("a.jsonl".to_owned(), 1), ("b.jsonl".to_owned(), 10)]
+    );
+    assert_eq!(
+        db::transcript_len(&db, s, "b.jsonl").await.unwrap(),
+        Some(10)
+    );
+    assert_eq!(db::transcript_len(&db, s, "c.jsonl").await.unwrap(), None);
+    let mut read = Vec::new();
+    let mut offset = 0;
+    loop {
+        let chunk = db::transcript_chunk(&db, s, "b.jsonl", offset, 4)
+            .await
+            .unwrap();
+        if chunk.is_empty() {
+            break;
+        }
+        offset += chunk.len() as i64;
+        read.extend(chunk);
+    }
+    assert_eq!(read, b"0123456789");
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_replacement_in_pieces_keeps_the_old_copy_until_it_is_whole(db: PgPool) {
+    use std::collections::HashMap;
+
+    use crate::link::store_transcript_piece;
+
+    let s = session(&db, "dev").await;
+    db::upsert_transcript(&db, s, "t.jsonl", b"old copy")
+        .await
+        .unwrap();
+    let stored = |db: PgPool| async move { db::transcripts(&db, s).await.unwrap() };
+
+    // Cut off after the first piece: the old copy is what's restored.
+    let mut staging = HashMap::new();
+    assert!(
+        store_transcript_piece(&db, s, &mut staging, "t.jsonl", 0, b"new ", Some(8))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        stored(db.clone()).await,
+        [("t.jsonl".to_owned(), b"old copy".to_vec())]
+    );
+    assert!(db::transcript_lens(&db, s).await.unwrap().len() == 1);
+
+    // A link that starts over sends it whole again, and the last piece swaps it in.
+    let mut staging = HashMap::new();
+    for (offset, piece, replaces) in [(0, &b"new "[..], Some(8)), (4, &b"copy"[..], None)] {
+        assert!(
+            store_transcript_piece(&db, s, &mut staging, "t.jsonl", offset, piece, replaces)
+                .await
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        stored(db.clone()).await,
+        [("t.jsonl".to_owned(), b"new copy".to_vec())]
+    );
+    assert!(staging.is_empty());
+
+    // Appends after it go to the file as usual.
+    assert!(
+        store_transcript_piece(&db, s, &mut staging, "t.jsonl", 8, b"!", None)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        db::transcript_lens(&db, s).await.unwrap(),
+        [("t.jsonl".to_owned(), 9)]
+    );
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
 async fn a_session_log_reads_back_from_its_latest(db: PgPool) {
     let s = session(&db, "dev").await;
     let other = session(&db, "dev").await;

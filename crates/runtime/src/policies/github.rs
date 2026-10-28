@@ -7,6 +7,7 @@ use sloppod_contracts::capability;
 use sloppod_contracts::{
     Decision, Error, HttpRequest, Manifest, RequestPolicy, Result, SessionContext,
 };
+use sloppod_contracts::{repo_from_git_path, same_repo};
 
 use crate::credentials::Credentials;
 use crate::github::{GitHubApp, PushLog};
@@ -48,7 +49,7 @@ impl GitHubPolicy {
                 // without one, so it's readable only if it's public.
                 let granted: Vec<&str> = session.repos().collect();
                 let token = match self.app(session).await {
-                    Some(app) if granted.iter().any(|r| r.eq_ignore_ascii_case(&git.repo)) => {
+                    Some(app) if granted.iter().any(|r| same_repo(r, &git.repo)) => {
                         app.read_token(&git.repo, &granted).await.ok()
                     }
                     _ => None,
@@ -290,12 +291,7 @@ fn read_token_order<'a>(path: &str, granted: &[&'a str]) -> Vec<&'a str> {
         let mut parts = rest.splitn(3, '/');
         Some(format!("{}/{}", parts.next()?, parts.next()?))
     });
-    let first = named.and_then(|named| {
-        granted
-            .iter()
-            .find(|g| g.eq_ignore_ascii_case(&named))
-            .copied()
-    });
+    let first = named.and_then(|named| granted.iter().find(|g| same_repo(g, &named)).copied());
     first
         .into_iter()
         .chain(granted.iter().copied().filter(|g| Some(*g) != first))
@@ -328,7 +324,7 @@ impl GitRequest {
         let path = request.path_only().trim_start_matches('/');
         let mut parts = path.splitn(3, '/');
         let owner = parts.next()?;
-        let repo = parts.next()?.trim_end_matches(".git");
+        let repo = repo_from_git_path(parts.next()?);
         let rest = parts.next()?;
         let (service, advertisement) = match (request.method.as_str(), rest) {
             ("GET", "info/refs") => {

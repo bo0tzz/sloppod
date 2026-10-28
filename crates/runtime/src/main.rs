@@ -241,6 +241,10 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state.clone());
     let sessions = Router::new()
         .route(sloppod_protocol::link::PATH, get(link::handler))
+        .route(
+            &format!("{}/{{name}}", sloppod_protocol::link::TRANSCRIPT_PATH),
+            get(link::transcript),
+        )
         .route("/mcp", post(mcp::handler))
         .route(memory::PREFIX, any(memory::proxy))
         .route(&format!("{}/{{*path}}", memory::PREFIX), any(memory::proxy))
