@@ -118,6 +118,16 @@ impl SessionContext {
         self.writable_repos().next()
     }
 
+    /// The credential the session acts with on `repo` (ADR 29): one of the owner's GitHub tokens, by id, or none for
+    /// the owner's GitHub App.
+    pub fn repo_credential(&self, repo: &str) -> Option<&str> {
+        self.grants
+            .iter()
+            .filter(|g| g.capability == capability::REPO)
+            .find(|g| g.param("repo").is_some_and(|r| same_repo(r, repo)))
+            .and_then(|g| g.param("credential"))
+    }
+
     pub fn writable_repo_for(&self, repo: &str) -> Option<RepoGrant<'_>> {
         self.writable_repos().find(|g| same_repo(g.repo, repo))
     }
@@ -151,6 +161,22 @@ pub mod capability {
 /// repository names goes through here.
 pub fn same_repo(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
+}
+
+/// Whether `repo` is shaped like a GitHub repository, `owner/name`, in the characters GitHub allows: safe to put in a
+/// URL or a path as it is.
+pub fn is_repo_name(repo: &str) -> bool {
+    let Some((owner, name)) = repo.split_once('/') else {
+        return false;
+    };
+    let owner_ok = (1..=39).contains(&owner.len())
+        && owner.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    let name_ok = (1..=100).contains(&name.len())
+        && !matches!(name, "." | "..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    owner_ok && name_ok
 }
 
 /// The name in `repos` that is `wanted`, as written there (the canonical form, when `repos` came from GitHub).
@@ -485,6 +511,38 @@ pub trait ProposalKind: Send + Sync {
 #[cfg(test)]
 mod repo_tests {
     use super::*;
+
+    #[test]
+    fn repository_names_have_github_s_shape() {
+        assert!(is_repo_name("bo0tzz/sloppod"));
+        assert!(is_repo_name("a-b/c.d_e"));
+        for bad in [
+            "sloppod", "a/b/c", "a/..", "../b", "a/", "/b", "a b/c", "a/b?x", "a/b#", "a_b/c",
+        ] {
+            assert!(!is_repo_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_repository_grant_can_name_its_credential() {
+        let session = SessionContext {
+            session_id: "s".into(),
+            owner: "o".into(),
+            grants: vec![
+                Grant::new(
+                    capability::REPO,
+                    serde_json::json!({"repo": "o/app", "access": "rw", "branch": "b"}),
+                ),
+                Grant::new(
+                    capability::REPO,
+                    serde_json::json!({"repo": "o/mine", "access": "rw", "branch": "b", "credential": "c1"}),
+                ),
+            ],
+        };
+        assert_eq!(session.repo_credential("O/Mine"), Some("c1"));
+        assert_eq!(session.repo_credential("o/app"), None);
+        assert_eq!(session.repo_credential("o/other"), None);
+    }
 
     #[test]
     fn repository_names_compare_as_github_does() {
