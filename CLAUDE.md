@@ -12,6 +12,7 @@ A runtime for coding-agent sessions on Kubernetes. The design lives in the ADRs 
 - `ui`: the web UI (SvelteKit SPA with @immich/ui), served by the runtime. `ui/mock` is a mock runtime for UI tests.
 - `charts/sloppod`: the Helm chart. `Containerfile` builds both images (`--target runtime`, `--target session`).
 - `docs/api.md` is the contract between the runtime and UIs; `docs/deploy.md` covers deploying.
+- `docs/practice.md` is how we work with sloppod: priorities, talking to the user, running sub-sessions, proposals. Read it before taking on work.
 
 ## Working here
 

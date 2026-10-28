@@ -29,10 +29,11 @@
     type RepoGrantPayload,
     type StackPayload,
   } from '#lib/api.ts';
-  import { diffStats, parseUnifiedDiff } from '#lib/diff.ts';
+  import { diffStats, diffTexts, parseUnifiedDiff } from '#lib/diff.ts';
   import { readStored, writeStored } from '#lib/storage.ts';
   import { absoluteTime } from '#lib/format.ts';
   import { proposalKinds, proposalStatus, proposalSummary } from '#lib/presentation.ts';
+  import DiffView from './DiffView.svelte';
   import Markdown from './Markdown.svelte';
   import PullRequestChanges from './PullRequestChanges.svelte';
   import ReviewHistory from './ReviewHistory.svelte';
@@ -72,6 +73,8 @@
   const filing = $derived(drafts.filter((draft) => draft.file).length);
   let updateDrafts = $state<(IssueUpdate & { make: boolean })[]>([]);
   const making = $derived(updateDrafts.filter((draft) => draft.make).length);
+  // What the issues an update rewrites say now, to show its change against.
+  const currentIssue = (number: number) => detail?.current?.find((issue) => issue.number === number);
   const summary = $derived(proposalSummary(detail ?? proposal));
   const stack = $derived(detail?.kind === 'github.stack.create' ? (detail.payload as StackPayload) : null);
   const pending = $derived(detail?.status === 'pending');
@@ -259,6 +262,7 @@
           <ul class="flex flex-col gap-3" data-testid="issue-updates">
             <!-- By position: one proposal may update the same issue twice. -->
             {#each updateDrafts as update, index (index)}
+              {@const current = currentIssue(update.number)}
               <li
                 class={['border-light-200 flex flex-col gap-1 rounded-xl border p-3', !update.make && 'opacity-60']}
                 data-testid="issue-update"
@@ -276,7 +280,11 @@
                     </label>
                   {/if}
                 </div>
-                {#if update.title}<Text size="small">New title: {update.title}</Text>{/if}
+                {#if update.title && current}
+                  <Text size="small" data-testid="issue-update-title">Title: <s class="text-muted">{current.title}</s> → {update.title}</Text>
+                {:else if update.title}
+                  <Text size="small" data-testid="issue-update-title">New title: {update.title}</Text>
+                {/if}
                 {#if update.add_labels?.length}<Text size="small">Add labels: {update.add_labels.join(', ')}</Text>{/if}
                 {#if update.remove_labels?.length}
                   <Text size="small">Remove labels: {update.remove_labels.join(', ')}</Text>
@@ -288,11 +296,19 @@
                 {:else if update.comment}
                   <div class="bg-light-100 rounded-lg p-2 text-sm"><Markdown text={update.comment} /></div>
                 {/if}
+                {#if current && update.body !== undefined}
+                  {@const bodyDiff = diffTexts(`Body of #${update.number}`, current.body, update.body)}
+                  {#if bodyDiff.additions + bodyDiff.deletions === 0}
+                    <Text size="small" color="muted">The body stays as it is</Text>
+                  {:else}
+                    <DiffView diff={bodyDiff} wrap />
+                  {/if}
+                {/if}
                 {#if update.body === ''}
                   <Text size="small">Clears the body</Text>
                 {:else if update.body}
                   <details>
-                    <summary class="text-muted cursor-pointer text-sm">New body</summary>
+                    <summary class="text-muted cursor-pointer text-sm">{current ? 'New body, rendered' : 'New body'}</summary>
                     <div class="bg-light-100 mt-1 rounded-lg p-2 text-sm"><Markdown text={update.body} /></div>
                   </details>
                 {/if}

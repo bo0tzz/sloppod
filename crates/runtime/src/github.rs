@@ -1074,6 +1074,15 @@ impl GitHubApp {
             .collect())
     }
 
+    /// An issue's title and body as they are now, `{title, body}`; a missing body is empty.
+    pub async fn issue(&self, repo: &str, number: u64) -> anyhow::Result<Value> {
+        let issue: Value = self.repo_json(repo, &format!("/issues/{number}")).await?;
+        Ok(json!({
+            "title": issue["title"].as_str().unwrap_or_default(),
+            "body": issue["body"].as_str().unwrap_or_default(),
+        }))
+    }
+
     pub async fn create_issue(&self, repo: &str, payload: &Value) -> anyhow::Result<Value> {
         let body = self.repo_post(repo, "/issues", payload).await?;
         Ok(json!({"url": body["html_url"], "number": body["number"]}))
@@ -1472,6 +1481,19 @@ mod tests {
             .ok_or(StatusCode::NOT_FOUND)
     }
 
+    /// #1 has a body; #2 has none, which GitHub gives as null.
+    async fn issue(
+        Path((_, _, number)): Path<(String, String, u64)>,
+    ) -> Result<Json<Value>, StatusCode> {
+        match number {
+            1 => Ok(Json(
+                json!({"number": 1, "title": "Flaky", "body": "It fails.\n"}),
+            )),
+            2 => Ok(Json(json!({"number": 2, "title": "Bare", "body": null}))),
+            _ => Err(StatusCode::NOT_FOUND),
+        }
+    }
+
     async fn repository() -> Json<Value> {
         Json(json!({"allow_squash_merge": true}))
     }
@@ -1552,6 +1574,7 @@ mod tests {
             .route("/repos/{owner}/{name}/stacks", get(stacks))
             .route("/repos/{owner}/{name}/stacks/{number}", get(stack))
             .route("/repos/{owner}/{name}/commits/{reference}", get(commit))
+            .route("/repos/{owner}/{name}/issues/{number}", get(issue))
             .route("/graphql", post(graphql))
             .with_state(fake.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1584,6 +1607,20 @@ mod tests {
             .filter(|p| p.2)
             .map(|p| p.0)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn reads_an_issue_as_it_is_now() {
+        let (_, app) = fake_github().await;
+        assert_eq!(
+            app.issue("o/r", 1).await.unwrap(),
+            json!({"title": "Flaky", "body": "It fails.\n"})
+        );
+        assert_eq!(
+            app.issue("o/r", 2).await.unwrap(),
+            json!({"title": "Bare", "body": ""})
+        );
+        assert!(app.issue("o/r", 3).await.is_err());
     }
 
     #[tokio::test]

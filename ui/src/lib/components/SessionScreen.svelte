@@ -247,8 +247,13 @@
 </svelte:head>
 
 {#snippet waitingItems()}
-      {#each view.questions as question (question.rpcId)}
-        <QuestionCard request={question} onRespond={(response) => view.answerQuestion(question, response)} />
+      <!-- One request at a time; the rest wait their turn behind it. -->
+      {#each view.questions.slice(0, 1) as question (question.rpcId)}
+        <QuestionCard
+          request={question}
+          queued={view.questions.length - 1}
+          onRespond={(response) => view.answerQuestion(question, response)}
+        />
       {/each}
       {#each view.permissions as request (request.rpcId)}
         <PermissionCard

@@ -430,21 +430,24 @@ async function agentScript(session, turn, prompt) {
 
   if (/ask_user/i.test(prompt)) {
     await step(1);
-    const askId = randomUUID();
-    tool({ toolCallId: askId, title: 'mcp__sloppod__ask_user', kind: 'other', status: 'pending', rawInput: { questions: [QUESTIONS[0]] } });
-    void requestFromUser(session, {
-      method: 'elicitation/create',
-      params: questionsToElicitation([QUESTIONS[0]], session.data.id),
-      cancelled: { action: 'cancel' },
-      blocking: false,
-    }).then((response) => {
-      const answers = response.action === 'accept' ? summariseAnswers([QUESTIONS[0]], response.content ?? {}) : [];
-      const notice = answers.length
-        ? `sloppod: the user answered your question:\n- ${QUESTIONS[0].question}: ${answers.join(' ')}`
-        : `sloppod: the user dismissed your question without answering it:\n- ${QUESTIONS[0].question}`;
-      void notifyAgent(session, notice, answers.length ? `Thanks, going with that. ${answers.join(' ')}` : "I'll use my own judgement then.");
-    });
-    update(askId, { status: 'completed' });
+    // "twice" asks each question with a call of its own, so the second request waits behind the first.
+    for (const question of /twice/i.test(prompt) ? QUESTIONS : [QUESTIONS[0]]) {
+      const askId = randomUUID();
+      tool({ toolCallId: askId, title: 'mcp__sloppod__ask_user', kind: 'other', status: 'pending', rawInput: { questions: [question] } });
+      void requestFromUser(session, {
+        method: 'elicitation/create',
+        params: questionsToElicitation([question], session.data.id),
+        cancelled: { action: 'cancel' },
+        blocking: false,
+      }).then((response) => {
+        const answers = response.action === 'accept' ? summariseAnswers([question], response.content ?? {}) : [];
+        const notice = answers.length
+          ? `sloppod: the user answered your question:\n- ${question.question}: ${answers.join(' ')}`
+          : `sloppod: the user dismissed your question without answering it:\n- ${question.question}`;
+        void notifyAgent(session, notice, answers.length ? `Thanks, going with that. ${answers.join(' ')}` : "I'll use my own judgement then.");
+      });
+      update(askId, { status: 'completed' });
+    }
     await say("I've asked you about the backoff; I'll carry on meanwhile.");
     await step(4);
     await say('Done with the parts that don\'t depend on your answer.');
@@ -836,9 +839,22 @@ function createIssueUpdates(session) {
       updates: [
         { number: 100, comment: 'Fixed by #148.', close: 'completed', remove_labels: ['priority'] },
         { number: 65, comment: 'Superseded by #196.', close: 'duplicate' },
-        { number: 59, add_labels: ['priority'], title: 'Startup failures show in the UI' },
+        {
+          number: 59,
+          add_labels: ['priority'],
+          title: 'Startup failures show in the UI',
+          body: 'A pod that fails to start says why in the UI.\n\nToday it only shows in the logs.',
+        },
       ],
     },
+    // Like the runtime's detail: what the rewritten issue says now.
+    current: [
+      {
+        number: 59,
+        title: 'Startup failures are only in the logs',
+        body: 'A pod that fails to start says nothing.\n\nToday it only shows in the logs.',
+      },
+    ],
     created_at: now(),
   };
   proposals.set(proposal.id, proposal);
@@ -879,7 +895,7 @@ function createStack(session) {
 }
 
 function publicProposal(proposal) {
-  const { diff: _diff, commits: _commits, layers: _layers, ...rest } = proposal;
+  const { diff: _diff, commits: _commits, layers: _layers, current: _current, ...rest } = proposal;
   return rest;
 }
 

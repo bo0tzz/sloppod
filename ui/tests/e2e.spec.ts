@@ -780,12 +780,26 @@ test('answers questions from the agent, in every tab', async ({ page, context })
   await expect(phase(page)).toHaveAttribute('data-phase', 'waiting');
   await expect(page.getByTestId('activity')).toHaveText('Waiting for your answer');
 
+  // One question at a time: the second one, and its option descriptions, wait for Next.
+  await expect(questionCard(page).getByTestId('question-step')).toHaveText('Question 1 of 2');
+  await expect(questionField(page, 'question_1')).toHaveCount(0);
+  await expect(questionCard(page).getByRole('button', { name: 'Answer' })).toHaveCount(0);
+
   const backoff = questionField(page, 'question_0');
   await expect(backoff).toContainText('Backoff');
   await expect(backoff).toContainText('Which backoff strategy should reconnects use?');
   await expect(backoff).toContainText('Double the delay after each failure');
   await backoff.getByRole('radio', { name: /Exponential/ }).check();
   await expect(backoff.getByTestId('option-preview')).toContainText('Math.min(500 * 2 ** attempt');
+  await questionCard(page).getByRole('button', { name: 'Next' }).click();
+  await expect(questionCard(page).getByTestId('question-step')).toHaveText('Question 2 of 2');
+  await expect(questionField(page, 'question_0')).toHaveCount(0);
+  await expect(questionCard(page)).not.toContainText('Double the delay after each failure');
+
+  // Back keeps what was picked.
+  await questionCard(page).getByRole('button', { name: 'Back' }).click();
+  await expect(questionField(page, 'question_0').getByRole('radio', { name: /Exponential/ })).toBeChecked();
+  await questionCard(page).getByRole('button', { name: 'Next' }).click();
 
   const tests = questionField(page, 'question_1');
   await tests.getByRole('checkbox', { name: /Unit/ }).check();
@@ -805,8 +819,10 @@ test('answers questions from the agent, in every tab', async ({ page, context })
   });
 });
 
-test('Enter in the "Other" field submits the answer', async ({ page }) => {
+test('Enter in the "Other" field moves on, and on the last question submits the answers', async ({ page }) => {
   await createSession(page, 'Ask me before you start');
+  await questionField(page, 'question_0_custom').getByRole('textbox').press('Enter');
+  await expect(questionCard(page).getByTestId('question-step')).toHaveText('Question 2 of 2');
   const other = questionField(page, 'question_1_custom').getByRole('textbox');
   await other.fill('Load tests');
   await other.press('Enter');
@@ -845,12 +861,33 @@ test('a question asked with ask_user outlives the turn and a stop', async ({ pag
   await expect(agentMessages(page).filter({ hasText: 'Thanks, going with that. Backoff: Exponential, capped.' })).toBeVisible();
 });
 
+test('questions asked in separate requests show one after another', async ({ page }) => {
+  await createSession(page, 'Use ask_user twice');
+  await expect(questionCard(page)).toHaveCount(1);
+  await expect(questionCard(page)).toContainText('Which backoff strategy should reconnects use?');
+  await expect(questionCard(page).getByTestId('questions-queued')).toHaveText('One more request after this');
+  // A request with one question has no steps.
+  await expect(questionCard(page).getByTestId('question-step')).toHaveCount(0);
+
+  await questionField(page, 'question_0').getByRole('radio', { name: /Fixed/ }).check();
+  await questionCard(page).getByRole('button', { name: 'Answer' }).click();
+  await expect(questionCard(page)).toContainText('Which tests should I add?');
+  await expect(questionCard(page).getByTestId('questions-queued')).toHaveCount(0);
+  await expect(questionField(page, 'question_0').getByRole('checkbox', { name: /Unit/ })).not.toBeChecked();
+  await questionField(page, 'question_0').getByRole('checkbox', { name: /Unit/ }).check();
+  await questionCard(page).getByRole('button', { name: 'Answer' }).click();
+  await expect(questionCard(page)).toHaveCount(0);
+  await expect(agentMessages(page).filter({ hasText: 'Thanks, going with that. Backoff: Fixed.' })).toBeVisible();
+  await expect(agentMessages(page).filter({ hasText: 'Thanks, going with that. Tests: Unit.' })).toBeVisible();
+});
+
 test('shows an open question again after a reload', async ({ page }) => {
   await createSession(page, 'Ask me something, then reload');
   await expect(questionCard(page)).toBeVisible();
   await page.reload();
   await expect(questionCard(page)).toBeVisible();
   await questionField(page, 'question_0_custom').getByRole('textbox').fill('Whatever you think is best');
+  await questionCard(page).getByRole('button', { name: 'Next' }).click();
   await questionCard(page).getByRole('button', { name: 'Answer' }).click();
   await expect(agentMessages(page).filter({ hasText: 'Backoff: Whatever you think is best.' })).toBeVisible();
 });
@@ -1286,7 +1323,16 @@ test('reviews and approves updates to existing issues', async ({ page }) => {
   await expect(updates.nth(0)).toContainText('close as completed');
   await expect(updates.nth(0)).toContainText('Remove labels: priority');
   await expect(updates.nth(1)).toContainText('close as a duplicate');
-  await expect(updates.nth(2)).toContainText('New title: Startup failures show in the UI');
+  // A rewrite shows against what the issue says now.
+  await expect(updates.nth(2).getByTestId('issue-update-title')).toHaveText(
+    'Title: Startup failures are only in the logs → Startup failures show in the UI',
+  );
+  const bodyDiff = updates.nth(2).getByTestId('diff');
+  await expect(bodyDiff).toContainText('Body of #59');
+  await expect(bodyDiff).toContainText('+1');
+  await expect(bodyDiff).toContainText('−1');
+  await expect(bodyDiff.getByText('A pod that fails to start says nothing.')).toBeVisible();
+  await expect(bodyDiff.getByText('A pod that fails to start says why in the UI.')).toBeVisible();
 
   // Drop the duplicate close, and reword the first comment.
   await updates.nth(1).getByRole('checkbox', { name: 'Make this update' }).click();
