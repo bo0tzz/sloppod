@@ -8,11 +8,14 @@ use std::sync::{Arc, Mutex as StdMutex};
 use serde_json::{Value, json};
 use sloppod_protocol::api::{Phase, Proposal};
 use sloppod_protocol::link::RunningAgent;
-use tokio::sync::{Mutex, broadcast, oneshot};
+use tokio::sync::{Mutex, Notify, broadcast, oneshot};
 use uuid::Uuid;
 
 use crate::link::{AgentConn, RpcError};
 use crate::store::SessionStore;
+
+/// The longest a steer waits for a compaction to end.
+const COMPACTION_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[derive(Clone, Debug)]
 pub enum UiEvent {
@@ -65,6 +68,8 @@ struct LiveState {
     /// The agent is replaying history for `session/load`; that replay isn't new.
     loading: bool,
     turn_running: bool,
+    /// The agent is compacting its context; steers wait for it to end.
+    compacting: bool,
     /// How many turns the hub sent have ended, and why the last one failed, if it did. A watcher compares the count
     /// with the one it saw, so no turn's end is missed between its looks.
     turns_ended: u64,
@@ -84,6 +89,7 @@ pub struct Live {
     state: Mutex<LiveState>,
     /// Held while the session is parked or woken, so the two never overlap.
     transition: Mutex<()>,
+    compaction_ended: Notify,
 }
 
 /// What `run_queued` does with its batch.
@@ -180,6 +186,7 @@ impl Hub {
                     events: broadcast::channel(4096).0,
                     state: Mutex::default(),
                     transition: Mutex::default(),
+                    compaction_ended: Notify::new(),
                 })
             })
             .clone()
@@ -259,6 +266,8 @@ impl Hub {
         }
         state.agent_session_id = None;
         state.turn_running = false;
+        state.compacting = false;
+        live.compaction_ended.notify_waiters();
     }
 
     pub async fn set_restart_notice(&self, id: Uuid, notice: String) {
@@ -555,6 +564,12 @@ impl Hub {
                 && let Some(mode) = update.get("currentModeId")
             {
                 state.agent_state["modes"]["currentModeId"] = mode.clone();
+            }
+            if update["sessionUpdate"] == "compaction_update" {
+                state.compacting = update["status"] == "in_progress";
+                if !state.compacting {
+                    live.compaction_ended.notify_waiters();
+                }
             }
         }
         if update["sessionUpdate"] == "session_info_update"
@@ -884,9 +899,12 @@ impl Hub {
                 });
             }
             Some(false) => {
-                if let Err(e) = self.steer_in(id, blocks).await {
-                    tracing::warn!(session = %id, error = %e, "steering a notice in");
-                }
+                let hub = self.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = hub.steer_in(id, blocks).await {
+                        tracing::warn!(session = %id, error = %e, "steering a notice in");
+                    }
+                });
             }
         }
     }
@@ -895,6 +913,7 @@ impl Hub {
     /// is tracked like any other rather than run detached by the adapter.
     async fn steer_in(self: &Arc<Self>, id: Uuid, blocks: Vec<Value>) -> Result<Value, RpcError> {
         for _ in 0..10 {
+            self.after_compaction(id).await;
             let (agent, agent_session_id) = self.agent_for(id).await?;
             let result = agent
                 .request(
@@ -930,6 +949,22 @@ impl Hub {
             -32002,
             "couldn't deliver the message; send it again",
         ))
+    }
+
+    /// A steer pre-empts whatever the agent is generating, and a compaction it pre-empts is cancelled rather than
+    /// resumed. So steers wait for one to end: a few minutes at most, so a missed end can't hold them forever.
+    async fn after_compaction(&self, id: Uuid) {
+        let live = self.live(id);
+        let ended = async {
+            loop {
+                let notified = live.compaction_ended.notified();
+                if !live.state.lock().await.compacting {
+                    return;
+                }
+                notified.await;
+            }
+        };
+        let _ = tokio::time::timeout(COMPACTION_WAIT, ended).await;
     }
 
     /// Delivers a message into the running turn; before the agent is up it joins the queue instead.
