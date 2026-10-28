@@ -925,36 +925,38 @@ impl GitHubApp {
         top_node_id: &str,
         layers: &[(u64, &str)],
     ) -> anyhow::Result<StackWatch> {
-        let mut pulls = Vec::new();
-        for (number, _) in layers {
-            let pull: Value = self
-                .repo_get(
-                    repo,
-                    &format!("/pulls/{number}"),
-                    "application/vnd.github+json",
-                )
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            pulls.push(pull);
-        }
-        let Some(top) = pulls.last() else {
+        let Some((top, _)) = layers.last() else {
             return Ok(StackWatch::Done);
         };
-        if top["state"] != "open" || top["auto_merge"].is_null() {
+        let top_pull = self.pull(repo, *top).await?;
+        if top_pull["state"] != "open" || top_pull["auto_merge"].is_null() {
             return Ok(StackWatch::Done);
         }
-        let moved = layers.iter().zip(&pulls).find(|((_, sha), pull)| {
-            pull["state"] == "open" && pull["head"]["sha"].as_str() != Some(*sha)
-        });
-        match moved {
-            Some(((number, _), _)) => {
+        // A layer seen to have moved turns auto-merge off even if another couldn't be read: a lookup that fails only
+        // matters when nothing moved.
+        let mut unread = None;
+        for (number, sha) in layers {
+            let pull = if number == top {
+                top_pull.clone()
+            } else {
+                match self.pull(repo, *number).await {
+                    Ok(pull) => pull,
+                    Err(e) => {
+                        unread.get_or_insert(e);
+                        continue;
+                    }
+                }
+            };
+            if pull["state"] == "open" && pull["head"]["sha"].as_str() != Some(*sha) {
                 self.disable_pull_auto_merge_in(repo, top_node_id).await?;
-                Ok(StackWatch::Moved(*number))
+                return Ok(StackWatch::Moved(*number));
             }
-            None => Ok(StackWatch::Holding),
         }
+        unread.map_or(Ok(StackWatch::Holding), Err)
+    }
+
+    async fn pull(&self, repo: &str, number: u64) -> anyhow::Result<Value> {
+        self.repo_json(repo, &format!("/pulls/{number}")).await
     }
 
     /// A stack's pull requests, bottom to top.
@@ -1071,6 +1073,8 @@ mod tests {
         heads_fail_once_merging: bool,
         /// Pull requests of `o/r` that are merged.
         merged: Mutex<Vec<u64>>,
+        /// Pull requests whose lookup fails.
+        failing: Mutex<Vec<u64>>,
     }
 
     async fn commit(
@@ -1119,6 +1123,9 @@ mod tests {
         State(fake): State<Arc<Fake>>,
         Path((_, _, number)): Path<(String, String, u64)>,
     ) -> Result<Json<Value>, StatusCode> {
+        if fake.failing.lock().unwrap().contains(&number) {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
         let mut pull = {
             let pulls = fake.pulls.lock().unwrap();
             pulls
@@ -1476,6 +1483,30 @@ mod tests {
             StackWatch::Moved(1)
         );
         assert!(auto_merging(&fake).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_moved_layer_stops_the_stack_merging_though_another_cant_be_read() {
+        let (fake, app) = serve(merging()).await;
+        fake.heads.lock().unwrap().insert("s-2".into(), "b2".into());
+        fake.failing.lock().unwrap().push(1);
+        assert_eq!(
+            app.check_merging_stack("o/r", "PR3", WATCHED)
+                .await
+                .unwrap(),
+            StackWatch::Moved(2)
+        );
+        assert!(auto_merging(&fake).is_empty());
+
+        // With nothing seen to move, an unread layer is an error, and auto-merge stays on until the next look.
+        let (fake, app) = serve(merging()).await;
+        fake.failing.lock().unwrap().push(1);
+        assert!(
+            app.check_merging_stack("o/r", "PR3", WATCHED)
+                .await
+                .is_err()
+        );
+        assert_eq!(auto_merging(&fake), [3]);
     }
 
     #[tokio::test]
