@@ -40,6 +40,15 @@
 
   let { id }: { id: string } = $props();
 
+  /** Calls `action` whenever the element scrolls into view. */
+  function whenVisible(node: HTMLElement, action: () => void) {
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) action();
+    });
+    observer.observe(node);
+    return { destroy: () => observer.disconnect() };
+  }
+
   // The route wraps this component in {#key id}, so capturing the first id is intended.
   // svelte-ignore state_referenced_locally
   const view = new SessionView(id);
@@ -90,6 +99,8 @@
   let scroller = $state<HTMLElement | null>(null);
   let content = $state<HTMLElement | null>(null);
   let atBottom = $state(true);
+  /** Earlier history loads by itself only once the reader has scrolled, not when the view starts out at the top. */
+  let userScrolled = false;
 
   onMount(() => {
     loadAutoApprovals().catch(() => {});
@@ -105,6 +116,14 @@
   function scrollToBottom(behavior: ScrollBehavior = 'instant') {
     scroller?.scrollTo({ top: scroller.scrollHeight, behavior });
   }
+
+  $effect(() => {
+    if (!scroller) return;
+    const scrolled = () => (userScrolled = true);
+    const events = ['wheel', 'touchmove', 'keydown'] as const;
+    for (const event of events) scroller.addEventListener(event, scrolled, { passive: true });
+    return () => events.forEach((event) => scroller?.removeEventListener(event, scrolled));
+  });
 
   // Follow new output while the reader is at the bottom, but leave them alone when they scrolled up.
   $effect(() => {
@@ -338,6 +357,13 @@
               {:else}
                 {#if view.transcript.items.length === 0 && session?.phase !== 'starting'}
                   <Text color="muted" class="py-16 text-center">Nothing here yet. Send a message to get going.</Text>
+                {/if}
+                {#if view.historyBefore !== null}
+                  <div class="flex justify-center py-2" use:whenVisible={() => userScrolled && view.loadEarlier()}>
+                    <Button size="small" variant="ghost" loading={view.loadingHistory} onclick={() => view.loadEarlier()}>
+                      Load earlier messages
+                    </Button>
+                  </div>
                 {/if}
                 <TranscriptView items={view.transcript.items} running={view.turnRunning} />
                 {#if activity}

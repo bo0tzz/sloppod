@@ -123,27 +123,45 @@ impl Conn {
         let events = self.state.hub.subscribe(session);
         // Up to the end of the log as it is now; what's recorded meanwhile comes from the subscription.
         let until = self.state.hub.last_event(session).await.map_err(internal)?;
-        let mut after = 0;
-        while after < until {
-            let page = self
-                .state
-                .hub
-                .events(session, after, REPLAY_PAGE)
-                .await
-                .map_err(internal)?;
-            let Some((last, _)) = page.last() else { break };
-            after = *last;
-            for (_, update) in page.iter().filter(|(seq, _)| *seq <= until) {
-                self.send(session_update(session, update)).await;
-            }
+        // Only the latest of it; the UI asks for older pages (`_sloppod/history`) as they're scrolled to.
+        let latest = self
+            .state
+            .hub
+            .events_before(session, until + 1, HISTORY_PAGE)
+            .await
+            .map_err(internal)?;
+        for (_, update) in &latest {
+            self.send(session_update(session, update)).await;
         }
-        let after = until;
         let replay = self.state.hub.replay(session).await.map_err(internal)?;
-        let task = tokio::spawn(self.clone().forward(session, events, after));
+        let task = tokio::spawn(self.clone().forward(session, events, until));
         if let Some(old) = self.loaded.lock().await.insert(session, task) {
             old.abort();
         }
-        Ok((replay.agent_state, replay.permissions, replay.queue))
+        let mut response = replay.agent_state;
+        if let Some(response) = response.as_object_mut() {
+            response.insert(
+                "_meta".into(),
+                json!({"sloppod": {"historyBefore": older_than(&latest)}}),
+            );
+        }
+        Ok((response, replay.permissions, replay.queue))
+    }
+
+    /// A page of the session's log before `before`, for a UI scrolling back.
+    async fn history(&self, session: Uuid, params: &Value) -> Result<Value, RpcError> {
+        let before = params["before"]
+            .as_i64()
+            .ok_or_else(|| RpcError::new(-32602, "`before` is required"))?;
+        let page = self
+            .state
+            .hub
+            .events_before(session, before, HISTORY_PAGE)
+            .await
+            .map_err(internal)?;
+        let before = older_than(&page);
+        let updates: Vec<Value> = page.into_iter().map(|(_, update)| update).collect();
+        Ok(json!({"updates": updates, "before": before}))
     }
 
     async fn handle_request(self: Arc<Self>, id: Value, method: String, params: Value) {
@@ -178,6 +196,7 @@ impl Conn {
             ("initialize", _) => Ok(self.initialize()),
             ("authenticate", _) => Ok(json!({})),
             ("session/list", _) => self.list().await,
+            ("_sloppod/history", Some(session)) => self.history(session, &params).await,
             ("session/new", _) => Err(RpcError::new(
                 -32601,
                 "create sessions with POST /api/v1/sessions",
@@ -252,8 +271,13 @@ impl Conn {
     }
 }
 
-/// How many recorded updates a replay reads at once.
-const REPLAY_PAGE: i64 = 500;
+/// How many recorded updates a UI gets at once: the latest when it loads a session, then each older page.
+const HISTORY_PAGE: i64 = 2000;
+
+/// Where the page before `page` ends, if there may be one: a full page may have more before it.
+fn older_than(page: &[(i64, Value)]) -> Option<i64> {
+    (page.len() as i64 == HISTORY_PAGE).then(|| page[0].0)
+}
 
 fn internal(e: impl std::fmt::Display) -> RpcError {
     RpcError::new(-32603, e.to_string())

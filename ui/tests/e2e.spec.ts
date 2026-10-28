@@ -514,6 +514,23 @@ test('says what the pod is doing while the agent starts, and why a start failed'
   await expect(failure).toBeVisible();
 });
 
+test('a long session opens at its latest messages, and older ones load on the way up', async ({ page }) => {
+  const prompt = 'Write a long history in sloppod';
+  await createSession(page, prompt);
+  await expect(page.getByText('The end.')).toBeVisible({ timeout: 20_000 });
+
+  await page.reload();
+  await expect(page.getByText('The end.')).toBeVisible();
+  const earlier = page.getByRole('button', { name: 'Load earlier messages' });
+  await expect(earlier).toBeAttached();
+  // The first message is in the page before; scrolling up to the top brings it in.
+  await page.getByText('The end.').hover();
+  for (let i = 0; i < 20 && (await earlier.count()) > 0; i++) await page.mouse.wheel(0, -5000);
+  await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(1);
+  await expect(earlier).not.toBeAttached();
+  await expect(page.getByText('The end.')).toBeVisible();
+});
+
 test('runs a session without a repository', async ({ page }) => {
   const prompt = 'Explain what the runtime does';
   await createSession(page, prompt);

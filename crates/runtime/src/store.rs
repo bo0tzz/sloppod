@@ -18,8 +18,13 @@ pub trait SessionStore: Send + Sync {
     async fn append_event(&self, id: Uuid, payload: &Value) -> sqlx::Result<i64>;
     /// The sequence number of the session's latest event; 0 when it has none.
     async fn last_event(&self, id: Uuid) -> sqlx::Result<i64>;
-    /// Up to `limit` of the session's events after `after`, in order.
-    async fn events(&self, id: Uuid, after: i64, limit: i64) -> sqlx::Result<Vec<(i64, Value)>>;
+    /// Up to `limit` of the session's latest events before `before`, in order.
+    async fn events_before(
+        &self,
+        id: Uuid,
+        before: i64,
+        limit: i64,
+    ) -> sqlx::Result<Vec<(i64, Value)>>;
     /// Keeps a session's queued messages, `{id, blocks}` each, replacing what was kept; none clears them.
     async fn save_queue(&self, id: Uuid, queue: &[Value]) -> sqlx::Result<()>;
     /// Every session's kept queue, for after a restart.
@@ -58,8 +63,13 @@ impl SessionStore for PgStore {
         db::last_event(&self.0, id).await
     }
 
-    async fn events(&self, id: Uuid, after: i64, limit: i64) -> sqlx::Result<Vec<(i64, Value)>> {
-        db::events(&self.0, id, after, limit).await
+    async fn events_before(
+        &self,
+        id: Uuid,
+        before: i64,
+        limit: i64,
+    ) -> sqlx::Result<Vec<(i64, Value)>> {
+        db::events_before(&self.0, id, before, limit).await
     }
 
     async fn pending_prompt(&self, id: Uuid) -> sqlx::Result<Option<String>> {
@@ -164,19 +174,22 @@ pub mod memory {
                 .unwrap_or(0))
         }
 
-        async fn events(
+        async fn events_before(
             &self,
             id: Uuid,
-            after: i64,
+            before: i64,
             limit: i64,
         ) -> sqlx::Result<Vec<(i64, Value)>> {
             let events = self.events.lock().unwrap();
-            Ok(events
+            let mut latest: Vec<(i64, Value)> = events
                 .iter()
-                .filter(|(s, seq, _)| *s == id && *seq > after)
+                .filter(|(s, seq, _)| *s == id && *seq < before)
+                .rev()
                 .take(limit as usize)
                 .map(|(_, seq, p)| (*seq, p.clone()))
-                .collect())
+                .collect();
+            latest.reverse();
+            Ok(latest)
         }
 
         async fn save_queue(&self, id: Uuid, queue: &[Value]) -> sqlx::Result<()> {

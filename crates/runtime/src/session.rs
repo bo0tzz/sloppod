@@ -1103,16 +1103,15 @@ impl Hub {
         Ok(result)
     }
 
-    /// Everything a UI needs when it loads a session.
-    /// Up to `limit` of the session's recorded updates after `after`; a UI replays the log a page at a time, so
-    /// the whole of a long session's log is never in memory at once.
-    pub async fn events(
+    /// Up to `limit` of the session's latest recorded updates before `before`. A UI gets the latest when it loads a
+    /// session and older pages as it asks for them, so neither it nor the runtime holds a long session's whole log.
+    pub async fn events_before(
         &self,
         id: Uuid,
-        after: i64,
+        before: i64,
         limit: i64,
     ) -> Result<Vec<(i64, Value)>, sqlx::Error> {
-        self.store.events(id, after, limit).await
+        self.store.events_before(id, before, limit).await
     }
 
     /// The sequence number of the session's latest recorded update; 0 when it has none.
@@ -1120,6 +1119,7 @@ impl Hub {
         self.store.last_event(id).await
     }
 
+    /// Everything a UI needs when it loads a session, but the log.
     pub async fn replay(&self, id: Uuid) -> Result<Replay, sqlx::Error> {
         let live = self.live(id);
         let state = live.state.lock().await;

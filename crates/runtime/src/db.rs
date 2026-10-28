@@ -417,18 +417,19 @@ pub async fn last_event(db: &PgPool, id: Uuid) -> sqlx::Result<i64> {
         .await
 }
 
-/// Up to `limit` of the session's events after `after`, in order.
-pub async fn events(
+/// Up to `limit` of the session's latest events before `before`, in order.
+pub async fn events_before(
     db: &PgPool,
     id: Uuid,
-    after: i64,
+    before: i64,
     limit: i64,
 ) -> sqlx::Result<Vec<(i64, Value)>> {
     let rows = sqlx::query(
-        "select seq, payload from session_events where session_id = $1 and seq > $2 order by seq limit $3",
+        "select seq, payload from (select seq, payload from session_events where session_id = $1 and seq < $2 \
+         order by seq desc limit $3) latest order by seq",
     )
     .bind(id)
-    .bind(after)
+    .bind(before)
     .bind(limit)
     .fetch_all(db)
     .await?;
