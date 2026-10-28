@@ -793,3 +793,17 @@ async fn a_sessions_first_message_is_its_task(db: PgPool) {
         Some("Fix the build.")
     );
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn live_descendants_are_found_below_deleted_ones(db: PgPool) {
+    // A → B → C, with B deleted and C restored on its own.
+    let a = session(&db, "alice").await;
+    let b = session(&db, "alice").await;
+    let c = session(&db, "alice").await;
+    db::set_parent(&db, b, a).await.unwrap();
+    db::set_parent(&db, c, b).await.unwrap();
+    db::mark_deleted(&db, b).await.unwrap();
+    let ids = |rows: Vec<db::SessionRow>| rows.iter().map(|r| r.id).collect::<Vec<_>>();
+    assert_eq!(ids(db::live_descendants(&db, a).await.unwrap()), [c]);
+    assert!(db::live_descendants(&db, c).await.unwrap().is_empty());
+}

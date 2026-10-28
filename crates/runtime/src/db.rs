@@ -182,6 +182,19 @@ pub async fn children(db: &PgPool, parent: Uuid) -> sqlx::Result<Vec<SessionRow>
     .await
 }
 
+/// Every sub-session below `session` that isn't deleted, at any depth, also below sub-sessions that are.
+pub async fn live_descendants(db: &PgPool, session: Uuid) -> sqlx::Result<Vec<SessionRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "with recursive down as (select id from sessions where parent_id = $1 \
+           union all select s.id from sessions s join down on s.parent_id = down.id) \
+         select {SESSION_COLUMNS} from sessions where id in (select id from down) and deleted_at is null \
+         order by created_at"
+    )))
+    .bind(session)
+    .fetch_all(db)
+    .await
+}
+
 /// How many sub-sessions of `session`'s tree, its root's descendants, are running: what ADR 27's limit counts.
 pub async fn running_in_tree(db: &PgPool, session: Uuid) -> sqlx::Result<i64> {
     sqlx::query_scalar(

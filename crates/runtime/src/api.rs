@@ -408,8 +408,9 @@ async fn delete_session(
     let session = db::owned_session(&state.db, id, &user)
         .await?
         .ok_or_else(not_found)?;
-    // Its sub-sessions stop with it (ADR 27), and their own in turn.
-    let mut pending = vec![session];
+    // Its sub-sessions stop with it (ADR 27), at any depth, including any restored below one already deleted.
+    let mut pending = db::live_descendants(&state.db, id).await?;
+    pending.push(session);
     while let Some(session) = pending.pop() {
         let id = session.id;
         // Marked first, so nothing wakes it between parking and marking.
@@ -420,7 +421,6 @@ async fn delete_session(
         }
         reviews::abandon(&state, id).await?;
         state.hub.broadcast_session(id).await;
-        pending.extend(db::children(&state.db, id).await?);
     }
     Ok(StatusCode::NO_CONTENT)
 }

@@ -1305,16 +1305,17 @@ async function handleApi(req, res, url) {
       return json(res, 200, session.data);
     }
     if (parts.length === 2 && method === 'DELETE') {
-      // Its sub-sessions go with it, and theirs in turn.
-      const pending = [session];
-      while (pending.length) {
-        const doomed = pending.pop();
+      // Its sub-sessions go with it, at any depth, also below ones already deleted.
+      const tree = [session];
+      for (let i = 0; i < tree.length; i++) {
+        for (const other of sessions.values()) {
+          if (other.data.parent_id === tree[i].data.id) tree.push(other);
+        }
+      }
+      for (const doomed of tree.filter((s) => s === session || !s.data.deleted_at)) {
         cancelTurn(doomed);
         doomed.data.deleted_at = now();
         doomed.setPhase('parked');
-        for (const other of sessions.values()) {
-          if (other.data.parent_id === doomed.data.id && !other.data.deleted_at) pending.push(other);
-        }
       }
       res.writeHead(204).end();
       return;
