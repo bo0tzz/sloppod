@@ -138,6 +138,62 @@ test('a permission answered elsewhere disappears', async ({ page, context }) => 
   await expect(agentMessages(page).filter({ hasText: FINAL })).toBeVisible();
 });
 
+/** A 1×1 PNG. */
+const PIXEL = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==';
+
+/** Hands the composer an image the way the browser would for a paste or a drop. */
+async function handImage(page: Page, kind: 'paste' | 'drop', name: string) {
+  await page.evaluate(
+    ([kind, name, pixel]) => {
+      const bytes = Uint8Array.from(atob(pixel), (c) => c.charCodeAt(0));
+      const data = new DataTransfer();
+      data.items.add(new File([bytes], name, { type: 'image/png' }));
+      const box = document.querySelector('textarea[aria-label="Prompt"]')!;
+      const event =
+        kind === 'paste'
+          ? new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true })
+          : new DragEvent('drop', { dataTransfer: data, bubbles: true, cancelable: true });
+      box.dispatchEvent(event);
+    },
+    [kind, name, PIXEL] as const,
+  );
+}
+
+test('sends images picked, pasted or dropped into the message box', async ({ page }) => {
+  await createSession(page, 'Look at my screenshots in sloppod');
+  await finishTurn(page);
+  const attachments = page.getByTestId('attachment');
+
+  await page.getByTestId('image-picker').setInputFiles({ name: 'a.png', mimeType: 'image/png', buffer: Buffer.from(PIXEL, 'base64') });
+  await expect(attachments).toHaveCount(1);
+  await handImage(page, 'paste', 'b.png');
+  await expect(attachments).toHaveCount(2);
+  await handImage(page, 'drop', 'c.png');
+  await expect(attachments).toHaveCount(3);
+  await page.getByRole('button', { name: 'Remove image 2' }).click();
+  await expect(attachments).toHaveCount(2);
+
+  // An image alone can be sent; with text, both go.
+  await page.getByRole('textbox', { name: 'Prompt' }).fill('What do these show?');
+  await page.getByRole('button', { name: 'Send' }).click();
+  await expect(attachments).toHaveCount(0);
+  const sent = userMessages(page).filter({ hasText: 'What do these show?' });
+  await expect(sent.locator('img')).toHaveCount(2);
+  await expect(sent.locator('img').first()).toHaveAttribute('src', `data:image/png;base64,${PIXEL}`);
+
+  // And they're there after a reload, from the session's history.
+  await page.reload();
+  await expect(userMessages(page).filter({ hasText: 'What do these show?' }).locator('img')).toHaveCount(2);
+});
+
+test('a file that is not an image is not attached', async ({ page }) => {
+  await createSession(page, 'Look at my files in sloppod');
+  await finishTurn(page);
+  await page.getByTestId('image-picker').setInputFiles({ name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('hi') });
+  await expect(page.getByText("notes.txt isn't an image")).toBeVisible();
+  await expect(page.getByTestId('attachment')).toHaveCount(0);
+});
+
 test('steers a queued message into the running turn', async ({ page }) => {
   await createSession(page, 'Steer me in sloppod');
   await expect(permissionCard(page)).toBeVisible();

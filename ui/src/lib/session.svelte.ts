@@ -20,7 +20,7 @@ import type {
 } from './acp/types.ts';
 import { account } from './account.svelte.ts';
 import { api, ApiError, newerProposal, newerSession, type Proposal, type Session } from './api.ts';
-import { loadUnconfirmed, saveUnconfirmed } from './drafts.ts';
+import { loadUnconfirmed, saveUnconfirmed, type Outgoing } from './drafts.ts';
 import { sessions } from './sessions.svelte.ts';
 
 export type PendingPermission = RequestPermissionRequest & { rpcId: RequestId };
@@ -31,7 +31,11 @@ export type QueuedMessage = { id: string; prompt: ContentBlock[] };
 export const queuedText = (message: QueuedMessage) =>
   message.prompt.map((block) => (block.type === 'text' ? block.text : '')).join('');
 
-const textPrompt = (text: string): ContentBlock[] => [{ type: 'text', text }];
+/** A message as the prompt it's sent as: its text, then its images. */
+const promptBlocks = ({ text, images = [] }: Outgoing): ContentBlock[] => [
+  ...(text ? [{ type: 'text' as const, text }] : []),
+  ...images.map((image) => ({ type: 'image' as const, ...image })),
+];
 
 /** One open session: its ACP connection, transcript, and the REST state that goes with it. */
 export class SessionView {
@@ -54,6 +58,8 @@ export class SessionView {
   /** The agent's model picker, if it offers one. */
   model = $derived(this.configOptions.find((option) => option.id === 'model' && option.type === 'select'));
   steeringSupported = $state(false);
+  /** Whether the agent takes images in a prompt. */
+  imagesSupported = $state(false);
 
   permissions = $state<PendingPermission[]>([]);
   /** Open questions from the agent (form elicitations), answered like permission requests. */
@@ -79,11 +85,11 @@ export class SessionView {
   historyBefore = $state<number | null>(null);
   loadingHistory = $state(false);
   /** Messages a dropped connection cut off before the runtime confirmed them; the next load settles each. */
-  #unconfirmed: { id: string; text: string }[] = [];
+  #unconfirmed: Outgoing[] = [];
   /** Messages written while the connection was down, shown as waiting; the next load sends them. */
-  unsent = $state<{ id: string; text: string }[]>([]);
+  unsent = $state<Outgoing[]>([]);
   /** Messages that couldn't be delivered, kept until the user puts each back or dismisses it. */
-  undelivered = $state<{ id: string; text: string }[]>([]);
+  undelivered = $state<Outgoing[]>([]);
 
   constructor(id: string) {
     this.id = id;
@@ -165,6 +171,7 @@ export class SessionView {
       clientInfo: { name: 'sloppod-ui', version: '0.0.0' },
     });
     this.steeringSupported = init?._meta?.steering?.supported === true;
+    this.imagesSupported = init?.agentCapabilities?.promptCapabilities?.image === true;
 
     // A reconnect: the runtime may have been redeployed meanwhile.
     if (this.loaded) account.refresh();
@@ -307,20 +314,21 @@ export class SessionView {
    * the runtime records it under, so if the connection drops first, the next load can tell whether it arrived: if
    * not, it's sent again once, and if that fails it ends up in `undelivered`.
    */
-  async prompt(text: string, id: string = crypto.randomUUID()): Promise<StopReason | undefined> {
+  async prompt(message: Outgoing): Promise<StopReason | undefined> {
+    const { id } = message;
     this.promptsInFlight++;
     // Kept until the runtime answers, so a page reload before then can still tell whether it arrived.
-    this.#keepSending(id, text);
+    this.#keepSending(message);
     try {
       const result = await this.#conn.request<{ stopReason: StopReason }>('session/prompt', {
         sessionId: this.id,
-        prompt: textPrompt(text),
+        prompt: promptBlocks(message),
         _meta: { sloppod: { messageId: id } },
       });
       this.#doneSending(id);
       return result?.stopReason;
     } catch (error) {
-      if (error instanceof ConnectionClosedError) this.#unconfirmed.push({ id, text });
+      if (error instanceof ConnectionClosedError) this.#unconfirmed.push(message);
       else this.#doneSending(id);
       throw error;
     } finally {
@@ -332,15 +340,15 @@ export class SessionView {
    * Keeps a message written while the connection is down and sends it once the session has loaded again, the same
    * way as one a dropped connection cut off: under its id, so it can't arrive twice.
    */
-  sendWhenConnected(text: string, id: string = crypto.randomUUID()) {
-    this.#keepSending(id, text);
-    this.#unconfirmed.push({ id, text });
-    this.unsent.push({ id, text });
+  sendWhenConnected(message: Outgoing) {
+    this.#keepSending(message);
+    this.#unconfirmed.push(message);
+    this.unsent.push(message);
   }
 
-  #keepSending(id: string, text: string) {
-    const kept = loadUnconfirmed(this.id).filter((message) => message.id !== id);
-    saveUnconfirmed(this.id, [...kept, { id, text }]);
+  #keepSending(message: Outgoing) {
+    const kept = loadUnconfirmed(this.id).filter((kept) => kept.id !== message.id);
+    saveUnconfirmed(this.id, [...kept, message]);
   }
 
   #doneSending(id: string) {
@@ -367,7 +375,7 @@ export class SessionView {
         this.#doneSending(message.id);
         continue;
       }
-      this.prompt(message.text, message.id).catch((error) => {
+      this.prompt(message).catch((error) => {
         if (error instanceof ConnectionClosedError || this.received(message.id)) return;
         this.undelivered.push(message);
       });

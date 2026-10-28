@@ -131,7 +131,7 @@ export type ElicitationResponse =
 
 export type InitializeResponse = {
   protocolVersion: number;
-  agentCapabilities?: Record<string, unknown>;
+  agentCapabilities?: { promptCapabilities?: { image?: boolean } } & Record<string, unknown>;
   agentInfo?: { name: string; version?: string } | null;
   _meta?: { steering?: { supported?: boolean } } & Record<string, unknown>;
 };
