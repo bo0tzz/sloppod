@@ -1469,8 +1469,9 @@ test('the sidebar shows every usage window of each account, by its name', async 
   await page.request.post('/_mock/quotas', {
     data: [
       quota('claude', 'work', false, [
-        ['five_hour', 0.2, 'allowed'],
         ['seven_day', 0.95, 'warning'],
+        ['1_day', 0.4, 'allowed'],
+        ['five_hour', 0.2, 'allowed'],
       ]),
       quota('chatgpt', 'reviews', true, [['five_hour', 1, 'rejected']]),
     ],
@@ -1483,14 +1484,16 @@ test('the sidebar shows every usage window of each account, by its name', async 
     const work = meters.filter({ hasText: 'work' });
     await expect(work).toContainText('Claude');
     const workWindows = work.getByTestId('quota-window');
-    await expect(workWindows).toHaveCount(2);
+    await expect(workWindows).toHaveCount(3);
     await expect(workWindows.nth(0)).toHaveAttribute('data-window', 'five_hour');
     await expect(workWindows.nth(0)).toContainText('5-hour');
     await expect(workWindows.nth(0)).toContainText('20%, resets in 2 hours');
     await expect(workWindows.nth(0)).toHaveAttribute('data-level', 'normal');
-    await expect(workWindows.nth(1)).toContainText('Week');
-    await expect(workWindows.nth(1)).toContainText('95%');
-    await expect(workWindows.nth(1)).toHaveAttribute('data-level', 'warning');
+    await expect(workWindows.nth(1)).toHaveAttribute('data-window', '1_day');
+    await expect(workWindows.nth(1)).toContainText('Day');
+    await expect(workWindows.nth(2)).toContainText('Week');
+    await expect(workWindows.nth(2)).toContainText('95%');
+    await expect(workWindows.nth(2)).toHaveAttribute('data-level', 'warning');
     await expect(work.getByTestId('quota-limited')).toHaveCount(0);
     const reviews = meters.filter({ hasText: 'reviews' });
     await expect(reviews).toContainText('ChatGPT');

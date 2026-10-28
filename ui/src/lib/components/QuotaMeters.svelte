@@ -9,21 +9,29 @@
   const providers: Record<string, string> = { claude: 'Claude', chatgpt: 'ChatGPT' };
   const windows: Record<string, string> = {
     five_hour: '5-hour',
+    '1_day': 'Day',
     seven_day: 'Week',
     seven_day_overage_included: 'Week, with overage',
   };
-  /** Shortest window first: the one that resets soonest. */
-  const order = ['five_hour', 'seven_day', 'seven_day_overage_included'];
+  const unit: Record<string, number> = { minute: 60, hour: 3600, day: 86400 };
+  const named: Record<string, number> = { five_hour: 5 * 3600, seven_day: 7 * 86400, seven_day_overage_included: 7 * 86400 + 1 };
+
+  /** A window's length in seconds, from its name (`five_hour`, or `<n>_<unit>` as the runtime names ChatGPT's); unknown last. */
+  function duration(window: string): number {
+    if (window in named) return named[window];
+    const [, n, u] = /^(\d+)_(minute|hour|day)$/.exec(window) ?? [];
+    return n ? Number(n) * unit[u] : Infinity;
+  }
 
   const label = (window: string) => windows[window] ?? window.replaceAll('_', ' ');
   const percent = (window: QuotaWindow) => Math.round((window.utilization ?? 0) * 100);
 
+  /** Shortest window first: the one that resets soonest. */
   function sorted(quota: Quota): QuotaWindow[] {
-    const rank = (window: QuotaWindow) => {
-      const known = order.indexOf(window.window);
-      return known === -1 ? order.length : known;
-    };
-    return [...quota.windows].sort((a, b) => rank(a) - rank(b));
+    return [...quota.windows].sort((a, b) => {
+      const [x, y] = [duration(a.window), duration(b.window)];
+      return x === y ? 0 : x < y ? -1 : 1;
+    });
   }
 
   function level(quota: Quota, window: QuotaWindow): 'danger' | 'warning' | 'normal' {
