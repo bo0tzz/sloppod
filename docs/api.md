@@ -55,7 +55,7 @@ type Session = {
   grants: Grant[];
   phase: Phase;
   agent: string;         // "claude-code" or "codex"
-  kind: "work" | "review"; // "review": a session reviewing a proposal (ADR 24); `GET /sessions` leaves these out
+  kind: "work" | "review" | "utility"; // "review": a session reviewing a proposal (ADR 24); "utility": an owner's session for the runtime's judgements (ADR 26); `GET /sessions` leaves both out
   review: "off" | "required"; // whether its pull requests are reviewed by another model first; from the user's settings
   created_at: string;    // RFC 3339
   updated_at: string;

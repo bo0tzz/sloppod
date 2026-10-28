@@ -293,6 +293,26 @@ pub async fn finish_purge(db: &PgPool, id: Uuid) -> sqlx::Result<()> {
         .map(|_| ())
 }
 
+/// The owner's utility session (ADR 26), if they have one that isn't stopped.
+pub async fn utility_session(db: &PgPool, owner: &str) -> sqlx::Result<Option<SessionRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "select {SESSION_COLUMNS} from sessions where owner = $1 and kind = 'utility' and phase <> 'stopped' \
+         and deleted_at is null order by created_at limit 1"
+    )))
+    .bind(owner)
+    .fetch_optional(db)
+    .await
+}
+
+/// Every owner's utility session that isn't stopped.
+pub async fn utility_sessions(db: &PgPool) -> sqlx::Result<Vec<SessionRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "select {SESSION_COLUMNS} from sessions where kind = 'utility' and phase <> 'stopped' and deleted_at is null"
+    )))
+    .fetch_all(db)
+    .await
+}
+
 pub async fn active_sessions(db: &PgPool) -> sqlx::Result<Vec<SessionRow>> {
     sqlx::query_as(AssertSqlSafe(format!(
         "select {SESSION_COLUMNS} from sessions where phase not in ('stopped', 'parked')"

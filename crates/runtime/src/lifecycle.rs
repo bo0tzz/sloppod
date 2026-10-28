@@ -21,9 +21,18 @@ fn mints_memory(session: &db::SessionRow, has_memory_grant: bool) -> bool {
     session.parent_id.is_none() || has_memory_grant
 }
 
+/// Whether a session of `kind` gets the owner's memory when they have memini. A utility session (ADR 26) only has
+/// model access.
+fn gets_memory(kind: sloppod_protocol::api::SessionKind) -> bool {
+    kind != sloppod_protocol::api::SessionKind::Utility
+}
+
 /// Gives a session its memini key when its owner has memini and it has none, e.g. because it was just created, or
 /// its key was lost (ADR 22). Keeps the namespace of an existing memory grant.
 async fn ensure_memini_key(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
+    if !gets_memory(session.kind) {
+        return Ok(());
+    }
     let Some((admin, memini)) = state.credentials.memini(&session.owner).await? else {
         return Ok(());
     };
@@ -406,6 +415,14 @@ mod tests {
         session.parent_id = Some(uuid::Uuid::new_v4());
         assert!(!super::mints_memory(&session, false));
         assert!(super::mints_memory(&session, true));
+    }
+
+    #[test]
+    fn a_utility_session_gets_no_memory() {
+        use sloppod_protocol::api::SessionKind;
+        assert!(gets_memory(SessionKind::Work));
+        assert!(gets_memory(SessionKind::Review));
+        assert!(!gets_memory(SessionKind::Utility));
     }
 
     #[test]
