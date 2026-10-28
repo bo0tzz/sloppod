@@ -10,6 +10,7 @@ mod db_tests;
 mod enforcer;
 mod github;
 mod grants;
+mod identity;
 mod lifecycle;
 mod link;
 mod mcp;
@@ -293,6 +294,7 @@ async fn reconcile(state: &AppState) {
     }
     proposals::resume_approved(state).await;
     reviews::resume_round_watches(state).await;
+    proposals::resume_stack_watches(state).await;
 }
 
 /// Tells an agent whose turn a runtime restart cut off what it lost, so it can carry on without the user.

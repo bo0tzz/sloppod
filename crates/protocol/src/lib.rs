@@ -286,6 +286,19 @@ pub mod api {
 pub mod link {
     use super::*;
 
+    /// Where the supervisor serves the runtime's session endpoints (MCP, memory) to the agent, attaching the pod's
+    /// ServiceAccount token to each request, so the runtime knows the session from the pod's own identity.
+    pub const LOCAL_PROXY: &str = "127.0.0.1:7811";
+
+    /// Whether `name` can be a transcript file: a plain `.jsonl` file name, nothing that reaches outside the
+    /// transcript directory. Checked when the runtime stores a file and again when a supervisor restores it.
+    pub fn is_transcript_file_name(name: &str) -> bool {
+        name.ends_with(".jsonl")
+            && name.len() > ".jsonl".len()
+            && !name.starts_with('.')
+            && !name.contains(['/', '\\', '\0'])
+    }
+
     /// Path of the supervisor link WebSocket on the runtime.
     pub const PATH: &str = "/link/v1";
     /// Where in the session's workdir the supervisor keeps `{"build": ...}` for the runtime it's connected to.
@@ -381,6 +394,9 @@ pub mod link {
             /// An agent still running from an earlier link; the runtime attaches to it rather than launching.
             #[serde(default, skip_serializing_if = "Option::is_none")]
             agent: Option<RunningAgent>,
+            /// The supervisor serves the runtime's session endpoints at [`LOCAL_PROXY`]; older ones don't.
+            #[serde(default)]
+            local_proxy: bool,
         },
         Status {
             message: String,
@@ -405,5 +421,26 @@ pub mod link {
         Error {
             message: String,
         },
+    }
+}
+
+#[cfg(test)]
+mod transcript_name_tests {
+    use super::link::is_transcript_file_name;
+
+    #[test]
+    fn transcript_files_stay_in_their_directory() {
+        assert!(is_transcript_file_name("0b6a1c.jsonl"));
+        for refused in [
+            "../x.jsonl",
+            "a/b.jsonl",
+            "a\\b.jsonl",
+            ".jsonl",
+            ".hidden.jsonl",
+            "x.txt",
+            "",
+        ] {
+            assert!(!is_transcript_file_name(refused), "{refused}");
+        }
     }
 }

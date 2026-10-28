@@ -19,6 +19,7 @@ import type {
   StopReason,
 } from './acp/types.ts';
 import { api, ApiError, newerProposal, newerSession, type Proposal, type Session } from './api.ts';
+import { loadUnconfirmed, saveUnconfirmed } from './drafts.ts';
 import { sessions } from './sessions.svelte.ts';
 
 export type PendingPermission = RequestPermissionRequest & { rpcId: RequestId };
@@ -77,6 +78,8 @@ export class SessionView {
 
   constructor(id: string) {
     this.id = id;
+    // Sent before a reload and never confirmed: settled like any other once the session loads.
+    this.#unconfirmed = loadUnconfirmed(id);
     this.#conn = new AcpConnection(acpUrl(), {
       onReady: (connection) => this.#onReady(connection),
       onNotification: (method, params) => this.#onNotification(method, params),
@@ -266,19 +269,35 @@ export class SessionView {
    */
   async prompt(text: string, id: string = crypto.randomUUID()): Promise<StopReason | undefined> {
     this.promptsInFlight++;
+    // Kept until the runtime answers, so a page reload before then can still tell whether it arrived.
+    this.#keepSending(id, text);
     try {
       const result = await this.#conn.request<{ stopReason: StopReason }>('session/prompt', {
         sessionId: this.id,
         prompt: textPrompt(text),
         _meta: { sloppod: { messageId: id } },
       });
+      this.#doneSending(id);
       return result?.stopReason;
     } catch (error) {
       if (error instanceof ConnectionClosedError) this.#unconfirmed.push({ id, text });
+      else this.#doneSending(id);
       throw error;
     } finally {
       this.promptsInFlight--;
     }
+  }
+
+  #keepSending(id: string, text: string) {
+    const kept = loadUnconfirmed(this.id).filter((message) => message.id !== id);
+    saveUnconfirmed(this.id, [...kept, { id, text }]);
+  }
+
+  #doneSending(id: string) {
+    saveUnconfirmed(
+      this.id,
+      loadUnconfirmed(this.id).filter((message) => message.id !== id),
+    );
   }
 
   /** Whether the runtime has a message: recorded in the transcript, or waiting in the queue. */
@@ -293,7 +312,10 @@ export class SessionView {
   #settleUnconfirmed() {
     const unconfirmed = this.#unconfirmed.splice(0);
     for (const message of unconfirmed) {
-      if (this.received(message.id)) continue;
+      if (this.received(message.id)) {
+        this.#doneSending(message.id);
+        continue;
+      }
       this.prompt(message.text, message.id).catch((error) => {
         if (error instanceof ConnectionClosedError || this.received(message.id)) return;
         this.undelivered.push(message);
