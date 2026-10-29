@@ -663,6 +663,20 @@ async fn carry_out(
     .await;
     let proposal = finished.to_api();
     state.hub.broadcast_proposal(&proposal);
+    if proposal.status == ProposalStatus::Executed
+        && let Some(result) = &proposal.result
+        && let Err(e) = crate::work::follow::executed(
+            &state.db,
+            &session.owner,
+            session_id,
+            &proposal.kind,
+            &proposal.payload,
+            result,
+        )
+        .await
+    {
+        tracing::warn!(proposal = %id, error = ?e, "moving the work items a proposal carries out");
+    }
     // What it has to tell other sessions, e.g. a report for a sub-session's parent, which is woken for it if it
     // parked meanwhile. Not held to the tree's limit (ADR 27): the reporting sub-session is done, so its place is
     // about to free up, and a report left unread would leave its work with nobody.

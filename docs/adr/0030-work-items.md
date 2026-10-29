@@ -75,3 +75,12 @@ Open questions:
   - Items are never deleted. Undoing an item's creation drops it.
   - State changes the rules make are recorded as automatic and can't be undone: they follow links and parts.
 - **What's ready** is the open items with no unfinished parts that nothing unfinished blocks, directly or through an item they're part of, and that aren't inside a done or dropped item. Active items are under way, so they aren't in it.
+
+2026-10-29: stage 3 is built ([#386](https://github.com/bo0tzz/sloppod/issues/386)): items move with what's linked to them. The runtime sets a link's status as what it points at moves, through stage 1's rules, and records each change with `sloppod` as its author.
+
+- **Pull requests.** The PR watcher (`pulls.rs`) moves links to the pull requests it watches on every poll: open, merged (`finished`), or closed unmerged (`abandoned`).
+- **Issues, and pull requests no watcher covers.** These are polled every minute until webhooks ([#204](https://github.com/bo0tzz/sloppod/issues/204)), as the owner's GitHub App, while their link is `open`.
+  - An issue closed as completed is `finished`; one closed as not planned or a duplicate is `abandoned`.
+  - Links that are no longer open aren't polled, so an issue reopened later isn't seen, and neither is a repository the App isn't installed on.
+- **Proposals.** A pull request or stack that a proposal opens is linked to the items its session is linked to, with the same role as the session's link. So the pull request of a session that completes an item completes it too.
+- **Sessions.** A session link is `open` while the session acts, and `finished` once it has an executed report (a sub-session's `report_done`). It's `abandoned` once the session is parked, stopped or deleted without one. This is checked every minute, and at once when a report is carried out. A sub-session that's given more work after reporting stays `finished`.

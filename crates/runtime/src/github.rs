@@ -1305,6 +1305,12 @@ impl GitHubApp {
         }))
     }
 
+    /// An issue or pull request as GitHub's REST API has it: `state`, `state_reason`, and `pull_request.merged_at` for a
+    /// pull request.
+    pub async fn issue_state(&self, repo: &str, number: u64) -> anyhow::Result<Value> {
+        self.repo_json(repo, &format!("/issues/{number}")).await
+    }
+
     pub async fn create_issue(&self, repo: &str, payload: &Value) -> anyhow::Result<Value> {
         let body = self.repo_post(repo, "/issues", payload).await?;
         Ok(json!({"url": body["html_url"], "number": body["number"]}))
@@ -1786,6 +1792,19 @@ pub(crate) mod tests {
                 json!({"number": 1, "title": "Flaky", "body": "It fails.\n"}),
             )),
             2 => Ok(Json(json!({"number": 2, "title": "Bare", "body": null}))),
+            // Closed: as completed, as not planned; a pull request merged, and one closed unmerged.
+            3 => Ok(Json(
+                json!({"number": 3, "state": "closed", "state_reason": "completed"}),
+            )),
+            4 => Ok(Json(
+                json!({"number": 4, "state": "closed", "state_reason": "not_planned"}),
+            )),
+            5 => Ok(Json(
+                json!({"number": 5, "state": "closed", "pull_request": {"merged_at": "2026-10-29T12:00:00Z"}}),
+            )),
+            6 => Ok(Json(
+                json!({"number": 6, "state": "closed", "pull_request": {"merged_at": null}}),
+            )),
             _ => Err(StatusCode::NOT_FOUND),
         }
     }
@@ -1926,7 +1945,7 @@ pub(crate) mod tests {
             app.issue("o/r", 2).await.unwrap(),
             json!({"title": "Bare", "body": ""})
         );
-        assert!(app.issue("o/r", 3).await.is_err());
+        assert!(app.issue("o/r", 99).await.is_err());
     }
 
     #[tokio::test]

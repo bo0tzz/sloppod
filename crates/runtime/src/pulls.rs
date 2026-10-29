@@ -209,6 +209,19 @@ async fn check(state: &AppState, pull: &db::WatchedPull) -> anyhow::Result<()> {
         &response["data"]["repository"]["pullRequest"],
     );
     let changes = changes(&pull.repo, pull.number as u64, before.as_ref(), &now);
+    // Items linked to it move with it (ADR 30).
+    let status = crate::work::follow::pull_status(&now.state);
+    if let Err(e) = crate::work::follow::follow(
+        &state.db,
+        &pull.owner,
+        crate::work::rules::LinkKind::PullRequest,
+        &pull_ref(&pull.repo, pull.number as u64),
+        status,
+    )
+    .await
+    {
+        tracing::warn!(repo = %pull.repo, number = pull.number, error = ?e, "moving the items linked to a pull request");
+    }
     // Told before it's saved: a restart in between tells it again rather than never.
     if !changes.is_empty() {
         let text = format!("sloppod: {}", changes.join(" "));

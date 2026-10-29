@@ -1312,5 +1312,7 @@ pub async fn undo(db: &PgPool, actor: Actor<'_>, id: Uuid) -> WorkResult<Event> 
     Ok(inverse)
 }
 
+pub mod follow;
+
 #[cfg(test)]
 mod tests;
