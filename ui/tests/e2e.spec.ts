@@ -103,9 +103,9 @@ test("downloads a debug bundle for an agent message's turn", async ({ page }) =>
   const bundle = JSON.parse(await readFile(await file.path(), 'utf8'));
   // The turn is the one the user's message started.
   const first = bundle.turns.at(-1).events[0];
-  expect(first.sessionUpdate).toBe('user_message_chunk');
-  expect(first.content.text).toBe('Add backoff to the reconnect logic in sloppod');
-  expect(bundle.turn).toBe(first.messageId);
+  expect(first.update.sessionUpdate).toBe('user_message_chunk');
+  expect(first.update.content.text).toBe('Add backoff to the reconnect logic in sloppod');
+  expect(bundle.turn).toBe(first.update.messageId);
   expect(bundle.turns.at(-1).model_calls.length).toBeGreaterThan(0);
 
   await expect(userMessages(page).getByRole('link', { name: 'Download debug bundle' })).toHaveCount(0);
@@ -128,7 +128,7 @@ test('a debug bundle finds the turn of a message loaded without the message that
   await page.reload();
   await expect(page.getByText('The end.')).toBeVisible();
   await expect(userMessages(page)).toHaveCount(0);
-  expect((await firstEvent()).content.text).toBe(prompt);
+  expect((await firstEvent()).update.content.text).toBe(prompt);
 
   // And then inside the turn before the first message loaded.
   const box = page.getByRole('textbox', { name: 'Prompt' });
@@ -138,7 +138,7 @@ test('a debug bundle finds the turn of a message loaded without the message that
   await page.reload();
   await expect(agentMessages(page).filter({ hasText: FINAL })).toBeVisible();
   await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(0);
-  expect((await firstEvent()).content.text).toBe(prompt);
+  expect((await firstEvent()).update.content.text).toBe(prompt);
 });
 
 test('touch screens always show the copy button', async ({ page, browser }) => {
@@ -460,6 +460,58 @@ test('approves a proposal with an edited title', async ({ page }) => {
   const pr = proposals.find((p) => p.kind === 'github.pr.create');
   expect(pr?.payload.title).toBe('Back off when reconnecting the ACP socket');
   expect(pr?.payload.auto_merge).toBe(false);
+});
+
+test('Esc in the review modal undoes one step, and unsaved edits are asked about', async ({ page }) => {
+  await createSession(page, 'Propose a PR for sloppod');
+  await finishTurn(page);
+  const card = page.getByTestId('proposal-card');
+  const detail = page.getByTestId('proposal-detail');
+  const confirm = page.getByRole('dialog').filter({ hasText: 'Discard your edits?' });
+  await card.getByRole('button', { name: 'Review' }).click();
+  await expect(detail.getByTestId('proposal-title')).toBeVisible();
+
+  // Reject… focuses the reason; Esc goes back to the decision buttons, not out of the modal.
+  await page.getByRole('button', { name: 'Reject…' }).click();
+  const reason = page.getByRole('textbox', { name: 'Reason (optional)' });
+  await expect(reason).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(reason).toBeHidden();
+  await expect(page.getByRole('button', { name: 'Reject…' })).toBeFocused();
+  await expect(detail).toBeVisible();
+
+  // With edits, Esc asks before leaving editing; keeping them stays put.
+  await page.getByRole('button', { name: 'Edit' }).click();
+  const title = page.getByRole('textbox', { name: 'Title' });
+  await title.fill('Back off when reconnecting');
+  await page.keyboard.press('Escape');
+  await expect(confirm).toBeVisible();
+  await confirm.getByRole('button', { name: 'Cancel' }).click();
+  await expect(title).toHaveValue('Back off when reconnecting');
+
+  // ✕ asks too.
+  await page.getByRole('dialog').filter({ has: detail }).getByRole('button', { name: 'Close' }).first().click();
+  await expect(confirm).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(confirm).toBeHidden();
+  await expect(title).toHaveValue('Back off when reconnecting');
+
+  // Discarding leaves editing; then Esc closes the modal.
+  await page.keyboard.press('Escape');
+  await confirm.getByRole('button', { name: 'Discard edits' }).click();
+  await expect(title).toBeHidden();
+  await expect(detail.getByTestId('proposal-title')).toHaveText('Reconnect the ACP socket with exponential backoff');
+  await page.keyboard.press('Escape');
+  await expect(detail).toBeHidden();
+
+  // Without edits, editing is left and the modal closed without asking.
+  await card.getByRole('button', { name: 'Review' }).click();
+  await page.getByRole('button', { name: 'Edit' }).click();
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('textbox', { name: 'Title' })).toBeHidden();
+  await page.keyboard.press('Escape');
+  await expect(detail).toBeHidden();
+  await expect(confirm).toHaveCount(0);
 });
 
 test('a proposal made with the user\'s own GitHub token says so', async ({ page }) => {
