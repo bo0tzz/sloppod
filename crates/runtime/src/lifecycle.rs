@@ -46,8 +46,7 @@ async fn ensure_memini_key(state: &AppState, session: &db::SessionRow) -> anyhow
         return Ok(());
     }
     let context = session.context();
-    let granted = context
-        .grant(capability::MEMORY)
+    let granted = crate::capabilities::grant_with(&context, &crate::capabilities::Part::Memory)
         .and_then(|g| g.param("namespace"))
         .map(str::to_owned);
     if !mints_memory(session, granted.is_some()) {
@@ -178,7 +177,11 @@ pub async fn apply_egress(state: &AppState, id: Uuid) -> anyhow::Result<bool> {
     state
         .hub
         .apply_egress(id, &*state.enforcer, |session| {
-            egress_spec(session, state.policies.hosts(), &state.config.direct_hosts)
+            egress_spec(
+                session,
+                state.policies.hosts_for(&session.context()),
+                &state.config.direct_hosts,
+            )
         })
         .await
 }
@@ -453,7 +456,7 @@ pub async fn remove_session(state: &AppState, session: &db::SessionRow) -> anyho
     state.hub.stop(id).await?;
     state.placement.delete(&id.to_string()).await?;
     state.hub.remove_egress(id, &*state.enforcer).await?;
-    if session.context().has(capability::MEMORY)
+    if crate::capabilities::holds(&session.context(), &crate::capabilities::Part::Memory)
         && let Some((admin, _)) = state.credentials.memini(&session.owner).await?
         && let Err(e) = admin
             .delete_key(&MeminiAdmin::key_name(&id.to_string()))
@@ -567,5 +570,93 @@ mod tests {
         // Without word on its commands, only after a long quiet.
         assert!(!due(&idle, Some("session:old"), None));
         assert!(due(&session(Phase::Idle, 150), Some("session:old"), None));
+    }
+
+    /// A request policy that only names its hosts.
+    struct Hosts(&'static [&'static str]);
+
+    #[async_trait::async_trait]
+    impl sloppod_contracts::RequestPolicy for Hosts {
+        fn manifest(&self) -> sloppod_contracts::Manifest {
+            sloppod_contracts::Manifest::builtin("hosts")
+        }
+
+        fn hosts(&self) -> Vec<String> {
+            self.0.iter().map(|h| (*h).to_owned()).collect()
+        }
+
+        async fn decide(
+            &self,
+            _: &sloppod_contracts::SessionContext,
+            _: &sloppod_contracts::HttpRequest,
+        ) -> sloppod_contracts::Result<sloppod_contracts::Decision> {
+            Ok(sloppod_contracts::Decision::allow())
+        }
+    }
+
+    #[test]
+    fn a_session_reaches_only_the_hosts_of_the_parts_it_holds() {
+        use crate::capabilities::{Part, Provider};
+        use sloppod_contracts::{Grant, capability};
+        use std::sync::Arc;
+
+        let mut policies = crate::policies::Policies::default();
+        policies.register(
+            Part::Model(Provider::Anthropic),
+            Arc::new(Hosts(&["api.anthropic.com"])),
+        );
+        policies.register(
+            Part::Model(Provider::ChatGpt),
+            Arc::new(Hosts(&["chatgpt.com"])),
+        );
+        policies.register(
+            Part::Github,
+            Arc::new(Hosts(&["api.github.com", "github.com"])),
+        );
+        let direct = ["crates.io".to_owned()];
+        let spec = |grants: &[&str]| {
+            let mut session = crate::db::SessionRow::for_test(uuid::Uuid::new_v4(), "dev");
+            let grants: Vec<Grant> = grants
+                .iter()
+                .map(|name| match *name {
+                    capability::REPO => {
+                        Grant::new(name, serde_json::json!({"repo": "o/r", "access": "rw"}))
+                    }
+                    _ => Grant::new(name, serde_json::json!({})),
+                })
+                .collect();
+            session.set_grants(&grants);
+            let spec =
+                super::egress_spec(&session, policies.hosts_for(&session.context()), &direct);
+            (spec.intercepted_hosts, spec.direct_hosts)
+        };
+
+        assert_eq!(
+            spec(&[capability::MODEL, capability::DOCS]),
+            (vec!["api.anthropic.com".to_owned()], vec![])
+        );
+        assert_eq!(
+            spec(&[capability::MODEL, capability::GITHUB, capability::REPO]),
+            (
+                vec![
+                    "api.anthropic.com".to_owned(),
+                    "api.github.com".to_owned(),
+                    "github.com".to_owned()
+                ],
+                vec![]
+            )
+        );
+        // A repository without github reaches no GitHub host: the repository is a param of github.
+        assert_eq!(
+            spec(&[capability::MODEL, capability::REPO]),
+            (vec!["api.anthropic.com".to_owned()], vec![])
+        );
+        assert_eq!(
+            spec(&[capability::CODEX, capability::PACKAGES]),
+            (vec!["chatgpt.com".to_owned()], vec!["crates.io".to_owned()])
+        );
+        assert_eq!(spec(&[]), (vec![], vec![]));
+        // The listeners' certificate still covers every policy's hosts.
+        assert_eq!(policies.hosts().len(), 4);
     }
 }

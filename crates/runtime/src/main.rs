@@ -56,6 +56,7 @@ use sloppod_protocol::api::Phase;
 use sqlx::PgPool;
 use tower_http::services::{ServeDir, ServeFile};
 
+use crate::capabilities::{Part, Provider};
 use crate::config::Config;
 use crate::credentials::Credentials;
 use crate::enforcer::Cilium;
@@ -155,15 +156,24 @@ async fn main() -> anyhow::Result<()> {
     let credentials = Arc::new(Credentials::new(db.clone(), vault).await?);
 
     let mut policies = Policies::default();
-    policies.register(Arc::new(ModelPolicy::new(credentials.clone())));
-    policies.register(Arc::new(CodexPolicy::new(credentials.clone())));
+    policies.register(
+        Part::Model(Provider::Anthropic),
+        Arc::new(ModelPolicy::new(credentials.clone())),
+    );
+    policies.register(
+        Part::Model(Provider::ChatGpt),
+        Arc::new(CodexPolicy::new(credentials.clone())),
+    );
     let pushes = Arc::new(github::PushLog::default());
     let (rechecks, pushes_to_recheck) = rebases::Rechecks::new(db.clone());
-    policies.register(Arc::new(GitHubPolicy::new(
-        credentials.clone(),
-        pushes.clone(),
-        rechecks.clone(),
-    )));
+    policies.register(
+        Part::Github,
+        Arc::new(GitHubPolicy::new(
+            credentials.clone(),
+            pushes.clone(),
+            rechecks.clone(),
+        )),
+    );
 
     let mut proposals = ProposalKinds::default();
     proposals.register(Arc::new(proposals::PullRequest::new(credentials.clone())));
