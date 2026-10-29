@@ -1885,6 +1885,36 @@ test('reviews and approves updates to existing issues', async ({ page }) => {
   expect(made.payload.updates[0].comment).toBe('Fixed by #148, closing.');
 });
 
+test('reviews and approves updates to open pull requests', async ({ page }) => {
+  await createSession(page, 'Tidy the pull requests in sloppod');
+  const card = page.getByTestId('proposal-card');
+  await expect(card).toHaveAttribute('data-kind', 'github.pr.update');
+  await expect(card).toContainText('Pull request updates');
+  await card.getByRole('button', { name: 'Review' }).click();
+  const updates = page.getByTestId('issue-update');
+  await expect(updates).toHaveCount(2);
+  await expect(updates.nth(0)).toContainText('#96');
+  await expect(updates.nth(0)).toContainText('· close');
+  await expect(updates.nth(0)).not.toContainText('close as');
+  await expect(updates.nth(0)).toContainText('Remove labels: wip');
+  await expect(updates.nth(1)).toContainText('mark ready for review');
+  // A rewrite shows against what the pull request says now.
+  await expect(updates.nth(1).getByTestId('issue-update-title')).toHaveText('Title: WIP: pod failures → Show why a pod fails to start');
+  const bodyDiff = updates.nth(1).getByTestId('diff');
+  await expect(bodyDiff).toContainText('Body of #97');
+  await expect(bodyDiff.getByText('Closes #59.')).toBeVisible();
+
+  // Leave the close out, and make the other.
+  await updates.nth(0).getByRole('checkbox', { name: 'Make this update' }).click();
+  await page.getByRole('button', { name: 'Make 1 update' }).click();
+  await expect(page.getByTestId('system-notice').last()).toContainText('Your pull request updates were approved and made');
+  const proposals: { kind: string; payload: { updates: { number: number; ready?: boolean }[] } }[] = await (
+    await page.request.get('/api/v1/proposals')
+  ).json();
+  const made = proposals.filter((p) => p.kind === 'github.pr.update').at(-1)!;
+  expect(made.payload.updates).toEqual([expect.objectContaining({ number: 97, ready: true })]);
+});
+
 test('a draft survives a page reload', async ({ page }) => {
   await createSession(page, 'Keep my draft in sloppod');
   await finishTurn(page);

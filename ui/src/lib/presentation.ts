@@ -80,6 +80,7 @@ export const proposalKinds: Record<string, { title: string; plural: string; exec
   'github.stack.create': { title: 'Stacked pull requests', plural: 'Stacked pull requests', executed: 'Opened' },
   'github.issue.create': { title: 'Issues proposal', plural: 'Issues', executed: 'Filed' },
   'github.issue.update': { title: 'Issue updates', plural: 'Issue updates', executed: 'Updated' },
+  'github.pr.update': { title: 'Pull request updates', plural: 'Pull request updates', executed: 'Updated' },
   'sloppod.repo.grant': { title: 'Repository access', plural: 'Repository access', executed: 'Granted' },
   'sloppod.repo.act_as_owner': { title: 'Acting as you', plural: 'Acting as you', executed: 'Granted' },
   'sloppod.session.report': { title: 'Report to the parent session', plural: 'Reports', executed: 'Delivered' },
@@ -135,6 +136,15 @@ export function proposalSummary(proposal: Proposal): { label: string; title: str
         title: updates.length === 1 ? `#${String(updates[0].number)}` : `${updates.length} issues`,
         detail: payloadText(payload.repo),
         icon: mdiAlertCircleOutline,
+      };
+    }
+    case 'github.pr.update': {
+      const updates = Array.isArray(payload.updates) ? (payload.updates as { number?: unknown }[]) : [];
+      return {
+        label: 'Pull request updates',
+        title: updates.length === 1 ? `#${String(updates[0].number)}` : `${updates.length} pull requests`,
+        detail: payloadText(payload.repo),
+        icon: mdiSourcePull,
       };
     }
     case 'sloppod.repo.act_as_owner':

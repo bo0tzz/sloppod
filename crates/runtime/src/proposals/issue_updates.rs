@@ -9,6 +9,7 @@ use sloppod_contracts::{
     Error, Manifest, ProposalKind, RepoGrant, Result, SessionContext, ToolSpec,
 };
 
+use super::updates::{self, MAX_UPDATES};
 use super::{err, target_repo};
 use crate::credentials::Credentials;
 
@@ -22,193 +23,63 @@ impl IssueUpdates {
     }
 }
 
-const MAX_UPDATES: usize = 50;
-
 /// Why an issue is closed, as GitHub records it.
 const CLOSE_REASONS: &[&str] = &["completed", "not_planned", "duplicate"];
 
-fn labels(update: &Value, field: &str, i: usize) -> Result<Vec<String>> {
-    match &update[field] {
-        Value::Null => Ok(Vec::new()),
-        Value::Array(labels) => labels
-            .iter()
-            .map(|l| {
-                l.as_str()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty())
-                    .map(str::to_owned)
-            })
-            .collect::<Option<_>>()
-            .ok_or_else(|| Error::new(format!("update {}'s {field} must be label names", i + 1))),
-        _ => Err(Error::new(format!(
-            "update {}'s {field} must be a list",
-            i + 1
-        ))),
-    }
-}
+/// What an issue update can have.
+const FIELDS: updates::Fields = updates::Fields {
+    all: &[
+        "number",
+        "title",
+        "comment",
+        "body",
+        "close",
+        "reopen",
+        "add_labels",
+        "remove_labels",
+    ],
+    text: &["title", "comment", "body", "close"],
+    flags: &["reopen"],
+};
 
-/// What an update can have; anything else is refused rather than dropped, so a proposal shows all it will do.
-const FIELDS: &[&str] = &[
-    "number",
-    "title",
-    "comment",
-    "body",
-    "close",
-    "reopen",
-    "add_labels",
-    "remove_labels",
-];
-
-/// Refuses an update with a field it can't have, or one of the wrong type, before its fields are read.
-fn check_fields(update: &Value, i: usize) -> Result<()> {
-    let Some(fields) = update.as_object() else {
-        return Err(Error::new(format!("update {} must be an object", i + 1)));
-    };
-    if let Some(unknown) = fields.keys().find(|k| !FIELDS.contains(&k.as_str())) {
-        return Err(Error::new(format!(
-            "update {} has `{unknown}`, which an update can't have; it can have {}",
-            i + 1,
-            FIELDS.join(", ")
-        )));
-    }
-    for field in ["title", "comment", "body", "close"] {
-        if !matches!(
-            fields.get(field),
-            None | Some(Value::Null | Value::String(_))
-        ) {
-            return Err(Error::new(format!(
-                "update {}'s {field} must be text",
-                i + 1
-            )));
-        }
-    }
-    if !matches!(
-        fields.get("reopen"),
-        None | Some(Value::Null | Value::Bool(_))
-    ) {
-        return Err(Error::new(format!(
-            "update {}'s reopen must be true or false",
-            i + 1
-        )));
-    }
-    Ok(())
-}
-
-/// Checks a list of updates from the agent or the reviewer, keeping only what GitHub gets. Each names an issue and
-/// changes at least one thing.
+/// Checks a list of updates from the agent or the reviewer, keeping only what GitHub gets.
 fn update_list(updates: &Value) -> Result<Vec<Value>> {
-    let Some(updates) = updates.as_array().filter(|u| !u.is_empty()) else {
-        return Err(Error::new("give at least one update"));
-    };
-    if updates.len() > MAX_UPDATES {
-        return Err(Error::new(format!(
-            "propose at most {MAX_UPDATES} updates at a time"
-        )));
-    }
-    updates
-        .iter()
-        .enumerate()
-        .map(|(i, update)| {
-            check_fields(update, i)?;
-            let number = update["number"]
-                .as_u64()
-                .ok_or_else(|| Error::new(format!("update {} needs the issue's number", i + 1)))?;
-            let mut checked = Map::new();
-            checked.insert("number".into(), json!(number));
-            for field in ["title", "comment"] {
-                if let Some(text) = update[field].as_str().filter(|t| !t.trim().is_empty()) {
-                    checked.insert(field.into(), json!(text.trim()));
-                }
+    updates::update_list(updates, "issue", &FIELDS, |update, i, number, checked| {
+        match update["close"].as_str() {
+            None => {}
+            Some(reason) if CLOSE_REASONS.contains(&reason) => {
+                checked.insert("close".into(), json!(reason));
             }
-            // A body replaces the old one, so an empty one is kept: it clears the body.
-            if let Some(body) = update["body"].as_str() {
-                checked.insert("body".into(), json!(body.trim()));
-            }
-            match update["close"].as_str() {
-                None => {}
-                Some(reason) if CLOSE_REASONS.contains(&reason) => {
-                    checked.insert("close".into(), json!(reason));
-                }
-                Some(other) => {
-                    return Err(Error::new(format!(
-                        "update {} closes as {other}; say completed, not_planned or duplicate",
-                        i + 1
-                    )));
-                }
-            }
-            if update["reopen"] == true {
-                if checked.contains_key("close") {
-                    return Err(Error::new(format!(
-                        "update {} can't both close and reopen #{number}",
-                        i + 1
-                    )));
-                }
-                checked.insert("reopen".into(), json!(true));
-            }
-            for field in ["add_labels", "remove_labels"] {
-                let names = labels(update, field, i)?;
-                if !names.is_empty() {
-                    checked.insert(field.into(), json!(names));
-                }
-            }
-            if checked.len() == 1 {
+            Some(other) => {
                 return Err(Error::new(format!(
-                    "update {} doesn't change #{number}",
+                    "update {} closes as {other}; say completed, not_planned or duplicate",
                     i + 1
                 )));
             }
-            Ok(Value::Object(checked))
-        })
-        .collect()
-}
-
-/// The reviewer sends the updates to make, so dropping one leaves it out.
-fn edit_updates(payload: &Value, edits: &Value) -> Result<Value> {
-    let mut payload = payload.clone();
-    if let Some(updates) = edits.get("updates") {
-        payload["updates"] = json!(update_list(updates)?);
-    }
-    Ok(payload)
-}
-
-/// The issues whose title or body the updates replace, each once, for the reviewer to compare with what they are now.
-fn rewritten(payload: &Value) -> Vec<u64> {
-    let mut numbers: Vec<u64> = payload["updates"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|u| u.get("title").is_some() || u.get("body").is_some())
-        .filter_map(|u| u["number"].as_u64())
-        .collect();
-    numbers.sort_unstable();
-    numbers.dedup();
-    numbers
+        }
+        if update["reopen"] == true {
+            if checked.contains_key("close") {
+                return Err(Error::new(format!(
+                    "update {} can't both close and reopen #{number}",
+                    i + 1
+                )));
+            }
+            checked.insert("reopen".into(), json!(true));
+        }
+        Ok(())
+    })
 }
 
 /// What an update changes, in a few words, for the result and the agent's notice.
 fn describe(update: &Value) -> String {
-    let mut parts = Vec::new();
-    if update.get("comment").is_some() {
-        parts.push("commented".to_owned());
-    }
+    let mut state = Vec::new();
     if let Some(reason) = update["close"].as_str() {
-        parts.push(format!("closed as {}", reason.replace('_', " ")));
+        state.push(format!("closed as {}", reason.replace('_', " ")));
     }
     if update.get("reopen").is_some() {
-        parts.push("reopened".to_owned());
+        state.push("reopened".to_owned());
     }
-    if update.get("title").is_some() {
-        parts.push("retitled".to_owned());
-    }
-    match update["body"].as_str() {
-        Some("") => parts.push("body cleared".to_owned()),
-        Some(_) => parts.push("body replaced".to_owned()),
-        None => {}
-    }
-    if update.get("add_labels").is_some() || update.get("remove_labels").is_some() {
-        parts.push("relabelled".to_owned());
-    }
-    parts.join(", ")
+    updates::describe(update, state)
 }
 
 #[async_trait]
@@ -279,7 +150,7 @@ impl ProposalKind for IssueUpdates {
 
     async fn detail(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
         let repo = payload["repo"].as_str().unwrap_or_default();
-        let numbers = rewritten(payload);
+        let numbers = updates::rewritten(payload);
         if numbers.is_empty() {
             return Ok(json!({}));
         }
@@ -294,7 +165,7 @@ impl ProposalKind for IssueUpdates {
     }
 
     fn edit(&self, payload: &Value, edits: &Value) -> Result<Value> {
-        edit_updates(payload, edits)
+        updates::edit_updates(payload, edits, update_list)
     }
 
     async fn execute(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
@@ -302,75 +173,22 @@ impl ProposalKind for IssueUpdates {
         let updates = update_list(&payload["updates"])?;
         let app = super::github_for(&self.credentials, session, repo).await?;
 
-        let (mut done, mut failed) = (Vec::new(), Vec::new());
-        for update in &updates {
-            let number = update["number"].as_u64().unwrap_or_default();
-            match apply(&app, repo, number, update).await {
-                Ok(()) => done.push(json!({"number": number, "did": describe(update)})),
-                Err(e) => failed.push(json!({"number": number, "error": format!("{e:#}")})),
-            }
-        }
-        if done.is_empty() {
-            return Err(Error::new(format!(
-                "no issues were updated: {}",
-                failed[0]["error"].as_str().unwrap_or_default()
-            )));
-        }
-        let mut message = format!(
-            "Updated {}.",
-            done.iter()
-                .map(|u| format!(
-                    "#{} ({})",
-                    u["number"],
-                    u["did"].as_str().unwrap_or_default()
-                ))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        for failure in &failed {
-            message.push_str(&format!(
-                " #{} failed: {}.",
-                failure["number"],
-                failure["error"].as_str().unwrap_or_default()
-            ));
-        }
-        Ok(json!({"updated": done, "failed": failed, "message": message}))
+        updates::execute_all(&updates, "issues", describe, |number, update| {
+            let (app, repo) = (app.clone(), repo.to_owned());
+            async move { apply(&app, &repo, number, &update).await }
+        })
+        .await
     }
 }
 
-/// Makes one update. Carrying out an approved proposal again (after a restart) repeats only what's harmless to
-/// repeat: a comment already on the issue isn't posted twice.
+/// Makes one update: the comment and labels as for any update, then the issue's own fields.
 async fn apply(
     app: &crate::github::GitHubApp,
     repo: &str,
     number: u64,
     update: &Value,
 ) -> anyhow::Result<()> {
-    if let Some(comment) = update["comment"].as_str() {
-        let comments = app.issue_comments(repo, number).await?;
-        if !comments.iter().any(|c| c.trim() == comment) {
-            app.comment_on_issue(repo, number, comment).await?;
-        }
-    }
-    let added: Vec<&str> = update["add_labels"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect();
-    if !added.is_empty() {
-        // Per update, after its comment: a label GitHub won't create fails only this update.
-        app.ensure_labels(repo, &added).await?;
-        app.add_labels(repo, number, &added).await?;
-    }
-    for label in update["remove_labels"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-    {
-        app.remove_label(repo, number, label).await?;
-    }
+    updates::comment_and_label(app, repo, number, update).await?;
     let mut patch = Map::new();
     for field in ["title", "body"] {
         if let Some(text) = update.get(field) {
@@ -449,20 +267,24 @@ mod tests {
             {"number": 4, "title": "Clearer"},
             {"number": 9, "body": ""},
         ]});
-        assert_eq!(rewritten(&payload), [4, 9]);
-        assert!(rewritten(&json!({"updates": [{"number": 1, "close": "completed"}]})).is_empty());
+        assert_eq!(updates::rewritten(&payload), [4, 9]);
+        assert!(
+            updates::rewritten(&json!({"updates": [{"number": 1, "close": "completed"}]}))
+                .is_empty()
+        );
     }
 
     #[test]
     fn edits_and_describes_updates() {
         let payload = json!({"repo": "a/one", "updates": [{"number": 1, "close": "duplicate", "comment": "See #2"}, {"number": 3, "reopen": true}]});
-        let edited = edit_updates(
+        let edited = updates::edit_updates(
             &payload,
             &json!({"updates": [{"number": 3, "reopen": true}]}),
+            update_list,
         )
         .unwrap();
         assert_eq!(edited["updates"], json!([{"number": 3, "reopen": true}]));
-        assert!(edit_updates(&payload, &json!({"updates": []})).is_err());
+        assert!(updates::edit_updates(&payload, &json!({"updates": []}), update_list).is_err());
         assert_eq!(
             describe(&payload["updates"][0]),
             "commented, closed as duplicate"

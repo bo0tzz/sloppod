@@ -166,6 +166,9 @@ async fn main() -> anyhow::Result<()> {
     proposals.register(Arc::new(proposals::Stack::new(credentials.clone(), pushes)));
     proposals.register(Arc::new(proposals::Issues::new(credentials.clone())));
     proposals.register(Arc::new(proposals::IssueUpdates::new(credentials.clone())));
+    proposals.register(Arc::new(proposals::PullRequestUpdates::new(
+        credentials.clone(),
+    )));
     proposals.register(Arc::new(proposals::CodeReview::new(credentials.clone())));
     proposals.register(Arc::new(proposals::Report::new(
         db.clone(),

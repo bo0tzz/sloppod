@@ -1126,6 +1126,17 @@ impl GitHubApp {
         self.repo_json(repo, &format!("/pulls/{number}")).await
     }
 
+    /// Marks a draft pull request, by its node id, ready for review.
+    pub async fn mark_ready(&self, repo: &str, node_id: &str) -> anyhow::Result<()> {
+        self.graphql(
+            repo,
+            "mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { clientMutationId } }",
+            json!({"id": node_id}),
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// A stack's pull requests, bottom to top.
     pub async fn stack_members(&self, repo: &str, stack: u64) -> anyhow::Result<Vec<u64>> {
         let stack: Value = self.repo_json(repo, &format!("/stacks/{stack}")).await?;
@@ -1519,6 +1530,8 @@ mod tests {
         merged: Mutex<Vec<u64>>,
         /// Pull requests whose lookup fails.
         failing: Mutex<Vec<u64>>,
+        /// Node ids of the pull requests marked ready for review.
+        readied: Mutex<Vec<String>>,
     }
 
     async fn commit(
@@ -1646,6 +1659,14 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .to_owned();
+        if body["query"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("markPullRequestReadyForReview")
+        {
+            fake.readied.lock().unwrap().push(id);
+            return Json(json!({"data": {}}));
+        }
         for pull in fake.pulls.lock().unwrap().iter_mut() {
             if format!("PR{}", pull.0) == id {
                 pull.2 = on;
@@ -1759,6 +1780,15 @@ mod tests {
             json!({"title": "Bare", "body": ""})
         );
         assert!(app.issue("o/r", 3).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn marks_a_draft_ready_for_review_by_its_node_id() {
+        let (fake, app) = serve(stacked()).await;
+        app.mark_ready("o/r", "PR2").await.unwrap();
+        assert_eq!(*fake.readied.lock().unwrap(), ["PR2"]);
+        // Auto-merge isn't touched.
+        assert_eq!(auto_merging(&fake), [3, 4]);
     }
 
     #[tokio::test]

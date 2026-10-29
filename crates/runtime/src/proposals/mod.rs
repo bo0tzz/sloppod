@@ -5,8 +5,10 @@ mod code_review;
 mod issue_updates;
 mod issues;
 mod pull_request;
+mod pull_request_updates;
 mod repo_access;
 mod report;
+mod updates;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,6 +28,7 @@ pub use issue_updates::IssueUpdates;
 pub use issues::Issues;
 use pull_request::stack_layers;
 pub use pull_request::{PullRequest, Stack};
+pub use pull_request_updates::PullRequestUpdates;
 pub use repo_access::{RepoAccess, grant_repo, grant_repo_as, repo_granted, repo_granted_as};
 pub use report::{REPORT, Report};
 

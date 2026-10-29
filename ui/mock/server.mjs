@@ -589,6 +589,20 @@ async function agentScript(session, turn, prompt) {
     return;
   }
 
+  if (session.data.repo && /tidy the pull requests/i.test(prompt)) {
+    await step(2);
+    const proposeId = randomUUID();
+    tool({ toolCallId: proposeId, title: 'mcp__sloppod__propose_pull_request_updates', kind: 'other', status: 'pending' });
+    await step(2);
+    const proposal = createPullRequestUpdates(session);
+    update(proposeId, {
+      status: 'completed',
+      content: [{ type: 'content', content: { type: 'text', text: `Proposal ${proposal.id} created and waiting for human review.` } }],
+    });
+    await say("I've proposed closing a replaced draft and marking another ready.");
+    return;
+  }
+
   if (session.data.repo && /file issues/i.test(prompt)) {
     await step(2);
     const proposeId = randomUUID();
@@ -944,6 +958,40 @@ function createIssueUpdates(session) {
         number: 59,
         title: 'Startup failures are only in the logs',
         body: 'A pod that fails to start says nothing.\n\nToday it only shows in the logs.',
+      },
+    ],
+    created_at: now(),
+  };
+  proposals.set(proposal.id, proposal);
+  broadcastProposal(proposal);
+  applyStandingApproval(proposal);
+  return proposal;
+}
+
+function createPullRequestUpdates(session) {
+  const proposal = {
+    id: randomUUID(),
+    session_id: session.data.id,
+    kind: 'github.pr.update',
+    status: 'pending',
+    payload: {
+      repo: session.data.repo,
+      updates: [
+        { number: 96, comment: 'Replaced by #99.', close: true, remove_labels: ['wip'] },
+        {
+          number: 97,
+          ready: true,
+          title: 'Show why a pod fails to start',
+          body: 'A pod that fails to start says why in the UI.\n\nCloses #59.',
+        },
+      ],
+    },
+    // Like the runtime's detail: what the rewritten pull request says now.
+    current: [
+      {
+        number: 97,
+        title: 'WIP: pod failures',
+        body: 'A pod that fails to start says why in the UI.',
       },
     ],
     created_at: now(),
@@ -1627,6 +1675,13 @@ function approve(proposal, body, decidedBy) {
     proposal.result = { updated, failed: [], message: `Updated ${updated.map((u) => `#${u.number}`).join(', ')}.` };
     notice = `Your issue updates were approved and made: ${proposal.result.message}`;
     ack = 'Thanks, the tracker is tidy.';
+  } else if (proposal.kind === 'github.pr.update') {
+    if (Array.isArray(body.updates)) proposal.payload.updates = body.updates;
+    const updated = proposal.payload.updates.map((u) => ({ number: u.number }));
+    proposal.status = 'executed';
+    proposal.result = { updated, failed: [], message: `Updated ${updated.map((u) => `#${u.number}`).join(', ')}.` };
+    notice = `Your pull request updates were approved and made: ${proposal.result.message}`;
+    ack = 'Thanks, the pull requests are tidy.';
   } else if (proposal.kind === 'github.issue.create') {
     if (Array.isArray(body.issues)) proposal.payload.issues = body.issues;
     const filed = proposal.payload.issues.map((issue, index) => {
