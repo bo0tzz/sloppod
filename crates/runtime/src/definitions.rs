@@ -11,7 +11,7 @@ use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sloppod_contracts::{Grant, capability};
+use sloppod_contracts::Grant;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -22,19 +22,6 @@ pub const PREFIX: &str = "/servers";
 
 /// The largest request body forwarded to a server.
 const MAX_BODY: usize = 8 << 20;
-
-/// Names the built-in capabilities and the agent's own MCP servers already use.
-const TAKEN: &[&str] = &[
-    capability::MODEL,
-    capability::CODEX,
-    capability::GITHUB,
-    capability::REPO,
-    capability::PACKAGES,
-    capability::DOCS,
-    capability::MEMORY,
-    "sloppod",
-    "memini",
-];
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Definition {
@@ -70,7 +57,7 @@ pub fn invalid(new: &NewDefinition) -> Option<String> {
             "a name is 1 to 32 lowercase letters, digits and dashes, starting with a letter".into(),
         );
     }
-    if TAKEN.contains(&name) {
+    if crate::capabilities::reserved(name) {
         return Some(format!("{name} is a built-in capability's name"));
     }
     if new.description.trim().is_empty() {
@@ -393,7 +380,10 @@ mod tests {
             credential_id: None,
             created_at: Utc::now(),
         };
-        let grants = vec![Grant::new(capability::DOCS, json!({})), grant(&definition)];
+        let grants = vec![
+            Grant::new(sloppod_contracts::capability::DOCS, json!({})),
+            grant(&definition),
+        ];
         assert_eq!(
             servers(&grants, "http://127.0.0.1:7777"),
             [(
