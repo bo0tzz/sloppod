@@ -45,3 +45,5 @@ A session is the runtime's own object. It has a stable ID, a name, a transcript 
 Spike, 2026-10-26: restoring only the single `<session>.jsonl` into a fresh `CLAUDE_CONFIG_DIR` and resuming from a different working directory recovered the conversation. Without a pinned `CLAUDE_CODE_PROJECT_DIR_NAME`, Claude Code also resumes, but writes into a new directory named after the path.
 
 Prior art: Coder Agents, OpenHands and Claude Code cloud sessions all keep the conversation in the control plane and treat the sandbox as disposable.
+
+2026-10-29: debug bundles ([#378](https://github.com/bo0tzz/sloppod/issues/378)) read into the agent's transcript, which is otherwise kept opaque: for a Claude Code session they take each line's `timestamp`, `version`, `requestId` and `message.model`, `message.id` and `message.stop_reason`, and include the lines up to the chosen turn. That's best effort: a format change leaves those fields out of the bundle, and nothing else depends on them.

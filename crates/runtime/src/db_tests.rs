@@ -1888,3 +1888,42 @@ async fn only_a_session_s_grants_reach_its_servers(db: PgPool) {
         Err(StatusCode::FORBIDDEN)
     );
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_session_s_turns_start_at_messages_not_steered_in(db: PgPool) {
+    let id = session(&db, "dev").await;
+    let user = |message: &str, steering: bool| {
+        let mut update = json!({"sessionUpdate": "user_message_chunk", "messageId": message,
+                                "content": {"type": "text", "text": "hi"}});
+        if steering {
+            update["_meta"] = json!({"sloppod": {"steering": true}});
+        }
+        update
+    };
+    let agent =
+        json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "ok"}});
+    for update in [
+        user("a", false),
+        user("a", false),
+        agent.clone(),
+        user("s", true),
+        agent.clone(),
+        user("b", false),
+        agent,
+    ] {
+        db::append_event(&db, id, &update).await.unwrap();
+    }
+    let turns = db::turn_starts(&db, id).await.unwrap();
+    let ids: Vec<&str> = turns.iter().map(|t| t.2.as_str()).collect();
+    assert_eq!(ids, ["a", "b"]);
+    let first = db::events_between(&db, id, turns[0].0, Some(turns[1].0))
+        .await
+        .unwrap();
+    assert_eq!(
+        first.len(),
+        5,
+        "the first turn, the steered message in it included"
+    );
+    let last = db::events_between(&db, id, turns[1].0, None).await.unwrap();
+    assert_eq!(last.len(), 2);
+}

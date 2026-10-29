@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { expect, test, type Page, type WebSocketRoute } from '@playwright/test';
 import type { Proposal } from '../src/lib/api.ts';
 
@@ -87,6 +88,57 @@ test("copies an agent message's Markdown", async ({ page, context }) => {
   await message.getByRole('button', { name: 'Copy message' }).click();
   await expect(message.getByRole('button', { name: "Couldn't copy" })).toBeVisible();
   await expect(message.getByRole('status')).toHaveText("Couldn't copy the message");
+});
+
+test("downloads a debug bundle for an agent message's turn", async ({ page }) => {
+  await createSession(page, 'Add backoff to the reconnect logic in sloppod');
+  await finishTurn(page);
+
+  const message = agentMessages(page).filter({ hasText: FINAL });
+  await message.hover();
+  const download = page.waitForEvent('download');
+  await message.getByRole('link', { name: 'Download debug bundle' }).click();
+  const file = await download;
+  expect(file.suggestedFilename()).toMatch(/^sloppod-debug-.+\.json$/);
+  const bundle = JSON.parse(await readFile(await file.path(), 'utf8'));
+  // The turn is the one the user's message started.
+  const first = bundle.turns.at(-1).events[0];
+  expect(first.sessionUpdate).toBe('user_message_chunk');
+  expect(first.content.text).toBe('Add backoff to the reconnect logic in sloppod');
+  expect(bundle.turn).toBe(first.messageId);
+  expect(bundle.turns.at(-1).model_calls.length).toBeGreaterThan(0);
+
+  await expect(userMessages(page).getByRole('link', { name: 'Download debug bundle' })).toHaveCount(0);
+});
+
+test('a debug bundle finds the turn of a message loaded without the message that started it', async ({ page }) => {
+  const prompt = 'Write a long history in sloppod';
+  await createSession(page, prompt);
+  await expect(page.getByText('The end.')).toBeVisible({ timeout: 20_000 });
+  const firstEvent = async () => {
+    const words = agentMessages(page).filter({ hasText: 'word word' }).first();
+    await words.hover();
+    const download = page.waitForEvent('download');
+    await words.getByRole('link', { name: 'Download debug bundle' }).click();
+    const bundle = JSON.parse(await readFile(await (await download).path(), 'utf8'));
+    return bundle.turns.at(-1).events[0];
+  };
+
+  // The loaded history begins inside the latest turn.
+  await page.reload();
+  await expect(page.getByText('The end.')).toBeVisible();
+  await expect(userMessages(page)).toHaveCount(0);
+  expect((await firstEvent()).content.text).toBe(prompt);
+
+  // And then inside the turn before the first message loaded.
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Add backoff to the reconnect logic in sloppod');
+  await box.press('Enter');
+  await finishTurn(page);
+  await page.reload();
+  await expect(agentMessages(page).filter({ hasText: FINAL })).toBeVisible();
+  await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(0);
+  expect((await firstEvent()).content.text).toBe(prompt);
 });
 
 test('touch screens always show the copy button', async ({ page, browser }) => {

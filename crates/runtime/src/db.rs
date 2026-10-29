@@ -731,6 +731,38 @@ pub async fn first_message(db: &PgPool, id: Uuid) -> sqlx::Result<Option<String>
     .map(Option::flatten)
 }
 
+/// Where each of the session's turns starts: a user message that isn't steered into a running turn, by the id it was
+/// recorded under, with the sequence number and time of its first event. In order.
+pub async fn turn_starts(db: &PgPool, id: Uuid) -> sqlx::Result<Vec<(i64, DateTime<Utc>, String)>> {
+    sqlx::query_as(
+        "select min(seq), min(created_at), payload->>'messageId' from session_events where session_id = $1 \
+         and payload->>'sessionUpdate' = 'user_message_chunk' and payload->>'messageId' is not null \
+         and coalesce(payload->'_meta'->'sloppod'->>'steering', 'false') <> 'true' \
+         group by payload->>'messageId' order by 1",
+    )
+    .bind(id)
+    .fetch_all(db)
+    .await
+}
+
+/// The session's events from `from` on, and before `to` if given, with when each was recorded, in order.
+pub async fn events_between(
+    db: &PgPool,
+    id: Uuid,
+    from: i64,
+    to: Option<i64>,
+) -> sqlx::Result<Vec<(i64, DateTime<Utc>, Value)>> {
+    sqlx::query_as(
+        "select seq, created_at, payload from session_events where session_id = $1 and seq >= $2 \
+         and ($3::bigint is null or seq < $3) order by seq",
+    )
+    .bind(id)
+    .bind(from)
+    .bind(to)
+    .fetch_all(db)
+    .await
+}
+
 /// Up to `limit` of the session's latest events before `before`, in order.
 pub async fn events_before(
     db: &PgPool,

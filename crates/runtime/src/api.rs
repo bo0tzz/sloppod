@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::proposals::{self, DecideError, Verdict};
 use crate::session::ParkError;
 use crate::users::User;
-use crate::{AppState, db, lifecycle, quota, reviews, subsessions};
+use crate::{AppState, db, debug_bundle, lifecycle, quota, reviews, subsessions};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -37,6 +37,7 @@ pub fn routes() -> Router<AppState> {
         .route("/sessions/{id}/park", post(park_session))
         .route("/sessions/{id}/wake", post(wake_session))
         .route("/sessions/{id}/review", put(set_review))
+        .route("/sessions/{id}/debug-bundle", get(debug_bundle))
         .route("/repos", get(repos))
         .route(
             "/credentials",
@@ -775,6 +776,41 @@ async fn wake_session(
         .await?
         .ok_or_else(not_found)?;
     Ok(Json(session.to_api()))
+}
+
+#[derive(Deserialize)]
+struct BundleQuery {
+    message: Option<String>,
+    before: Option<String>,
+}
+
+/// A debug bundle for one of the session's turns (#378), as a file to download.
+async fn debug_bundle(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+    Query(query): Query<BundleQuery>,
+) -> ApiResult<impl IntoResponse> {
+    let session = db::owned_session(&state.db, id, &user)
+        .await?
+        .ok_or_else(not_found)?;
+    let turn = match (query.message, query.before) {
+        (Some(message), None) => debug_bundle::Turn::Started(message),
+        (None, Some(before)) => debug_bundle::Turn::Before(before),
+        (None, None) => debug_bundle::Turn::Latest,
+        (Some(_), Some(_)) => return Err(bad_request("give `message` or `before`, not both")),
+    };
+    let bundle = debug_bundle::load(&state, &session, &turn)
+        .await?
+        .ok_or_else(not_found)?;
+    let disposition = format!(
+        "attachment; filename=\"{}\"",
+        debug_bundle::file_name(id, bundle["turn"].as_str().unwrap_or_default())
+    );
+    Ok((
+        [(axum::http::header::CONTENT_DISPOSITION, disposition)],
+        Json(bundle),
+    ))
 }
 
 /// The capabilities the user defined themselves (ADR 2): so far, MCP servers.
