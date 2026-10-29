@@ -245,23 +245,12 @@ async fn forward(
     }
 
     let (parts, body) = request.into_parts();
-    let rest = parts
+    let below = parts
         .uri
-        .path_and_query()
-        .map(|p| p.as_str())
-        .unwrap_or("/")
+        .path()
         .strip_prefix(&format!("{PREFIX}/{name}"))
         .unwrap_or("");
-    let rest = match rest {
-        "" => String::new(),
-        rest => crate::proxy::canonical_path(rest)
-            .map_err(|e| anyhow::anyhow!("an invalid path: {e}"))?,
-    };
-    // The server's own URL for the bare path, and paths below it for the rest (e.g. a separate SSE endpoint).
-    let url = match rest.as_str() {
-        "" | "/" => definition.mcp_url.clone(),
-        rest => format!("{}{rest}", definition.mcp_url.trim_end_matches('/')),
-    };
+    let url = upstream_url(&definition.mcp_url, below, parts.uri.query())?;
     let body = axum::body::to_bytes(body, MAX_BODY)
         .await
         .context("reading the request body")?;
@@ -280,6 +269,29 @@ async fn forward(
         vec!["authorization".into(), "cookie".into()],
     )
     .await
+}
+
+/// Where a request goes: the server's own URL for the bare path, and paths below it for the rest (a separate SSE
+/// endpoint, say). Path and query are kept apart: the request's query follows the URL's own, if it has one.
+fn upstream_url(mcp_url: &str, below: &str, query: Option<&str>) -> anyhow::Result<String> {
+    let mut url = reqwest::Url::parse(mcp_url)?;
+    let below = match below {
+        "" | "/" => String::new(),
+        below => crate::proxy::canonical_path(below)
+            .map_err(|e| anyhow::anyhow!("an invalid path: {e}"))?,
+    };
+    if !below.is_empty() {
+        let path = format!("{}{below}", url.path().trim_end_matches('/'));
+        url.set_path(&path);
+    }
+    if let Some(query) = query.filter(|q| !q.is_empty()) {
+        let joined = match url.query() {
+            Some(own) if !own.is_empty() => format!("{own}&{query}"),
+            _ => query.to_owned(),
+        };
+        url.set_query(Some(&joined));
+    }
+    Ok(url.into())
 }
 
 /// The header a `token` credential is sent as: `Authorization: Bearer <token>`, or its own header if it names one.
@@ -336,6 +348,39 @@ mod tests {
         let mut blank = new("logs", "https://x/mcp");
         blank.description = " ".into();
         assert!(invalid(&blank).is_some());
+    }
+
+    #[test]
+    fn requests_go_to_the_server_s_url_with_their_path_and_query_kept_apart() {
+        let to =
+            |url: &str, below: &str, query: Option<&str>| upstream_url(url, below, query).unwrap();
+        assert_eq!(to("https://x/mcp", "", None), "https://x/mcp");
+        assert_eq!(to("https://x/mcp", "/", None), "https://x/mcp");
+        assert_eq!(
+            to("https://x/mcp", "", Some("cursor=1")),
+            "https://x/mcp?cursor=1"
+        );
+        assert_eq!(
+            to("https://x/mcp", "/messages", None),
+            "https://x/mcp/messages"
+        );
+        assert_eq!(
+            to("https://x/mcp/", "/messages", Some("a=b")),
+            "https://x/mcp/messages?a=b"
+        );
+        assert_eq!(
+            to("https://x/mcp?tenant=a", "/messages", None),
+            "https://x/mcp/messages?tenant=a"
+        );
+        assert_eq!(
+            to("https://x/mcp?tenant=a", "", Some("cursor=1")),
+            "https://x/mcp?tenant=a&cursor=1"
+        );
+        assert_eq!(
+            to("http://vl.svc:8080/mcp", "/%6Dsg", None),
+            "http://vl.svc:8080/mcp/msg"
+        );
+        assert!(upstream_url("https://x/mcp", "/../admin", None).is_err());
     }
 
     #[test]

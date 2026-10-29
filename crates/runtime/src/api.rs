@@ -378,8 +378,14 @@ async fn add_grant(
         None => Grant::new(capability, json!({})),
     };
     db::grant(&state.db, id, &grant, body.expires_at).await?;
+    // An agent gets its MCP servers when it starts, so a server granted now reaches it then.
+    let later = if defined.is_some() || capability == sloppod_contracts::capability::DOCS {
+        " Its MCP server reaches you when your agent next starts, e.g. after the session is parked and woken."
+    } else {
+        ""
+    };
     let what = format!(
-        "the user granted this session {capability}: {}",
+        "the user granted this session {capability}: {}{later}",
         crate::grants::describe(&grant)
     );
     lifecycle::grants_changed(&state, id, &what).await;
