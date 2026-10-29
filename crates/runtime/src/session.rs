@@ -214,6 +214,12 @@ impl LiveState {
     fn runs_on(&self, agent: &Arc<AgentConn>) -> bool {
         self.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent))
     }
+
+    /// Whether a turn's end on `agent` is the session's: the current link, and not closed, as one is just before
+    /// the hub hears it's gone. A closed link's turns didn't end; their answers were dropped.
+    fn ends_on(&self, agent: &Arc<AgentConn>) -> bool {
+        self.runs_on(agent) && !agent.is_closed()
+    }
 }
 
 impl Live {
@@ -1451,7 +1457,7 @@ impl Hub {
         let next = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
-            if !state.runs_on(agent) {
+            if !state.ends_on(agent) {
                 return;
             }
             live.end_work(&mut state);
@@ -1941,7 +1947,7 @@ impl Hub {
     async fn turn_finished(self: &Arc<Self>, id: Uuid, agent: &Arc<AgentConn>, end: TurnEnd) {
         // A turn whose link was replaced or dropped hasn't ended: the agent may still be running it, under a newer
         // link.
-        if !self.live(id).state.lock().await.runs_on(agent) {
+        if !self.live(id).state.lock().await.ends_on(agent) {
             return;
         }
         self.heard_from_agent(id);
@@ -1954,7 +1960,7 @@ impl Hub {
         let limited = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
-            if !state.runs_on(agent) {
+            if !state.ends_on(agent) {
                 return;
             }
             state.turns_ended += 1;

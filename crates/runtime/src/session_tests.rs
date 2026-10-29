@@ -2086,6 +2086,29 @@ async fn a_reconnect_during_a_turn_doesnt_end_it() {
     assert_eq!(h.phase().await, "idle");
 }
 
+#[tokio::test]
+async fn a_link_that_drops_doesnt_end_its_turns() {
+    // The link closes (its pending answers dropped) before the hub hears it's gone.
+    let mut h = Harness::ready().await;
+    let _turn = h.prompt("Work");
+    h.next().await;
+    let _next = h.prompt("Queued");
+    wait_for_queue(&h, 1).await;
+    h.agent.close();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.hub.turns_ended(h.id).await.0, 0);
+    assert_eq!(h.queued().await.len(), 1, "not handed to the closed link");
+    h.hub.detach_agent(h.id, &h.agent).await;
+    assert_eq!(h.hub.turns_ended(h.id).await.0, 0);
+
+    let turn = json!({"jsonrpc": "2.0", "id": 7, "method": "session/prompt", "params": {"sessionId": "agent-session"}});
+    let h = Harness::adopted(vec![turn], Vec::new()).await;
+    h.agent.close();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    h.hub.detach_agent(h.id, &h.agent).await;
+    assert_eq!(h.hub.turns_ended(h.id).await.0, 0);
+}
+
 /// `START`, moved on by `minutes`.
 fn later(minutes: i64) -> chrono::DateTime<chrono::Utc> {
     START.parse::<chrono::DateTime<chrono::Utc>>().unwrap() + chrono::Duration::minutes(minutes)
