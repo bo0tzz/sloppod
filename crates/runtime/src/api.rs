@@ -61,9 +61,10 @@ pub fn routes() -> Router<AppState> {
         .route("/proposals/{id}/reviews", get(list_reviews))
         .route("/proposals/{id}/approve", post(approve))
         .route("/proposals/{id}/reject", post(reject))
+        .merge(crate::work::api::routes())
 }
 
-pub struct ApiError(StatusCode, String);
+pub struct ApiError(pub StatusCode, pub String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -95,15 +96,15 @@ fn park_error(e: ParkError) -> ApiError {
     }
 }
 
-fn not_found() -> ApiError {
+pub(crate) fn not_found() -> ApiError {
     ApiError(StatusCode::NOT_FOUND, "not found".into())
 }
 
-fn bad_request(message: impl Into<String>) -> ApiError {
+pub(crate) fn bad_request(message: impl Into<String>) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, message.into())
 }
 
-type ApiResult<T> = Result<T, ApiError>;
+pub(crate) type ApiResult<T> = Result<T, ApiError>;
 
 async fn me(State(state): State<AppState>, User(user): User) -> impl IntoResponse {
     Json(json!({"user": user, "version": state.config.version, "build": state.config.build}))

@@ -330,6 +330,107 @@ type StandingApproval = {
 };
 ```
 
+### Work
+
+The owner's work graphs ([ADR 30](adr/0030-work-items.md)). Each graph holds items. An item can be part of one other item, its parent, and can block others. A part waits on what blocks the items it's part of, and an item on its parts. No edge may leave an item waiting on itself that way, through blocks, parts or inherited blockers: adding one that would is refused (`409`), as is making an item part of one of its own parts, and so is an edge between graphs (`400`). An item links the issues, pull requests, sessions and proposals that carry it out (`completes`) or relate to it (`related`). Every change is an event in the item's history, and a change can be undone from there. Owners see and change only their own graphs. So far the owner is the only one who changes them, and a link's `status` is set through this API; later stages give sessions a `work` grant and have the runtime move links as it watches pull requests, sessions and proposals.
+
+```
+GET    /api/v1/work/graphs                     -> WorkGraph[]
+POST   /api/v1/work/graphs                     -> WorkGraph (201)  body: {name}; 409 if you have one by that name
+GET    /api/v1/work/graphs/{id}                -> WorkGraph & {items: WorkItem[]}   items by rank
+PATCH  /api/v1/work/graphs/{id}                -> WorkGraph        body: {name}
+DELETE /api/v1/work/graphs/{id}                -> 204              with its items and history
+GET    /api/v1/work/graphs/{id}/frontier       -> WorkItem[]       what's ready to start, in order (below)
+GET    /api/v1/work/graphs/{id}/history        -> WorkEvent[]      oldest first
+POST   /api/v1/work/graphs/{id}/items          -> WorkItem (201)   body: {title, description?, parent_id?, after?}
+GET    /api/v1/work/items/{id}                 -> WorkItem
+PATCH  /api/v1/work/items/{id}                 -> WorkItem         body: {title?, description?}
+POST   /api/v1/work/items/{id}/state           -> WorkItem         body: {state}; 409 where the rules refuse it (below)
+POST   /api/v1/work/items/{id}/move            -> WorkItem         body: {parent_id?, after?}; parent_id null for the top level, left out to stay
+POST   /api/v1/work/items/{id}/blocks          -> WorkItem         body: {item}; this item blocks `item` (no-op if it does)
+DELETE /api/v1/work/items/{id}/blocks/{other}  -> WorkItem         it no longer blocks `other`
+POST   /api/v1/work/items/{id}/links           -> WorkLink (201)   body: {kind, target, role}; 409 if it links that already
+PATCH  /api/v1/work/links/{id}                 -> WorkLink         body: {status}
+DELETE /api/v1/work/links/{id}                 -> 204
+GET    /api/v1/work/items/{id}/history         -> WorkEvent[]      oldest first: its changes, and those of the edges it blocks through
+POST   /api/v1/work/events/{id}/undo           -> WorkEvent (201)  the inverse change; 409 if it's undone already, changed since, or the rules' own
+```
+
+```ts
+type WorkGraph = { id: string; name: string; created_at: string };
+
+type WorkItem = {
+  id: string;
+  graph_id: string;
+  parent_id: string | null;
+  title: string;            // 1 to 200 characters
+  description: string;      // up to 20000; the details belong in a linked issue
+  state: "open" | "active" | "done" | "dropped";
+  rank: number;             // orders it among its siblings, lowest first
+  links: WorkLink[];
+  blocks: string[];         // the items it blocks
+  blocked_by: string[];     // the items that block it
+  created_at: string;
+  updated_at: string;
+};
+
+type WorkLink = {
+  id: string;
+  item_id: string;
+  kind: "issue" | "pull_request" | "session" | "proposal";
+  target: string;           // owner/repo#n for issues and pull requests; the id of one of your sessions or proposals
+  role: "completes" | "related";
+  // open: under way (open, a session working, a proposal waiting); finished: done what it's for (merged, closed as
+  // completed, reported done, carried out); abandoned: ended without that (closed unmerged or as not planned, rejected).
+  status: "open" | "finished" | "abandoned";
+  created_at: string;
+};
+
+type WorkEvent = {
+  id: string;
+  graph_id: string;
+  item_id: string | null;   // null for a graph's rename; the blocked item for blocks and unblocks
+  actor: string;            // the user who made it
+  session_id: string | null;  // the session that made it, if one did
+  // create, edit, state, move, block, unblock, link, unlink, link_status, rename
+  kind: string;
+  before: unknown | null;   // what it changed, as it was: e.g. {state}, {title, description}, {parent_id, rank}
+  after: unknown | null;    // and as it became
+  automatic: boolean;       // a state change the rules made, following links and parts
+  undoes: string | null;    // the change this one undoes
+  at: string;
+};
+```
+
+**Placing items.** `after` names the sibling (an item with the same parent) the item goes right after. Null puts it first, and leaving it out puts it last. Ranks are numbers between their neighbours'. When there's no room left between two, the siblings are spread out again (`1, 2, 3, …`) without an event of their own.
+
+**State.** Items start `open`. The rules move them as their links and parts change, and each such move is an `automatic` event:
+
+- An item is `done` once every child is `done` or `dropped` and every completing link is `finished`. An abandoned completing link no longer counts. An item without completing links is done this way only if it has children.
+- An item that the rules made done or active, and that nothing makes so any more, goes back to `open`: for instance when its completing link is removed or abandoned, its last part is moved away, or the session working on it ends. An item made done by hand goes back to `open` when it gains an unfinished part or a completing link.
+- An item is `active` while a linked session is open (working), or a completing pull request or proposal is open.
+- A `dropped` item stays dropped. Otherwise an item keeps the state it was last given by hand.
+
+By hand, through `state`:
+
+- An item can't be made `done` while a child is unfinished, or while it has completing links (the links decide that).
+- An item the rules find done can't be reopened.
+- An item that something is working on can't be moved back to `open`.
+- Dropping, and taking an item back out of `dropped`, is always allowed.
+
+**Frontier.** These items are ready to start:
+
+- open items whose parts are all done or dropped;
+- that nothing unfinished blocks, either directly or through an item they're part of;
+- that aren't inside a done or dropped item.
+
+They're ordered by rank: siblings by their own, and items under different parents by their ancestors' ranks first.
+
+**Undo** makes the inverse change and records it as an event with `undoes` set. Undoing that event redoes the change.
+- A change can be undone only while its effect is still there, so a later change isn't silently overwritten.
+- Undoing an item's creation drops the item; items are never deleted, so their history stays.
+- The rules' own state changes can't be undone: change the link or part that caused them.
+
 ## ACP at `/acp`
 
 A WebSocket carrying [ACP](https://agentclientprotocol.com) JSON-RPC 2.0, one message per text frame. The runtime is the agent from the UI's point of view. ACP `sessionId`s are runtime session IDs. Sessions are created through REST, not `session/new`. Like any write through the REST API, a browser can only open it from sloppod's own pages: a request whose `Origin` is neither the scheme and host it was made to (`X-Forwarded-Proto` and `X-Forwarded-Host`, or `http` and `Host`) nor one of `SLOPPOD_ALLOWED_ORIGINS` gets 403. Clients that send no `Origin`, like `sloppodctl`, are unaffected.
