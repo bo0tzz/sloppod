@@ -237,6 +237,9 @@ struct AddRepo {
 #[derive(Deserialize)]
 struct NewGrant {
     capability: String,
+    /// For `work`: `{graph, level?}`.
+    #[serde(default)]
+    params: serde_json::Value,
     /// RFC 3339; none: it doesn't run out.
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -366,7 +369,24 @@ async fn add_grant(
             "{capability} can't be granted here; repositories are added with POST /sessions/{{id}}/repos"
         )));
     }
-    if session.context().has(capability) {
+    let work = match capability {
+        sloppod_contracts::capability::WORK => Some(
+            crate::work::agent::grant(&state.db, &user, &body.params)
+                .await
+                .map_err(bad_request)?,
+        ),
+        _ => None,
+    };
+    // A session can hold a work grant per graph.
+    let held = match &work {
+        Some(grant) => session
+            .context()
+            .grants
+            .iter()
+            .any(|g| g.capability == capability && g.param("graph") == grant.param("graph")),
+        None => session.context().has(capability),
+    };
+    if held {
         return Err(ApiError(
             StatusCode::CONFLICT,
             format!("the session already has {capability}"),
@@ -375,9 +395,10 @@ async fn add_grant(
     if body.expires_at.is_some_and(|at| at <= chrono::Utc::now()) {
         return Err(bad_request("expires_at is in the past"));
     }
-    let grant = match &defined {
-        Some(definition) => crate::definitions::grant(definition),
-        None => Grant::new(capability, json!({})),
+    let grant = match (&defined, work) {
+        (Some(definition), _) => crate::definitions::grant(definition),
+        (None, Some(work)) => work,
+        (None, None) => Grant::new(capability, json!({})),
     };
     db::grant(&state.db, id, &grant, body.expires_at).await?;
     // An agent gets its MCP servers when it starts, so a server granted now reaches it then.

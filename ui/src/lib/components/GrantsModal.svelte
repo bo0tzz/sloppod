@@ -3,7 +3,7 @@
   import Dialog from './Dialog.svelte';
   import { mdiShieldKeyOutline } from '@mdi/js';
   import { onMount } from 'svelte';
-  import { api, type Grant, type GrantChange, type Session } from '#lib/api.ts';
+  import { api, type Grant, type GrantChange, type Session, type WorkGraph, type WorkLevel } from '#lib/api.ts';
   import { clockTime } from '#lib/format.ts';
 
   let {
@@ -13,15 +13,31 @@
   }: { session: Session; onChange: (session: Session) => void; onClose: () => void } = $props();
 
   /** What can be granted while a session runs; repositories are added on their own. */
-  const builtIn = ['model', 'github', 'packages', 'docs', 'codex'];
+  const builtIn = ['model', 'github', 'packages', 'docs', 'codex', 'work'];
   /** The user's own capabilities, offered by name after the built-ins; without them, only the built-ins. */
   let own = $state<string[]>([]);
+  /** The user's work graphs (ADR 30), for a `work` grant: one per graph. */
+  let graphs = $state<WorkGraph[]>([]);
   onMount(() => {
     api.listCapabilities().then(
       (definitions) => (own = definitions.map((definition) => definition.name)),
       () => {},
     );
+    api.listWorkGraphs().then(
+      (listed) => (graphs = listed),
+      () => {},
+    );
   });
+  const ungranted = $derived(
+    graphs.filter((g) => !session.grants.some((grant) => grant.capability === 'work' && grant.params.graph === g.id)),
+  );
+  const levels = [
+    { value: 'read', label: 'Read' },
+    { value: 'track', label: 'Track' },
+    { value: 'plan', label: 'Plan' },
+  ];
+  let graph = $state<string>();
+  let level = $state<WorkLevel>('track');
   const grantable = $derived([...builtIn, ...own]);
   const durations: Record<string, number> = { hour: 3600_000, day: 24 * 3600_000, week: 7 * 24 * 3600_000 };
   const runsOut = [
@@ -33,7 +49,11 @@
   const expiry = (choice: string) => (choice in durations ? new Date(Date.now() + durations[choice]).toISOString() : null);
 
   const changeable = $derived(session.phase !== 'stopped' && session.kind === 'work');
-  const missing = $derived(grantable.filter((capability) => !session.grants.some((grant) => grant.capability === capability)));
+  const missing = $derived(
+    grantable.filter((capability) =>
+      capability === 'work' ? ungranted.length > 0 : !session.grants.some((grant) => grant.capability === capability),
+    ),
+  );
   let capability = $state<string>();
   let lasts = $state('never');
   let busy = $state(false);
@@ -63,8 +83,11 @@
   const revoke = (grant: Grant) => act(() => api.revokeGrant(session.id, grant.id!));
   async function add() {
     const chosen = capability;
-    if (chosen && (await act(() => api.grantSession(session.id, chosen, expiry(lasts) ?? undefined)))) {
+    if (!chosen || (chosen === 'work' && !graph)) return;
+    const params = chosen === 'work' && graph ? { graph, level } : undefined;
+    if (await act(() => api.grantSession(session.id, chosen, expiry(lasts) ?? undefined, params))) {
       capability = undefined;
+      graph = undefined;
     }
   }
 </script>
@@ -119,12 +142,24 @@
               <Select options={missing} bind:value={capability} placeholder="Capability" />
             </Field>
           </div>
+          {#if capability === 'work'}
+            <div class="w-40">
+              <Field label="Graph">
+                <Select options={ungranted.map((g) => ({ value: g.id, label: g.name }))} bind:value={graph} placeholder="Work graph" />
+              </Field>
+            </div>
+            <div class="w-32">
+              <Field label="Level">
+                <Select options={levels} bind:value={level} />
+              </Field>
+            </div>
+          {/if}
           <div class="w-40">
             <Field label="Runs out">
               <Select options={runsOut} bind:value={lasts} />
             </Field>
           </div>
-          <Button shape="round" disabled={!capability || busy} onclick={add}>Grant</Button>
+          <Button shape="round" disabled={!capability || (capability === 'work' && !graph) || busy} onclick={add}>Grant</Button>
         </div>
       {/if}
       {#if error}

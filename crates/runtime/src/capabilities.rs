@@ -48,6 +48,8 @@ pub enum Part {
     Memory,
     /// The deployment's package hosts, reached directly, uninspected.
     Egress,
+    /// One of the owner's work graphs, through sloppod's MCP tools (ADR 30).
+    Work,
 }
 
 /// Whose models a model part reaches.
@@ -118,6 +120,15 @@ pub const BUILTINS: &[Builtin] = &[
         always_inherited: false,
         needs: None,
         parts: &[Part::Memory],
+    },
+    Builtin {
+        name: capability::WORK,
+        // With its graph and level, from the grants list.
+        grantable: true,
+        start: Start::Not,
+        always_inherited: false,
+        needs: None,
+        parts: &[Part::Work],
     },
 ];
 

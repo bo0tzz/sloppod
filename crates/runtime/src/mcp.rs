@@ -11,7 +11,7 @@ use sloppod_contracts::SessionRole;
 use sloppod_protocol::api::{ProposalStatus, SessionKind};
 use uuid::Uuid;
 
-use crate::{AppState, db, proposals, reviews, subsessions};
+use crate::{AppState, db, proposals, reviews, subsessions, work};
 
 pub async fn handler(
     State(state): State<AppState>,
@@ -35,7 +35,7 @@ pub async fn handler(
         })),
         "ping" => Ok(json!({})),
         "tools/list" => match session_kind(&state, session).await {
-            Ok(kind) => Ok(json!({"tools": tools(&state, kind)})),
+            Ok(row) => Ok(json!({"tools": tools(&state, &row)})),
             Err(e) => Err(json!({"code": -32603, "message": e})),
         },
         "tools/call" => Ok(call(&state, session, &message["params"]).await),
@@ -49,10 +49,10 @@ pub async fn handler(
 }
 
 /// Which tools a session gets depends on its kind, so a session that can't be loaded gets none.
-async fn session_kind(state: &AppState, session: Uuid) -> Result<SessionKind, String> {
+async fn session_kind(state: &AppState, session: Uuid) -> Result<db::SessionRow, String> {
     match db::get_session(&state.db, session).await {
         Ok(Some(row)) => match row.not_acting() {
-            None => Ok(row.kind),
+            None => Ok(row),
             Some(why) => Err(format!("this session is {why}, so it has no tools")),
         },
         Ok(None) => Err("this session no longer exists".into()),
@@ -109,7 +109,9 @@ fn review_tools() -> Vec<Value> {
     ]
 }
 
-fn tools(state: &AppState, kind: SessionKind) -> Vec<Value> {
+fn tools(state: &AppState, row: &db::SessionRow) -> Vec<Value> {
+    let kind = row.kind;
+    let context = row.context();
     match kind {
         SessionKind::Review => return review_tools(),
         SessionKind::Utility => return Vec::new(),
@@ -119,6 +121,7 @@ fn tools(state: &AppState, kind: SessionKind) -> Vec<Value> {
         .proposals
         .tools()
         .into_iter()
+        .filter(|t| work::agent::shown(&context, &t.name))
         .map(|t| json!({"name": t.name, "description": t.description, "inputSchema": t.input_schema}))
         .collect();
     tools.push(list_grants());
@@ -192,6 +195,7 @@ fn tools(state: &AppState, kind: SessionKind) -> Vec<Value> {
     if kind == SessionKind::Work {
         tools.extend(subsessions::tools());
     }
+    tools.extend(work::agent::tools(&context));
     tools
 }
 
@@ -202,11 +206,11 @@ fn text(text: String, is_error: bool) -> Value {
 async fn call(state: &AppState, session: Uuid, params: &Value) -> Value {
     let name = params["name"].as_str().unwrap_or_default();
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-    let kind = match session_kind(state, session).await {
-        Ok(kind) => kind,
+    let row = match session_kind(state, session).await {
+        Ok(row) => row,
         Err(e) => return text(e, true),
     };
-    if !tools(state, kind).iter().any(|t| t["name"] == name) {
+    if !tools(state, &row).iter().any(|t| t["name"] == name) {
         return text(format!("{name} isn't one of this session's tools"), true);
     }
     let result = match name {
@@ -219,6 +223,9 @@ async fn call(state: &AppState, session: Uuid, params: &Value) -> Value {
         "spawn_session" => subsessions::spawn(state, session, &arguments).await,
         "list_sessions" => subsessions::list(state, session).await,
         "message_session" => subsessions::message(state, session, &arguments).await,
+        work::agent::LIST | work::agent::UPDATE => {
+            work::agent::call(&state.db, &row.context(), name, &arguments).await
+        }
         _ => propose(state, session, name, arguments).await,
     };
     match result {

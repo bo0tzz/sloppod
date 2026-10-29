@@ -72,6 +72,11 @@ export type Grant = {
 /** A change to one of a session's grants: when it runs out (`null`: never), or narrowing it. */
 export type GrantChange = { expires_at?: string | null; narrow?: true };
 
+/** One of the user's work graphs (ADR 30). */
+export type WorkGraph = { id: string; name: string; created_at: string };
+/** What a `work` grant lets a session do with its graph. */
+export type WorkLevel = 'read' | 'track' | 'plan';
+
 export type ProposalStatus =
   | 'in_review'
   | 'changes_requested'
@@ -330,8 +335,10 @@ export const api = {
   /** Write access to `repo`; with `credential`, one of the user's GitHub tokens, the session acts on it as them (ADR 29). */
   addSessionRepo: (id: string, repo: string, credential?: string) =>
     call<Session>('POST', `/sessions/${encodeURIComponent(id)}/repos`, { repo, credential }),
-  grantSession: (id: string, capability: string, expires_at?: string) =>
-    call<Session>('POST', `/sessions/${encodeURIComponent(id)}/grants`, { capability, expires_at }),
+  /** `params` for `work`: the graph and the level (ADR 30). */
+  grantSession: (id: string, capability: string, expires_at?: string, params?: { graph: string; level: WorkLevel }) =>
+    call<Session>('POST', `/sessions/${encodeURIComponent(id)}/grants`, { capability, expires_at, params }),
+  listWorkGraphs: () => call<WorkGraph[]>('GET', '/work/graphs'),
   changeGrant: (id: string, grant: string, change: GrantChange) =>
     call<Session>('PATCH', `/sessions/${encodeURIComponent(id)}/grants/${encodeURIComponent(grant)}`, change),
   revokeGrant: (id: string, grant: string) =>

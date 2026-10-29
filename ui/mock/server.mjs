@@ -307,6 +307,15 @@ const grantable = {
   codex: "Codex's API on chatgpt.com, with the owner's ChatGPT login.",
 };
 
+/** The user's work graphs (ADR 30). */
+const workGraphs = [{ id: '0192f000-0000-7000-8000-000000000001', name: 'sloppod', created_at: '2026-10-29T10:00:00Z' }];
+
+/** What the runtime says of a `work` grant (`grants::describe`). */
+const workDescription = (graph, level) =>
+  `The work graph ${graph.name} (${graph.id}): ${
+    { plan: 'read it, track work in it, and propose plan changes (ranking, reparenting, dropping)', track: 'read it and track work in it: add items and edges, link work, move items between open, active and done', read: 'read it' }[level]
+  }.`;
+
 const newGrant = (capability, params, description, expires_at) => ({
   id: randomUUID(),
   capability,
@@ -1494,6 +1503,7 @@ async function handleApi(req, res, url) {
 
   if (parts[0] === 'credentials') return handleCredentials(req, res, parts);
   if (parts[0] === 'capabilities') return handleCapabilities(req, res, parts);
+  if (parts[0] === 'work' && parts[1] === 'graphs' && parts.length === 2 && method === 'GET') return json(res, 200, workGraphs);
   if (parts[0] === 'quotas' && parts.length === 1 && method === 'GET') return json(res, 200, quotas);
   if (parts[0] === 'standing-approvals') return handleStandingApprovals(req, res, parts);
 
@@ -1649,6 +1659,19 @@ async function handleApi(req, res, url) {
       const body = await readBody(req);
       // A built-in, or one of the user's own by its name.
       const own = definitions.find((d) => d.name === body.capability);
+      if (body.capability === 'work') {
+        const graph = workGraphs.find((g) => g.id === body.params?.graph);
+        if (!graph) return json(res, 400, { error: "that isn't one of your work graphs" });
+        const level = body.params.level ?? 'track';
+        if (!['read', 'track', 'plan'].includes(level)) return json(res, 400, { error: '`level` is read, track or plan' });
+        if (session.data.grants.some((grant) => grant.capability === 'work' && grant.params.graph === graph.id)) {
+          return json(res, 409, { error: 'the session already has work' });
+        }
+        session.data.grants.push(newGrant('work', { graph: graph.id, name: graph.name, level }, workDescription(graph, level), body.expires_at));
+        session.broadcast();
+        void notifyAgent(session, 'sloppod: the user granted this session work.', 'Thanks, I can see the work graph now.');
+        return json(res, 201, session.data);
+      }
       if (!grantable[body.capability] && !own) {
         return json(res, 400, { error: `${body.capability} can't be granted here; repositories are added with POST /sessions/{id}/repos` });
       }

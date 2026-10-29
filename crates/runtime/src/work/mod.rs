@@ -2,6 +2,7 @@
 //! change as an event that can be undone. The rules live in [`rules`]; this keeps the graphs in the database and applies
 //! the rules to every change, under a lock on the graph so changes to one graph happen one at a time.
 
+pub mod agent;
 pub mod api;
 pub mod rules;
 
@@ -754,10 +755,31 @@ async fn write_text(tx: &mut PgConnection, id: Uuid, text: &Value) -> sqlx::Resu
 
 /// Moves an item to a state by hand, within the rules (`rules::Graph::refuse_move`).
 pub async fn move_state(db: &PgPool, actor: Actor<'_>, id: Uuid, to: State) -> WorkResult<Item> {
+    change_state(db, actor, id, to, true).await
+}
+
+/// Moves an item to a state as tracking does (ADR 30's `track`): within the rules, and never into or out of `dropped`,
+/// which is planning. Checked under the graph's lock, so a drop that lands first isn't undone.
+pub async fn track_state(db: &PgPool, actor: Actor<'_>, id: Uuid, to: State) -> WorkResult<Item> {
+    change_state(db, actor, id, to, false).await
+}
+
+async fn change_state(
+    db: &PgPool,
+    actor: Actor<'_>,
+    id: Uuid,
+    to: State,
+    plans: bool,
+) -> WorkResult<Item> {
     let mut tx = db.begin().await?;
     let graph = lock_item_graph(&mut tx, actor.user, id).await?;
     let rules = snapshot(&mut tx, graph).await?;
     let was = rules.items[&id].state;
+    if !plans && (was == State::Dropped || to == State::Dropped) {
+        return conflict(
+            "dropping an item, and reopening a dropped one, are plan changes: propose them with propose_work_plan",
+        );
+    }
     if let Some(why) = rules.refuse_move(id, to) {
         return conflict(why);
     }
@@ -981,6 +1003,18 @@ async fn lock_link(tx: &mut PgConnection, owner: &str, id: Uuid) -> WorkResult<(
     .fetch_one(&mut *tx)
     .await?;
     Ok((graph, link))
+}
+
+/// The item one of the owner's links is on.
+pub async fn link_item(db: &PgPool, owner: &str, link: Uuid) -> sqlx::Result<Option<Uuid>> {
+    sqlx::query_scalar(
+        "select l.item_id from work_links l join work_items i on i.id = l.item_id \
+         join work_graphs g on g.id = i.graph_id where l.id = $1 and g.owner = $2",
+    )
+    .bind(link)
+    .bind(owner)
+    .fetch_optional(db)
+    .await
 }
 
 /// Records where what a link points at stands. Later stages do this as they watch pull requests, sessions and
