@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine;
-use graphql_parser::query::{Definition, OperationDefinition};
+use graphql_parser::query::{
+    Definition, OperationDefinition, Selection, SelectionSet, Value as GraphqlValue,
+};
 use sloppod_contracts::{
     Decision, Error, HttpRequest, Manifest, RequestPolicy, Result, SessionContext,
 };
@@ -264,32 +266,38 @@ impl GitHubPolicy {
             )));
         }
         // Reads carry a read-only token covering the granted repositories in one installation, which also reads
-        // public data: the installation of the repository the path names, if it's granted, or else the first granted
-        // repository whose installation still works. Without any, or without a GitHub App, reads are unauthenticated.
-        // A repository the session acts on with one of the owner's tokens is read with that token, and only when the
-        // path names it; the App's tokens never cover it.
+        // public data: the installation of the repository the request names, if it's granted, or else the first
+        // granted repository whose installation still works. A session with no repository it reads as the App gets a
+        // token for public data only. Without a GitHub App, or when minting fails, reads are unauthenticated.
+        // Repositories the session acts on with one of the owner's tokens are read with that token, and only when the
+        // request names nothing else; the App's tokens never cover them.
         let granted: Vec<&str> = session.repos().collect();
-        if let Some(named) = named_repo(path)
-            && granted.iter().any(|g| same_repo(g, &named))
-            && session.repo_credential(&named).is_some()
-        {
-            return match self.acting_as(session, &named).await {
+        let named: Vec<String> = if path == "/graphql" {
+            graphql_repos(&request.body).unwrap_or_default()
+        } else {
+            named_repo(path).into_iter().collect()
+        };
+        if let Some(repo) = user_token_repo(session, &granted, &named) {
+            return match self.acting_as(session, repo).await {
                 Ok(Some(client)) => {
-                    let token = client.read_token(&named, &[]).await.map_err(err)?;
-                    audit(session, &client, &named, request);
+                    let token = client.read_token(repo, &[]).await.map_err(err)?;
+                    for repo in &named {
+                        audit(session, &client, repo, request);
+                    }
                     Ok(Decision::allow_with(
                         vec![("authorization".into(), format!("token {token}"))],
                         Vec::new(),
                     ))
                 }
-                Ok(None) => Ok(Decision::allow_with(Vec::new(), Vec::new())),
+                Ok(None) => Ok(anonymous(session, path)),
                 Err(refusal) => Ok(refusal),
             };
         }
         let granted = app_repos(session, &granted);
         let token = match self.app(session).await {
+            Some(app) if granted.is_empty() => public_token(&session.session_id, &app).await,
             Some(app) => {
-                let order = read_token_order(path, &granted);
+                let order = read_token_order(&named, &granted);
                 first_token(&session.session_id, order, READ_TOKEN_BUDGET, |repo| {
                     app.read_token(repo, &granted)
                 })
@@ -297,10 +305,13 @@ impl GitHubPolicy {
             }
             None => None,
         };
-        let headers = token
-            .map(|t| vec![("authorization".into(), format!("token {t}"))])
-            .unwrap_or_default();
-        Ok(Decision::allow_with(headers, Vec::new()))
+        Ok(match token {
+            Some(t) => Decision::allow_with(
+                vec![("authorization".into(), format!("token {t}"))],
+                Vec::new(),
+            ),
+            None => anonymous(session, path),
+        })
     }
 }
 
@@ -405,6 +416,48 @@ where
         })
 }
 
+/// A token for public data from the owner's App, for a session with no repository to scope a read token to, or
+/// `None` if none comes within the budget.
+async fn public_token(session: &str, app: &GitHubApp) -> Option<String> {
+    match tokio::time::timeout(READ_TOKEN_BUDGET, app.public_read_token()).await {
+        Ok(Ok(token)) => Some(token),
+        Ok(Err(e)) => {
+            tracing::warn!(session, error = %e, "minting a public read token");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(session, "minting a public read token took too long");
+            None
+        }
+    }
+}
+
+/// Lets a read through without a token. GitHub allows 60 of those an hour per IP, shared by the cluster's egress,
+/// and refuses GraphQL outright, so each is logged.
+fn anonymous(session: &SessionContext, path: &str) -> Decision {
+    tracing::warn!(session = %session.session_id, path, "reading GitHub without a token");
+    Decision::allow_with(Vec::new(), Vec::new())
+}
+
+/// The repository to read through with one of the owner's tokens: the first of `named`, when every one of them is
+/// granted with the same token. A request that names no repository never gets the token, which reaches more than
+/// the grants do (ADR 29).
+fn user_token_repo<'a>(
+    session: &SessionContext,
+    granted: &[&str],
+    named: &'a [String],
+) -> Option<&'a str> {
+    let first = named.first()?;
+    let credential = session.repo_credential(first)?;
+    named
+        .iter()
+        .all(|repo| {
+            granted.iter().any(|g| same_repo(g, repo))
+                && session.repo_credential(repo) == Some(credential)
+        })
+        .then_some(first.as_str())
+}
+
 /// The repository an API path names, `/repos/<owner>/<name>/…`.
 fn named_repo(path: &str) -> Option<String> {
     path.strip_prefix("/repos/").and_then(|rest| {
@@ -437,10 +490,11 @@ fn audit(session: &SessionContext, client: &GitHubApp, repo: &str, request: &Htt
     }
 }
 
-/// Granted repositories to mint a read token through, in order: the one the API path names first, if any.
-fn read_token_order<'a>(path: &str, granted: &[&'a str]) -> Vec<&'a str> {
-    let named = named_repo(path);
-    let first = named.and_then(|named| granted.iter().find(|g| same_repo(g, &named)).copied());
+/// Granted repositories to mint a read token through, in order: the first the request names, if any, first.
+fn read_token_order<'a>(named: &[String], granted: &[&'a str]) -> Vec<&'a str> {
+    let first = named
+        .iter()
+        .find_map(|named| granted.iter().find(|g| same_repo(g, named)).copied());
     first
         .into_iter()
         .chain(granted.iter().copied().filter(|g| Some(*g) != first))
@@ -600,13 +654,80 @@ fn pushed_refs(body: &[u8]) -> Option<Push> {
     }
 }
 
+/// The requests in a GraphQL body, which may be a batch.
+fn graphql_requests(json: &serde_json::Value) -> Vec<&serde_json::Value> {
+    match json {
+        serde_json::Value::Array(batch) => batch.iter().collect(),
+        other => vec![other],
+    }
+}
+
+/// The repositories a GraphQL query reads: those its `repository(owner:, name:)` lookups name, at any depth, from
+/// literals or the request's `variables`. `None` when it reads anything else from the root (`viewer`, `search`,
+/// `node`), or looks up a repository whose owner or name it doesn't say, so can't be matched against the grants.
+fn graphql_repos(body: &[u8]) -> Option<Vec<String>> {
+    let json: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let mut repos = Vec::new();
+    for request in graphql_requests(&json) {
+        let document = graphql_parser::parse_query::<&str>(request["query"].as_str()?).ok()?;
+        let variables = &request["variables"];
+        for definition in &document.definitions {
+            let set = match definition {
+                Definition::Operation(OperationDefinition::Query(query)) => &query.selection_set,
+                Definition::Operation(OperationDefinition::SelectionSet(set)) => set,
+                Definition::Operation(_) => return None,
+                Definition::Fragment(fragment) => {
+                    repositories_in(&fragment.selection_set, variables, &mut repos)?;
+                    continue;
+                }
+            };
+            let only_repositories = set.items.iter().all(|item| {
+                matches!(item, Selection::Field(field) if matches!(field.name, "repository" | "__typename"))
+            });
+            if !only_repositories {
+                return None;
+            }
+            repositories_in(set, variables, &mut repos)?;
+        }
+    }
+    (!repos.is_empty()).then_some(repos)
+}
+
+/// Adds the repositories `set`'s `repository` lookups name to `repos`, or `None` for a lookup it can't tell. A
+/// `repository` field without arguments is the repository of an object already reached, not a lookup.
+fn repositories_in<'a>(
+    set: &SelectionSet<'a, &'a str>,
+    variables: &serde_json::Value,
+    repos: &mut Vec<String>,
+) -> Option<()> {
+    for item in &set.items {
+        let field = match item {
+            Selection::Field(field) => field,
+            Selection::InlineFragment(fragment) => {
+                repositories_in(&fragment.selection_set, variables, repos)?;
+                continue;
+            }
+            Selection::FragmentSpread(_) => continue,
+        };
+        if field.name == "repository" && !field.arguments.is_empty() {
+            let argument = |name: &str| {
+                let (_, value) = field.arguments.iter().find(|(n, _)| *n == name)?;
+                match value {
+                    GraphqlValue::String(s) => Some(s.clone()),
+                    GraphqlValue::Variable(v) => variables[*v].as_str().map(str::to_owned),
+                    _ => None,
+                }
+            };
+            repos.push(format!("{}/{}", argument("owner")?, argument("name")?));
+        }
+        repositories_in(&field.selection_set, variables, repos)?;
+    }
+    Some(())
+}
+
 fn graphql_is_read_only(body: &[u8]) -> std::result::Result<bool, String> {
     let json: serde_json::Value = serde_json::from_slice(body).map_err(|e| e.to_string())?;
-    let requests = match &json {
-        serde_json::Value::Array(batch) => batch.iter().collect::<Vec<_>>(),
-        other => vec![other],
-    };
-    for request in requests {
+    for request in graphql_requests(&json) {
         let query = request["query"].as_str().ok_or("no query")?;
         let document = graphql_parser::parse_query::<&str>(query).map_err(|e| e.to_string())?;
         for definition in document.definitions {
@@ -671,6 +792,213 @@ mod tests {
             .grants
             .push(Grant::new(capability::GITHUB, json!({})));
         assert!(!refused(policy.decide(&session, &fetch).await.unwrap()));
+    }
+
+    /// A policy over the fake GitHub, with the owner's App and two of their tokens, `github_pat_u` and
+    /// `github_pat_v`, whose credential ids it returns.
+    async fn reads_policy(
+        db: sqlx::PgPool,
+        fake: crate::github::tests::Fake,
+    ) -> (
+        GitHubPolicy,
+        Arc<crate::github::tests::Fake>,
+        String,
+        String,
+    ) {
+        use crate::credentials::{GITHUB_APP, GITHUB_USER};
+        use crate::github::GitHubApp;
+
+        let key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let credentials =
+            Credentials::new(db.clone(), crate::vault::Vault::from_base64(&key).unwrap())
+                .await
+                .unwrap();
+        let (fake, app) = crate::github::tests::serve(fake).await;
+        credentials.add_github_client("dev", GITHUB_APP, app).await;
+        let mut users = Vec::new();
+        for token in ["github_pat_u", "github_pat_v"] {
+            let client =
+                GitHubApp::for_user_with_api(crate::github::API, token.into(), "octo".into())
+                    .unwrap();
+            let id = credentials
+                .add_github_client("dev", GITHUB_USER, client)
+                .await;
+            users.push(id.to_string());
+        }
+        let (rechecks, _) = Rechecks::new(db);
+        let policy = GitHubPolicy::new(Arc::new(credentials), Arc::default(), rechecks);
+        let v = users.pop().unwrap();
+        (policy, fake, users.pop().unwrap(), v)
+    }
+
+    /// A session holding `github` and read grants on `repos`, each with the credential it names, if any.
+    fn reading(repos: &[(&str, Option<&str>)]) -> SessionContext {
+        use serde_json::json;
+        use sloppod_contracts::{Grant, capability};
+
+        let mut session = context(Default::default());
+        session
+            .grants
+            .push(Grant::new(capability::GITHUB, json!({})));
+        for (repo, credential) in repos {
+            let mut params = json!({"repo": repo, "access": "r"});
+            if let Some(credential) = credential {
+                params["credential"] = json!(credential);
+            }
+            session.grants.push(Grant::new(capability::REPO, params));
+        }
+        session
+    }
+
+    fn api_request(method: &str, path: &str, body: serde_json::Value) -> HttpRequest {
+        HttpRequest {
+            method: method.into(),
+            host: "api.github.com".into(),
+            path: path.into(),
+            headers: Default::default(),
+            body: if body.is_null() {
+                Vec::new()
+            } else {
+                body.to_string().into_bytes()
+            },
+            body_truncated: false,
+        }
+    }
+
+    /// `gh pr view`'s query, with the repository in its variables.
+    fn pr_view(repo: &str) -> HttpRequest {
+        let (owner, name) = repo.split_once('/').unwrap();
+        api_request(
+            "POST",
+            "/graphql",
+            serde_json::json!({
+                "query": "query PullRequestByNumber($owner: String!, $repo: String!, $pr_number: Int!) { \
+                          repository(owner: $owner, name: $repo) { pullRequest(number: $pr_number) { title } } }",
+                "variables": {"owner": owner, "repo": name, "pr_number": 1},
+            }),
+        )
+    }
+
+    /// The token a decision attaches, if any.
+    fn token(decision: Decision) -> Option<String> {
+        let Decision::Allow { set_headers, .. } = decision else {
+            panic!("refused: {decision:?}");
+        };
+        set_headers
+            .into_iter()
+            .find(|(name, _)| name == "authorization")
+            .map(|(_, value)| value.trim_start_matches("token ").to_owned())
+    }
+
+    /// What the last App token minted was scoped to.
+    fn last_minted(fake: &crate::github::tests::Fake) -> serde_json::Value {
+        fake.minted.lock().unwrap().last().unwrap().1.clone()
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn graphql_reads_with_the_owners_token_only_on_its_grants(db: sqlx::PgPool) {
+        use serde_json::json;
+
+        let (policy, fake, u, v) = reads_policy(db, Default::default()).await;
+        let session = reading(&[
+            ("o/r", None),
+            ("u/mine", Some(&u)),
+            ("u/two", Some(&u)),
+            ("u/three", Some(&v)),
+        ]);
+        let decide = |request: HttpRequest| {
+            let (policy, session) = (&policy, &session);
+            async move { token(policy.decide(session, &request).await.unwrap()) }
+        };
+        let app_read = json!({"repositories": ["r"], "permissions": {
+            "contents": "read", "issues": "read", "metadata": "read", "pull_requests": "read",
+        }});
+
+        assert_eq!(
+            decide(pr_view("u/mine")).await.as_deref(),
+            Some("github_pat_u")
+        );
+        assert_eq!(
+            decide(pr_view("U/Mine")).await.as_deref(),
+            Some("github_pat_u")
+        );
+        let both = api_request(
+            "POST",
+            "/graphql",
+            json!({"query": "{ a: repository(owner: \"u\", name: \"mine\") { id } \
+                    b: repository(owner: \"u\", name: \"two\") { id } }"}),
+        );
+        assert_eq!(decide(both).await.as_deref(), Some("github_pat_u"));
+
+        // An App-granted or ungranted repository, or one named alongside a token-granted one, reads as the App.
+        for request in [
+            pr_view("o/r"),
+            pr_view("x/y"),
+            api_request(
+                "POST",
+                "/graphql",
+                json!({"query": "{ repository(owner: \"u\", name: \"mine\") { id \
+                        parent { repository(owner: \"x\", name: \"y\") { id } } } }"}),
+            ),
+        ] {
+            assert_eq!(decide(request).await.as_deref(), Some("token-1"));
+            assert_eq!(last_minted(&fake), app_read);
+        }
+        // Repositories granted with two different tokens.
+        let mixed = api_request(
+            "POST",
+            "/graphql",
+            json!({"query": "{ a: repository(owner: \"u\", name: \"mine\") { id } \
+                    b: repository(owner: \"u\", name: \"three\") { id } }"}),
+        );
+        assert_eq!(decide(mixed).await.as_deref(), Some("token-1"));
+        assert_eq!(last_minted(&fake), app_read);
+
+        // Nothing that reaches past the named repositories reads as the owner.
+        for query in [
+            "{ viewer { login } }",
+            "{ viewer { login } repository(owner: \"u\", name: \"mine\") { id } }",
+            "{ search(query: \"secret\", type: REPOSITORY, first: 1) { repositoryCount } }",
+            "{ node(id: \"R_1\") { id } }",
+            "query Q($o: String!) { repository(owner: $o, name: \"mine\") { id } }",
+            "{ ...F } fragment F on Query { repository(owner: \"u\", name: \"mine\") { id } }",
+        ] {
+            let request = api_request("POST", "/graphql", json!({"query": query}));
+            assert_eq!(decide(request).await.as_deref(), Some("token-1"), "{query}");
+        }
+
+        // REST reads as before.
+        let rest = api_request("GET", "/repos/u/mine/pulls", serde_json::Value::Null);
+        assert_eq!(decide(rest).await.as_deref(), Some("github_pat_u"));
+        let mutation = api_request(
+            "POST",
+            "/graphql",
+            json!({"query": "mutation { addStar(input: {starrableId: \"x\"}) { clientMutationId } }"}),
+        );
+        assert!(matches!(
+            policy.decide(&session, &mutation).await.unwrap(),
+            Decision::Deny { .. }
+        ));
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_session_with_no_app_repository_reads_public_data_as_the_app(db: sqlx::PgPool) {
+        use serde_json::json;
+
+        let (policy, fake, u, _) = reads_policy(db, Default::default()).await;
+        let public = json!({"repositories": ["site"], "permissions": {"metadata": "read"}});
+        for session in [reading(&[("u/mine", Some(&u))]), reading(&[])] {
+            for request in [
+                pr_view("x/y"),
+                api_request("POST", "/graphql", json!({"query": "{ viewer { login } }"})),
+                api_request("GET", "/users/x", serde_json::Value::Null),
+                api_request("GET", "/repos/x/y", serde_json::Value::Null),
+            ] {
+                let decision = policy.decide(&session, &request).await.unwrap();
+                assert_eq!(token(decision).as_deref(), Some("token-1"));
+                assert_eq!(last_minted(&fake), public);
+            }
+        }
     }
 
     #[test]
@@ -787,20 +1115,19 @@ mod tests {
     #[test]
     fn reads_go_through_the_named_repository_first() {
         let granted = ["o/a", "o/b", "p/c"];
+        let order = |path: &str, granted: &[&'static str]| {
+            let named: Vec<String> = named_repo(path).into_iter().collect();
+            read_token_order(&named, granted)
+        };
+        assert_eq!(order("/repos/o/b/pulls", &granted), ["o/b", "o/a", "p/c"]);
+        assert_eq!(order("/repos/O/B", &granted), ["o/b", "o/a", "p/c"]);
+        assert_eq!(order("/repos/x/y/issues", &granted), ["o/a", "o/b", "p/c"]);
+        assert_eq!(order("/user", &granted), ["o/a", "o/b", "p/c"]);
+        assert!(order("/user", &[]).is_empty());
         assert_eq!(
-            read_token_order("/repos/o/b/pulls", &granted),
-            ["o/b", "o/a", "p/c"]
+            read_token_order(&["x/y".into(), "p/c".into()], &granted),
+            ["p/c", "o/a", "o/b"]
         );
-        assert_eq!(
-            read_token_order("/repos/O/B", &granted),
-            ["o/b", "o/a", "p/c"]
-        );
-        assert_eq!(
-            read_token_order("/repos/x/y/issues", &granted),
-            ["o/a", "o/b", "p/c"]
-        );
-        assert_eq!(read_token_order("/user", &granted), ["o/a", "o/b", "p/c"]);
-        assert!(read_token_order("/user", &[]).is_empty());
     }
 
     #[test]

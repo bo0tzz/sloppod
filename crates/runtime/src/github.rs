@@ -235,6 +235,8 @@ pub struct GitHubApp {
     permissions: Mutex<HashMap<u64, BTreeMap<String, String>>>,
     tokens: Mutex<HashMap<TokenScope, TokenSlot>>,
     identity: OnceCell<GitIdentity>,
+    /// The installation and repository [`GitHubApp::public_read_token`] scopes its tokens to, with when it was chosen.
+    public_scope: Mutex<Option<(u64, String, Instant)>>,
 }
 
 /// Who commits made with an app's access are by: its bot user.
@@ -296,6 +298,7 @@ impl GitHubApp {
             permissions: Mutex::default(),
             tokens: Mutex::default(),
             identity: OnceCell::new(),
+            public_scope: Mutex::default(),
         })
     }
 
@@ -322,6 +325,7 @@ impl GitHubApp {
             permissions: Mutex::default(),
             tokens: Mutex::default(),
             identity: OnceCell::new(),
+            public_scope: Mutex::default(),
         })
     }
 
@@ -494,6 +498,10 @@ impl GitHubApp {
             .unwrap()
             .retain(|_, (id, _)| *id != Some(installation));
         self.permissions.lock().unwrap().remove(&installation);
+        self.public_scope
+            .lock()
+            .unwrap()
+            .take_if(|(id, _, _)| *id == installation);
         self.tokens
             .lock()
             .unwrap()
@@ -601,6 +609,82 @@ impl GitHubApp {
         })
         .await?
         .with_context(|| format!("the GitHub App's installation on {repo} keeps disappearing"))
+    }
+
+    /// A read token for public data, for a session with no repository it reads as the App to scope one to: an
+    /// installation token for one repository with only `metadata: read`, the narrowest GitHub documents (leaving the
+    /// repositories out covers them all). Like any installation token, it reads public data anywhere. The repository
+    /// is a public one where the App has one, so the token sees nothing that isn't public; otherwise it also sees that
+    /// one private repository's metadata (its name, description, topics and collaborators), never its contents.
+    pub async fn public_read_token(&self) -> anyhow::Result<String> {
+        if self.user.is_some() {
+            bail!("a public read token comes from the GitHub App, not a user's token");
+        }
+        self.mint_scoped(|| async move {
+            let (installation, repo) = self.public_scope().await?;
+            Ok(Some(TokenScope {
+                installation,
+                repositories: Some(vec![repo]),
+                permissions: Some(BTreeMap::from([("metadata".to_owned(), "read".to_owned())])),
+            }))
+        })
+        .await?
+        .context("the GitHub App's installations keep disappearing")
+    }
+
+    /// The installation and repository [`GitHubApp::public_read_token`] is for: the first public repository in the
+    /// App's installations, or failing that the first repository.
+    async fn public_scope(&self) -> anyhow::Result<(u64, String)> {
+        if let Some((id, repo, at)) = self.public_scope.lock().unwrap().clone()
+            && at.elapsed() < INSTALLATION_TTL
+        {
+            return Ok((id, repo));
+        }
+        let installations: Vec<Value> = self
+            .app_get(&format!("/app/installations?per_page={PAGE}"))
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let mut chosen = None;
+        let mut fallback = None;
+        for id in installations.iter().filter_map(|i| i["id"].as_u64()) {
+            let Some(token) = self.mint(TokenScope::full(id)).await? else {
+                continue;
+            };
+            let listed: Value = self
+                .http
+                .get(self.url(&format!("/installation/repositories?per_page={PAGE}")))
+                .bearer_auth(token)
+                .header("accept", "application/vnd.github+json")
+                .timeout(AUTHZ_TIMEOUT)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let repos = listed["repositories"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let name = |r: &Value| Some((id, r["name"].as_str()?.to_lowercase()));
+            if let Some(public) = repos
+                .iter()
+                .filter(|r| r["private"] == Value::Bool(false))
+                .find_map(name)
+            {
+                chosen = Some(public);
+                break;
+            }
+            if fallback.is_none() {
+                fallback = repos.iter().find_map(name);
+            }
+        }
+        let (id, repo) = chosen
+            .or(fallback)
+            .context("the GitHub App is installed on no repositories")?;
+        *self.public_scope.lock().unwrap() = Some((id, repo.clone(), Instant::now()));
+        Ok((id, repo))
     }
 
     /// A session's token for pushing to `repo`: that repository only, with [`push_permissions`].
@@ -1411,7 +1495,7 @@ pub fn without_agent_credits(text: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use axum::extract::{Path, State};
@@ -1506,12 +1590,12 @@ mod tests {
     /// A fake GitHub: `o/r` and `o/r2` are on the current installation, `o/other` on [`OTHER`], other
     /// repositories have none.
     #[derive(Default)]
-    struct Fake {
+    pub(crate) struct Fake {
         installation: AtomicU64,
         lookups: AtomicUsize,
         mints: AtomicUsize,
         /// Each mint's installation and request body.
-        minted: Mutex<Vec<(u64, Value)>>,
+        pub(crate) minted: Mutex<Vec<(u64, Value)>>,
         /// Holds each mint until this many are in flight at once.
         rendezvous: Option<tokio::sync::Barrier>,
         /// Open pull requests of `o/r`: number, head branch, and whether auto-merge is on.
@@ -1528,6 +1612,24 @@ mod tests {
         failing: Mutex<Vec<u64>>,
         /// Node ids of the pull requests marked ready for review.
         readied: Mutex<Vec<String>>,
+        /// The current installation has no public repository; otherwise `o/site` is one.
+        pub(crate) all_private: bool,
+    }
+
+    async fn installations(State(fake): State<Arc<Fake>>) -> Json<Value> {
+        Json(json!([{"id": fake.installation.load(Ordering::SeqCst)}]))
+    }
+
+    /// The current installation's repositories.
+    async fn installation_repositories(State(fake): State<Arc<Fake>>) -> Json<Value> {
+        let mut repos = vec![
+            json!({"name": "r", "private": true}),
+            json!({"name": "r2", "private": true}),
+        ];
+        if !fake.all_private {
+            repos.push(json!({"name": "site", "private": false}));
+        }
+        Json(json!({"repositories": repos}))
     }
 
     async fn commit(
@@ -1713,16 +1815,18 @@ mod tests {
         ))
     }
 
-    async fn fake_github() -> (Arc<Fake>, GitHubApp) {
+    pub(crate) async fn fake_github() -> (Arc<Fake>, GitHubApp) {
         serve(Fake::default()).await
     }
 
-    async fn serve(fake: Fake) -> (Arc<Fake>, GitHubApp) {
+    pub(crate) async fn serve(fake: Fake) -> (Arc<Fake>, GitHubApp) {
         let fake = Arc::new(fake);
         fake.installation.store(1, Ordering::SeqCst);
         let router = Router::new()
             .route("/repos/{owner}/{name}/installation", get(installation))
             .route("/app/installations/{id}/access_tokens", post(mint))
+            .route("/app/installations", get(installations))
+            .route("/installation/repositories", get(installation_repositories))
             .route("/repos/{owner}/{name}", get(repository))
             .route("/repos/{owner}/{name}/pulls", get(pulls))
             .route("/repos/{owner}/{name}/pulls/{number}", get(pull))
@@ -2090,6 +2194,30 @@ mod tests {
         fake.installation.store(2, Ordering::SeqCst);
         app.tokens.lock().unwrap().clear();
         assert_eq!(app.token_for("o/r").await.unwrap(), "token-2");
+    }
+
+    #[tokio::test]
+    async fn a_public_read_token_reaches_one_repository_metadata_only() {
+        let metadata_of =
+            |repo: &str| json!({"repositories": [repo], "permissions": {"metadata": "read"}});
+        let (fake, app) = fake_github().await;
+        assert_eq!(app.public_read_token().await.unwrap(), "token-1");
+        app.public_read_token().await.unwrap();
+        let minted = fake.minted.lock().unwrap().clone();
+        // The full token lists the installation's repositories, for the runtime only; then one public read token,
+        // from the cache the second time.
+        assert_eq!(minted, vec![(1, json!({})), (1, metadata_of("site"))]);
+
+        let (fake, app) = serve(Fake {
+            all_private: true,
+            ..Fake::default()
+        })
+        .await;
+        app.public_read_token().await.unwrap();
+        assert_eq!(fake.minted.lock().unwrap()[1], (1, metadata_of("r")));
+
+        let user = GitHubApp::for_user_with_api(API, "t".into(), "octo".into()).unwrap();
+        assert!(user.public_read_token().await.is_err());
     }
 
     #[tokio::test]
