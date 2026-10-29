@@ -198,6 +198,7 @@ async fn main() -> anyhow::Result<()> {
         db.clone(),
         credentials.clone(),
     )));
+    proposals.register(Arc::new(work::agent::WorkPlan::new(db.clone())));
 
     let mut agents = adapter::Agents::default();
     agents.register(Arc::new(adapter::ClaudeCode));

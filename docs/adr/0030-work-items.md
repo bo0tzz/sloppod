@@ -76,6 +76,16 @@ Open questions:
   - State changes the rules make are recorded as automatic and can't be undone: they follow links and parts.
 - **What's ready** is the open items with no unfinished parts that nothing unfinished blocks, directly or through an item they're part of, and that aren't inside a done or dropped item. Active items are under way, so they aren't in it.
 
+2026-10-29: stage 2 is built ([#385](https://github.com/bo0tzz/sloppod/issues/385)): the `work` grant, sloppod's MCP tools, `plan` changes as a proposal kind, and linked items in the prompt. Choices:
+
+- **A grant per graph.** `work` grants carry `{graph, name, level}`. The owner grants them from the session's grants list, `track` by default. A session can hold one per graph.
+- **Tools by level.** `list_work` from `read`, and `update_work` from `track`. `propose_work_plan` is shown only at `plan`, and refused below it. A session without a grant sees none of them. Every call is checked against the graph its grant names, so an item in another graph can't be reached.
+- **What `track` covers.** It adds and edits items (placed last among their siblings, since ranking is `plan`), moves them between `open`, `active` and `done`, adds and removes blocks, and links work. The rules of stage 1 still decide what a move may do. Moves into `dropped` and out of it are refused there, at any level, and point to the proposal. That is checked under the graph's lock, so a drop that lands between the agent's read and its change is never undone.
+- **The plan proposal** (`sloppod.work.plan`) targets the graph's id, so a standing approval for the session and graph approves it. It's carried out change by change as the session's changes, so each is in the item's history and can be undone there. It's carried out only if the session still holds a `plan` grant of the graph then: one revoked or narrowed while it waited changes nothing.
+  - An automatically approved one shows up for the owner as any proposal does: listed with `decided_by: standing-approval:<id>`, and broadcast. A separate notice for it waits for the UI work.
+- **Attenuation.** A sub-session's grant of its parent's graph is at most `track`, and never more than the parent's.
+- **The prompt** names the graphs a session is granted, with their levels, and the items it's linked to by a session link. It also says to read the frontier after a compaction. It's built when the agent starts, so a link made later is in the tool's answer, and in the prompt from the next start.
+
 2026-10-29: stage 3 is built ([#386](https://github.com/bo0tzz/sloppod/issues/386)): items move with what's linked to them. The runtime sets a link's status as what it points at moves, through stage 1's rules, and records each change with `sloppod` as its author.
 
 - **Pull requests.** The PR watcher (`pulls.rs`) moves links to the pull requests it watches on every poll: open, merged (`finished`), or closed unmerged (`abandoned`).
@@ -84,3 +94,4 @@ Open questions:
   - Links that are no longer open aren't polled, so an issue reopened later isn't seen, and neither is a repository the App isn't installed on.
 - **Proposals.** A pull request or stack that a proposal opens is linked to the items its session is linked to, with the same role as the session's link. So the pull request of a session that completes an item completes it too. A proposal is marked once that's done (`work_followed_proposals`). One carried out without the mark, however long ago, is linked by the next minute's pass, so a failure or a restart in between loses nothing; those carried out before following existed were marked when it arrived. After that it's left alone, even once someone unlinks what it linked.
 - **Sessions.** Links to sessions and proposals store the id in canonical form, however it was written, and older ones were rewritten to it. A session link is `open` while the session acts, and `finished` once it has an executed report (a sub-session's `report_done`). It's `abandoned` once the session is parked, stopped or deleted without one. This is checked every minute, and at once when a report is carried out. A sub-session that's given more work after reporting stays `finished`.
+
