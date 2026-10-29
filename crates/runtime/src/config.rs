@@ -6,7 +6,8 @@ use clap::Parser;
 const DEFAULT_DIRECT_HOSTS: &str = "static.rust-lang.org,sh.rustup.rs,index.crates.io,static.crates.io,crates.io,\
 objects.githubusercontent.com,release-assets.githubusercontent.com,raw.githubusercontent.com,codeload.github.com,\
 registry.npmjs.org,nodejs.org,pypi.org,files.pythonhosted.org,mise.jdx.dev,mise-versions.jdx.dev,\
-dl.k8s.io,get.helm.sh,proxy.golang.org,sum.golang.org,storage.googleapis.com,\
+dl.k8s.io,get.helm.sh,proxy.golang.org,sum.golang.org,storage.googleapis.com,dl.google.com,go.dev,golang.org,\
+ghcr.io,pkg-containers.githubusercontent.com,\
 results-receiver.actions.githubusercontent.com,pipelines.actions.githubusercontent.com,productionresultssa*.blob.core.windows.net,\
 cdn.playwright.dev,playwright.download.prss.microsoft.com,tuf-repo-cdn.sigstore.dev";
 
