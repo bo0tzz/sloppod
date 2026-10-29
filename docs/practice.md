@@ -4,7 +4,7 @@ What bo0tzz and the sessions working on sloppod have learned about working toget
 
 ## Deciding what to work on
 
-- **The work order lives outside a session's context,** which compaction erodes. It's moving into sloppod as a graph of work items ([ADR 30](adr/0030-work-items.md)); until that's built, the last agreed order is the closing comment on the old Priorities issue ([#255](https://github.com/bo0tzz/sloppod/issues/255)), and the parent session keeps it in memory. Read it before picking up work and after every compaction, and say so when switching away from it.
+- **The work order lives in sloppod's own work graph,** "sloppod" ([ADR 30](adr/0030-work-items.md)), not in a session's context, which compaction erodes. The parent session holds it at `plan`, sub-sessions at `track`. Read the frontier (`list_work`, `view: "frontier"`) before picking up work and after every compaction, and say so when switching away from it. New work gets an item linked to its issue; reordering is a plan proposal. (#255, the old Priorities issue, is closed.)
 - **Standing rule:** work that speeds up development, in and on sloppod, comes first.
 - **A new idea becomes a labelled issue, not work.** Start on something at once only when it's called urgent ("first priority", "fix this now").
 - **Labels:** every issue gets an area label (`ui`, `harness`, `proposals`, `security`, `credentials`, `memory`, `ci`, `adr`, `prompt`, `testing`, `enforcement`), plus `dogfood` when it came from using sloppod, and `priority` or `needs discussion` where they apply. Check `gh label list`; don't invent labels.
