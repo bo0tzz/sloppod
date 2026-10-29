@@ -2041,18 +2041,18 @@ test("a model grant names the user's accounts, and the user picks which one it u
     await page.getByRole('button', { name: 'Session actions' }).click();
     await page.getByRole('menuitem', { name: 'Grants' }).click();
     const model = page.getByTestId('grants').getByTestId('grant-model');
-    // Made with all of the user's Claude accounts, the default first, which is the one in use.
+    // Made with all of the user's Claude accounts, the default first.
     const accounts = model.getByTestId('grant-account');
     await expect(accounts).toHaveCount(2);
     await expect(accounts.nth(0)).toContainText('Personal');
-    await expect(accounts.nth(0)).toContainText('in use');
+    await expect(accounts.nth(0)).toContainText('used first');
     await expect(accounts.nth(1)).toHaveText(/Work/);
 
     const changing = page.waitForRequest((request) => request.method() === 'PATCH');
     await accounts.nth(1).getByRole('button', { name: 'Use first' }).click();
     expect((await changing).postDataJSON().credentials[0]).toBe(work.id);
     await expect(accounts.nth(0)).toContainText('Work');
-    await expect(accounts.nth(0)).toContainText('in use');
+    await expect(accounts.nth(0)).toContainText('used first');
 
     await accounts.nth(1).getByRole('button', { name: 'Remove' }).click();
     await expect(accounts).toHaveCount(1);

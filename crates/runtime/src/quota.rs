@@ -355,6 +355,38 @@ pub async fn for_credential(
     Ok(row.map(|row| row.into_quota(now)))
 }
 
+/// Whether a credential is at its usage limit now, as far as its quota says.
+pub async fn is_limited(db: &PgPool, credential: Uuid, now: DateTime<Utc>) -> sqlx::Result<bool> {
+    Ok(for_credential(db, credential, now)
+        .await?
+        .is_some_and(|quota| quota.limited))
+}
+
+/// A turn failed on a credential's usage limit (#252): it's kept as limited, until `until` when nothing says when the
+/// limit resets, so sessions move to their next account and come back to it once it may have reset. A quota that
+/// already says it's limited is left as it is.
+pub async fn hit(
+    state: &AppState,
+    credential: &CredentialRow,
+    now: DateTime<Utc>,
+    until: DateTime<Utc>,
+) {
+    match is_limited(&state.db, credential.id, now).await {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(credential = %credential.id, error = %e, "reading a credential's quota");
+            return;
+        }
+    }
+    let observation = Observation {
+        observed_at: now,
+        limited: true,
+        resets_at: Some(until),
+        windows: BTreeMap::new(),
+    };
+    record(state, credential.id, &credential.owner, observation).await;
+}
 async fn record(state: &AppState, credential: Uuid, owner: &str, observation: Observation) {
     if let Err(e) = store(&state.db, credential, &observation).await {
         tracing::warn!(%credential, error = %e, "keeping a credential's quota");
