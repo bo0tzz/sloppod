@@ -160,7 +160,10 @@ pub async fn apply_egress(state: &AppState, session: &db::SessionRow) -> anyhow:
             session_id: id.clone(),
             pod_labels: pod_labels(&id),
             intercepted_hosts: state.policies.hosts(),
-            direct_hosts: if session.context().has(capability::PACKAGES) {
+            // The deployment's package hosts, for a session granted a capability with an egress part (`packages`).
+            direct_hosts: if session.context().grants.iter().any(|g| {
+                crate::capabilities::has_part(&g.capability, &crate::capabilities::Part::Egress)
+            }) {
                 state.config.direct_hosts.clone()
             } else {
                 Vec::new()
