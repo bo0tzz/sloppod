@@ -87,3 +87,5 @@ Prior art:
 - **The built-ins become definitions shipped with the runtime,** keeping their names. What no definition can express comes from an extension the definition names ([ADR 7](0007-extension-points.md)): git push rules and proposals for `repo`, memini keys for `memory`, and scoped GitHub tokens for `github`.
 
 Still to decide: per-owner or deployment-wide definitions, MCP servers through the authorizer or proxied by the runtime, and how params narrow a user-defined capability.
+
+2026-10-29: the first owner-defined capabilities are built: MCP servers, per owner. Of the questions above, two are answered. The runtime proxies the server, at `/servers/<name>` on the sessions port, rather than the authorizer reaching it as egress. That way an in-cluster server needs no egress or certificate, and its credential (a new `token` kind) is attached outside the pod. Params don't narrow user definitions yet.

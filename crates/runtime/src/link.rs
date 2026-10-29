@@ -511,6 +511,7 @@ pub async fn agent_context(
         repo_dir: work_dir(session).to_owned(),
         repos_dir: REPOS_DIR.to_owned(),
         tools_url: format!("{endpoints}/mcp"),
+        endpoints: endpoints.clone(),
         // A review session's instructions are the reviewer's own, not the ones the owner's sessions work by.
         instructions: match session.kind {
             SessionKind::Review => Some(crate::reviews::INSTRUCTIONS.to_owned()),

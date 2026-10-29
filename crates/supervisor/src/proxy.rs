@@ -42,6 +42,7 @@ pub async fn serve(
         .route("/mcp", any(forward))
         .route("/memini", any(forward))
         .route("/memini/{*rest}", any(forward))
+        .route("/servers/{*rest}", any(forward))
         .with_state(proxy);
     axum::serve(listener, app).await?;
     Ok(())

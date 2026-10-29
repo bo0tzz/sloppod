@@ -21,7 +21,7 @@ POST   /api/v1/sessions/{id}/restore -> Session    brings a deleted session back
 POST   /api/v1/sessions/{id}/park   -> Session     ends its pod and keeps its volume, transcript, branch, grants and keys; 409 during a turn
 POST   /api/v1/sessions/{id}/wake   -> Session     brings a parked session back (no-op otherwise); a message sent to it does too
 POST   /api/v1/sessions/{id}/repos  -> Session     body: {repo: string, credential?: string}; grants write access to another repository and tells the agent (no-op if it has it); with `credential`, one of the user's `github-user` tokens, the session acts on it with that token (see below)
-POST   /api/v1/sessions/{id}/grants -> Session (201) body: {capability, expires_at?}; grants model, github, packages, docs or codex; 409 if the session has it
+POST   /api/v1/sessions/{id}/grants -> Session (201) body: {capability, expires_at?}; grants model, github, packages, docs or codex, or one of the user's own capabilities by name (below); 409 if the session has it
 PATCH  /api/v1/sessions/{id}/grants/{grant} -> Session  body: {expires_at?: string | null, narrow?: true}; changes when it runs out (null: never), or narrows it (a repository it can push to becomes read only)
 DELETE /api/v1/sessions/{id}/grants/{grant} -> Session  revokes it
 PUT    /api/v1/sessions/{id}/review -> Session     body: {review: "off" | "required"}
@@ -115,6 +115,27 @@ type Phase =
 
 Accounts and keys the runtime uses on a user's behalf ([ADR 21](adr/0021-credentials-live-in-the-runtime.md)). Secrets are write-only: the API never returns them. The first credential of a kind becomes the default for it; deleting the default promotes the oldest remaining one. Running sessions use whichever is the default when they make a request. An invalid credential (unknown kind, a private key that doesn't parse, a URL without a host) gets `400` with `{error}`.
 
+**Own capabilities** ([ADR 2](adr/0002-capabilities.md)): the user defines capabilities sloppod passes through without knowing what they are. So far that's an MCP server, e.g. their VictoriaLogs or VictoriaMetrics one. A definition is theirs alone, and is granted like a built-in, by its name, through `POST /api/v1/sessions/{id}/grants`; it's in no starting set. Its grant's description is the definition's. Like `docs`, a server granted while the agent runs reaches it at its next start (after a park and wake, say), since an agent's MCP servers are set when it starts; the agent is told so. The runtime serves it to the sessions granted it on the sessions port (`/servers/<name>`, below), so a credential for it never enters the pod.
+
+```
+GET    /api/v1/capabilities       -> Definition[]
+POST   /api/v1/capabilities       -> Definition (201)  body: {name, description, mcp_url, credential_id?}; 400 for an invalid one, 409 for a name taken
+DELETE /api/v1/capabilities/{id}  -> 204   grants of it stay, and stop working
+```
+
+```ts
+type Definition = {
+  id: string;
+  name: string;           // 1 to 32 lowercase letters, digits and dashes, starting with a letter; not a built-in's name, "sloppod" or "memini"
+  description: string;    // what it's for; the agent's list_grants and the grants list show it
+  mcp_url: string;        // the server's http(s) URL, without credentials in it
+  credential_id?: string; // a "token" credential, attached to every request
+  created_at: string;
+};
+```
+
+A `token` credential is a secret such a server takes: sent as `Authorization: Bearer <token>`, or, with `config.header`, as that header's value.
+
 A `github-user` credential is the user's own GitHub identity, for acting as them where they grant it ([ADR 28](adr/0028-acting-as-the-owner.md), [ADR 29](adr/0029-grants-name-their-credential.md)): a session's repository grant can name one (`POST /api/v1/sessions/{id}/repos` with `credential`). Only fine-grained tokens (`github_pat_…`) are taken: a classic one (`ghp_…`) reaches everything its user can, so it's refused. When one is added, the runtime asks GitHub whose it is (`GET /user`), when it expires (the `github-authentication-token-expiration` header; `expires_at` is `null` for one that doesn't), and which repositories it reaches (`GET /user/repos`, the first thousand, with `more_repositories` when there are more), and keeps that as its config. A token GitHub refuses gets `400`. Like the other secrets, the token stays in the runtime, sealed (ADR 21).
 
 ```
@@ -130,7 +151,8 @@ type CredentialKind =
   | "github-app"         // secret: the app's private key (PEM); config: {app_id: string}
   | "memini"             // secret: a memini admin key; config: {url: string, home?: string} (home: your personal namespace)
   | "chatgpt"            // secret: the auth.json of a `codex login` only sloppod uses; config: {account_id} (derived)
-  | "github-user";       // secret: a fine-grained GitHub personal access token; config: {login, expires_at, repositories, more_repositories} (derived)
+  | "github-user"        // secret: a fine-grained GitHub personal access token; config: {login, expires_at, repositories, more_repositories} (derived)
+  | "token";             // secret: a token an own capability's server takes; config: {header?: string} (sent as that header, else as a bearer token)
 
 type NewCredential = { kind: CredentialKind; name: string; config: Record<string, string>; secret: string };
 
@@ -314,7 +336,7 @@ Every agent is told about its session in a prompt the runtime writes (`session_p
 - **A sub-session** is also told its parent's id: that its chat replies only reach the user, that `message_session` reaches its parent, and that `report_done` hands its work back.
 - **A review session** gets the environment and messages sections, with a read-only checkout, plus the reviewer's own instructions.
 
-Session pods use three more endpoints, on their own port (8081, `sessions`); that port is the only one they can reach, so they can't use the API above. Keep it off public routes.
+Session pods use four more endpoints, on their own port (8081, `sessions`); that port is the only one they can reach, so they can't use the API above. Keep it off public routes.
 
 - `/link/v1`: the supervisor link ([ADR 17](adr/0017-in-pod-supervisor.md)), a WebSocket authenticated with the pod's projected ServiceAccount token. Its types are in `crates/protocol`.
 - `/mcp`: an MCP server (streamable HTTP, JSON responses) registered with the agent at session start. It identifies the session by the pod's own identity: the supervisor's local proxy attaches the pod's ServiceAccount token; pods from before that are identified by their IP. Its tools:
@@ -331,6 +353,7 @@ Session pods use three more endpoints, on their own port (8081, `sessions`); tha
   - `report_done {summary, title?, head?, review?}`, for a sub-session, creates a `sloppod.session.report` proposal: reviewed like a pull request under the session's review policy, then delivered to the parent with the summary, the branch and how the review ended. `head` names the branch the work is on when it isn't the session branch, e.g. a reused child's later task on `<session branch>-<name>` (the same rule as `propose_pull_request`'s `head`); a named branch without commits on the base is refused. `title` says what the task was, for a child reused for more than one.
   - `request_code_review {head?, base?, repo?, focus?}` creates a `sloppod.code_review`: a review of a pushed branch (the session branch by default) against `base` (the default branch by default), with nothing proposed. Its success text says so: no human is asked and nothing is carried out. `request_review` takes it for the next round, with `update` limited to `{focus}`.
 - `/memini/*`: memini, for sessions with a `memory` grant, identified like `/mcp`. The runtime forwards each request to the owner's memini with the session's own key and namespace, and refuses memini's administration endpoints. The memini plugin's `MEMINI_BASE_URL` points here.
+- `/servers/<name>` and below: the MCP server of a capability the user defined, for sessions granted it, identified like `/mcp`. The runtime forwards each request to the definition's `mcp_url` (the bare path to the URL itself, paths below it appended) with the definition's `token` credential attached and the agent's own `authorization` and `cookie` headers dropped, and streams the answer back. A session without the grant gets `403`; a definition deleted, or deleted and made again under its name since it was granted, gets `404` or `403`. Each request is logged with the session and the server's name. The agent's MCP config lists each granted one under its name.
 
 A session that's stopped, parked or deleted can't act, even if its pod is still up: the authorizer refuses its egress, `/mcp` gives it no tools, and `/memini/*` answers 403.
 

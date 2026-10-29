@@ -59,7 +59,11 @@ pub fn describe(grant: &Grant) -> String {
                 None => format!("{access}."),
             }
         }
-        other => format!("{other}."),
+        // A capability the owner defined says what it is itself.
+        other => match grant.param("description") {
+            Some(description) => description.to_owned(),
+            None => format!("{other}."),
+        },
     }
 }
 
