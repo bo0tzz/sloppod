@@ -960,7 +960,7 @@ test('the new-session page suggests a starting set, and sends the one the user e
   await box.fill('Fix the build in bo0tzz/sloppod');
   const title = card.getByRole('textbox', { name: 'Title' });
   await expect(title).toHaveValue('Fix the build in bo0tzz/sloppod');
-  await expect(card.getByRole('combobox')).toContainText('bo0tzz/sloppod');
+  await expect(card.getByTestId('starting-repos')).toContainText('bo0tzz/sloppod');
   await expect(card.getByTestId('starting-source')).toHaveText('Matched from your message');
 
   // What the user changes stays, whatever a later suggestion says; the rest follows it.
@@ -968,7 +968,7 @@ test('the new-session page suggests a starting set, and sends the one the user e
   await card.getByTestId('capability-packages').getByRole('checkbox').click();
   await expect(card.getByTestId('capability-packages').getByRole('checkbox')).not.toBeChecked();
   await box.fill('Fix the build in bo0tzz/memini');
-  await expect(card.getByRole('combobox')).toContainText('bo0tzz/memini');
+  await expect(card.getByTestId('starting-repos')).toContainText('bo0tzz/memini');
   await expect(title).toHaveValue('Mend the build');
   await expect(card.getByTestId('capability-packages').getByRole('checkbox')).not.toBeChecked();
 
@@ -981,6 +981,75 @@ test('the new-session page suggests a starting set, and sends the one the user e
   const grants = page.getByTestId('grants');
   await expect(grants.getByTestId('grant-docs')).toBeVisible();
   await expect(grants.getByTestId('grant-packages')).toHaveCount(0);
+});
+
+test("a session starts acting as one of the user's GitHub tokens on its repository", async ({ page }) => {
+  await page.request.post('/api/v1/credentials', {
+    data: { kind: 'github-user', name: 'mine', secret: 'github_pat_x', config: {} },
+  });
+  try {
+    await openNewSession(page);
+    const card = page.getByTestId('starting-card');
+    const box = page.getByRole('textbox', { name: 'Prompt' });
+    await box.fill('Fix the build in bo0tzz/sloppod');
+    const row = card.getByTestId('starting-repo');
+    // The suggestion picks the repository, never a token: it acts as the App until the user says otherwise.
+    await expect(row.getByRole('combobox', { name: 'Act as' })).toContainText('The GitHub App');
+    await expect(row.getByRole('combobox', { name: 'Repository' })).toContainText('bo0tzz/sloppod');
+    await row.getByRole('combobox', { name: 'Act as' }).click();
+    await page.getByRole('option', { name: 'bo0tzz (mine)' }).click();
+    await expect(card.getByText('What the session pushes there is attributed to that person.')).toBeVisible();
+    // What the token reaches is offered, and a repository from the App's list that it doesn't isn't.
+    await row.getByRole('combobox', { name: 'Repository' }).click();
+    await expect(page.getByRole('option', { name: 'bo0tzz/memini' })).toHaveCount(0);
+    await page.getByRole('option', { name: 'bo0tzz/dotfiles' }).click();
+
+    await box.press('Enter');
+    await expect(page).toHaveURL(/\/sessions\/[0-9a-f-]+$/);
+    await expect(page.getByTestId('session-subtitle')).toHaveText('bo0tzz/dotfiles');
+    await page.getByRole('button', { name: 'Session actions' }).click();
+    await page.getByRole('menuitem', { name: 'Grants' }).click();
+    await expect(page.getByTestId('grants').getByTestId('grant-repo')).toContainText('as bo0tzz');
+    // GitHub comes with a repository, whether or not it was ticked.
+    await expect(page.getByTestId('grants').getByTestId('grant-github')).toBeVisible();
+  } finally {
+    await deleteGitHubTokens(page);
+  }
+});
+
+test("the card starts a session with one of the user's own capabilities, and with more than one repository", async ({ page }) => {
+  const made: { id: string } = await (
+    await page.request.post('/api/v1/capabilities', {
+      data: { name: 'victorialogs', description: "Search the cluster's logs", mcp_url: 'https://logs.example.com/mcp' },
+    })
+  ).json();
+  try {
+    await openNewSession(page);
+    const card = page.getByTestId('starting-card');
+    const own = card.getByTestId('capability-victorialogs').getByRole('checkbox');
+    // It's offered, and is never in a suggestion.
+    await expect(own).not.toBeChecked();
+    await page.getByRole('textbox', { name: 'Prompt' }).fill('Fix the build in bo0tzz/sloppod');
+    await expect(card.getByTestId('starting-repos')).toContainText('bo0tzz/sloppod');
+    await expect(own).not.toBeChecked();
+    await own.click();
+    // A second repository, from the App's list less the one the first has.
+    await card.getByRole('button', { name: 'Add repository' }).click();
+    await card.getByTestId('starting-repo').nth(1).getByRole('combobox', { name: 'Repository' }).click();
+    await expect(page.getByRole('option', { name: 'bo0tzz/sloppod' })).toHaveCount(0);
+    await page.getByRole('option', { name: 'bo0tzz/memini' }).click();
+
+    await page.getByRole('textbox', { name: 'Prompt' }).press('Enter');
+    await expect(page).toHaveURL(/\/sessions\/[0-9a-f-]+$/);
+    await expect(page.getByTestId('session-subtitle')).toHaveText('bo0tzz/sloppod');
+    await page.getByRole('button', { name: 'Session actions' }).click();
+    await page.getByRole('menuitem', { name: 'Grants' }).click();
+    const grants = page.getByTestId('grants');
+    await expect(grants.getByTestId('grant-victorialogs')).toContainText("Search the cluster's logs");
+    await expect(grants.getByTestId('grant-repo')).toHaveCount(2);
+  } finally {
+    await page.request.delete(`/api/v1/capabilities/${made.id}`);
+  }
 });
 
 // Holds the suggestion for `prompt` back for `ms`, as a slow runtime does.
@@ -1019,7 +1088,7 @@ test('an answer for an earlier draft never replaces the card for a later one', a
   await expect(card.getByRole('textbox', { name: 'Title' })).not.toHaveValue('Fix the build in bo0tzz/sloppod');
   await expect(card.getByTestId('starting-source')).toHaveText('Suggested by the model');
   await expect(card.getByRole('textbox', { name: 'Title' })).toHaveValue('question: how does the library behave?');
-  await expect(card.getByRole('combobox')).toContainText('No repository');
+  await expect(card.getByTestId('starting-repo')).toHaveCount(0);
 });
 
 test('sending before the suggestion for the message is in uses that suggestion', async ({ page }) => {
@@ -1065,9 +1134,8 @@ test('choosing no repository sends none, though the message names one', async ({
   await openNewSession(page);
   const card = page.getByTestId('starting-card');
   await page.getByRole('textbox', { name: 'Prompt' }).fill('Fix the build in bo0tzz/sloppod');
-  await expect(card.getByRole('combobox')).toContainText('bo0tzz/sloppod');
-  await card.getByRole('combobox').click();
-  await page.getByRole('option', { name: 'No repository' }).click();
+  await expect(card.getByTestId('starting-repos')).toContainText('bo0tzz/sloppod');
+  await card.getByRole('button', { name: 'Remove repository' }).click();
   await page.getByRole('textbox', { name: 'Prompt' }).press('Enter');
   await expect(page).toHaveURL(/\/sessions\/[0-9a-f-]+$/);
   await expect(page.getByTestId('session-subtitle')).toHaveText('No repository');
@@ -1078,7 +1146,7 @@ test('a judgement of the first message shows as its source, and gives the card i
   const card = page.getByTestId('starting-card');
   await page.getByRole('textbox', { name: 'Prompt' }).fill('question: how does the library behave?');
   await expect(card.getByTestId('starting-source')).toHaveText('Suggested by the model');
-  await expect(card.getByRole('combobox')).toContainText('No repository');
+  await expect(card.getByTestId('starting-repo')).toHaveCount(0);
   await expect(card.getByTestId('capability-packages').getByRole('checkbox')).toBeChecked();
   await expect(card.getByTestId('capability-github').getByRole('checkbox')).not.toBeChecked();
 });

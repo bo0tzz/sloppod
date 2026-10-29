@@ -3,10 +3,10 @@
   import { ContextMenuButton, Text } from '@immich/ui';
   import { mdiCogOutline, mdiSend } from '@mdi/js';
   import { onMount } from 'svelte';
-  import { api, ApiError, type StartingSet } from '#lib/api.ts';
+  import { api, ApiError, type GitHubUserConfig, type StartingGrant, type StartingSet } from '#lib/api.ts';
   import ChatHeader from '#lib/components/ChatHeader.svelte';
   import Composer from '#lib/components/Composer.svelte';
-  import StartingCard from '#lib/components/StartingCard.svelte';
+  import StartingCard, { type OwnCapability, type RepoRow, type TokenChoice } from '#lib/components/StartingCard.svelte';
   import { sessions } from '#lib/sessions.svelte.ts';
 
   let text = $state('');
@@ -28,9 +28,17 @@
   let pending = $state(false);
   let source = $state<StartingSet['source'] | null>(null);
   let title = $state('');
-  let repo = $state<string | null>(null);
+  // The starting set is a list of grants: repositories, each with who it acts as, and the capabilities chosen. A
+  // suggestion fills in the repository and the built-ins; the user's own capabilities and the identity a repository
+  // acts as are only ever theirs to choose.
+  let rows = $state<RepoRow[]>([]);
   let capabilities = $state<string[]>([]);
-  const touched = { title: false, repo: false, capabilities: false };
+  let own = $state<OwnCapability[]>([]);
+  let ownChosen = $state<string[]>([]);
+  let tokens = $state<TokenChoice[]>([]);
+  let nextRow = 0;
+  const touched = { title: false, repos: false, capabilities: false };
+  const suggestedRows = (repo: string | null): RepoRow[] => (repo ? [{ id: nextRow++, repo, credential: null }] : []);
   /** Advances with every change to the draft, so an answer to an earlier one is dropped, debounce or not. */
   let generation = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -54,7 +62,7 @@
           shown = set;
           source = set.source;
           if (!touched.title) title = set.title;
-          if (!touched.repo) repo = set.repo;
+          if (!touched.repos) rows = suggestedRows(set.repo);
           if (!touched.capabilities) capabilities = set.capabilities;
         }
         return set;
@@ -80,6 +88,26 @@
       (list) => (repos = list),
       () => {},
     );
+    // What the card can add beyond the suggestion; without them it offers the App's repositories and built-ins alone.
+    api.listCapabilities().then(
+      (list) => (own = list.map((definition) => ({ name: definition.name, description: definition.description }))),
+      () => {},
+    );
+    api.listCredentials().then(
+      (list) =>
+        (tokens = list
+          .filter((credential) => credential.kind === 'github-user')
+          .map((credential) => {
+            const config = credential.config as unknown as GitHubUserConfig;
+            return {
+              id: credential.id,
+              label: `${config.login} (${credential.name})`,
+              repositories: config.repositories,
+              more: config.more_repositories,
+            };
+          })),
+      () => {},
+    );
     // Once with the empty draft, which also warms the runtime up for the first real one.
     void suggest('');
     return () => clearTimeout(timer);
@@ -100,6 +128,29 @@
   function toggle(capability: string, on: boolean) {
     touched.capabilities = true;
     capabilities = on ? [...new Set([...capabilities, capability])] : capabilities.filter((c) => c !== capability);
+  }
+
+  const toggleOwn = (name: string, on: boolean) =>
+    (ownChosen = on ? [...new Set([...ownChosen, name])] : ownChosen.filter((chosen) => chosen !== name));
+
+  function changeRow(id: number, change: Partial<RepoRow>) {
+    touched.repos = true;
+    rows = rows.map((row) => (row.id === id ? { ...row, ...change } : row));
+  }
+
+  /** The grants a starting set comes to: its repositories, then the built-ins and own capabilities chosen. */
+  function startingGrants(repoRows: RepoRow[], builtIns: string[]): StartingGrant[] {
+    return [
+      ...repoRows
+        .filter((row) => row.repo)
+        .map((row): StartingGrant => ({
+          capability: 'repo',
+          params: { repo: row.repo },
+          ...(row.credential ? { credential: row.credential } : {}),
+        })),
+      ...builtIns.map((capability) => ({ capability })),
+      ...ownChosen.map((capability) => ({ capability })),
+    ];
   }
 
   async function send() {
@@ -123,11 +174,15 @@
           new Promise<null>((resolve) => setTimeout(() => resolve(null), SEND_WAITS_AT_MOST)),
         ]);
       }
+      // What the user set is sent as they set it, the rest from the suggestion for this prompt. With nothing set and no
+      // suggestion, no grants are sent and the runtime derives the starting set as it always did.
+      const anything = set || touched.repos || touched.capabilities || ownChosen.length > 0;
+      const repoRows = touched.repos || !set ? rows : suggestedRows(set.repo);
+      const builtIns = touched.capabilities || !set ? capabilities : set.capabilities;
       const session = await api.createSession({
         prompt,
         title: touched.title ? title.trim() || undefined : set?.title,
-        repo: touched.repo ? repo : set?.repo,
-        capabilities: touched.capabilities ? capabilities : set?.capabilities,
+        grants: anything ? startingGrants(repoRows, builtIns) : undefined,
       });
       sessions.upsert(session);
       await goto(`/sessions/${session.id}`);
@@ -164,9 +219,12 @@
         <div class="mt-6 w-full">
           <StartingCard
             {title}
-            {repo}
+            {rows}
             {capabilities}
             {offered}
+            {own}
+            {ownChosen}
+            {tokens}
             {repos}
             {pending}
             {source}
@@ -174,11 +232,18 @@
               touched.title = true;
               title = value;
             }}
-            onRepo={(value) => {
-              touched.repo = true;
-              repo = value;
+            onAddRepo={() => {
+              touched.repos = true;
+              rows = [...rows, { id: nextRow++, repo: '', credential: null }];
             }}
+            onRemoveRepo={(id) => {
+              touched.repos = true;
+              rows = rows.filter((row) => row.id !== id);
+            }}
+            onRepo={(id, repo) => changeRow(id, { repo })}
+            onIdentity={(id, credential) => changeRow(id, { credential, repo: '' })}
             onCapability={toggle}
+            onOwn={toggleOwn}
           />
         </div>
       {/if}

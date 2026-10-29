@@ -30,13 +30,23 @@ export type Session = {
 export type NewSession = {
   /** The first message. The runtime records it right away and derives the repository from it. */
   prompt: string;
-  /** Absent, it's derived from the prompt; `null` means no repository. */
+  /** Absent, it's derived from the prompt; `null` means no repository. Not with `grants`. */
   repo?: string | null;
   title?: string;
-  /** What it starts with, from the starting set's capabilities; all of them when absent. */
+  /** What it starts with, from the starting set's capabilities; all of them when absent. Not with `grants`. */
   capabilities?: string[];
+  /** The starting set as grants, instead of `repo` and `capabilities`: model access and docs always come, and GitHub with a repository. */
+  grants?: StartingGrant[];
   /** Instead of the user's default model. */
   model?: string;
+};
+
+/** One grant of a starting set: a built-in offered, `repo` with its repository, or one of the user's own capabilities by name. */
+export type StartingGrant = {
+  capability: string;
+  params?: { repo?: string };
+  /** For `repo` only: one of the user's `github-user` tokens that reaches it, to act as them there; else the GitHub App. */
+  credential?: string;
 };
 
 /** What the runtime suggests a new session starts with for a first message as it's written (#232); advisory. */
