@@ -357,6 +357,39 @@ async fn a_steered_message_the_agent_never_got_goes_back_to_its_place_in_the_que
 }
 
 #[tokio::test]
+async fn steers_that_fail_together_go_back_in_their_order() {
+    let mut h = Harness::ready().await;
+    let first = h.prompt("First");
+    let first_request = h.next().await;
+    let _a = h.prompt("A");
+    wait_for_queue(&h, 1).await;
+    let _b = h.prompt("B");
+    let queued = wait_for_queue(&h, 2).await;
+
+    let (hub, id) = (h.hub.clone(), h.id);
+    let steer = |qid: String| {
+        let hub = hub.clone();
+        tokio::spawn(async move { hub.steer_queued(id, json!({"id": qid})).await })
+    };
+    let steer_a = steer(queued[0].clone());
+    let steering_a = h.next().await;
+    let steer_b = steer(queued[1].clone());
+    let steering_b = h.next().await;
+    for steering in [&steering_a, &steering_b] {
+        let failed = json!({"jsonrpc": "2.0", "id": steering["id"], "error": {"code": -32603, "message": "boom"}});
+        from_agent(&h.hub, h.id, &h.agent, failed).await;
+    }
+    assert!(steer_a.await.unwrap().is_err());
+    assert!(steer_b.await.unwrap().is_err());
+    assert_eq!(h.queued().await, queued);
+
+    h.respond(&first_request, json!({"stopReason": "end_turn"}))
+        .await;
+    first.await.unwrap().unwrap();
+    assert_eq!(prompt_text(&h.next().await), ["A", "B"]);
+}
+
+#[tokio::test]
 async fn steering_a_message_while_the_agent_is_down_leaves_it_queued() {
     let mut h = Harness::ready().await;
     let _first = h.prompt("First");
@@ -1397,6 +1430,7 @@ fn batch(
         blocks: vec![json!({"type": "text", "text": text})],
         notice: false,
         reply: Some(reply),
+        seq: 0,
     };
     (vec![queued], receiver)
 }

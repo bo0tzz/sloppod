@@ -41,6 +41,9 @@ pub(crate) struct Queued {
     pub(crate) blocks: Vec<Value>,
     pub(crate) notice: bool,
     pub(crate) reply: Option<oneshot::Sender<Result<Value, RpcError>>>,
+    /// Where it joined the queue, counted per session; kept while it's held, so one that goes back after a failed
+    /// steer takes its old place. 0 for what was queued before this runtime started, or put at the front.
+    pub(crate) seq: u64,
 }
 
 /// Whether the message `id` waits in the queue, or is held on its way to the agent.
@@ -65,6 +68,7 @@ fn unstored(q: &Value) -> Queued {
         blocks: q["blocks"].as_array().cloned().unwrap_or_default(),
         notice: q["notice"] == true,
         reply: None,
+        seq: 0,
     }
 }
 
@@ -75,6 +79,7 @@ fn notice_queued(text: &str) -> Queued {
         blocks: vec![json!({"type": "text", "text": text})],
         notice: true,
         reply: None,
+        seq: 0,
     }
 }
 
@@ -225,6 +230,17 @@ struct LiveState {
     restart_notice: Option<String>,
     /// The session was stopped: nothing queued for it runs any more.
     stopped: bool,
+    /// The last `seq` given to a queued prompt.
+    queued_seq: u64,
+}
+
+impl LiveState {
+    /// Adds `queued` to the end of the queue.
+    fn enqueue(&mut self, mut queued: Queued) {
+        self.queued_seq += 1;
+        queued.seq = self.queued_seq;
+        self.queue.push(queued);
+    }
 }
 
 impl Live {
@@ -1385,11 +1401,12 @@ impl Hub {
                 // Shown as waiting, and not waking a parked session, unless it waits only for the agent to be up.
                 let waiting = agent_up || state.limited_until.is_some();
                 let (reply, receiver) = oneshot::channel();
-                state.queue.push(Queued {
+                state.enqueue(Queued {
                     id: waiting.then(|| message_id.unwrap_or_else(Uuid::new_v4)),
                     blocks: blocks.clone(),
                     notice: false,
                     reply: Some(reply),
+                    seq: 0,
                 });
                 self.save_queue(id, &state).await;
                 (Some(receiver), waiting)
@@ -1524,7 +1541,7 @@ impl Hub {
             self.move_limit(id, self.now()).await;
             return Ok(json!({"outcome": "queued"}));
         }
-        let (queued, held, before) = self.take_queued(id, &params, Take::Steer).await?;
+        let (queued, held) = self.take_queued(id, &params, Take::Steer).await?;
         match self
             .steer_in(id, queued.blocks.clone(), false, held, queued.id)
             .await
@@ -1542,8 +1559,8 @@ impl Hub {
                     let put = move |queue: &mut Vec<Queued>, _: Vec<Queued>| {
                         let at = queue
                             .iter()
-                            .rposition(|q| q.id.is_some_and(|q| before.contains(&q)))
-                            .map_or(0, |i| i + 1);
+                            .position(|q| q.seq > queued.seq)
+                            .unwrap_or(queue.len());
                         queue.insert(at, queued);
                     };
                     self.requeue_held(id, key, put).await;
@@ -1558,7 +1575,7 @@ impl Hub {
 
     /// Takes a message waiting behind the running turn out of the queue, e.g. for the user to edit, and returns it.
     pub async fn remove_queued(&self, id: Uuid, params: Value) -> Result<Value, RpcError> {
-        let (queued, _, _) = self.take_queued(id, &params, Take::Remove).await?;
+        let (queued, _) = self.take_queued(id, &params, Take::Remove).await?;
         if let Some(reply) = queued.reply {
             let _ = reply.send(Ok(json!({"stopReason": "cancelled"})));
         }
@@ -1566,13 +1583,13 @@ impl Hub {
     }
 
     /// Takes the waiting message `params.id` names out of the queue. Taken back, the store remembers it wasn't run;
-    /// taken to steer in, it's held until the agent has it. Returns it, what holds it, and the ids queued before it.
+    /// taken to steer in, it's held until the agent has it. Returns it, and what holds it.
     async fn take_queued(
         &self,
         id: Uuid,
         params: &Value,
         take: Take,
-    ) -> Result<(Queued, Option<Uuid>, Vec<Uuid>), RpcError> {
+    ) -> Result<(Queued, Option<Uuid>), RpcError> {
         let qid = params["id"]
             .as_str()
             .and_then(|q| q.parse::<Uuid>().ok())
@@ -1591,7 +1608,6 @@ impl Hub {
                     .await
                     .map_err(|e| RpcError::new(-32603, e.to_string()))?;
             }
-            let before = state.queue[..index].iter().filter_map(|q| q.id).collect();
             let queued = state.queue.remove(index);
             let held = match take {
                 Take::Remove => {
@@ -1603,7 +1619,7 @@ impl Hub {
                         .await
                 }
             };
-            (queued, held, before)
+            (queued, held)
         };
         self.broadcast_queue(id).await;
         Ok(taken)
@@ -1683,7 +1699,7 @@ impl Hub {
             let mut state = live.state.lock().await;
             let up = state.agent.is_some() && state.agent_session_id.is_some();
             if !up || (state.limited_until.is_some() && !state.turn_running) {
-                state.queue.push(notice);
+                state.enqueue(notice);
                 let kept = self.save_queue(id, &state).await;
                 (Delivery::Queued, kept)
             } else if state.turn_running {
@@ -1788,6 +1804,7 @@ impl Hub {
                     blocks,
                     notice,
                     reply: None,
+                    seq: 0,
                 }];
                 tokio::spawn(self.clone().run_queued(id, agent, None, queued, held));
                 return Ok(json!({"outcome": "startedNewTurn"}));
@@ -1833,11 +1850,12 @@ impl Hub {
             {
                 let live = self.live(id);
                 let mut state = live.state.lock().await;
-                state.queue.push(Queued {
+                state.enqueue(Queued {
                     id: None,
                     blocks,
                     notice: false,
                     reply: None,
+                    seq: 0,
                 });
                 self.save_queue(id, &state).await;
             }
@@ -1856,6 +1874,7 @@ impl Hub {
                 blocks: blocks.clone(),
                 notice: false,
                 reply: None,
+                seq: 0,
             };
             self.hold(id, &mut state, std::slice::from_ref(&steer))
                 .await
