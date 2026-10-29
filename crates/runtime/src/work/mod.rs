@@ -196,13 +196,14 @@ fn check_graph_name(name: &str) -> WorkResult<()> {
     Ok(())
 }
 
-/// Where a link points must be well-formed, and a session or proposal the owner's own.
+/// Where a link points, checked: well-formed, and a session or proposal the owner's own. Ids come back in their
+/// canonical form, so a link is found by the id's text however it was written.
 async fn check_target(
     tx: &mut PgConnection,
     owner: &str,
     kind: LinkKind,
     target: &str,
-) -> WorkResult<()> {
+) -> WorkResult<String> {
     match kind {
         LinkKind::Issue | LinkKind::PullRequest => {
             let well_formed = target.rsplit_once('#').is_some_and(|(repo, number)| {
@@ -230,9 +231,10 @@ async fn check_target(
             if !exists {
                 return invalid(format!("no {} of yours has that id", kind_str(kind)));
             }
+            return Ok(id.to_string());
         }
     }
-    Ok(())
+    Ok(target.to_owned())
 }
 
 pub async fn list_graphs(db: &PgPool, owner: &str) -> sqlx::Result<Vec<WorkGraph>> {
@@ -932,7 +934,7 @@ pub async fn add_link(
     let target = new.target.trim();
     let mut tx = db.begin().await?;
     let graph = lock_item_graph(&mut tx, actor.user, item).await?;
-    check_target(&mut tx, actor.user, new.kind, target).await?;
+    let target = check_target(&mut tx, actor.user, new.kind, target).await?;
     let link: Option<Link> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "insert into work_links (id, item_id, kind, target, role) values ($1, $2, $3, $4, $5) \
          on conflict (item_id, kind, target) do nothing returning {LINK_COLUMNS}"
@@ -940,7 +942,7 @@ pub async fn add_link(
     .bind(Uuid::now_v7())
     .bind(item)
     .bind(kind_str(new.kind))
-    .bind(target)
+    .bind(&target)
     .bind(role_str(new.role))
     .fetch_optional(&mut *tx)
     .await?;

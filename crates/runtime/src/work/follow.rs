@@ -245,6 +245,9 @@ pub async fn run(state: crate::AppState) {
         if let Err(e) = issues(&state.db, &state.credentials).await {
             tracing::warn!(error = ?e, "following linked issues");
         }
+        if let Err(e) = unfollowed(&state.db).await {
+            tracing::warn!(error = ?e, "linking pull requests proposals opened");
+        }
     }
 }
 
@@ -253,6 +256,7 @@ pub async fn run(state: crate::AppState) {
 pub async fn executed(
     db: &PgPool,
     owner: &str,
+    proposal: Uuid,
     session: Uuid,
     kind: &str,
     payload: &serde_json::Value,
@@ -275,9 +279,41 @@ pub async fn executed(
             opened(db, owner, session, repo, &numbers).await?;
         }
         "sloppod.session.report" => {
-            sessions(db, Some(session)).await?;
+            return sessions(db, Some(session)).await.map(|_| ());
         }
-        _ => {}
+        _ => return Ok(()),
+    }
+    // Done: the next pass leaves it be, also once someone unlinks what it linked.
+    sqlx::query(
+        "insert into work_followed_proposals (proposal_id) values ($1) on conflict do nothing",
+    )
+    .bind(proposal)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Links what executed pull request and stack proposals of the last day opened, where that wasn't done when they were
+/// carried out: it failed, or the runtime stopped in between. Carrying one out again isn't needed, nor done.
+pub async fn unfollowed(db: &PgPool) -> WorkResult<()> {
+    let missed: Vec<(
+        Uuid,
+        String,
+        Uuid,
+        String,
+        serde_json::Value,
+        serde_json::Value,
+    )> = sqlx::query_as(
+        "select p.id, s.owner, p.session_id, p.kind, p.payload, p.result from proposals p \
+         join sessions s on s.id = p.session_id \
+         where p.kind in ('github.pr.create', 'github.stack.create') and p.status = 'executed' \
+         and p.result is not null and p.decided_at > now() - interval '1 day' \
+         and not exists (select 1 from work_followed_proposals f where f.proposal_id = p.id)",
+    )
+    .fetch_all(db)
+    .await?;
+    for (proposal, owner, session, kind, payload, result) in missed {
+        executed(db, &owner, proposal, session, &kind, &payload, &result).await?;
     }
     Ok(())
 }
@@ -464,6 +500,7 @@ mod tests {
         executed(
             &db,
             "dev",
+            Uuid::now_v7(),
             worker,
             "github.pr.create",
             &json!({"repo": "o/r"}),
@@ -512,6 +549,7 @@ mod tests {
             executed(
                 &db,
                 "dev",
+                Uuid::now_v7(),
                 worker,
                 "github.stack.create",
                 &json!({"repo": "o/r"}),
@@ -521,6 +559,70 @@ mod tests {
             .unwrap();
         }
         assert_eq!(links(background).await.len(), 4);
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_pull_request_linking_missed_at_execution_is_made_up_once(db: PgPool) {
+        let graph = create_graph(&db, "dev", "g").await.unwrap().id;
+        let worker = session(&db).await;
+        let fix = new_item(&db, graph, "fix").await;
+        link(
+            &db,
+            fix,
+            LinkKind::Session,
+            &worker.to_string(),
+            Role::Completes,
+        )
+        .await;
+        // Carried out, but the runtime stopped before linking what it opened.
+        let proposal = crate::db::insert_proposal(
+            &db,
+            worker,
+            "github.pr.create",
+            sloppod_protocol::api::ProposalStatus::Pending,
+            &json!({"repo": "o/r"}),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "update proposals set status = 'executed', result = $2, decided_at = now() where id = $1",
+        )
+        .bind(proposal.id)
+        .bind(json!({"number": 12}))
+        .execute(&db)
+        .await
+        .unwrap();
+        unfollowed(&db).await.unwrap();
+        let pull = |links: Vec<crate::work::Link>| links.into_iter().find(|l| l.target == "o/r#12");
+        let linked = pull(item(&db, "dev", fix).await.unwrap().unwrap().links).unwrap();
+        // Once made up, it's left be, also after the user unlinks it.
+        crate::work::remove_link(&db, DEV, linked.id).await.unwrap();
+        unfollowed(&db).await.unwrap();
+        assert!(pull(item(&db, "dev", fix).await.unwrap().unwrap().links).is_none());
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_session_link_is_found_however_its_id_was_written(db: PgPool) {
+        let graph = create_graph(&db, "dev", "g").await.unwrap().id;
+        let worker = session(&db).await;
+        let fix = new_item(&db, graph, "fix").await;
+        let shouting = worker.to_string().to_uppercase();
+        link(&db, fix, LinkKind::Session, &shouting, Role::Completes).await;
+        let stored = item(&db, "dev", fix).await.unwrap().unwrap().links;
+        assert_eq!(stored[0].target, worker.to_string());
+        sqlx::query("update sessions set phase = 'parked' where id = $1")
+            .bind(worker)
+            .execute(&db)
+            .await
+            .unwrap();
+        sessions(&db, None).await.unwrap();
+        assert_eq!(stored_status(&db, fix).await, "abandoned");
+    }
+
+    async fn stored_status(db: &PgPool, id: Uuid) -> String {
+        item(db, "dev", id).await.unwrap().unwrap().links[0]
+            .status
+            .clone()
     }
 
     #[sqlx::test(migrator = "crate::db::MIGRATOR")]
@@ -571,6 +673,7 @@ mod tests {
         executed(
             &db,
             "dev",
+            Uuid::now_v7(),
             worker,
             "sloppod.session.report",
             &json!({}),

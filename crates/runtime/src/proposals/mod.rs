@@ -668,6 +668,7 @@ async fn carry_out(
         && let Err(e) = crate::work::follow::executed(
             &state.db,
             &session.owner,
+            id,
             session_id,
             &proposal.kind,
             &proposal.payload,
