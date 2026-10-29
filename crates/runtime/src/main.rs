@@ -78,6 +78,8 @@ pub struct Inner {
     pub placement: Arc<dyn PlacementBackend>,
     pub enforcer: Arc<dyn Enforcer>,
     pub cilium: Arc<Cilium>,
+    /// Where requests to owners' MCP servers may go: not back to the runtime.
+    pub reach: proxy::Reach,
     pub ca: tls::Ca,
     pub authz_addr: SocketAddr,
     pub agents: adapter::Agents,
@@ -232,6 +234,12 @@ async fn main() -> anyhow::Result<()> {
         enforcer: cilium.clone(),
         cilium,
         ca,
+        reach: proxy::Reach::new(
+            [Some(authz_addr.ip()), config.pod_ip]
+                .into_iter()
+                .flatten()
+                .collect(),
+        ),
         authz_addr,
         agents,
         instructions,

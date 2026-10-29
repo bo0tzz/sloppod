@@ -231,15 +231,18 @@ async fn forward(
         set.push(token_header(state, &session.owner, credential).await?);
     }
     tracing::info!(session = %session.id, server = %name, method = %parts.method, "request to an MCP server");
-    crate::proxy::forward(
-        parts.method,
-        &parts.headers,
-        &url,
-        body,
-        set,
-        vec!["authorization".into(), "cookie".into()],
-    )
-    .await
+    state
+        .reach
+        .forward(crate::proxy::Forward {
+            method: parts.method,
+            headers: &parts.headers,
+            url: &url,
+            body,
+            set,
+            remove: vec!["authorization".into(), "cookie".into()],
+            user_header: &state.config.user_header,
+        })
+        .await
 }
 
 /// The server a session's request for `name` goes to.
