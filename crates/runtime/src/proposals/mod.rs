@@ -14,7 +14,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
-use sloppod_contracts::{Error, ProposalKind, RepoGrant, Result, SessionContext, ToolSpec};
+use sloppod_contracts::{
+    Error, ProposalKind, RepoGrant, Result, SessionContext, ToolSpec, operation,
+};
 use sloppod_protocol::api::{Proposal, ProposalStatus, ReviewPolicy};
 use tracing::Instrument;
 use uuid::Uuid;
@@ -183,6 +185,31 @@ pub(crate) async fn prepared(
     Ok(payload)
 }
 
+/// An outward proposal on a repository whose grant doesn't cover proposing is refused: a sub-session's inherited grant
+/// of a repository its parent acts on as the user covers reading it and pushing the child's own branches (ADR 29), and
+/// proposals there are the parent's to make.
+fn may_propose(
+    session: &SessionContext,
+    kind: &dyn ProposalKind,
+    target: Option<&str>,
+) -> Result<()> {
+    match target {
+        Some(repo)
+            if kind.outward()
+                && session.repo_limited(repo)
+                && !session.repo_covers(repo, operation::PROPOSE) =>
+        {
+            Err(Error::new(format!(
+                "this session acts on {repo} as {} only to read it and push its own branches, as inherited from its \
+                 parent session; proposals there are the parent's to make. Push your branch and report it with \
+                 report_done, and your parent proposes it",
+                session.repo_acting_as(repo).unwrap_or("the user")
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// A proposal is carried out as whoever it said it would act as when it was approved (`as` in its payload, or the
 /// App): if the session's grant of its repository changed identity since, nothing is done.
 fn same_identity(session: &SessionContext, target: Option<&str>, payload: &Value) -> Result<()> {
@@ -257,6 +284,7 @@ pub async fn propose(
     let payload = prepared(kind.as_ref(), &context, arguments)
         .await
         .map_err(|e| e.0)?;
+    may_propose(&context, kind.as_ref(), kind.target(&payload).as_deref()).map_err(|e| e.0)?;
     let mut subject = kind.review_subject(&payload).filter(|_| asked || required);
     if asked && subject.is_none() {
         return Err("proposals of this kind aren't reviewed; propose it without review".into());
@@ -611,7 +639,9 @@ async fn carry_out(
             .and_then(|repo| context.repo_credential(repo)),
     );
     let execute = async {
-        match same_identity(&context, target.as_deref(), payload) {
+        match same_identity(&context, target.as_deref(), payload)
+            .and_then(|()| may_propose(&context, kind, target.as_deref()))
+        {
             Ok(()) => kind.execute(&context, id, payload).instrument(span).await,
             Err(e) => Err(e),
         }
@@ -858,6 +888,56 @@ mod tests {
             same_identity(&mine, None, &json!({})).is_ok(),
             "nothing on a repository"
         );
+    }
+
+    #[test]
+    fn a_sub_session_proposes_nothing_where_it_only_inherited_the_users_token() {
+        let mut child = session(&["a/one", "a/two"]);
+        child.grants[0].params["credential"] = json!("c1");
+        child.grants[0].params["as"] = json!("dev");
+        child.grants[0].params["operations"] = json!(["read", "push"]);
+        let refused = may_propose(&child, &OnRepo, Some("A/One")).unwrap_err();
+        assert!(
+            refused.0.contains("as dev only to read it and push"),
+            "{}",
+            refused.0
+        );
+        assert!(may_propose(&child, &OnRepo, Some("a/two")).is_ok());
+        assert!(
+            may_propose(&child, &OnRepo, Some("x/y")).is_ok(),
+            "not a grant of it"
+        );
+        assert!(may_propose(&child, &OnRepo, None).is_ok());
+        // Its report isn't outward, so it goes through: the parent proposes from it.
+        struct Inward;
+        #[async_trait::async_trait]
+        impl ProposalKind for Inward {
+            fn manifest(&self) -> sloppod_contracts::Manifest {
+                OnRepo.manifest()
+            }
+            fn kind(&self) -> String {
+                "test.inward".into()
+            }
+            fn summary(&self, _: &Value) -> String {
+                String::new()
+            }
+            fn tool(&self) -> ToolSpec {
+                OnRepo.tool()
+            }
+            fn outward(&self) -> bool {
+                false
+            }
+            async fn prepare(&self, _: &SessionContext, arguments: Value) -> Result<Value> {
+                Ok(arguments)
+            }
+            async fn detail(&self, _: &SessionContext, _: &Value) -> Result<Value> {
+                Ok(json!({}))
+            }
+            async fn execute(&self, _: &SessionContext, _: Uuid, _: &Value) -> Result<Value> {
+                Ok(json!({}))
+            }
+        }
+        assert!(may_propose(&child, &Inward, Some("a/one")).is_ok());
     }
 
     /// A kind that proposes on the repository it's given, and logs from inside its preparation as a GitHub client's
