@@ -2032,39 +2032,97 @@ test('lists the session grants from the session menu', async ({ page }) => {
   await expect(grants.getByText(/^bo0tzz\/sloppod: read, and push the session branch `sloppod\//)).toBeVisible();
 });
 
+async function addCredential(page: Page, kind: string, name: string) {
+  const response = await page.request.post('/api/v1/credentials', { data: { kind, name, secret: `secret-${name}`, config: {} } });
+  return ((await response.json()) as { id: string }).id;
+}
+
+async function openGrants(page: Page) {
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await page.getByRole('menuitem', { name: 'Grants' }).click();
+  return page.getByTestId('grants');
+}
+
 test("a model grant names the user's accounts, and the user picks which one it uses", async ({ page }) => {
-  const work = (await (
-    await page.request.post('/api/v1/credentials', { data: { kind: 'claude', name: 'Work', secret: 'sk-ant-work', config: {} } })
-  ).json()) as { id: string };
+  const work = await addCredential(page, 'claude', 'Work');
+  const spare = await addCredential(page, 'claude', 'Spare');
   try {
     await createSession(page, 'Fix the build in bo0tzz/sloppod');
-    await page.getByRole('button', { name: 'Session actions' }).click();
-    await page.getByRole('menuitem', { name: 'Grants' }).click();
-    const model = page.getByTestId('grants').getByTestId('grant-model');
+    const model = (await openGrants(page)).getByTestId('grant-model');
     // Made with all of the user's Claude accounts, the default first, which is the one in use.
     const accounts = model.getByTestId('grant-account');
-    await expect(accounts).toHaveCount(2);
+    await expect(accounts).toHaveCount(3);
     await expect(accounts.nth(0)).toContainText('Personal');
     await expect(accounts.nth(0)).toContainText('in use');
-    await expect(accounts.nth(1)).toHaveText(/Work/);
 
+    // The third goes to the front, the others keep their order.
     const changing = page.waitForRequest((request) => request.method() === 'PATCH');
-    await accounts.nth(1).getByRole('button', { name: 'Use first' }).click();
-    expect((await changing).postDataJSON().credentials[0]).toBe(work.id);
-    await expect(accounts.nth(0)).toContainText('Work');
+    await accounts.nth(2).getByRole('button', { name: 'Use first' }).click();
+    const sent = (await changing).postDataJSON().credentials;
+    expect(sent[0]).toBe(spare);
+    expect(sent[2]).toBe(work);
+    await expect(accounts.nth(0)).toContainText('Spare');
     await expect(accounts.nth(0)).toContainText('in use');
+    await expect(accounts.nth(1)).toContainText('Personal');
 
     await accounts.nth(1).getByRole('button', { name: 'Remove' }).click();
+    await expect(accounts).toHaveCount(2);
+    await accounts.nth(1).getByRole('button', { name: 'Remove' }).click();
     await expect(accounts).toHaveCount(1);
-    await expect(accounts.nth(0)).toContainText('Work');
-    // The last account can't be removed, and the one removed can be added back.
+    await expect(accounts.nth(0)).toContainText('Spare');
+    // The last account can't be removed, and one removed can be added back.
     await expect(accounts.getByRole('button', { name: 'Remove' })).toHaveCount(0);
     await model.getByRole('combobox', { name: 'Add an account' }).click();
     await page.getByRole('option', { name: 'Personal' }).click();
     await expect(accounts).toHaveCount(2);
     await expect(accounts.nth(1)).toContainText('Personal');
   } finally {
-    await page.request.delete(`/api/v1/credentials/${work.id}`);
+    for (const id of [work, spare]) await page.request.delete(`/api/v1/credentials/${id}`);
+  }
+});
+
+test('a model grant whose accounts were all deleted is given another', async ({ page }) => {
+  const temporary = await addCredential(page, 'claude', 'Temporary');
+  try {
+    const id = await createSession(page, 'Fix the build in bo0tzz/sloppod');
+    const session = await (await page.request.get(`/api/v1/sessions/${id}`)).json();
+    const grant = session.grants.find((g: { capability: string }) => g.capability === 'model');
+    await page.request.patch(`/api/v1/sessions/${id}/grants/${grant.id}`, { data: { credentials: [temporary] } });
+  } finally {
+    await page.request.delete(`/api/v1/credentials/${temporary}`);
+  }
+  const model = (await openGrants(page)).getByTestId('grant-model');
+  const accounts = model.getByTestId('grant-account');
+  await expect(accounts).toHaveCount(1);
+  await expect(accounts.nth(0)).toContainText('A deleted account');
+  const changing = page.waitForRequest((request) => request.method() === 'PATCH');
+  await model.getByRole('combobox', { name: 'Add an account' }).click();
+  await page.getByRole('option', { name: 'Personal' }).click();
+  expect((await changing).postDataJSON().credentials).toHaveLength(1);
+  await expect(accounts).toHaveCount(1);
+  await expect(accounts.nth(0)).toContainText('Personal');
+  await expect(accounts.nth(0)).toContainText('in use');
+});
+
+test('a grant made before the user had an account of its kind is given one later', async ({ page }) => {
+  await createSession(page, 'Fix the build in bo0tzz/sloppod');
+  let grants = await openGrants(page);
+  const add = grants.getByTestId('add-grant');
+  await add.getByRole('combobox', { name: 'Grant' }).click();
+  await page.getByRole('option', { name: 'codex' }).click();
+  await add.getByRole('button', { name: 'Grant' }).click();
+  await expect(grants.getByTestId('grant-codex').getByTestId('grant-account-default')).toBeVisible();
+  await page.keyboard.press('Escape');
+  const login = await addCredential(page, 'chatgpt', 'Reviews');
+  try {
+    grants = await openGrants(page);
+    const codex = grants.getByTestId('grant-codex');
+    await codex.getByRole('combobox', { name: 'Add an account' }).click();
+    await page.getByRole('option', { name: 'Reviews' }).click();
+    await expect(codex.getByTestId('grant-account')).toContainText('Reviews');
+    await expect(codex.getByTestId('grant-account-default')).toHaveCount(0);
+  } finally {
+    await page.request.delete(`/api/v1/credentials/${login}`);
   }
 });
 

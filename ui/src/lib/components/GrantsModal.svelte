@@ -20,6 +20,7 @@
   let graphs = $state<WorkGraph[]>([]);
   /** The user's credentials, for the accounts a model grant names (ADR 29). */
   let credentials = $state<Credential[]>([]);
+  let credentialsLoaded = $state(false);
   onMount(() => {
     api.listCapabilities().then(
       (definitions) => (own = definitions.map((definition) => definition.name)),
@@ -30,7 +31,10 @@
       () => {},
     );
     api.listCredentials().then(
-      (listed) => (credentials = listed),
+      (listed) => {
+        credentials = listed;
+        credentialsLoaded = true;
+      },
       () => {},
     );
   });
@@ -75,15 +79,16 @@
   const accountsOf = (grant: Grant) =>
     Array.isArray(grant.params.credentials) ? (grant.params.credentials as string[]) : [];
   const accountName = (id: string) => credentials.find((c) => c.id === id)?.name;
+  /** Those still there: a change is made of these, since the runtime refuses a deleted one. Until the user's credentials
+   * have loaded, every one counts as there. */
+  const liveAccounts = (grant: Grant) =>
+    accountsOf(grant).filter((id) => !credentialsLoaded || accountName(id) !== undefined);
   /** The user's accounts of the grant's kind that it doesn't name yet. */
   const addable = (grant: Grant) =>
     credentials.filter((c) => c.kind === accountKinds[grant.capability] && !accountsOf(grant).includes(c.id));
   const setAccounts = (grant: Grant, ids: string[]) => change(grant, { credentials: ids });
-  const moveUp = (grant: Grant, index: number) => {
-    const ids = [...accountsOf(grant)];
-    [ids[index - 1], ids[index]] = [ids[index], ids[index - 1]];
-    return setAccounts(grant, ids);
-  };
+  const useFirst = (grant: Grant, id: string) => setAccounts(grant, [id, ...liveAccounts(grant).filter((other) => other !== id)]);
+  const remove = (grant: Grant, id: string) => setAccounts(grant, liveAccounts(grant).filter((other) => other !== id));
 
   async function act(call: () => Promise<Session>): Promise<boolean> {
     if (busy) return false;
@@ -123,37 +128,35 @@
           <li class="flex flex-col gap-1" data-testid="grant-{grant.capability}">
             <span class="font-mono text-sm font-medium">{grant.capability}</span>
             <span class="text-sm">{grant.description ?? ''}</span>
-            {#if accountKinds[grant.capability] && accountsOf(grant).length > 0}
+            {#if accountKinds[grant.capability]}
               <ol class="flex flex-col gap-1 text-sm" data-testid="grant-accounts">
                 {#each accountsOf(grant) as id, index (id)}
+                  {@const live = liveAccounts(grant)}
                   <li class="flex flex-wrap items-center gap-2" data-testid="grant-account">
-                    {#if accountName(id) !== undefined}
-                      <span>{accountName(id)}</span>
-                      {#if index === 0}
+                    {#if live.includes(id)}
+                      <span>{accountName(id) ?? ''}</span>
+                      {#if live[0] === id}
                         <Text color="muted" size="small">in use</Text>
                       {/if}
                     {:else}
                       <Text color="danger" size="small">A deleted account</Text>
                     {/if}
                     {#if changeable && grant.id}
-                      {#if index > 0}
-                        <Button size="tiny" variant="ghost" shape="round" disabled={busy} onclick={() => moveUp(grant, index)}>
+                      {#if live.includes(id) && live[0] !== id}
+                        <Button size="tiny" variant="ghost" shape="round" disabled={busy} onclick={() => useFirst(grant, id)}>
                           Use first
                         </Button>
                       {/if}
-                      {#if accountsOf(grant).length > 1}
-                        <Button
-                          size="tiny"
-                          variant="ghost"
-                          shape="round"
-                          disabled={busy}
-                          onclick={() => setAccounts(grant, accountsOf(grant).filter((other) => other !== id))}
-                        >
+                      <!-- A grant keeps at least one account; a deleted one goes whenever another is left. -->
+                      {#if live.filter((other) => other !== id).length > 0}
+                        <Button size="tiny" variant="ghost" shape="round" disabled={busy} onclick={() => remove(grant, id)}>
                           Remove
                         </Button>
                       {/if}
                     {/if}
                   </li>
+                {:else}
+                  <li data-testid="grant-account-default"><Text color="muted" size="small">Your default account</Text></li>
                 {/each}
               </ol>
               {#if changeable && grant.id && addable(grant).length > 0}
@@ -165,7 +168,7 @@
                         options={addable(grant).map((c) => ({ value: c.id, label: c.name }))}
                         placeholder="Add an account"
                         title="Add an account to {grant.capability}"
-                        onChange={(value) => void setAccounts(grant, [...accountsOf(grant), value as string])}
+                        onChange={(value) => void setAccounts(grant, [...liveAccounts(grant), value as string])}
                       />
                     </Field>
                   {/key}
