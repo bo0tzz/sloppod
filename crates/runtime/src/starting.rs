@@ -260,17 +260,22 @@ mod tests {
         };
         assert_eq!(
             capabilities(grants(DEFAULTS, None, None, id).unwrap()),
-            ["model", "github", "packages", "docs"]
+            ["model", "docs", "github", "packages"]
         );
-        let docs = ["docs".to_owned()];
+        // Model access and docs come whatever's chosen, even nothing.
         assert_eq!(
-            capabilities(grants(DEFAULTS, Some(&docs), None, id).unwrap()),
+            capabilities(grants(DEFAULTS, Some(&[]), None, id).unwrap()),
             ["model", "docs"]
+        );
+        let packages = ["packages".to_owned()];
+        assert_eq!(
+            capabilities(grants(DEFAULTS, Some(&packages), None, id).unwrap()),
+            ["model", "docs", "packages"]
         );
         // A repository needs GitHub, so it comes along.
         assert_eq!(
-            capabilities(grants(DEFAULTS, Some(&docs), Some("o/r"), id).unwrap()),
-            ["model", "github", "docs", "repo"]
+            capabilities(grants(DEFAULTS, Some(&packages), Some("o/r"), id).unwrap()),
+            ["model", "docs", "github", "packages", "repo"]
         );
         let more = ["memory".to_owned()];
         assert!(grants(DEFAULTS, Some(&more), None, id).is_err());
