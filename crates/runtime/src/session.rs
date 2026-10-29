@@ -363,18 +363,31 @@ pub struct Hub {
     /// The time the tests say it is, instead of the clock's.
     now: StdMutex<Option<DateTime<Utc>>>,
     limit_hit: StdMutex<Option<LimitHit>>,
-    /// Holds a turn just before it's sent, until released; for tests of a link going meanwhile.
+    /// Hold a turn just before it starts, and just before it's sent, until released; for tests of a link going
+    /// meanwhile.
     #[cfg(test)]
-    pub(crate) send_gate: SendGate,
+    pub(crate) start_gate: Gate,
+    #[cfg(test)]
+    pub(crate) send_gate: Gate,
 }
 
-/// See `Hub::send_gate`.
+/// See `Hub::start_gate` and `Hub::send_gate`.
 #[cfg(test)]
 #[derive(Default)]
-pub(crate) struct SendGate {
+pub(crate) struct Gate {
     pub(crate) on: std::sync::atomic::AtomicBool,
     pub(crate) reached: Notify,
     pub(crate) released: Notify,
+}
+
+#[cfg(test)]
+impl Gate {
+    async fn pass(&self) {
+        if self.on.load(std::sync::atomic::Ordering::SeqCst) {
+            self.reached.notify_one();
+            self.released.notified().await;
+        }
+    }
 }
 
 fn notification(method: &str, params: Value) -> Value {
@@ -408,7 +421,9 @@ impl Hub {
             limit_hit: StdMutex::default(),
             now: StdMutex::default(),
             #[cfg(test)]
-            send_gate: SendGate::default(),
+            start_gate: Gate::default(),
+            #[cfg(test)]
+            send_gate: Gate::default(),
         }
     }
 
@@ -1540,18 +1555,30 @@ impl Hub {
         blocks: Vec<Value>,
         held: Option<Uuid>,
     ) -> Result<Value, RpcError> {
+        #[cfg(test)]
+        self.start_gate.pass().await;
         let Some((agent, agent_session_id)) = self.begin_turn(id).await else {
-            let live = self.live(id);
-            let mut state = live.state.lock().await;
-            state.turn_running = false;
-            self.release(id, &mut state, held).await;
-            return Err(RpcError::new(
-                -32002,
-                "the session's agent isn't running yet; try again shortly",
-            ));
+            self.live(id).state.lock().await.turn_running = false;
+            return Err(self.unsent(id, held).await);
         };
         self.turn_on(id, &agent, &agent_session_id, blocks, false, held)
             .await
+    }
+
+    /// A turn whose link went before it was sent goes back to the front of the queue, for the agent that's up now
+    /// or the next; what its senders are told.
+    async fn unsent(self: &Arc<Self>, id: Uuid, held: Option<Uuid>) -> RpcError {
+        if let Some(key) = held {
+            self.requeue_held(id, key, |queue, back| {
+                let since = std::mem::take(queue);
+                *queue = back.into_iter().chain(since).collect();
+            })
+            .await;
+        }
+        RpcError::new(
+            -32002,
+            "the agent's link dropped; the message is kept, and runs once the agent is back",
+        )
     }
 
     /// Marks a turn working on the session's current agent, which it returns; `None` if there isn't one up.
@@ -1582,10 +1609,7 @@ impl Hub {
     ) -> Result<Value, RpcError> {
         let prompt = self.with_time(id, blocks, notice).await;
         #[cfg(test)]
-        if self.send_gate.on.load(std::sync::atomic::Ordering::SeqCst) {
-            self.send_gate.reached.notify_one();
-            self.send_gate.released.notified().await;
-        }
+        self.send_gate.pass().await;
         // Sent and noted under the lock a link's going takes, so that either finds the other done: a turn sent on a
         // link that then goes is settled by the next one, and one whose link went first isn't sent on it.
         let answer = {
@@ -1603,18 +1627,7 @@ impl Hub {
             }
         };
         let Some(answer) = answer else {
-            // Back at the front of the queue, for the agent that's up now, or the next.
-            if let Some(key) = held {
-                self.requeue_held(id, key, |queue, back| {
-                    let since = std::mem::take(queue);
-                    *queue = back.into_iter().chain(since).collect();
-                })
-                .await;
-            }
-            return Err(RpcError::new(
-                -32002,
-                "the agent's link dropped; the message is kept, and runs once the agent is back",
-            ));
+            return Err(self.unsent(id, held).await);
         };
         let result = answer.await;
         {

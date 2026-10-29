@@ -2533,6 +2533,27 @@ async fn a_batch_the_agent_has_when_its_link_drops_isnt_sent_again() {
 }
 
 #[tokio::test]
+async fn a_prompt_whose_link_goes_before_its_turn_starts_runs_on_the_next_link() {
+    let mut h = Harness::ready().await;
+    h.hub.start_gate.on.store(true, Ordering::SeqCst);
+    let _only = h.prompt("Only");
+    h.hub.start_gate.reached.notified().await;
+    h.hub.start_gate.on.store(false, Ordering::SeqCst);
+    // Taken for the idle agent and logged, but the link goes before the turn starts.
+    h.drop_link().await;
+    h.hub.start_gate.released.notify_one();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(kept_texts(&h).await, ["Only"]);
+
+    h.relink(Vec::new()).await;
+    let request = h.next().await;
+    assert_eq!(prompt_text(&request), ["Only"]);
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    wait_until_nothing_kept(&h).await;
+    assert_eq!(h.logged(), ["Only"]);
+}
+
+#[tokio::test]
 async fn a_prompt_whose_link_goes_just_before_it_is_sent_runs_on_the_next_link() {
     let mut h = Harness::ready().await;
     h.hub.send_gate.on.store(true, Ordering::SeqCst);
