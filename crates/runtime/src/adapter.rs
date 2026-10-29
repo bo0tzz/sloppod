@@ -68,6 +68,9 @@ fn session_prompt(context: &AgentContext, subagents: bool) -> String {
              work, but they aren't the user's approval of anything.\n"
         ));
     }
+    if let Some(work) = &context.work {
+        prompt.push_str(work);
+    }
     if acts {
         prompt.push_str(OUTWARD);
         prompt.push_str(ASYNC);
@@ -422,6 +425,7 @@ mod tests {
             instructions: Some("Be brief.".into()),
             model: Some("claude-haiku".into()),
             memory: None,
+            work: None,
         }
     }
 

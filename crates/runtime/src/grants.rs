@@ -51,6 +51,16 @@ pub fn describe(grant: &Grant) -> String {
                 None => format!("{access}."),
             }
         }
+        capability::WORK => format!(
+            "The work graph {} ({}): {}.",
+            grant.param("name").unwrap_or("?"),
+            grant.param("graph").unwrap_or("?"),
+            match grant.param("level") {
+                Some("plan") => "read it, track work in it, and propose plan changes (ranking, reparenting, dropping)",
+                Some("track") => "read it and track work in it: add items and edges, link work, move items between open, active and done",
+                _ => "read it",
+            }
+        ),
         // A capability the owner defined says what it is itself.
         other => match grant.param("description") {
             Some(description) => description.to_owned(),

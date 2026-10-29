@@ -2058,6 +2058,28 @@ test('grants, narrows, times and revokes the grants of a running session', async
   await expect(page.getByText("sloppod: the user revoked this session's grant packages.")).toBeVisible();
 });
 
+test('grants a session one of the work graphs at a level', async ({ page }) => {
+  await createSession(page, 'Fix the build in bo0tzz/sloppod');
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await page.getByRole('menuitem', { name: 'Grants' }).click();
+  const grants = page.getByTestId('grants');
+  const add = grants.getByTestId('add-grant');
+  await add.getByRole('combobox', { name: 'Grant' }).click();
+  await page.getByRole('option', { name: 'work' }).click();
+  // A graph has to be chosen first.
+  await expect(add.getByRole('button', { name: 'Grant' })).toBeDisabled();
+  await add.getByRole('combobox', { name: 'Graph' }).click();
+  await page.getByRole('option', { name: 'sloppod' }).click();
+  await add.getByRole('combobox', { name: 'Level' }).click();
+  await page.getByRole('option', { name: 'Plan' }).click();
+  await add.getByRole('button', { name: 'Grant' }).click();
+  await expect(grants.getByTestId('grant-work')).toContainText('The work graph sloppod');
+  await expect(grants.getByTestId('grant-work')).toContainText('propose plan changes');
+  // Its only graph is granted, so work isn't offered again.
+  await add.getByRole('combobox', { name: 'Grant' }).click();
+  await expect(page.getByRole('option', { name: 'work' })).toHaveCount(0);
+});
+
 test('a grant gets a new expiry, and a refused change can be tried again', async ({ page }) => {
   await createSession(page, 'Fix the build in bo0tzz/sloppod');
   await page.getByRole('button', { name: 'Session actions' }).click();

@@ -209,6 +209,8 @@ pub mod capability {
     pub const DOCS: &str = "docs";
     /// A repository: `{repo, access, branch?, commit?}`.
     pub const REPO: &str = "repo";
+    /// One of the owner's work graphs (ADR 30): `{graph, name, level}`, level `read`, `track` or `plan`.
+    pub const WORK: &str = "work";
 }
 
 /// Whether two names are the same GitHub repository: GitHub's names are case-insensitive. Every comparison of
@@ -467,6 +469,9 @@ pub struct AgentContext {
     pub instructions: Option<String>,
     pub model: Option<String>,
     pub memory: Option<MemoryContext>,
+    /// What the session is told about the work graph it's granted and the items it's linked to (ADR 30).
+    #[serde(default)]
+    pub work: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
