@@ -303,14 +303,10 @@ impl AgentAdapter for ClaudeCode {
     }
 }
 
-/// The MCP servers every agent gets: sloppod's own tools, and the docs server if the session may use it.
+/// The MCP servers every agent gets: sloppod's own tools, and those of its grants, which the runtime serves to it.
 fn mcp_servers(context: &AgentContext) -> Value {
     let mut servers =
         vec![json!({"type": "http", "name": "sloppod", "url": context.tools_url, "headers": []})];
-    if context.session.has(capability::DOCS) {
-        servers.push(json!({"type": "http", "name": "docs", "url": crate::policies::docs::URL, "headers": []}));
-    }
-    // Servers of capabilities the owner defined, which the runtime serves to the sessions granted them.
     for (name, url) in crate::definitions::servers(&context.session.grants, &context.endpoints) {
         servers.push(json!({"type": "http", "name": name, "url": url, "headers": []}));
     }
@@ -509,6 +505,11 @@ mod tests {
             .grants
             .push(sloppod_contracts::Grant::new(capability::DOCS, json!({})));
         assert_eq!(names(&context), ["sloppod", "docs"]);
+        // The runtime serves it, like an owner's server; the agent isn't sent to Context7 itself.
+        assert_eq!(
+            mcp_servers(&context)[1]["url"],
+            "http://runtime/servers/docs"
+        );
         // Both agents get the same servers.
         assert_eq!(
             ClaudeCode.launch(&context).new_session["mcpServers"],
