@@ -3,7 +3,7 @@
 //! own capabilities are definitions (`definitions.rs`); this is the built-ins' side of the same picture, and a
 //! built-in that's an MCP server is served like one of those.
 
-use sloppod_contracts::capability;
+use sloppod_contracts::{SessionContext, capability};
 
 use crate::credentials::CHATGPT;
 
@@ -41,13 +41,22 @@ pub enum Part {
     /// An MCP server, served by the runtime at `/servers/<name>` to the sessions granted it, with no credential.
     Mcp(&'static str),
     /// Inference for the session's agent, with the owner's credential for its provider.
-    Model,
+    Model(Provider),
     /// GitHub through tokens scoped to the session's repository grants, with push rules and proposals.
     Github,
     /// A memini key minted at placement, the runtime's proxy, and the agent's plugin.
     Memory,
     /// The deployment's package hosts, reached directly, uninspected.
     Egress,
+}
+
+/// Whose models a model part reaches.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Provider {
+    /// Claude, on the owner's Claude account.
+    Anthropic,
+    /// Codex's backend, on the owner's ChatGPT login.
+    ChatGpt,
 }
 
 pub const BUILTINS: &[Builtin] = &[
@@ -57,7 +66,7 @@ pub const BUILTINS: &[Builtin] = &[
         start: Start::Always,
         always_inherited: true,
         needs: None,
-        parts: &[Part::Model],
+        parts: &[Part::Model(Provider::Anthropic)],
     },
     Builtin {
         name: capability::DOCS,
@@ -90,7 +99,7 @@ pub const BUILTINS: &[Builtin] = &[
         start: Start::Offered,
         always_inherited: true,
         needs: Some(CHATGPT),
-        parts: &[Part::Model],
+        parts: &[Part::Model(Provider::ChatGpt)],
     },
     Builtin {
         name: capability::REPO,
@@ -98,7 +107,9 @@ pub const BUILTINS: &[Builtin] = &[
         start: Start::Not,
         always_inherited: false,
         needs: None,
-        parts: &[Part::Github],
+        // No parts: a repository is a param of github, so a grant of repo alone doesn't reach GitHub. With a GitHub
+        // part, a sub-session narrowed to just its repositories would gain the GitHub access it was narrowed out of.
+        parts: &[],
     },
     Builtin {
         name: capability::MEMORY,
@@ -132,6 +143,14 @@ pub fn has_part(name: &str, kind: &Part) -> bool {
     builtin(name).is_some_and(|b| b.parts.contains(kind))
 }
 
+/// Whether a session holds a grant with a part of this kind.
+pub fn holds(session: &SessionContext, kind: &Part) -> bool {
+    session
+        .grants
+        .iter()
+        .any(|grant| has_part(&grant.capability, kind))
+}
+
 /// Whether a session keeps a capability of its parent's, whatever it's narrowed to.
 pub fn always_inherited(name: &str) -> bool {
     builtin(name).is_some_and(|b| b.always_inherited)
@@ -162,8 +181,27 @@ mod tests {
     fn the_built_ins_say_where_they_stand() {
         // What each is made of: only packages reaches hosts directly, and docs is an MCP server.
         assert!(has_part("packages", &Part::Egress) && !has_part("github", &Part::Egress));
-        assert!(has_part("model", &Part::Model) && has_part("codex", &Part::Model));
-        assert!(has_part("repo", &Part::Github) && has_part("memory", &Part::Memory));
+        let (claude, chatgpt) = (
+            Part::Model(Provider::Anthropic),
+            Part::Model(Provider::ChatGpt),
+        );
+        assert!(has_part("model", &claude) && !has_part("model", &chatgpt));
+        assert!(has_part("codex", &chatgpt) && !has_part("codex", &claude));
+        assert!(has_part("github", &Part::Github) && has_part("memory", &Part::Memory));
+        // A repository is github's param, not GitHub access of its own.
+        assert!(builtin("repo").unwrap().parts.is_empty());
+        let session = |grants: &[&str]| SessionContext {
+            session_id: "s".into(),
+            owner: "dev".into(),
+            grants: grants
+                .iter()
+                .map(|name| sloppod_contracts::Grant::new(name, serde_json::json!({})))
+                .collect(),
+            role: Default::default(),
+        };
+        assert!(holds(&session(&["docs", "github"]), &Part::Github));
+        assert!(!holds(&session(&["repo", "model"]), &Part::Github));
+        assert!(!holds(&session(&["model"]), &chatgpt));
         assert_eq!(mcp_url("docs"), Some("https://mcp.context7.com/mcp"));
         assert_eq!(mcp_url("github"), None);
         assert_eq!(always().collect::<Vec<_>>(), ["model", "docs"]);

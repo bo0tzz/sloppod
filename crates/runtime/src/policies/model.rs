@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sloppod_contracts::capability;
 use sloppod_contracts::{
     Decision, Error, HttpRequest, Manifest, RequestPolicy, Result, SessionContext,
 };
 
+use crate::capabilities::{Part, Provider, holds};
 use crate::credentials::{CLAUDE, Credentials};
 
 const INFERENCE: &[&str] = &["/v1/messages", "/v1/messages/count_tokens"];
@@ -36,7 +36,7 @@ impl RequestPolicy for ModelPolicy {
     }
 
     async fn decide(&self, session: &SessionContext, request: &HttpRequest) -> Result<Decision> {
-        if !session.has(capability::MODEL) {
+        if !holds(session, &Part::Model(Provider::Anthropic)) {
             return Ok(Decision::deny(
                 "sloppod: this session has no model access.\n",
             ));

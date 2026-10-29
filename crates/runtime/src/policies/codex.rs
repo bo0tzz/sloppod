@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sloppod_contracts::capability;
 use sloppod_contracts::{
     Decision, Error, HttpRequest, Manifest, RequestPolicy, Result, SessionContext,
 };
 
+use crate::capabilities::{Part, Provider, holds};
 use crate::credentials::Credentials;
 
 /// Codex's model API on the ChatGPT backend, reached with the owner's ChatGPT subscription (ADR 24).
@@ -46,7 +46,7 @@ impl RequestPolicy for CodexPolicy {
     }
 
     async fn decide(&self, session: &SessionContext, request: &HttpRequest) -> Result<Decision> {
-        if !session.has(capability::CODEX) {
+        if !holds(session, &Part::Model(Provider::ChatGpt)) {
             return Ok(Decision::deny(
                 "sloppod: this session has no Codex access.\n",
             ));
