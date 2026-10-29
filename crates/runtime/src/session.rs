@@ -226,6 +226,9 @@ struct LiveState {
     last_turn: Option<TurnEnd>,
     /// The session hit its usage limit: nothing starts a turn by itself until then, when it carries on (#251).
     limited_until: Option<DateTime<Utc>>,
+    /// What the session is told when its wait ends, if not [`LIMIT_RESET_NOTICE`]: that it carries on with another
+    /// account (#252).
+    limit_notice: Option<String>,
     permissions: HashMap<u64, Permission>,
     next_permission: u64,
     queue: Vec<Queued>,
@@ -348,10 +351,11 @@ pub type TurnEnded = Arc<dyn Fn(Uuid) -> Pin<Box<dyn Future<Output = ()> + Send>
 pub type UsageSeen =
     Arc<dyn Fn(Uuid, Value) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
-/// Called when a session's turn hits its usage limit, to keep what depends on it (a review round's pause); says when
-/// the limit resets, if that's known (#140's quotas).
+/// Called when a session's turn hits its usage limit, to keep what depends on it (a review round's pause); says
+/// whether the session carries on with another account (#252) or waits, and until when, if that's known (#140's
+/// quotas).
 pub type LimitHit =
-    Arc<dyn Fn(Uuid) -> Pin<Box<dyn Future<Output = Option<DateTime<Utc>>> + Send>> + Send + Sync>;
+    Arc<dyn Fn(Uuid) -> Pin<Box<dyn Future<Output = limits::Next> + Send>> + Send + Sync>;
 
 pub struct Hub {
     store: Arc<dyn SessionStore>,
@@ -2209,9 +2213,9 @@ impl Hub {
         self.heard_from_agent(id);
         let now = self.now();
         let limit_hit = self.limit_hit.lock().unwrap().clone();
-        let reset = match (&end, limit_hit) {
+        let next = match (&end, limit_hit) {
             (TurnEnd::Limited, Some(limit_hit)) => limit_hit(id).await,
-            _ => None,
+            _ => limits::Next::Wait(None),
         };
         let limited = {
             let live = self.live(id);
@@ -2222,7 +2226,17 @@ impl Hub {
             state.turns_ended += 1;
             state.last_turn = Some(end.clone());
             let until = match end {
-                TurnEnd::Limited => Some(limits::wait_until(reset, now)),
+                TurnEnd::Limited => match next {
+                    // Another account isn't limited: the wait ends at once, and the session carries on with it.
+                    limits::Next::Fallback(notice) => {
+                        state.limit_notice = Some(notice);
+                        Some(now)
+                    }
+                    limits::Next::Wait(reset) => {
+                        state.limit_notice = None;
+                        Some(limits::wait_until(reset, now))
+                    }
+                },
                 TurnEnd::Ended | TurnEnd::Cancelled => None,
                 TurnEnd::Failed(_) => state.limited_until,
             };
@@ -2305,19 +2319,23 @@ impl Hub {
     /// Ends a session's wait for its usage limit, if it's still the one that was to end at `until`: the session is
     /// told to carry on, in one turn with whatever queued meanwhile. If that turn hits the limit again, it waits again.
     pub(crate) async fn resume_after_limit(self: &Arc<Self>, id: Uuid, until: DateTime<Utc>) {
-        let notice = notice_queued(LIMIT_RESET_NOTICE);
-        let block = notice.blocks[0].clone();
-        let (start, wake) = {
+        let (start, wake, block) = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
             if state.limited_until != Some(until) || state.stopped {
                 return;
             }
+            let text = state
+                .limit_notice
+                .take()
+                .unwrap_or_else(|| LIMIT_RESET_NOTICE.to_owned());
+            let notice = notice_queued(&text);
+            let block = notice.blocks[0].clone();
             // A turn the user started meanwhile carries on by itself, and the queue runs after it.
             if state.turn_running {
                 state.limited_until = None;
                 self.end_limit(id, self.now()).await;
-                (None, false)
+                (None, false, block)
             } else {
                 let up = state.agent.is_some() && state.agent_session_id.is_some();
                 // Kept before the wait is cleared, so a restart in between still carries on; one kept by a restart
@@ -2337,7 +2355,7 @@ impl Hub {
                 };
                 state.limited_until = None;
                 self.end_limit(id, self.now()).await;
-                (start, !up)
+                (start, !up, block)
             }
         };
         self.record_notice(id, &block, None).await;
