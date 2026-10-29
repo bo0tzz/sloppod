@@ -4,6 +4,7 @@
   import { account } from '#lib/account.svelte.ts';
   import { api, type Credential } from '#lib/api.ts';
   import ChatHeader from '#lib/components/ChatHeader.svelte';
+  import CapabilitySection from '#lib/components/CapabilitySection.svelte';
   import CredentialSection from '#lib/components/CredentialSection.svelte';
   import SessionDefaults from '#lib/components/SessionDefaults.svelte';
   import TimezoneSetting from '#lib/components/TimezoneSetting.svelte';
@@ -13,10 +14,13 @@
 
   let credentials = $state<Credential[] | null>(null);
   let error = $state<string | null>(null);
+  /** Bumped when credentials change, for the capabilities that name one. */
+  let credentialsVersion = $state(0);
 
   async function refresh() {
     try {
       credentials = await api.listCredentials();
+      credentialsVersion++;
       error = null;
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -56,6 +60,10 @@
             onChanged={refresh}
           />
         {/each}
+        <CapabilitySection
+          tokens={credentials.filter((credential) => credential.kind === 'token')}
+          version={credentialsVersion}
+        />
       {/if}
     </div>
   </div>

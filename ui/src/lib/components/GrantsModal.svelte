@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Alert, Button, Field, Modal, ModalBody, Select, Text } from '@immich/ui';
   import { mdiShieldKeyOutline } from '@mdi/js';
+  import { onMount } from 'svelte';
   import { api, type Grant, type GrantChange, type Session } from '#lib/api.ts';
   import { clockTime } from '#lib/format.ts';
 
@@ -11,7 +12,16 @@
   }: { session: Session; onChange: (session: Session) => void; onClose: () => void } = $props();
 
   /** What can be granted while a session runs; repositories are added on their own. */
-  const grantable = ['model', 'github', 'packages', 'docs', 'codex'];
+  const builtIn = ['model', 'github', 'packages', 'docs', 'codex'];
+  /** The user's own capabilities, offered by name after the built-ins; without them, only the built-ins. */
+  let own = $state<string[]>([]);
+  onMount(() => {
+    api.listCapabilities().then(
+      (definitions) => (own = definitions.map((definition) => definition.name)),
+      () => {},
+    );
+  });
+  const grantable = $derived([...builtIn, ...own]);
   const durations: Record<string, number> = { hour: 3600_000, day: 24 * 3600_000, week: 7 * 24 * 3600_000 };
   const runsOut = [
     { value: 'never', label: 'Never' },

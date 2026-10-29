@@ -196,7 +196,7 @@ export type StackPayload = {
   auto_merge?: boolean;
 };
 
-export type CredentialKind = 'claude' | 'github-app' | 'memini' | 'chatgpt' | 'github-user';
+export type CredentialKind = 'claude' | 'github-app' | 'memini' | 'chatgpt' | 'github-user' | 'token';
 
 export type Credential = {
   id: string;
@@ -216,6 +216,19 @@ export type GitHubUserConfig = {
   /** The list stops short: the token reaches more. */
   more_repositories: boolean;
 };
+
+/** One of the user's own capabilities (ADR 2): an MCP server the runtime serves to the sessions granted it, by name. */
+export type Definition = {
+  id: string;
+  name: string;
+  description: string;
+  mcp_url: string;
+  /** A `token` credential, attached to every request. */
+  credential_id?: string;
+  created_at: string;
+};
+
+export type NewDefinition = { name: string; description: string; mcp_url: string; credential_id?: string };
 
 export type NewCredential = {
   kind: CredentialKind;
@@ -296,6 +309,9 @@ export const api = {
   getSession: (id: string) => call<Session>('GET', `/sessions/${encodeURIComponent(id)}`),
   createSession: (body: NewSession) => call<Session>('POST', '/sessions', body),
   suggestSession: (prompt: string) => call<StartingSet>('POST', '/sessions/suggest', { prompt }),
+  listCapabilities: () => call<Definition[]>('GET', '/capabilities'),
+  createCapability: (body: NewDefinition) => call<Definition>('POST', '/capabilities', body),
+  deleteCapability: (id: string) => call<void>('DELETE', `/capabilities/${encodeURIComponent(id)}`),
   deleteSession: (id: string) => call<void>('DELETE', `/sessions/${encodeURIComponent(id)}`),
   listDeletedSessions: () => call<Session[]>('GET', '/sessions/deleted'),
   restoreSession: (id: string) => call<Session>('POST', `/sessions/${encodeURIComponent(id)}/restore`, {}),

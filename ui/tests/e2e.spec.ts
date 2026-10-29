@@ -1849,6 +1849,101 @@ test('a grant gets a new expiry, and a refused change can be tried again', async
   await expect(model).not.toContainText('Runs out');
 });
 
+test("adds a capability of one's own, grants it to a session, and deletes it", async ({ page }) => {
+  await page.goto('/settings');
+  const section = page.getByTestId('capabilities');
+  await expect(section).toContainText('No capability of your own yet.');
+  const fill = async (name: string, url = 'https://logs.example.com/mcp') => {
+    await section.getByRole('button', { name: 'Add capability' }).click();
+    await section.getByLabel('Name', { exact: true }).fill(name);
+    await section.getByLabel('Description', { exact: true }).fill("Search the cluster's logs");
+    await section.getByLabel('MCP server URL').fill(url);
+    await section.getByRole('button', { name: 'Save' }).click();
+  };
+
+  // A name a built-in has, and one with credentials in its URL, are refused with the runtime's reason.
+  await fill('docs');
+  await expect(section.getByText('docs is a name sloppod uses')).toBeVisible();
+  await section.getByLabel('Name', { exact: true }).fill('victorialogs');
+  await section.getByLabel('MCP server URL').fill('https://user:pass@logs.example.com/mcp');
+  await section.getByRole('button', { name: 'Save' }).click();
+  await expect(section.getByText('must not have credentials')).toBeVisible();
+  await section.getByLabel('MCP server URL').fill('https://logs.example.com/mcp');
+  await section.getByRole('button', { name: 'Save' }).click();
+  const listed = section.getByTestId('capability');
+  await expect(listed).toHaveCount(1);
+  await expect(listed).toContainText('victorialogs');
+  await expect(listed).toContainText("Search the cluster's logs");
+  await expect(listed).toContainText('https://logs.example.com/mcp');
+
+  // A name that is taken is refused.
+  await fill('victorialogs');
+  await expect(section.getByText('already have a capability called victorialogs')).toBeVisible();
+  await section.getByRole('button', { name: 'Cancel' }).click();
+
+  // It's offered when granting, after the built-ins, and its description shows like any grant's.
+  await createSession(page, 'Fix the build in bo0tzz/sloppod');
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await page.getByRole('menuitem', { name: 'Grants' }).click();
+  const grants = page.getByTestId('grants');
+  await grants.getByTestId('add-grant').getByRole('combobox', { name: 'Grant' }).click();
+  await page.getByRole('option', { name: 'victorialogs' }).click();
+  await grants.getByTestId('add-grant').getByRole('button', { name: 'Grant' }).click();
+  const granted = grants.getByTestId('grant-victorialogs');
+  await expect(granted).toContainText("Search the cluster's logs");
+
+  // Deleting it takes it out of the list, with a confirmation.
+  await page.goto('/settings');
+  await section.getByRole('button', { name: 'Delete victorialogs' }).click();
+  await page.getByRole('button', { name: 'Delete', exact: true }).click();
+  await expect(section.getByTestId('capability')).toHaveCount(0);
+  await expect(section).toContainText('No capability of your own yet.');
+});
+
+test('a token for a capability is added in settings and chosen for the capability', async ({ page }) => {
+  await page.goto('/settings');
+  const tokens = page.getByTestId('credentials-token');
+  await tokens.getByRole('button', { name: 'Add token' }).click();
+  await tokens.getByLabel('Name', { exact: true }).fill('logs key');
+  await tokens.getByLabel('Header').fill('X-API-Key');
+  await tokens.getByLabel('Token', { exact: true }).fill('secret');
+  await tokens.getByRole('button', { name: 'Save' }).click();
+  await expect(tokens.getByTestId('credential')).toContainText('logs key');
+  // As the runtime keeps it: header names are lowercased.
+  await expect(tokens.getByTestId('credential')).toContainText('Header: x-api-key');
+
+  const section = page.getByTestId('capabilities');
+  await section.getByRole('button', { name: 'Add capability' }).click();
+  await section.getByLabel('Name', { exact: true }).fill('metrics');
+  await section.getByLabel('Description', { exact: true }).fill('Query the metrics');
+  await section.getByLabel('MCP server URL').fill('https://metrics.example.com/mcp');
+  await section.getByRole('combobox', { name: 'Token' }).click();
+  await page.getByRole('option', { name: 'logs key' }).click();
+  await section.getByRole('button', { name: 'Save' }).click();
+  await expect(section.getByTestId('capability')).toContainText('Token: logs key');
+
+  // Deleting the token says what it does to the capability that sends it, and detaches it there, as the runtime's
+  // foreign key does.
+  await tokens.getByRole('button', { name: 'Delete logs key' }).click();
+  await expect(page.getByText('stop sending it at once, also to sessions that already have them')).toBeVisible();
+  await page.getByRole('button', { name: 'Delete', exact: true }).click();
+  await expect(tokens.getByTestId('credential')).toHaveCount(0);
+  await expect(section.getByTestId('capability')).toContainText('metrics');
+  await expect(section.getByTestId('capability')).not.toContainText('Token:');
+
+  await section.getByRole('button', { name: 'Delete metrics' }).click();
+  await page.getByRole('button', { name: 'Delete', exact: true }).click();
+  await expect(section.getByTestId('capability')).toHaveCount(0);
+
+  // A header name is letters, digits and dashes.
+  await tokens.getByRole('button', { name: 'Add token' }).click();
+  await tokens.getByLabel('Name', { exact: true }).fill('odd');
+  await tokens.getByLabel('Header').fill('X API Key');
+  await tokens.getByLabel('Token', { exact: true }).fill('secret');
+  await tokens.getByRole('button', { name: 'Save' }).click();
+  await expect(tokens.getByText('a header name is letters, digits and dashes')).toBeVisible();
+});
+
 test('reviews and approves updates to existing issues', async ({ page }) => {
   await createSession(page, 'Tidy the issues in sloppod');
   const card = page.getByTestId('proposal-card');

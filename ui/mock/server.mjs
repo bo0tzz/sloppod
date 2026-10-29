@@ -46,6 +46,8 @@ const proposals = new Map();
 const reviews = new Map();
 const connections = new Set();
 const credentials = [];
+/** The user's own capabilities, `{id, name, description, mcp_url, credential_id?, created_at}`. */
+const definitions = [];
 /** Set by `/_mock/quotas`: what `GET /api/v1/quotas` answers. */
 let quotas = [];
 
@@ -1431,6 +1433,7 @@ async function handleApi(req, res, url) {
   }
 
   if (parts[0] === 'credentials') return handleCredentials(req, res, parts);
+  if (parts[0] === 'capabilities') return handleCapabilities(req, res, parts);
   if (parts[0] === 'quotas' && parts.length === 1 && method === 'GET') return json(res, 200, quotas);
   if (parts[0] === 'standing-approvals') return handleStandingApprovals(req, res, parts);
 
@@ -1535,14 +1538,20 @@ async function handleApi(req, res, url) {
     }
     if (parts.length === 3 && parts[2] === 'grants' && method === 'POST') {
       const body = await readBody(req);
-      if (!grantable[body.capability]) {
+      // A built-in, or one of the user's own by its name.
+      const own = definitions.find((d) => d.name === body.capability);
+      if (!grantable[body.capability] && !own) {
         return json(res, 400, { error: `${body.capability} can't be granted here; repositories are added with POST /sessions/{id}/repos` });
       }
       if (session.data.grants.some((grant) => grant.capability === body.capability)) {
         return json(res, 409, { error: `the session already has ${body.capability}` });
       }
       if (body.expires_at && Date.parse(body.expires_at) <= Date.now()) return json(res, 400, { error: 'expires_at is in the past' });
-      session.data.grants.push(newGrant(body.capability, {}, grantable[body.capability], body.expires_at));
+      session.data.grants.push(
+        own
+          ? newGrant(body.capability, { definition: own.id, description: own.description }, own.description, body.expires_at)
+          : newGrant(body.capability, {}, grantable[body.capability], body.expires_at),
+      );
       session.broadcast();
       void notifyAgent(session, `sloppod: the user granted this session ${body.capability}.`, `Thanks, I have ${body.capability} now.`);
       return json(res, 201, session.data);
@@ -1771,7 +1780,62 @@ function handleStandingApprovals(req, res, parts) {
   return json(res, 404, { error: 'not found' });
 }
 
-const CREDENTIAL_CONFIG = { claude: [], 'github-app': ['app_id'], memini: ['url'], chatgpt: [], 'github-user': [] };
+const CREDENTIAL_CONFIG = { claude: [], 'github-app': ['app_id'], memini: ['url'], chatgpt: [], 'github-user': [], token: [] };
+
+/** Names a definition can't take: the built-in capabilities' (the runtime's `capability::BUILTIN`) and the MCP servers sloppod serves itself. */
+const RESERVED_NAMES = ['model', 'github', 'packages', 'docs', 'codex', 'repo', 'memory', 'sloppod', 'memini'];
+
+/** Why a new definition is refused, as the runtime does, or null. */
+function definitionProblem(body) {
+  const name = String(body.name ?? '');
+  if (!/^[a-z][a-z0-9-]{0,31}$/.test(name)) {
+    return 'a name is 1 to 32 lowercase letters, digits and dashes, starting with a letter';
+  }
+  if (RESERVED_NAMES.includes(name)) return `${name} is a name sloppod uses; pick another`;
+  if (!String(body.description ?? '').trim()) return 'give the capability a description';
+  let url;
+  try {
+    url = new URL(String(body.mcp_url ?? ''));
+  } catch {
+    return 'the MCP server needs an http or https URL';
+  }
+  if (!['http:', 'https:'].includes(url.protocol)) return 'the MCP server needs an http or https URL';
+  if (url.username || url.password) return 'the URL must not have credentials in it; attach a token credential instead';
+  if (body.credential_id && !credentials.some((c) => c.id === body.credential_id && c.kind === 'token')) {
+    return "that isn't one of your token credentials";
+  }
+  return null;
+}
+
+function handleCapabilities(req, res, parts) {
+  const method = req.method;
+  if (parts.length === 1 && method === 'GET') return json(res, 200, definitions);
+  if (parts.length === 1 && method === 'POST') {
+    return readBody(req).then((body) => {
+      const problem = definitionProblem(body);
+      if (problem) return json(res, 400, { error: problem });
+      if (definitions.some((d) => d.name === body.name)) return json(res, 409, { error: `you already have a capability called ${body.name}` });
+      const definition = {
+        id: randomUUID(),
+        name: body.name,
+        description: body.description.trim(),
+        mcp_url: body.mcp_url,
+        ...(body.credential_id ? { credential_id: body.credential_id } : {}),
+        created_at: now(),
+      };
+      definitions.push(definition);
+      return json(res, 201, definition);
+    });
+  }
+  if (parts.length === 2 && method === 'DELETE') {
+    const index = definitions.findIndex((d) => d.id === parts[1]);
+    if (index < 0) return json(res, 404, { error: 'not found' });
+    definitions.splice(index, 1);
+    res.writeHead(204).end();
+    return;
+  }
+  return json(res, 404, { error: 'not found' });
+}
 
 /** What the runtime learns of a GitHub token from GitHub; a token with "soon" in it expires in three days. */
 function inspectUserToken(secret) {
@@ -1812,6 +1876,12 @@ async function handleCredentials(req, res, parts) {
     const missing = keys.filter((key) => !body.config?.[key]);
     if (missing.length) return json(res, 400, { error: `missing config: ${missing.join(', ')}` });
     let config = Object.fromEntries(keys.map((key) => [key, String(body.config[key])]));
+    // A token's header is optional: sent as that header, else as a bearer token.
+    if (body.kind === 'token' && body.config?.header) {
+      const header = String(body.config.header);
+      if (!/^[A-Za-z0-9-]+$/.test(header)) return json(res, 400, { error: 'a header name is letters, digits and dashes' });
+      config.header = header.toLowerCase();
+    }
     if (body.kind === 'github-user') {
       const inspected = inspectUserToken(body.secret.trim());
       if (inspected.error) return json(res, 400, { error: inspected.error });
@@ -1827,6 +1897,8 @@ async function handleCredentials(req, res, parts) {
   }
   if (parts.length === 2 && method === 'DELETE') {
     credentials.splice(credentials.indexOf(credential), 1);
+    // A capability that named it keeps existing without it (the runtime's `on delete set null`).
+    for (const definition of definitions) if (definition.credential_id === credential.id) delete definition.credential_id;
     // Assumed: deleting the default promotes the oldest remaining credential of that kind.
     const next = credentials.find((c) => c.kind === credential.kind);
     if (credential.default && next) next.default = true;
