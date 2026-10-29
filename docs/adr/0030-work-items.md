@@ -86,6 +86,16 @@ Open questions:
 - **Attenuation.** A sub-session's grant of its parent's graph is at most `track`, and never more than the parent's.
 - **The prompt** names the graphs a session is granted, with their levels, and the items it's linked to by a session link. It also says to read the frontier after a compaction. It's built when the agent starts, so a link made later is in the tool's answer, and in the prompt from the next start.
 
+2026-10-29: stage 3 is built ([#386](https://github.com/bo0tzz/sloppod/issues/386)): items move with what's linked to them. The runtime sets a link's status as what it points at moves, through stage 1's rules, and records each change with `sloppod` as its author.
+
+- **Pull requests.** The PR watcher (`pulls.rs`) moves links to the pull requests it watches on every poll: open, merged (`finished`), or closed unmerged (`abandoned`).
+- **Issues, and pull requests no watcher covers.** These are polled every minute until webhooks ([#204](https://github.com/bo0tzz/sloppod/issues/204)), as the owner's GitHub App, while their link is `open`.
+  - An issue closed as completed is `finished`; one closed as not planned or a duplicate is `abandoned`.
+  - Links that are no longer open aren't polled, so an issue reopened later isn't seen, and neither is a repository the App isn't installed on.
+- **Proposals.** A pull request or stack that a proposal opens is linked to the items its session is linked to, with the same role as the session's link. So the pull request of a session that completes an item completes it too. A proposal is marked once that's done (`work_followed_proposals`). One carried out without the mark, however long ago, is linked by the next minute's pass, so a failure or a restart in between loses nothing; those carried out before following existed were marked when it arrived. After that it's left alone, even once someone unlinks what it linked.
+- **Sessions.** Links to sessions and proposals store the id in canonical form, however it was written, and older ones were rewritten to it. A session link is `open` while the session acts, and `finished` once it has an executed report (a sub-session's `report_done`). It's `abandoned` once the session is parked, stopped or deleted without one. This is checked every minute, and at once when a report is carried out. A sub-session that's given more work after reporting stays `finished`.
+
+
 2026-10-29: stage 4 is built ([#387](https://github.com/bo0tzz/sloppod/issues/387)): the work graph in the UI.
 - **Pages:** `/work` lists the owner's graphs and makes new ones. `/work/<id>` shows a graph: its ready list (the frontier, by rank) first, then the rest grouped by state with what blocks each, and a structure view. The structure view is the graph's edges as a list, not a diagram: parts are indented under what they're part of, by rank, and each item says what blocks it.
 - **An item's detail:**
@@ -95,3 +105,4 @@ Open questions:
   - its history, with undo for each change except the rules' own.
 - **Editing as the owner:** add items and blockers, link, change state (dropping included), reparent, and rank. Ranking is by dragging an item onto a sibling, or with the item's move up and down buttons, which also work on a phone.
 - **Home page:** shows the first five ready items of each graph, as the dashboard ([#137](https://github.com/bo0tzz/sloppod/issues/137)) begins. The sidebar links to `/work`.
+
