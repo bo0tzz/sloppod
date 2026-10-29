@@ -523,6 +523,45 @@ pub async fn resume_approved(state: &AppState) {
     }
 }
 
+/// The longest wait between tries to record a proposal's outcome.
+const OUTCOME_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Records a proposal's outcome with `write`, trying again with backoff until it lands. The work it records is done
+/// by then, so a failed write (the database briefly away) must neither drop its result nor leave the proposal
+/// approved for the next startup to carry out again (#326).
+async fn until_recorded<F, Fut, R>(id: Uuid, mut write: F) -> R
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = sqlx::Result<R>>,
+{
+    let mut wait = std::time::Duration::from_secs(1);
+    loop {
+        match write().await {
+            Ok(written) => return written,
+            Err(e) => {
+                tracing::warn!(proposal = %id, error = %e, "recording a proposal's outcome; trying again");
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(OUTCOME_RETRY_MAX);
+            }
+        }
+    }
+}
+
+/// Carries a proposal out once with `execute`, then records what it came to (its result, or why it failed) with
+/// `record`, trying the write again until it lands. The work is never repeated for a write that failed.
+async fn execute_then_record<F, Fut, R>(
+    id: Uuid,
+    execute: impl Future<Output = Result<Value>>,
+    mut record: F,
+) -> R
+where
+    F: FnMut(std::result::Result<Value, String>) -> Fut,
+    Fut: Future<Output = sqlx::Result<R>>,
+{
+    let executed = execute.await.map_err(|e| e.0);
+    until_recorded(id, || record(executed.clone())).await
+}
+
 async fn carry_out(
     state: &AppState,
     id: Uuid,
@@ -542,19 +581,27 @@ async fn carry_out(
             .as_deref()
             .and_then(|repo| context.repo_credential(repo)),
     );
-    let executed = match same_identity(&context, target.as_deref(), payload) {
-        Ok(()) => kind.execute(&context, payload).instrument(span).await,
-        Err(e) => Err(e),
-    };
-    let finished = match executed {
-        Ok(result) => {
-            db::finish_proposal(&state.db, id, ProposalStatus::Executed, Some(&result), None)
-                .await?
-        }
-        Err(e) => {
-            db::finish_proposal(&state.db, id, ProposalStatus::Failed, None, Some(&e.0)).await?
+    let execute = async {
+        match same_identity(&context, target.as_deref(), payload) {
+            Ok(()) => kind.execute(&context, payload).instrument(span).await,
+            Err(e) => Err(e),
         }
     };
+    let finished = execute_then_record(id, execute, |executed| {
+        let db = state.db.clone();
+        async move {
+            match executed {
+                Ok(result) => {
+                    db::finish_proposal(&db, id, ProposalStatus::Executed, Some(&result), None)
+                        .await
+                }
+                Err(e) => {
+                    db::finish_proposal(&db, id, ProposalStatus::Failed, None, Some(&e)).await
+                }
+            }
+        }
+    })
+    .await;
     let proposal = finished.to_api();
     state.hub.broadcast_proposal(&proposal);
     // What it has to tell other sessions, e.g. a report for a sub-session's parent, which is woken for it if it
@@ -919,5 +966,34 @@ mod tests {
             head_branch(branch, Some("sloppod/00000000-v1.2_x")).unwrap(),
             "sloppod/00000000-v1.2_x"
         );
+    }
+
+    /// An executor that succeeded, then a database that refuses the outcome a few times: the work is done once, and
+    /// its result is what's recorded in the end.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_outcome_write_is_retried_not_the_work() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (runs, writes) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let result = json!({"url": "https://github.com/o/r/pull/1"});
+        let recorded = execute_then_record(
+            Uuid::nil(),
+            async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok(result.clone())
+            },
+            |executed| {
+                let attempt = writes.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    match attempt {
+                        0..3 => Err(sqlx::Error::PoolTimedOut),
+                        _ => Ok(executed),
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(recorded, Ok(result));
+        assert_eq!(writes.load(Ordering::SeqCst), 4);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 }
