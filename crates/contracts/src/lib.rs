@@ -165,21 +165,39 @@ impl SessionContext {
     /// The credential the session acts with on `repo` (ADR 29): one of the owner's GitHub tokens, by id, or none for
     /// the owner's GitHub App.
     pub fn repo_credential(&self, repo: &str) -> Option<&str> {
+        self.repo_grant(repo)?.param("credential")
+    }
+
+    /// The session's grant of `repo`.
+    fn repo_grant(&self, repo: &str) -> Option<&Grant> {
         self.grants
             .iter()
             .filter(|g| g.capability == capability::REPO)
             .find(|g| g.param("repo").is_some_and(|r| same_repo(r, repo)))
-            .and_then(|g| g.param("credential"))
+    }
+
+    /// Whether the session's grant of `repo` covers `operation` ([`operation`]): every grant does unless it lists
+    /// its `operations`.
+    pub fn repo_covers(&self, repo: &str, operation: &str) -> bool {
+        self.repo_grant(repo)
+            .is_some_and(|g| match g.params.get("operations") {
+                Some(serde_json::Value::Array(listed)) => {
+                    listed.iter().any(|o| o.as_str() == Some(operation))
+                }
+                _ => true,
+            })
+    }
+
+    /// Whether the session's grant of `repo` covers less than every operation, as a sub-session's inherited grant of a
+    /// repository its parent acts on as the user does.
+    pub fn repo_limited(&self, repo: &str) -> bool {
+        self.repo_grant(repo).is_some() && !operation::ALL.iter().all(|o| self.repo_covers(repo, o))
     }
 
     /// Whose GitHub token the session acts with on `repo`, by login; none for the GitHub App.
     pub fn repo_acting_as(&self, repo: &str) -> Option<&str> {
         self.repo_credential(repo)?;
-        self.grants
-            .iter()
-            .filter(|g| g.capability == capability::REPO)
-            .find(|g| g.param("repo").is_some_and(|r| same_repo(r, repo)))
-            .and_then(|g| g.param("as"))
+        self.repo_grant(repo)?.param("as")
     }
 
     pub fn writable_repo_for(&self, repo: &str) -> Option<RepoGrant<'_>> {
@@ -249,6 +267,19 @@ pub fn repo_from_git_path(name: &str) -> &str {
 /// A repository grant's `access`: read only, or read and push the session's branches (ADR 2).
 pub const READ_ONLY: &str = "ro";
 pub const READ_WRITE: &str = "rw";
+
+/// What a repository grant covers (ADR 29's operations), in its `operations`; a grant without that list covers them all.
+/// Only a sub-session's inherited grant of a repository its parent acts on as the user is narrowed, to reading and
+/// pushing its own branches.
+pub mod operation {
+    /// Clone, fetch, and read through GitHub's API.
+    pub const READ: &str = "read";
+    /// Push the session's branches.
+    pub const PUSH: &str = "push";
+    /// Propose outward actions on the repository.
+    pub const PROPOSE: &str = "propose";
+    pub const ALL: &[&str] = &[READ, PUSH, PROPOSE];
+}
 
 /// One HTTP request leaving a session pod, as seen by the egress listener.
 #[derive(Debug, Clone, Serialize, Deserialize)]

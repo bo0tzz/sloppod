@@ -429,6 +429,22 @@ impl GitHubApp {
     }
 
     async fn installation_for(&self, repo: &str) -> anyhow::Result<u64> {
+        self.installation(repo)
+            .await?
+            .with_context(|| format!("the GitHub App is not installed on {repo}"))
+    }
+
+    /// Whether the App is installed on `repo`, so it can act there. Always for a user's token, whose reach is checked
+    /// against what it listed instead.
+    pub async fn installed_on(&self, repo: &str) -> anyhow::Result<bool> {
+        if self.user.is_some() {
+            return Ok(true);
+        }
+        Ok(self.installation(repo).await?.is_some())
+    }
+
+    /// The App's installation on `repo`, or `None` if it isn't installed there.
+    async fn installation(&self, repo: &str) -> anyhow::Result<Option<u64>> {
         let cached = self
             .installations
             .lock()
@@ -459,7 +475,7 @@ impl GitHubApp {
                 installation["id"].as_u64()
             }
         };
-        id.with_context(|| format!("the GitHub App is not installed on {repo}"))
+        Ok(id)
     }
 
     /// What `installation` was granted, or `None` if it's gone.

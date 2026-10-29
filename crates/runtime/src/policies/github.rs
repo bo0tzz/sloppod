@@ -8,7 +8,7 @@ use graphql_parser::query::{
 use sloppod_contracts::{
     Decision, Error, HttpRequest, Manifest, RequestPolicy, Result, SessionContext,
 };
-use sloppod_contracts::{repo_from_git_path, same_repo};
+use sloppod_contracts::{operation, repo_from_git_path, same_repo};
 
 use crate::capabilities::{Part, holds};
 use crate::credentials::Credentials;
@@ -72,7 +72,8 @@ impl GitHubPolicy {
     }
 
     /// Whether the owner's token the session acts with on `repo` reaches nothing the session isn't granted with it:
-    /// every repository it listed when it was added is granted with that token, and it listed them all.
+    /// every repository it listed when it was added is granted with that token, in full (not a sub-session's grant
+    /// limited to reading and pushing), and it listed them all.
     async fn reaches_only_grants(&self, session: &SessionContext, repo: &str) -> bool {
         let Some(credential) = session.repo_credential(repo) else {
             return false;
@@ -89,9 +90,9 @@ impl GitHubPolicy {
         };
         row.config["more_repositories"].as_bool() == Some(false)
             && reach.iter().all(|reached| {
-                reached
-                    .as_str()
-                    .is_some_and(|r| session.repo_credential(r) == Some(credential))
+                reached.as_str().is_some_and(|r| {
+                    session.repo_credential(r) == Some(credential) && !session.repo_limited(r)
+                })
             })
     }
 
@@ -142,6 +143,11 @@ impl GitHubPolicy {
                     )));
                 };
                 let (repo, branch) = (grant.repo, grant.branch);
+                if !session.repo_covers(repo, operation::PUSH) {
+                    return Ok(Decision::deny(format!(
+                        "sloppod: this session's grant of {repo} doesn't cover pushing to it.\n"
+                    )));
+                }
                 let app = match self.acting_as(session, repo).await {
                     Ok(Some(app)) => app,
                     Ok(None) => {
@@ -306,13 +312,14 @@ impl GitHubPolicy {
         let mut as_user = user_token_repo(session, &granted, &named);
         if let Some(repo) = as_user
             && graphql
-            && !self.reaches_only_grants(session, repo).await
+            && (named.iter().any(|r| session.repo_limited(r))
+                || !self.reaches_only_grants(session, repo).await)
         {
             tracing::info!(
                 session = %session.session_id,
                 %repo,
-                "GraphQL read as the App: the owner's token reaches more than this session is granted with it; \
-                 REST reads of the repository use the token"
+                "GraphQL read as the App: the owner's token reaches more than this session is granted with it in \
+                 full; REST reads of the repository use the token"
             );
             as_user = None;
         }
@@ -1052,6 +1059,91 @@ mod tests {
             policy.decide(&session, &mutation).await.unwrap(),
             Decision::Deny { .. }
         ));
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_sub_session_reads_and_pushes_its_own_branches_with_an_inherited_token(
+        db: sqlx::PgPool,
+    ) {
+        use serde_json::json;
+        use sloppod_contracts::{Grant, capability};
+
+        // The App isn't installed on futo/kupra; the parent acts there with the user's token, which reaches only it.
+        let (policy, _, users) =
+            reads_policy(db, Default::default(), &[(&["futo/kupra"], false)]).await;
+        let mut child = reading(&[]);
+        child.grants.push(Grant::new(
+            capability::REPO,
+            json!({
+                "repo": "futo/kupra", "access": "rw", "branch": "sloppod/p-0123abcd",
+                "credential": users[0], "as": "octo", "operations": ["read", "push"],
+            }),
+        ));
+        let git = |method: &str, path: &str, body: Vec<u8>| HttpRequest {
+            method: method.into(),
+            host: "github.com".into(),
+            path: path.into(),
+            headers: Default::default(),
+            body,
+            body_truncated: false,
+        };
+        let header = |decision: Decision| match decision {
+            Decision::Allow { set_headers, .. } => set_headers
+                .into_iter()
+                .find(|(name, _)| name == "authorization")
+                .map(|(_, value)| value),
+            refused => panic!("refused: {refused:?}"),
+        };
+        let as_user = Some(basic("github_pat_0"));
+        for service in ["git-upload-pack", "git-receive-pack"] {
+            let path = format!("/futo/kupra.git/info/refs?service={service}");
+            let decision = policy
+                .decide(&child, &git("GET", &path, Vec::new()))
+                .await
+                .unwrap();
+            assert_eq!(header(decision), as_user, "{service}");
+        }
+        // Only its own branches.
+        let mut push = pkt(&format!(
+            "{} {} refs/heads/main\0report-status\n",
+            "0".repeat(40),
+            "a".repeat(40)
+        ));
+        push.extend(b"0000");
+        let refused = policy
+            .decide(
+                &child,
+                &git("POST", "/futo/kupra.git/git-receive-pack", push),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&refused, Decision::Deny { message, .. } if message.contains("refused by sloppod")),
+            "{refused:?}"
+        );
+        // REST reads naming it use the token; GraphQL never does on a grant limited like this.
+        let rest = api_request("GET", "/repos/futo/kupra/pulls", serde_json::Value::Null);
+        assert_eq!(
+            token(policy.decide(&child, &rest).await.unwrap()).as_deref(),
+            Some("github_pat_0")
+        );
+        let graphql = token(policy.decide(&child, &pr_view("futo/kupra")).await.unwrap());
+        assert_ne!(graphql.as_deref(), Some("github_pat_0"));
+        // The same grant in full, as the parent holds it, does get the token on GraphQL.
+        let mut parent = child.clone();
+        if let Some(params) = parent.grants[1].params.as_object_mut() {
+            params.remove("operations");
+        }
+        assert_eq!(
+            token(
+                policy
+                    .decide(&parent, &pr_view("futo/kupra"))
+                    .await
+                    .unwrap()
+            )
+            .as_deref(),
+            Some("github_pat_0")
+        );
     }
 
     #[sqlx::test(migrator = "crate::db::MIGRATOR")]

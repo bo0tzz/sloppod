@@ -2,7 +2,7 @@
 //! most its parent's grants.
 
 use serde_json::{Value, json};
-use sloppod_contracts::{Grant, READ_WRITE, capability, same_repo};
+use sloppod_contracts::{Grant, READ_WRITE, capability, operation, same_repo};
 use sloppod_protocol::api::{Phase, SessionKind};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -41,9 +41,11 @@ fn child_grants(parent: &[Grant], keep: Option<&[String]>, child: Uuid) -> Vec<G
                 }
                 if let Some(params) = grant.params.as_object_mut() {
                     params.remove("commit");
-                    // Acting as the owner is never inherited (ADR 29): the child acts as the GitHub App.
-                    params.remove("credential");
-                    params.remove("as");
+                }
+                // A repository the parent acts on as the user, the child acts on as them too, but only to read it and push
+                // its own branches (ADR 29): proposals there stay the parent's. It can do nothing its parent couldn't.
+                if grant.param("credential").is_some() && grant.params.get("operations").is_none() {
+                    grant.params["operations"] = json!([operation::READ, operation::PUSH]);
                 }
             }
             grant
@@ -151,9 +153,19 @@ pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<
         Some(branch) => format!(" on branch `{branch}`"),
         None => String::new(),
     };
+    let mut warnings = Vec::new();
+    for grant in &grants {
+        if let Some(warning) =
+            crate::grants::reach_warning(&state.credentials, &parent.owner, grant).await
+        {
+            warnings.push(format!(" Warning: {warning}."));
+        }
+    }
     Ok(format!(
-        "Started sub-session {} \"{}\"{branch}. You're told when it reports; list_sessions shows how it's doing.",
-        child.id, child.title
+        "Started sub-session {} \"{}\"{branch}. You're told when it reports; list_sessions shows how it's doing.{}",
+        child.id,
+        child.title,
+        warnings.concat()
     ))
 }
 
@@ -237,7 +249,7 @@ pub fn tools() -> Vec<Value> {
     vec![
         json!({
             "name": "spawn_session",
-            "description": format!("Start a sub-session for a piece of your work that can run on its own: a session with its own pod and agent, linked to yours. It starts with your grants, or fewer, and works on a branch named after yours, starting from your branch as pushed (push first), so you can merge, rebase or propose what it does. At most {MAX_RUNNING} run at once. Returns its id and branch."),
+            "description": format!("Start a sub-session for a piece of your work that can run on its own: a session with its own pod and agent, linked to yours. It starts with your grants, or fewer (a repository you act on as the user, it acts on as them only to read and push its own branch; proposals there stay yours), and works on a branch named after yours, starting from your branch as pushed (push first), so you can merge, rebase or propose what it does. At most {MAX_RUNNING} run at once. Returns its id and branch."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -304,12 +316,14 @@ mod tests {
         assert_eq!(rw.param("access"), Some("rw"));
         assert_eq!(all[4].param("branch"), None);
         assert_eq!(all[4].param("commit"), None, "a child starts fresh");
-        assert_eq!(
-            all[4].param("credential"),
-            None,
-            "acting as the owner isn't inherited"
-        );
-        assert_eq!(all[4].param("as"), None);
+        // Acting as the owner is inherited only to read and push the child's own branches.
+        assert_eq!(all[4].param("credential"), Some("c"));
+        assert_eq!(all[4].param("as"), Some("ada"));
+        assert_eq!(all[4].params["operations"], json!(["read", "push"]));
+        assert_eq!(all[3].params.get("operations"), None);
+        // A grandchild keeps its parent's narrowing, and gets no more.
+        let grandchild = child_grants(&all, None, child);
+        assert_eq!(grandchild[4].params["operations"], json!(["read", "push"]));
 
         // A grant that runs out runs out for the child too.
         let mut expiring = parent.clone();

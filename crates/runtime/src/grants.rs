@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 use sloppod_contracts::capability;
-use sloppod_contracts::{Grant, READ_ONLY, READ_WRITE};
+use sloppod_contracts::{Grant, READ_ONLY, READ_WRITE, operation};
 
 /// The built-ins the owner can grant a session mid-session from its grants list (`capabilities::BUILTINS`).
 pub fn grantable(capability: &str) -> bool {
@@ -46,7 +46,16 @@ pub fn describe(grant: &Grant) -> String {
                 ),
                 _ => format!("{repo}: read only"),
             };
+            let limited = grant
+                .params
+                .get("operations")
+                .and_then(Value::as_array)
+                .is_some_and(|ops| !ops.iter().any(|o| o == operation::PROPOSE));
             match grant.param("as") {
+                Some(login) if limited => format!(
+                    "{access}, as {login} (the user's own GitHub token, inherited from the parent session for reading \
+                     and pushing only: proposals there are the parent's)."
+                ),
                 Some(login) => format!("{access}, as {login} (the user's own GitHub token)."),
                 None => format!("{access}."),
             }
@@ -59,6 +68,46 @@ pub fn describe(grant: &Grant) -> String {
     }
 }
 
+/// Why a repository grant's identity can't reach its repository, if it can't (ADR 29): the GitHub App isn't installed
+/// there, or the user's token it acts with doesn't list it. Said when the grant is made, rather than left to the first
+/// push or proposal to find out. A lookup that fails says nothing.
+pub async fn reach_warning(
+    credentials: &crate::credentials::Credentials,
+    owner: &str,
+    grant: &Grant,
+) -> Option<String> {
+    if grant.capability != capability::REPO {
+        return None;
+    }
+    let repo = grant.param("repo")?;
+    match grant.param("credential") {
+        Some(credential) => match credentials.github_user(owner, credential).await {
+            Ok(Some(token)) if crate::credentials::token_reaches(&token, repo).is_some() => None,
+            Ok(Some(token)) => Some(format!(
+                "the GitHub token {} it acts with on {repo} doesn't reach it, so git and GitHub's API there will be \
+                 refused",
+                token.name
+            )),
+            Ok(None) => Some(format!(
+                "the GitHub token it acts with on {repo} is gone, so git and GitHub's API there will be refused"
+            )),
+            Err(_) => None,
+        },
+        None => match credentials.github(owner).await {
+            Ok(app) => match app.installed_on(repo).await {
+                Ok(false) => Some(format!(
+                    "the GitHub App isn't installed on {repo}, so pushing and proposing there will fail, and so will \
+                     reading it if it's private; the user can install the App there, or have the session act with one \
+                     of their GitHub tokens"
+                )),
+                _ => None,
+            },
+            Err(_) => Some(format!(
+                "the user has no GitHub App, so nothing on {repo} can be done as one"
+            )),
+        },
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
