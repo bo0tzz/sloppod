@@ -950,9 +950,11 @@ test('the new-session page suggests a starting set, and sends the one the user e
   const card = page.getByTestId('starting-card');
   // The empty draft is suggested at once; it says what can be chosen.
   await expect(card).toBeVisible();
-  for (const capability of ['github', 'packages', 'docs']) {
+  for (const capability of ['github', 'packages']) {
     await expect(card.getByTestId(`capability-${capability}`).getByRole('checkbox')).toBeChecked();
   }
+  // Docs come with every session, so there's nothing to choose.
+  await expect(card.getByTestId('capability-docs')).toHaveCount(0);
 
   const box = page.getByRole('textbox', { name: 'Prompt' });
   await box.fill('Fix the build in bo0tzz/sloppod');
@@ -963,12 +965,12 @@ test('the new-session page suggests a starting set, and sends the one the user e
 
   // What the user changes stays, whatever a later suggestion says; the rest follows it.
   await title.fill('Mend the build');
-  await card.getByTestId('capability-docs').getByRole('checkbox').click();
-  await expect(card.getByTestId('capability-docs').getByRole('checkbox')).not.toBeChecked();
+  await card.getByTestId('capability-packages').getByRole('checkbox').click();
+  await expect(card.getByTestId('capability-packages').getByRole('checkbox')).not.toBeChecked();
   await box.fill('Fix the build in bo0tzz/memini');
   await expect(card.getByRole('combobox')).toContainText('bo0tzz/memini');
   await expect(title).toHaveValue('Mend the build');
-  await expect(card.getByTestId('capability-docs').getByRole('checkbox')).not.toBeChecked();
+  await expect(card.getByTestId('capability-packages').getByRole('checkbox')).not.toBeChecked();
 
   await box.press('Enter');
   await expect(page).toHaveURL(/\/sessions\/[0-9a-f-]+$/);
@@ -977,8 +979,8 @@ test('the new-session page suggests a starting set, and sends the one the user e
   await page.getByRole('button', { name: 'Session actions' }).click();
   await page.getByRole('menuitem', { name: 'Grants' }).click();
   const grants = page.getByTestId('grants');
-  await expect(grants.getByTestId('grant-packages')).toBeVisible();
-  await expect(grants.getByTestId('grant-docs')).toHaveCount(0);
+  await expect(grants.getByTestId('grant-docs')).toBeVisible();
+  await expect(grants.getByTestId('grant-packages')).toHaveCount(0);
 });
 
 // Holds the suggestion for `prompt` back for `ms`, as a slow runtime does.
@@ -996,10 +998,9 @@ test('what can be chosen comes from the empty draft, however late it answers', a
   await page.getByRole('textbox', { name: 'Prompt' }).fill('question: how does the library behave?');
   const card = page.getByTestId('starting-card');
   await expect(card.getByTestId('starting-source')).toHaveText('Suggested by the model');
-  // The judgement came first, with docs alone; the empty draft's answer still says what else can be chosen.
+  // The judgement came first, with packages alone; the empty draft's answer still says what else can be chosen.
   await expect(card.getByTestId('capability-github').getByRole('checkbox')).not.toBeChecked();
-  await expect(card.getByTestId('capability-packages').getByRole('checkbox')).not.toBeChecked();
-  await expect(card.getByTestId('capability-docs').getByRole('checkbox')).toBeChecked();
+  await expect(card.getByTestId('capability-packages').getByRole('checkbox')).toBeChecked();
 });
 
 test('an answer for an earlier draft never replaces the card for a later one', async ({ page }) => {
@@ -1078,9 +1079,8 @@ test('a judgement of the first message shows as its source, and gives the card i
   await page.getByRole('textbox', { name: 'Prompt' }).fill('question: how does the library behave?');
   await expect(card.getByTestId('starting-source')).toHaveText('Suggested by the model');
   await expect(card.getByRole('combobox')).toContainText('No repository');
-  await expect(card.getByTestId('capability-docs').getByRole('checkbox')).toBeChecked();
+  await expect(card.getByTestId('capability-packages').getByRole('checkbox')).toBeChecked();
   await expect(card.getByTestId('capability-github').getByRole('checkbox')).not.toBeChecked();
-  await expect(card.getByTestId('capability-packages').getByRole('checkbox')).not.toBeChecked();
 });
 
 test('adds a repository from the session menu', async ({ page }) => {
