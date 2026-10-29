@@ -172,7 +172,12 @@ impl ProposalKind for ActAsOwner {
         Ok(edited)
     }
 
-    async fn execute(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
+    async fn execute(
+        &self,
+        session: &SessionContext,
+        _proposal: uuid::Uuid,
+        payload: &Value,
+    ) -> Result<Value> {
         let (token, repo) = self.token(&session.owner, payload).await?;
         grant_repo_as(&self.db, session, &repo, &token)
             .await

@@ -175,18 +175,20 @@ pub fn describe(update: &Value, state: Vec<String>) -> String {
 }
 
 /// The part of an update GitHub treats alike for an issue and a pull request: the comment, then the labels. Carrying
-/// out an approved proposal again (after a restart) repeats only what's harmless to repeat: a comment already there
-/// isn't posted twice.
+/// out an approved proposal again (after a restart) repeats only what's harmless to repeat: the comment carries
+/// `marker`, the update's own, and isn't posted again if one with it is there, whoever else said the same (#346).
 pub async fn comment_and_label(
     app: &GitHubApp,
     repo: &str,
     number: u64,
     update: &Value,
+    marker: &str,
 ) -> anyhow::Result<()> {
     if let Some(comment) = update["comment"].as_str() {
         let comments = app.issue_comments(repo, number).await?;
-        if !comments.iter().any(|c| c.trim() == comment) {
-            app.comment_on_issue(repo, number, comment).await?;
+        if !comments.iter().any(|c| c.contains(marker)) {
+            app.comment_on_issue(repo, number, &super::marked(comment, marker))
+                .await?;
         }
     }
     let added: Vec<&str> = update["add_labels"]
@@ -211,7 +213,7 @@ pub async fn comment_and_label(
     Ok(())
 }
 
-/// Carries out `apply` for each update, and answers `{updated, failed, message}`; an error only when none went
+/// Carries out `apply` for each update, given its position, and answers `{updated, failed, message}`; an error only when none went
 /// through. `item` is the plural, for the message.
 pub async fn execute_all<F, Fut>(
     updates: &[Value],
@@ -220,13 +222,13 @@ pub async fn execute_all<F, Fut>(
     apply: F,
 ) -> Result<Value>
 where
-    F: Fn(u64, Value) -> Fut,
+    F: Fn(usize, u64, Value) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
     let (mut done, mut failed) = (Vec::new(), Vec::new());
-    for update in updates {
+    for (item, update) in updates.iter().enumerate() {
         let number = update["number"].as_u64().unwrap_or_default();
-        match apply(number, update.clone()).await {
+        match apply(item, number, update.clone()).await {
             Ok(()) => done.push(json!({"number": number, "did": describe(update)})),
             Err(e) => failed.push(json!({"number": number, "error": format!("{e:#}")})),
         }

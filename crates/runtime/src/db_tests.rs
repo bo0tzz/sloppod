@@ -1429,12 +1429,19 @@ async fn an_agent_asks_to_act_as_the_owner_and_the_owner_picks_the_token(db: PgP
         .edit(&payload, &json!({"credential": work.to_string()}))
         .unwrap();
     assert!(other.get("login").is_none());
-    assert!(kind.execute(&context().await, &other).await.is_err());
+    assert!(
+        kind.execute(&context().await, Uuid::now_v7(), &other)
+            .await
+            .is_err()
+    );
     assert!(context().await.writable_repo_for("dev/private").is_none());
 
     // Picking which identity is always a person's call (ADR 28).
     assert!(!kind.standing_approvable());
-    let done = kind.execute(&context().await, &payload).await.unwrap();
+    let done = kind
+        .execute(&context().await, Uuid::now_v7(), &payload)
+        .await
+        .unwrap();
     assert_eq!(done["login"], "dev");
     let granted = context().await;
     assert_eq!(

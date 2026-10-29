@@ -135,6 +135,35 @@ pub(crate) async fn github_for(
         .map_err(|e| Error::new(e.to_string()))
 }
 
+/// A hidden mark for the `item`th thing a proposal puts on GitHub (an issue, a comment). Carrying the proposal out
+/// again (a restart before its outcome was recorded) looks for this, rather than for something that only says the
+/// same, which could be anyone's (#346).
+pub(crate) fn marker(proposal: Uuid, item: usize) -> String {
+    format!("<!-- sloppod:proposal/{proposal}/{item} -->")
+}
+
+/// `text` with `marker` under it, out of sight in rendered Markdown.
+pub(crate) fn marked(text: &str, marker: &str) -> String {
+    if text.trim().is_empty() {
+        marker.to_owned()
+    } else {
+        format!("{text}\n\n{marker}")
+    }
+}
+
+/// From when to look for what a proposal put on GitHub: an hour before it was made, for clocks that disagree.
+/// Proposal ids are UUIDv7, so they say when; any other id looks from the start.
+pub(crate) fn made_since(proposal: Uuid) -> chrono::DateTime<chrono::Utc> {
+    proposal
+        .get_timestamp()
+        .and_then(|at| {
+            let (secs, _) = at.to_unix();
+            chrono::DateTime::from_timestamp(i64::try_from(secs).ok()?, 0)
+        })
+        .map(|at| at - chrono::Duration::hours(1))
+        .unwrap_or_default()
+}
+
 /// Prepares a proposal's payload from the agent's arguments, for its first round and every later one: the kind's own
 /// preparation, under the session's `acting_span`, plus `as`, who it acts as (ADR 29), which is shown wherever it's
 /// reviewed and held to when it's carried out.
@@ -543,7 +572,7 @@ async fn carry_out(
             .and_then(|repo| context.repo_credential(repo)),
     );
     let executed = match same_identity(&context, target.as_deref(), payload) {
-        Ok(()) => kind.execute(&context, payload).instrument(span).await,
+        Ok(()) => kind.execute(&context, id, payload).instrument(span).await,
         Err(e) => Err(e),
     };
     let finished = match executed {
@@ -818,7 +847,7 @@ mod tests {
         fn target(&self, payload: &Value) -> Option<String> {
             payload["repo"].as_str().map(str::to_owned)
         }
-        async fn execute(&self, _: &SessionContext, _: &Value) -> Result<Value> {
+        async fn execute(&self, _: &SessionContext, _: Uuid, _: &Value) -> Result<Value> {
             Ok(json!({}))
         }
     }

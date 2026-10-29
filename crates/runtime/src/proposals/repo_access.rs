@@ -167,7 +167,12 @@ impl ProposalKind for RepoAccess {
         Ok(json!({}))
     }
 
-    async fn execute(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
+    async fn execute(
+        &self,
+        session: &SessionContext,
+        _proposal: uuid::Uuid,
+        payload: &Value,
+    ) -> Result<Value> {
         let repo = payload["repo"].as_str().unwrap_or_default();
         grant_repo(&self.db, session, repo).await.map_err(err)?;
         let session_id: Uuid = session.session_id.parse().map_err(err)?;

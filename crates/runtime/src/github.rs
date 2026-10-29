@@ -1162,9 +1162,13 @@ impl GitHubApp {
             .context("GitHub returned no stack number")
     }
 
-    /// Issues created in the last day, by title, in `create_issue`'s result shape.
-    pub async fn recent_issues(&self, repo: &str) -> anyhow::Result<HashMap<String, Value>> {
-        let since = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+    /// Issues, not pull requests, updated since `since`, in `create_issue`'s result shape plus their `body`.
+    pub async fn issues_since(
+        &self,
+        repo: &str,
+        since: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<Value>> {
+        let since = since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let since = &since;
         let issues = all_pages(|page| async move {
             self.repo_json(
@@ -1176,20 +1180,8 @@ impl GitHubApp {
         .await?;
         Ok(issues
             .into_iter()
-            .filter(|issue| {
-                issue["pull_request"].is_null()
-                    && issue["created_at"]
-                        .as_str()
-                        .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
-                        .is_some_and(|at| at > Utc::now() - chrono::Duration::days(1))
-            })
-            .filter_map(|issue| {
-                let title = issue["title"].as_str()?.to_owned();
-                Some((
-                    title,
-                    json!({"url": issue["html_url"], "number": issue["number"]}),
-                ))
-            })
+            .filter(|issue| issue["pull_request"].is_null())
+            .map(|issue| json!({"url": issue["html_url"], "number": issue["number"], "body": issue["body"]}))
             .collect())
     }
 

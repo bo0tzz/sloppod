@@ -215,7 +215,12 @@ impl ProposalKind for Report {
         edit_report(payload, edits)
     }
 
-    async fn execute(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
+    async fn execute(
+        &self,
+        session: &SessionContext,
+        _proposal: uuid::Uuid,
+        payload: &Value,
+    ) -> Result<Value> {
         let child = format!(
             "\"{}\" ({})",
             payload["title"].as_str().unwrap_or_default(),
