@@ -1589,6 +1589,135 @@ async fn a_proposal_carries_over_the_review_its_sub_session_s_report_passed(db: 
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_review_carried_over_again_after_its_proposal_ended_is_claimed_or_refused(db: PgPool) {
+    use sloppod_contracts::ReviewSubject;
+
+    let parent = session(&db, "dev").await;
+    let child = session(&db, "dev").await;
+    db::set_parent(&db, child, parent).await.unwrap();
+    let reviewer = session_of_kind(&db, "dev", SessionKind::Review).await;
+    let report = db::insert_proposal(
+        &db,
+        child,
+        "sloppod.session.report",
+        ProposalStatus::Executed,
+        &json!({"repo": "o/r", "head": "sloppod/p-child", "head_sha": "c0ffee", "review": {"verdict": "pass"}}),
+    )
+    .await
+    .unwrap();
+    db::set_review_session(&db, report.id, reviewer)
+        .await
+        .unwrap();
+    let subject = ReviewSubject {
+        repo: "o/r".into(),
+        base: "main".into(),
+        head: "sloppod/p".into(),
+        head_sha: "beef".into(),
+        title: "Fix".into(),
+        body: String::new(),
+        describes_change: true,
+    };
+    let parent_row = db::get_session(&db, parent).await.unwrap().unwrap();
+    let reports = |kind: &str| kind == "sloppod.session.report";
+    let offered = || async {
+        crate::reviews::carried_over_in(&db, &parent_row, &child.to_string(), &subject, reports)
+            .await
+            .unwrap()
+            .map(|c| c.reviewer)
+    };
+    let propose = || async {
+        db::insert_proposal(
+            &db,
+            parent,
+            "github.pr.create",
+            ProposalStatus::InReview,
+            &json!({}),
+        )
+        .await
+        .unwrap()
+    };
+
+    // Carried over, passed, then withdrawn by the parent; then carried over, passed, and rejected by the user.
+    let withdrawn = propose().await;
+    assert_eq!(offered().await, Some(reviewer));
+    assert!(
+        db::claim_reviewer(&db, withdrawn.id, reviewer)
+            .await
+            .unwrap()
+    );
+    db::move_proposal(
+        &db,
+        withdrawn.id,
+        ProposalStatus::InReview,
+        ProposalStatus::Pending,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    db::withdraw_proposal(&db, withdrawn.id, parent, None)
+        .await
+        .unwrap()
+        .unwrap();
+    // Ending a proposal whose review was carried over keeps its reviewer (`reviews::finish`) rather than deleting it.
+    assert!(db::reviewer_carried_over(&db, reviewer).await.unwrap());
+
+    let rejected = propose().await;
+    assert_eq!(offered().await, Some(reviewer));
+    assert!(
+        db::claim_reviewer(&db, rejected.id, reviewer)
+            .await
+            .unwrap()
+    );
+    // Nothing retires a reviewer a proposal is reviewing with.
+    assert!(!db::retire_reviewer(&db, reviewer).await.unwrap());
+    db::move_proposal(
+        &db,
+        rejected.id,
+        ProposalStatus::InReview,
+        ProposalStatus::Pending,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    db::decide_proposal(
+        &db,
+        rejected.id,
+        ProposalStatus::Rejected,
+        &json!({}),
+        None,
+        "dev",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(db::reviewer_carried_over(&db, reviewer).await.unwrap());
+
+    let third = propose().await;
+    assert_eq!(offered().await, Some(reviewer));
+    assert!(db::claim_reviewer(&db, third.id, reviewer).await.unwrap());
+    db::withdraw_proposal(&db, third.id, parent, None)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Once it's retired, it's neither offered nor claimed, so the next proposal's review starts afresh.
+    assert!(db::retire_reviewer(&db, reviewer).await.unwrap());
+    let fourth = propose().await;
+    assert_eq!(offered().await, None);
+    assert!(!db::claim_reviewer(&db, fourth.id, reviewer).await.unwrap());
+
+    // A reviewer that was stopped without being marked deleted (before #359) isn't claimed either.
+    let stopped = session_of_kind(&db, "dev", SessionKind::Review).await;
+    db::set_phase(&db, stopped, Phase::Stopped).await.unwrap();
+    assert!(!db::claim_reviewer(&db, fourth.id, stopped).await.unwrap());
+
+    // One that never reviewed more than one proposal isn't carried over, and is deleted when its proposal ends.
+    assert!(!db::reviewer_carried_over(&db, stopped).await.unwrap());
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
 async fn an_owner_defines_a_capability_grants_it_and_deletes_it(db: PgPool) {
     use crate::definitions::{self, NewDefinition};
 

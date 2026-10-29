@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use sloppod_contracts::capability;
 use sloppod_contracts::{Grant, READ_ONLY, ReviewSubject};
-use sloppod_protocol::api::{ProposalStatus, ReviewPolicy, SessionKind};
+use sloppod_protocol::api::{Phase, ProposalStatus, ReviewPolicy, SessionKind};
 use uuid::Uuid;
 
 use crate::session::TurnEnd;
@@ -104,7 +104,7 @@ pub(crate) async fn carried_over_in(
     let kept = db::get_session(db, reviewer)
         .await
         .map_err(|e| e.to_string())?
-        .is_some_and(|row| row.deleted_at.is_none())
+        .is_some_and(|row| row.deleted_at.is_none() && row.phase() != Phase::Stopped)
         && !db::has_active_review(db, reviewer)
             .await
             .map_err(|e| e.to_string())?;
@@ -389,7 +389,7 @@ async fn give_up(
     };
     state.hub.broadcast_proposal(&row.to_api());
     let Some(kind) = state.proposals.get(&row.kind).cloned() else {
-        end(state, session);
+        finish(state, session);
         return Ok(());
     };
     let about = kind.summary(&row.payload);
@@ -409,7 +409,7 @@ async fn give_up(
             ),
         )
         .await;
-    end(state, session);
+    finish(state, session);
     if let Some(author) = db::get_session(&state.db, row.session_id).await? {
         proposals::settle(
             state,
@@ -837,7 +837,7 @@ pub async fn submit(state: &AppState, session: Uuid, arguments: &Value) -> Resul
     if kind.reviewed_again() {
         keep(state, session);
     } else {
-        end(state, session);
+        finish(state, session);
     }
     let author = db::get_session(&state.db, proposal.session_id)
         .await
@@ -979,7 +979,8 @@ pub async fn abandon(state: &AppState, session: Uuid) -> anyhow::Result<()> {
 }
 
 /// Parks a review session whose proposal's review may carry over to a later one (#247), after its current turn ends.
-/// It's deleted later: by the proposal that carries it over, or by [`sweep_kept_reviewers`].
+/// It's deleted by [`sweep_kept_reviewers`] once no proposal has used it for a while; a proposal that carries its review
+/// over keeps it again when it ends ([`finish`]).
 fn keep(state: &AppState, session: Uuid) {
     let state = state.clone();
     tokio::spawn(async move {
@@ -1024,13 +1025,42 @@ pub async fn sweep_kept_reviewers(state: &AppState) {
     }
 }
 
-/// Deletes a review session once it's done, after its current turn ends.
+/// Done with a review session whose proposal ended (passed, withdrawn, or handed over unreviewed): it's kept
+/// if its review was carried over, as the report it came from still offers it to the next proposal of that work
+/// (#359), and deleted otherwise.
+pub fn finish(state: &AppState, session: Uuid) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        match db::reviewer_carried_over(&state.db, session).await {
+            Ok(true) => keep(&state, session),
+            Ok(false) => end(&state, session),
+            Err(e) => tracing::warn!(%session, error = %e, "finishing with a review session"),
+        }
+    });
+}
+
+/// Deletes a review session once it's done, after its current turn ends. It's marked deleted straight away, so no
+/// proposal carries its review over meanwhile; one that claimed it first keeps it instead.
 pub fn end(state: &AppState, session: Uuid) {
     let state = state.clone();
     tokio::spawn(async move {
+        match db::retire_reviewer(&state.db, session).await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => {
+                tracing::warn!(%session, error = %e, "retiring a finished review session");
+                return;
+            }
+        }
         turn_ended(&state, session).await;
+        // A removal that fails is left to the purge sweep, which finds it deleted and not purged.
         let result = match db::get_session(&state.db, session).await {
-            Ok(Some(row)) => lifecycle::remove_session(&state, &row).await,
+            Ok(Some(row)) => match lifecycle::remove_session(&state, &row).await {
+                Ok(()) => db::finish_purge(&state.db, session)
+                    .await
+                    .map_err(Into::into),
+                Err(e) => Err(e),
+            },
             Ok(None) => Ok(()),
             Err(e) => Err(e.into()),
         };

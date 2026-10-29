@@ -1485,17 +1485,25 @@ pub async fn has_active_review(db: &PgPool, session: Uuid) -> sqlx::Result<bool>
     .await
 }
 
-/// Makes `reviewer` the review session of `proposal` if it reviews nothing else now, atomically, so two proposals
-/// carrying the same review over can't share it. Says whether it did.
-pub async fn claim_reviewer(db: &PgPool, proposal: Uuid, reviewer: Uuid) -> sqlx::Result<bool> {
-    let mut tx = db.begin().await?;
+/// Takes the lock that claiming a reviewer and retiring it hold, until the end of the transaction.
+async fn lock_reviewer(tx: &mut sqlx::PgConnection, reviewer: Uuid) -> sqlx::Result<()> {
     sqlx::query("select pg_advisory_xact_lock(hashtext($1::text))")
         .bind(reviewer)
-        .execute(&mut *tx)
-        .await?;
+        .execute(tx)
+        .await
+        .map(|_| ())
+}
+
+/// Makes `reviewer` the review session of `proposal` if it reviews nothing else now and is neither retired nor
+/// stopped, atomically, so two proposals carrying the same review over can't share it and none claims a reviewer
+/// that's being deleted (#359). Says whether it did.
+pub async fn claim_reviewer(db: &PgPool, proposal: Uuid, reviewer: Uuid) -> sqlx::Result<bool> {
+    let mut tx = db.begin().await?;
+    lock_reviewer(&mut tx, reviewer).await?;
     let claimed = sqlx::query(
         "update proposals set review_session_id = $2 where id = $1 and not exists (select 1 from proposals \
-         where review_session_id = $2 and id <> $1 and status in ('in_review', 'changes_requested'))",
+         where review_session_id = $2 and id <> $1 and status in ('in_review', 'changes_requested')) \
+         and exists (select 1 from sessions where id = $2 and deleted_at is null and phase <> 'stopped')",
     )
     .bind(proposal)
     .bind(reviewer)
@@ -1505,6 +1513,35 @@ pub async fn claim_reviewer(db: &PgPool, proposal: Uuid, reviewer: Uuid) -> sqlx
         > 0;
     tx.commit().await?;
     Ok(claimed)
+}
+
+/// Marks a review session deleted, with its purge started, unless a proposal is reviewing with it now: atomically
+/// with [`claim_reviewer`], so a reviewer is either claimed or retired, never claimed and then deleted. Says whether
+/// it did.
+pub async fn retire_reviewer(db: &PgPool, reviewer: Uuid) -> sqlx::Result<bool> {
+    let mut tx = db.begin().await?;
+    lock_reviewer(&mut tx, reviewer).await?;
+    let retired = sqlx::query(
+        "update sessions set deleted_at = now(), purge_started_at = now() where id = $1 and deleted_at is null \
+         and not exists (select 1 from proposals where review_session_id = $1 \
+           and status in ('in_review', 'changes_requested'))",
+    )
+    .bind(reviewer)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        > 0;
+    tx.commit().await?;
+    Ok(retired)
+}
+
+/// Whether a review session has reviewed more than one proposal: its review was carried over (#247), and the report
+/// it came from still offers it.
+pub async fn reviewer_carried_over(db: &PgPool, reviewer: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar("select count(*) > 1 from proposals where review_session_id = $1")
+        .bind(reviewer)
+        .fetch_one(db)
+        .await
 }
 
 #[derive(Debug, Clone, FromRow)]
