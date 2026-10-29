@@ -85,3 +85,13 @@ Open questions:
   - An automatically approved one shows up for the owner as any proposal does: listed with `decided_by: standing-approval:<id>`, and broadcast. A separate notice for it waits for the UI work.
 - **Attenuation.** A sub-session's grant of its parent's graph is at most `track`, and never more than the parent's.
 - **The prompt** names the graphs a session is granted, with their levels, and the items it's linked to by a session link. It also says to read the frontier after a compaction. It's built when the agent starts, so a link made later is in the tool's answer, and in the prompt from the next start.
+
+2026-10-29: stage 3 is built ([#386](https://github.com/bo0tzz/sloppod/issues/386)): items move with what's linked to them. The runtime sets a link's status as what it points at moves, through stage 1's rules, and records each change with `sloppod` as its author.
+
+- **Pull requests.** The PR watcher (`pulls.rs`) moves links to the pull requests it watches on every poll: open, merged (`finished`), or closed unmerged (`abandoned`).
+- **Issues, and pull requests no watcher covers.** These are polled every minute until webhooks ([#204](https://github.com/bo0tzz/sloppod/issues/204)), as the owner's GitHub App, while their link is `open`.
+  - An issue closed as completed is `finished`; one closed as not planned or a duplicate is `abandoned`.
+  - Links that are no longer open aren't polled, so an issue reopened later isn't seen, and neither is a repository the App isn't installed on.
+- **Proposals.** A pull request or stack that a proposal opens is linked to the items its session is linked to, with the same role as the session's link. So the pull request of a session that completes an item completes it too. A proposal is marked once that's done (`work_followed_proposals`). One carried out without the mark, however long ago, is linked by the next minute's pass, so a failure or a restart in between loses nothing; those carried out before following existed were marked when it arrived. After that it's left alone, even once someone unlinks what it linked.
+- **Sessions.** Links to sessions and proposals store the id in canonical form, however it was written, and older ones were rewritten to it. A session link is `open` while the session acts, and `finished` once it has an executed report (a sub-session's `report_done`). It's `abandoned` once the session is parked, stopped or deleted without one. This is checked every minute, and at once when a report is carried out. A sub-session that's given more work after reporting stays `finished`.
+
