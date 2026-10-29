@@ -85,3 +85,13 @@ Open questions:
   - An automatically approved one shows up for the owner as any proposal does: listed with `decided_by: standing-approval:<id>`, and broadcast. A separate notice for it waits for the UI work.
 - **Attenuation.** A sub-session's grant of its parent's graph is at most `track`, and never more than the parent's.
 - **The prompt** names the graphs a session is granted, with their levels, and the items it's linked to by a session link. It also says to read the frontier after a compaction. It's built when the agent starts, so a link made later is in the tool's answer, and in the prompt from the next start.
+
+2026-10-29: stage 4 is built ([#387](https://github.com/bo0tzz/sloppod/issues/387)): the work graph in the UI.
+- **Pages:** `/work` lists the owner's graphs and makes new ones. `/work/<id>` shows a graph: its ready list (the frontier, by rank) first, then the rest grouped by state with what blocks each, and a structure view. The structure view is the graph's edges as a list, not a diagram: parts are indented under what they're part of, by rank, and each item says what blocks it.
+- **An item's detail:**
+  - description and state;
+  - links, each opening where it lives (GitHub for issues and pull requests, a session's page);
+  - blockers and parts;
+  - its history, with undo for each change except the rules' own.
+- **Editing as the owner:** add items and blockers, link, change state (dropping included), reparent, and rank. Ranking is by dragging an item onto a sibling, or with the item's move up and down buttons, which also work on a phone.
+- **Home page:** shows the first five ready items of each graph, as the dashboard ([#137](https://github.com/bo0tzz/sloppod/issues/137)) begins. The sidebar links to `/work`.
