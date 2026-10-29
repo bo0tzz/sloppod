@@ -329,6 +329,19 @@ pub const CLIENT_CREDENTIAL_HEADERS: &[&str] = &[
     "x-api-key",
 ];
 
+/// Headers an authenticating proxy in front of a service uses to say who and where a request comes from. A
+/// session's request the runtime sends on (`/servers`, `/memini`) never keeps them: the runtime's API takes the user
+/// from one of them, and the runtime is where the request would come from. Any other `x-forwarded-` header is
+/// dropped too, as is the deployment's own user header, whatever it's called.
+pub const FORWARDING_HEADERS: &[&str] = &["forwarded", "x-real-ip"];
+
+/// Whether `name` (lowercase, as `http` keeps names) is a forwarding header, or `user_header`.
+pub fn forwarding_header(name: &str, user_header: &str) -> bool {
+    FORWARDING_HEADERS.contains(&name)
+        || name.starts_with("x-forwarded-")
+        || name.eq_ignore_ascii_case(user_header)
+}
+
 /// What an allowed request's headers become, for whatever applies the decision: the headers to remove (the client's
 /// credentials and the ones the policy names, unless it sets them itself) and the headers to set.
 pub fn header_ops(
