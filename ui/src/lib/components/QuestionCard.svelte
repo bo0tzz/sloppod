@@ -124,6 +124,27 @@
 
   const answer = () => respond({ action: 'accept', content: content() });
 
+  // The card takes focus when it appears, so a stray Esc goes to it rather than stopping the turn, which would throw
+  // the questions away (#365). Someone part way through writing in a field elsewhere (the composer, say) keeps it.
+  let card = $state<HTMLElement>();
+  $effect(() => {
+    const active = document.activeElement;
+    const typing =
+      (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) && active.value.trim() !== '';
+    if (card && !typing) card.focus({ preventScroll: true });
+  });
+
+  // Esc on the card doesn't stop the turn (the composer's binding, which leaves an Esc already handled alone); Skip
+  // or the Stop button do what's meant.
+  $effect(() => {
+    const element = card;
+    const keepEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') event.preventDefault();
+    };
+    element?.addEventListener('keydown', keepEscape);
+    return () => element?.removeEventListener('keydown', keepEscape);
+  });
+
   /** Enter moves on to the next question, and on the last one sends the answers. */
   function submitOnEnter(event: KeyboardEvent) {
     if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
@@ -137,12 +158,14 @@
 </script>
 
 <section
-  class="border-info-300 bg-info-50 dark:bg-info-100/40 flex flex-col gap-3 rounded-2xl border p-3 {request.stale
+  class="border-info-300 bg-info-50 dark:bg-info-100/40 flex flex-col gap-3 rounded-2xl border p-3 outline-none {request.stale
     ? 'opacity-60'
     : ''}"
   data-testid="question-card"
   data-stale={request.stale || undefined}
   aria-label="Question from the agent"
+  tabindex="-1"
+  bind:this={card}
 >
   <header class="flex items-start gap-2 text-sm">
     <Icon icon={mdiChatQuestionOutline} class="text-info-700 mt-0.5 shrink-0" size="1.25em" aria-hidden />

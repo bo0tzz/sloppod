@@ -1268,6 +1268,45 @@ test('shows a proposal of an unknown kind generically', async ({ page }) => {
 const questionCard = (page: Page) => page.getByTestId('question-card');
 const questionField = (page: Page, key: string) => questionCard(page).locator(`[data-key="${key}"]`);
 
+test("Esc on a question card keeps the agent's questions; the composer's Esc still stops the turn", async ({ page }) => {
+  await createSession(page, 'Please ask me how to do it');
+  await expect(questionCard(page)).toBeVisible();
+  // The card takes focus when it appears, so a stray Esc goes to it.
+  await expect(questionCard(page)).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(questionCard(page)).toBeVisible();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'waiting');
+
+  // Nor does Esc from one of its options.
+  const option = questionField(page, 'question_0').getByRole('radio', { name: /Exponential/ });
+  await option.check();
+  await page.keyboard.press('Escape');
+  await expect(questionCard(page)).toBeVisible();
+  await expect(option).toBeChecked();
+
+  await page.getByRole('textbox', { name: 'Prompt' }).focus();
+  await page.keyboard.press('Escape');
+  await expect(questionCard(page)).toBeHidden();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+});
+
+test("a question card leaves the composer focused while something's being written there", async ({ page, context }) => {
+  const id = await createSession(page, 'Add backoff to the reconnect logic in sloppod');
+  await finishTurn(page);
+  const prompt = page.getByRole('textbox', { name: 'Prompt' });
+  await prompt.fill('half a thought');
+  // The question comes from a message sent in another tab.
+  const other = await context.newPage();
+  await other.goto(`/sessions/${id}`);
+  const otherPrompt = other.getByRole('textbox', { name: 'Prompt' });
+  await otherPrompt.fill('Please ask me how to do it');
+  await otherPrompt.press('Enter');
+  await expect(questionCard(page)).toBeVisible();
+  await expect(prompt).toBeFocused();
+  await expect(prompt).toHaveValue('half a thought');
+  await expect(questionCard(other)).toBeFocused();
+});
+
 test('answers questions from the agent, in every tab', async ({ page, context }) => {
   const sent: string[] = [];
   page.on('websocket', (socket) => socket.on('framesent', ({ payload }) => sent.push(String(payload))));
