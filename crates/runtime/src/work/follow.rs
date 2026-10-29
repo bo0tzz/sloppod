@@ -293,7 +293,7 @@ pub async fn executed(
     Ok(())
 }
 
-/// Links what executed pull request and stack proposals of the last day opened, where that wasn't done when they were
+/// Links what executed pull request and stack proposals opened, however long ago, where that wasn't done when they were
 /// carried out: it failed, or the runtime stopped in between. Carrying one out again isn't needed, nor done.
 pub async fn unfollowed(db: &PgPool) -> WorkResult<()> {
     let missed: Vec<(
@@ -307,7 +307,7 @@ pub async fn unfollowed(db: &PgPool) -> WorkResult<()> {
         "select p.id, s.owner, p.session_id, p.kind, p.payload, p.result from proposals p \
          join sessions s on s.id = p.session_id \
          where p.kind in ('github.pr.create', 'github.stack.create') and p.status = 'executed' \
-         and p.result is not null and p.decided_at > now() - interval '1 day' \
+         and p.result is not null \
          and not exists (select 1 from work_followed_proposals f where f.proposal_id = p.id)",
     )
     .fetch_all(db)
@@ -585,7 +585,7 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "update proposals set status = 'executed', result = $2, decided_at = now() where id = $1",
+            "update proposals set status = 'executed', result = $2, decided_at = now() - interval '30 days' where id = $1",
         )
         .bind(proposal.id)
         .bind(json!({"number": 12}))
@@ -617,6 +617,45 @@ mod tests {
             .unwrap();
         sessions(&db, None).await.unwrap();
         assert_eq!(stored_status(&db, fix).await, "abandoned");
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn older_links_name_their_ids_canonically_once_each(db: PgPool) {
+        let graph = create_graph(&db, "dev", "g").await.unwrap().id;
+        let worker = session(&db).await;
+        let (one, two) = (
+            new_item(&db, graph, "one").await,
+            new_item(&db, graph, "two").await,
+        );
+        let canonical = worker.to_string();
+        let shouting = canonical.to_uppercase();
+        let bare = worker.simple().to_string();
+        let braced = format!("{{{canonical}}}");
+        // As links were stored before: two spellings of one id on `one`, none of them canonical; one on `two`.
+        for (item, target) in [(one, &shouting), (one, &bare), (two, &braced)] {
+            sqlx::query(
+                "insert into work_links (id, item_id, kind, target, role) values ($1, $2, 'session', $3, 'related')",
+            )
+            .bind(Uuid::now_v7())
+            .bind(item)
+            .bind(target)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        sqlx::raw_sql(include_str!("../../migrations/0030_work_link_ids.sql"))
+            .execute(&db)
+            .await
+            .unwrap();
+        for item in [one, two] {
+            let links = super::super::item(&db, "dev", item)
+                .await
+                .unwrap()
+                .unwrap()
+                .links;
+            let targets: Vec<&str> = links.iter().map(|l| l.target.as_str()).collect();
+            assert_eq!(targets, [canonical.as_str()]);
+        }
     }
 
     async fn stored_status(db: &PgPool, id: Uuid) -> String {
