@@ -2,6 +2,7 @@
 //! change as an event that can be undone. The rules live in [`rules`]; this keeps the graphs in the database and applies
 //! the rules to every change, under a lock on the graph so changes to one graph happen one at a time.
 
+pub mod agent;
 pub mod api;
 pub mod rules;
 
@@ -981,6 +982,18 @@ async fn lock_link(tx: &mut PgConnection, owner: &str, id: Uuid) -> WorkResult<(
     .fetch_one(&mut *tx)
     .await?;
     Ok((graph, link))
+}
+
+/// The item one of the owner's links is on.
+pub async fn link_item(db: &PgPool, owner: &str, link: Uuid) -> sqlx::Result<Option<Uuid>> {
+    sqlx::query_scalar(
+        "select l.item_id from work_links l join work_items i on i.id = l.item_id \
+         join work_graphs g on g.id = i.graph_id where l.id = $1 and g.owner = $2",
+    )
+    .bind(link)
+    .bind(owner)
+    .fetch_optional(db)
+    .await
 }
 
 /// Records where what a link points at stands. Later stages do this as they watch pull requests, sessions and

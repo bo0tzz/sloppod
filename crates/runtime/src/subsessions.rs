@@ -34,6 +34,9 @@ fn child_grants(parent: &[Grant], keep: Option<&[String]>, child: Uuid) -> Vec<G
         .filter(|grant| kept(&grant.capability))
         .map(|grant| {
             let mut grant = grant.clone();
+            if grant.capability == capability::WORK {
+                crate::work::agent::inherited(&mut grant);
+            }
             if grant.capability == capability::REPO {
                 if let Some(branch) = grant.param("branch").map(str::to_owned) {
                     grant.params["branch"] = json!(format!("{branch}-{}", child_name(child)));
@@ -318,11 +321,20 @@ mod tests {
                 capability::REPO,
                 json!({"repo": "o/docs", "access": "ro", "commit": "f00", "credential": "c", "as": "ada"}),
             ),
+            grant(
+                capability::WORK,
+                json!({"graph": "g", "name": "plan", "level": "plan"}),
+            ),
         ];
         let child = Uuid::parse_str("0123456789abcdef0123456789abcdef").unwrap();
 
         let all = child_grants(&parent, None, child);
         assert_eq!(all.len(), parent.len());
+        assert_eq!(
+            all[5].param("level"),
+            Some("track"),
+            "a child tracks at most"
+        );
         let rw = &all[3];
         assert_eq!(rw.param("branch"), Some("sloppod/abcd1234-01234567"));
         assert_eq!(rw.param("from"), Some("sloppod/abcd1234"));

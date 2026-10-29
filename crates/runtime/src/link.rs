@@ -499,6 +499,7 @@ pub async fn agent_context(
         state.config.runtime_url()
     };
     let context = session.context();
+    let work = crate::work::agent::prompt(&state.db, &context).await;
     let namespace = crate::capabilities::grant_with(&context, &crate::capabilities::Part::Memory)
         .and_then(|g| g.param("namespace"))
         .map(str::to_owned);
@@ -527,6 +528,7 @@ pub async fn agent_context(
             SessionKind::Utility => None,
         },
         model: session.model.clone(),
+        work,
         memory,
     }
 }
