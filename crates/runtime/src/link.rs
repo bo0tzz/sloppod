@@ -58,7 +58,19 @@ pub struct RpcError {
     pub data: Option<Value>,
 }
 
+const DISCONNECTED: &str = "the session's agent disconnected";
+
 impl RpcError {
+    /// The answer to a request whose link closed before the agent answered.
+    pub fn disconnected() -> Self {
+        Self::new(-32002, DISCONNECTED)
+    }
+
+    /// Whether this is the answer to a request whose link closed before the agent answered.
+    pub fn is_disconnected(&self) -> bool {
+        self.code == -32002 && self.message == DISCONNECTED
+    }
+
     pub fn new(code: i64, message: impl Into<String>) -> Self {
         Self {
             code,
@@ -123,10 +135,7 @@ impl AgentConn {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().expect("pending lock").insert(id, tx);
         self.send_acp(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
-        let answer = async move {
-            rx.await
-                .unwrap_or_else(|_| Err(RpcError::new(-32002, "the session's agent disconnected")))
-        };
+        let answer = async move { rx.await.unwrap_or_else(|_| Err(RpcError::disconnected())) };
         (id, answer)
     }
 

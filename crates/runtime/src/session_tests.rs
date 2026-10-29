@@ -283,7 +283,7 @@ async fn a_steered_message_is_kept_until_the_agent_takes_it() {
     assert_eq!(steering["method"], "_session/steering");
 
     // Sent, but only in the runtime's hands until the agent answers: kept, and not in the log yet.
-    assert_eq!(kept_texts(&h).await, ["Steered"]);
+    assert_eq!(kept_texts(&h).await, ["First", "Steered"]);
     assert_eq!(h.user_messages(), [("First".to_owned(), false)]);
     // A UI that lost its connection meanwhile sends it again: it's had, and isn't queued twice.
     let resent = h
@@ -301,7 +301,7 @@ async fn a_steered_message_is_kept_until_the_agent_takes_it() {
     h.respond(&steering, json!({"outcome": "injected"})).await;
     steer.await.unwrap().unwrap();
     second.await.unwrap().unwrap();
-    assert!(h.store.queues().await.unwrap().is_empty());
+    assert_eq!(kept_texts(&h).await, ["First"], "only the running turn's");
     assert_eq!(
         h.user_messages(),
         [("First".to_owned(), false), ("Steered".to_owned(), true)]
@@ -333,7 +333,7 @@ async fn a_steered_message_the_agent_never_got_goes_back_to_its_place_in_the_que
 
     // Back where it was, waiting, and not shown as received.
     assert_eq!(h.queued().await, queued);
-    assert_eq!(kept_texts(&h).await, ["A", "B", "C"]);
+    assert_eq!(kept_texts(&h).await, ["First", "A", "B", "C"]);
     assert_eq!(h.user_messages(), [("First".to_owned(), false)]);
 
     // It runs with the rest when the turn ends, and its own prompt is answered then.
@@ -451,13 +451,14 @@ async fn steering_a_message_while_the_agent_is_down_leaves_it_queued() {
             .is_err()
     );
     assert_eq!(h.queued().await, queued);
-    assert_eq!(kept_texts(&h).await, ["Steered"]);
+    assert_eq!(kept_texts(&h).await, ["First", "Steered"]);
+    // With the turn its link cut off, which the agent never answered.
     assert_eq!(h.user_messages(), [("First".to_owned(), false)]);
 
     // The agent that comes back gets it.
     h.replace_agent().await;
     let request = h.next().await;
-    assert_eq!(prompt_text(&request), ["Steered"]);
+    assert_eq!(prompt_text(&request), ["First", "Steered"]);
     h.respond(&request, json!({"stopReason": "end_turn"})).await;
     second.await.unwrap().unwrap();
     assert_eq!(
@@ -490,7 +491,8 @@ async fn a_queued_message_can_be_taken_back() {
         .iter()
         .filter_map(|m| m["blocks"][0]["text"].as_str())
         .collect();
-    assert_eq!(texts, ["Kept"]);
+    // The running turn's message is kept too, until the agent answers it.
+    assert_eq!(texts, ["First", "Kept"]);
     assert!(
         h.hub
             .remove_queued(h.id, json!({"id": queued[1]}))
@@ -606,7 +608,7 @@ async fn a_notice_waits_for_a_tool_call_to_end() {
     assert!(h.to_agent.try_recv().is_err());
     assert_eq!(
         kept_texts(&h).await,
-        ["sloppod: your proposal was approved."],
+        ["First", "sloppod: your proposal was approved."],
         "kept while it waits"
     );
 
@@ -715,11 +717,11 @@ async fn a_direct_steer_is_logged_once_the_agent_takes_it_and_not_if_it_fails() 
     // Kept while it's on its way, and logged once the agent has it.
     let taken = steer("Taken");
     let steering = h.next().await;
-    assert_eq!(kept_texts(&h).await, ["Taken"]);
+    assert_eq!(kept_texts(&h).await, ["First", "Taken"]);
     assert_eq!(h.user_messages(), [("First".to_owned(), false)]);
     h.respond(&steering, json!({"outcome": "injected"})).await;
     taken.await.unwrap().unwrap();
-    assert!(h.store.queues().await.unwrap().is_empty());
+    assert_eq!(kept_texts(&h).await, ["First"], "only the running turn's");
 
     // One the agent never got errors, isn't logged, and isn't kept: the client has it to send again.
     let lost = steer("Lost");
@@ -727,7 +729,7 @@ async fn a_direct_steer_is_logged_once_the_agent_takes_it_and_not_if_it_fails() 
     let failed = json!({"jsonrpc": "2.0", "id": steering["id"], "error": {"code": -32603, "message": "boom"}});
     from_agent(&h.hub, h.id, &h.agent, failed).await;
     assert!(lost.await.unwrap().is_err());
-    assert!(h.store.queues().await.unwrap().is_empty());
+    assert_eq!(kept_texts(&h).await, ["First"], "only the running turn's");
     assert!(h.queued().await.is_empty());
     assert_eq!(
         h.user_messages(),
@@ -1842,9 +1844,7 @@ async fn a_queued_message_is_kept_until_its_turn_takes_it() {
     let busy = next_prompt(&mut h.to_agent).await;
     let _later = h.prompt("Later");
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let kept = h.store.queues().await.unwrap();
-    assert_eq!(kept.len(), 1);
-    assert_eq!(kept[0].1[0]["blocks"][0]["text"], "Later");
+    assert_eq!(kept_texts(&h).await, ["Busy", "Later"]);
 
     h.respond(&busy, json!({"stopReason": "end_turn"})).await;
     let later = next_prompt(&mut h.to_agent).await;
@@ -2154,7 +2154,7 @@ async fn a_message_taken_back_does_not_run_when_sent_again_after_a_restart() {
         .await
         .unwrap();
     assert_eq!(resent["stopReason"], "cancelled");
-    assert!(h.store.queues().await.unwrap().is_empty());
+    assert_eq!(kept_texts(&h).await, ["First"], "only the running turn's");
 }
 
 #[tokio::test]
@@ -2232,18 +2232,18 @@ async fn a_notice_steered_into_a_turn_is_kept_until_the_agent_takes_it() {
         .clone()
         .notify(h.id, "sloppod: approved.".into())
         .await;
-    assert_eq!(kept_texts(&h).await, ["sloppod: approved."]);
+    assert_eq!(kept_texts(&h).await, ["Busy", "sloppod: approved."]);
 
     let steering = h.next().await;
     assert_eq!(steering["method"], "_session/steering");
     assert_eq!(
         kept_texts(&h).await,
-        ["sloppod: approved."],
+        ["Busy", "sloppod: approved."],
         "sent, not yet taken"
     );
     h.respond(&steering, json!({"outcome": "injected"})).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(h.store.queues().await.unwrap().is_empty());
+    assert_eq!(kept_texts(&h).await, ["Busy"], "only the running turn's");
 
     h.respond(&turn_request, json!({"stopReason": "end_turn"}))
         .await;
@@ -2465,6 +2465,128 @@ async fn a_link_that_drops_doesnt_end_its_turns() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     h.hub.detach_agent(h.id, &h.agent).await;
     assert_eq!(h.hub.turns_ended(h.id).await.0, 0);
+}
+
+impl Harness {
+    /// The link drops: closed, its answers dropped, and then detached.
+    async fn drop_link(&self) {
+        self.agent.close();
+        self.hub.detach_agent(self.id, &self.agent).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// The text of each user message logged so far, however many chunks it has.
+    fn logged(&self) -> Vec<String> {
+        self.user_messages()
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn a_batch_whose_link_drops_before_the_agent_gets_it_runs_on_the_next_link() {
+    let mut h = Harness::ready().await;
+    let first = h.prompt("First");
+    let first_request = h.next().await;
+    let _queued = h.prompt("Queued");
+    wait_for_queue(&h, 1).await;
+    h.respond(&first_request, json!({"stopReason": "end_turn"}))
+        .await;
+    first.await.unwrap().unwrap();
+    let lost = h.next().await;
+    assert_eq!(prompt_text(&lost), ["Queued"]);
+
+    h.drop_link().await;
+    assert_eq!(kept_texts(&h).await, ["Queued"], "kept, not let go");
+
+    // The agent on the next link never got it: it's sent again, and logged once.
+    h.relink(Vec::new()).await;
+    let again = h.next().await;
+    assert_eq!(prompt_text(&again), ["Queued"]);
+    h.respond(&again, json!({"stopReason": "end_turn"})).await;
+    wait_until_nothing_kept(&h).await;
+    assert_eq!(h.logged(), ["First", "Queued"]);
+}
+
+#[tokio::test]
+async fn a_batch_the_agent_has_when_its_link_drops_isnt_sent_again() {
+    let mut h = Harness::ready().await;
+    let first = h.prompt("First");
+    let first_request = h.next().await;
+    let _queued = h.prompt("Queued");
+    wait_for_queue(&h, 1).await;
+    h.respond(&first_request, json!({"stopReason": "end_turn"}))
+        .await;
+    first.await.unwrap().unwrap();
+    let batch = h.next().await;
+
+    h.drop_link().await;
+    h.relink(vec![batch.clone()]).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    h.agent_sent_nothing();
+    assert_eq!(kept_texts(&h).await, Vec::<String>::new());
+    h.respond(&batch, json!({"stopReason": "end_turn"})).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.phase().await, "idle");
+    assert_eq!(h.logged(), ["First", "Queued"]);
+}
+
+#[tokio::test]
+async fn a_prompt_whose_link_goes_before_its_turn_starts_runs_on_the_next_link() {
+    let mut h = Harness::ready().await;
+    h.hub.start_gate.on.store(true, Ordering::SeqCst);
+    let _only = h.prompt("Only");
+    h.hub.start_gate.reached.notified().await;
+    h.hub.start_gate.on.store(false, Ordering::SeqCst);
+    // Taken for the idle agent and logged, but the link goes before the turn starts.
+    h.drop_link().await;
+    h.hub.start_gate.released.notify_one();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(kept_texts(&h).await, ["Only"]);
+
+    h.relink(Vec::new()).await;
+    let request = h.next().await;
+    assert_eq!(prompt_text(&request), ["Only"]);
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    wait_until_nothing_kept(&h).await;
+    assert_eq!(h.logged(), ["Only"]);
+}
+
+#[tokio::test]
+async fn a_prompt_whose_link_goes_just_before_it_is_sent_runs_on_the_next_link() {
+    let mut h = Harness::ready().await;
+    h.hub.send_gate.on.store(true, Ordering::SeqCst);
+    let _only = h.prompt("Only");
+    h.hub.send_gate.reached.notified().await;
+    h.hub.send_gate.on.store(false, Ordering::SeqCst);
+    // The link goes, and the next one is up and idle, before the turn is sent.
+    h.drop_link().await;
+    h.relink(Vec::new()).await;
+    h.hub.send_gate.released.notify_one();
+
+    let request = h.next().await;
+    assert_eq!(prompt_text(&request), ["Only"]);
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    wait_until_nothing_kept(&h).await;
+    assert_eq!(h.logged(), ["Only"]);
+}
+
+#[tokio::test]
+async fn a_prompt_whose_link_drops_before_the_agent_gets_it_runs_on_the_next_link() {
+    let mut h = Harness::ready().await;
+    let _only = h.prompt("Only");
+    let lost = h.next().await;
+    assert_eq!(prompt_text(&lost), ["Only"]);
+
+    h.drop_link().await;
+    assert_eq!(kept_texts(&h).await, ["Only"]);
+    h.relink(Vec::new()).await;
+    let again = h.next().await;
+    assert_eq!(prompt_text(&again), ["Only"]);
+    h.respond(&again, json!({"stopReason": "end_turn"})).await;
+    wait_until_nothing_kept(&h).await;
+    assert_eq!(h.logged(), ["Only"]);
 }
 
 /// `START`, moved on by `minutes`.
