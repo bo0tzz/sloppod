@@ -1,6 +1,7 @@
 //! What sloppod knows of each built-in capability, in one place (ADR 2): whether the owner can grant it mid-session,
 //! what a new session starts with, what a sub-session keeps, and which credential it needs. The owner's
-//! own capabilities are definitions (`definitions.rs`); this is the built-ins' side of the same picture.
+//! own capabilities are definitions (`definitions.rs`); this is the built-ins' side of the same picture, and a
+//! built-in that's an MCP server is served like one of those.
 
 use sloppod_contracts::capability;
 
@@ -28,6 +29,9 @@ pub struct Builtin {
     pub always_inherited: bool,
     /// A credential kind the owner needs before it's offered at all.
     pub needs: Option<&'static str>,
+    /// The MCP server it is, if it's one. The runtime serves it at `/servers/<name>` to the sessions granted it, as
+    /// it does an owner's definition, but with no credential.
+    pub mcp_url: Option<&'static str>,
 }
 
 pub const BUILTINS: &[Builtin] = &[
@@ -37,6 +41,7 @@ pub const BUILTINS: &[Builtin] = &[
         start: Start::Always,
         always_inherited: true,
         needs: None,
+        mcp_url: None,
     },
     Builtin {
         name: capability::DOCS,
@@ -44,6 +49,8 @@ pub const BUILTINS: &[Builtin] = &[
         start: Start::Always,
         always_inherited: false,
         needs: None,
+        // Context7's hosted server (#195), used without an API key, so it's rate limited.
+        mcp_url: Some("https://mcp.context7.com/mcp"),
     },
     Builtin {
         name: capability::GITHUB,
@@ -51,6 +58,7 @@ pub const BUILTINS: &[Builtin] = &[
         start: Start::Offered,
         always_inherited: false,
         needs: None,
+        mcp_url: None,
     },
     Builtin {
         name: capability::PACKAGES,
@@ -58,6 +66,7 @@ pub const BUILTINS: &[Builtin] = &[
         start: Start::Offered,
         always_inherited: false,
         needs: None,
+        mcp_url: None,
     },
     Builtin {
         name: capability::CODEX,
@@ -65,6 +74,7 @@ pub const BUILTINS: &[Builtin] = &[
         start: Start::Offered,
         always_inherited: true,
         needs: Some(CHATGPT),
+        mcp_url: None,
     },
     Builtin {
         name: capability::REPO,
@@ -72,6 +82,7 @@ pub const BUILTINS: &[Builtin] = &[
         start: Start::Not,
         always_inherited: false,
         needs: None,
+        mcp_url: None,
     },
     Builtin {
         name: capability::MEMORY,
@@ -79,6 +90,7 @@ pub const BUILTINS: &[Builtin] = &[
         start: Start::Not,
         always_inherited: false,
         needs: None,
+        mcp_url: None,
     },
 ];
 
@@ -89,6 +101,11 @@ pub fn builtin(name: &str) -> Option<&'static Builtin> {
 /// Names no definition of the owner's can take: the built-ins', and the agent's own MCP servers'.
 pub fn reserved(name: &str) -> bool {
     builtin(name).is_some() || matches!(name, "sloppod" | "memini")
+}
+
+/// The URL of the MCP server a built-in is, if it's one.
+pub fn mcp_url(name: &str) -> Option<&'static str> {
+    builtin(name).and_then(|b| b.mcp_url)
 }
 
 /// Whether a session keeps a capability of its parent's, whatever it's narrowed to.
@@ -130,6 +147,8 @@ mod tests {
         assert!(
             always_inherited("model") && always_inherited("codex") && !always_inherited("github")
         );
+        assert_eq!(mcp_url("docs"), Some("https://mcp.context7.com/mcp"));
+        assert!(mcp_url("github").is_none() && mcp_url("victorialogs").is_none());
         assert!(
             reserved("docs")
                 && reserved("sloppod")

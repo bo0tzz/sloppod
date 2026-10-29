@@ -1,6 +1,7 @@
 //! Capabilities an owner defines themselves (ADR 2, 2026-10-29). So far that's an MCP server: the runtime serves it
 //! to the sessions granted it, at `/servers/<name>`, with the definition's credential attached on the way, so the
-//! token never enters the pod. Sloppod doesn't know or care what the server does.
+//! token never enters the pod. Sloppod doesn't know or care what the server does. A built-in that's an MCP server
+//! (`docs`) is served the same way, from its URL in `capabilities.rs`, with no credential.
 
 use std::net::SocketAddr;
 
@@ -136,11 +137,17 @@ pub fn grant(definition: &Definition) -> Grant {
     )
 }
 
-/// The MCP servers a session's grants of definitions give its agent, as (name, URL under `base`).
+/// Whether a grant is of an MCP server the runtime serves: a definition's, or a built-in that's one.
+pub fn serves(grant: &Grant) -> bool {
+    grant.params.get("definition").is_some()
+        || crate::capabilities::mcp_url(&grant.capability).is_some()
+}
+
+/// The MCP servers a session's grants give its agent, as (name, URL under `base`).
 pub fn servers(grants: &[Grant], base: &str) -> Vec<(String, String)> {
     grants
         .iter()
-        .filter(|grant| grant.params.get("definition").is_some())
+        .filter(|grant| serves(grant))
         .map(|grant| {
             (
                 grant.capability.clone(),
@@ -150,8 +157,8 @@ pub fn servers(grants: &[Grant], base: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// `/servers/{name}` and below: a session's request to one of its definitions' MCP servers, forwarded with the
-/// definition's credential if the session holds a grant of it.
+/// `/servers/{name}` and below: a session's request to one of its MCP servers, forwarded if the session holds a
+/// grant of it: a definition's with its credential, a built-in's with none.
 pub async fn proxy(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -202,34 +209,11 @@ async fn forward(
             format!("sloppod: this session is {why}, so it reaches no servers\n"),
         );
     }
-    let context = session.context();
-    let Some(grant) = context
-        .grants
-        .iter()
-        .find(|grant| grant.capability == name && grant.params.get("definition").is_some())
-    else {
-        return refuse(
-            StatusCode::FORBIDDEN,
-            format!(
-                "sloppod: this session has no grant of {name}; the user can grant it in the session's grants\n"
-            ),
-        );
-    };
-    let Some(definition) = named(&state.db, &session.owner, name).await? else {
-        return refuse(
-            StatusCode::NOT_FOUND,
-            format!("sloppod: the {name} capability was deleted; tell the user\n"),
-        );
-    };
-    // A definition deleted and made again under its name isn't the one granted.
-    if grant.params["definition"] != json!(definition.id) {
-        return refuse(
-            StatusCode::FORBIDDEN,
-            format!(
-                "sloppod: {name} was redefined since it was granted; the user can grant it again\n"
-            ),
-        );
-    }
+    let upstream =
+        match upstream(&state.db, &session.owner, &session.context().grants, name).await? {
+            Ok(upstream) => upstream,
+            Err((status, message)) => return refuse(status, message),
+        };
 
     let (parts, body) = request.into_parts();
     let below = parts
@@ -237,16 +221,16 @@ async fn forward(
         .path()
         .strip_prefix(&format!("{PREFIX}/{name}"))
         .unwrap_or("");
-    let url = upstream_url(&definition.mcp_url, below, parts.uri.query())?;
+    let url = upstream_url(&upstream.mcp_url, below, parts.uri.query())?;
     let body = axum::body::to_bytes(body, MAX_BODY)
         .await
         .context("reading the request body")?;
     // Whatever the agent sent as credentials isn't passed on: the definition's is the only one.
     let mut set = Vec::new();
-    if let Some(credential) = definition.credential_id {
+    if let Some(credential) = upstream.credential_id {
         set.push(token_header(state, &session.owner, credential).await?);
     }
-    tracing::info!(session = %session.id, server = %name, method = %parts.method, "request to an owner-defined server");
+    tracing::info!(session = %session.id, server = %name, method = %parts.method, "request to an MCP server");
     crate::proxy::forward(
         parts.method,
         &parts.headers,
@@ -256,6 +240,60 @@ async fn forward(
         vec!["authorization".into(), "cookie".into()],
     )
     .await
+}
+
+/// The server a session's request for `name` goes to.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Upstream {
+    pub mcp_url: String,
+    pub credential_id: Option<Uuid>,
+}
+
+/// Which server a session with `grants` reaches as `name`, or why it reaches none, as a status and a message for the
+/// agent: a built-in that's an MCP server from its URL with no credential, or the owner's definition of that name if
+/// it's the one granted.
+pub async fn upstream(
+    db: &PgPool,
+    owner: &str,
+    grants: &[Grant],
+    name: &str,
+) -> sqlx::Result<Result<Upstream, (StatusCode, String)>> {
+    let Some(grant) = grants
+        .iter()
+        .find(|grant| grant.capability == name && serves(grant))
+    else {
+        return Ok(Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "sloppod: this session has no grant of {name}; the user can grant it in the session's grants\n"
+            ),
+        )));
+    };
+    if let Some(url) = crate::capabilities::mcp_url(name) {
+        return Ok(Ok(Upstream {
+            mcp_url: url.to_owned(),
+            credential_id: None,
+        }));
+    }
+    let Some(definition) = named(db, owner, name).await? else {
+        return Ok(Err((
+            StatusCode::NOT_FOUND,
+            format!("sloppod: the {name} capability was deleted; tell the user\n"),
+        )));
+    };
+    // A definition deleted and made again under its name isn't the one granted.
+    if grant.params["definition"] != json!(definition.id) {
+        return Ok(Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "sloppod: {name} was redefined since it was granted; the user can grant it again\n"
+            ),
+        )));
+    }
+    Ok(Ok(Upstream {
+        mcp_url: definition.mcp_url,
+        credential_id: definition.credential_id,
+    }))
 }
 
 /// Where a request goes: the server's own URL for the bare path, and paths below it for the rest (a separate SSE
@@ -382,15 +420,22 @@ mod tests {
         };
         let grants = vec![
             Grant::new(sloppod_contracts::capability::DOCS, json!({})),
+            Grant::new(sloppod_contracts::capability::GITHUB, json!({})),
             grant(&definition),
         ];
         assert_eq!(
             servers(&grants, "http://127.0.0.1:7777"),
-            [(
-                "victorialogs".to_owned(),
-                "http://127.0.0.1:7777/servers/victorialogs".to_owned()
-            )]
+            [
+                (
+                    "docs".to_owned(),
+                    "http://127.0.0.1:7777/servers/docs".to_owned()
+                ),
+                (
+                    "victorialogs".to_owned(),
+                    "http://127.0.0.1:7777/servers/victorialogs".to_owned()
+                )
+            ]
         );
-        assert_eq!(crate::grants::describe(&grants[1]), "Production logs");
+        assert_eq!(crate::grants::describe(&grants[2]), "Production logs");
     }
 }

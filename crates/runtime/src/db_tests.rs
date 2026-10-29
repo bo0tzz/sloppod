@@ -1651,3 +1651,104 @@ async fn an_owner_defines_a_capability_grants_it_and_deletes_it(db: PgPool) {
             .is_none()
     );
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn only_a_session_s_grants_reach_its_servers(db: PgPool) {
+    use crate::definitions::{self, NewDefinition, Upstream};
+    use axum::http::StatusCode;
+    use sloppod_contracts::{Grant, capability};
+
+    let new = NewDefinition {
+        name: "victorialogs".into(),
+        description: "Production logs".into(),
+        mcp_url: "http://vl-mcp.monitoring.svc:8080/mcp".into(),
+        credential_id: None,
+    };
+    let defined = definitions::create(&db, "dev", &new)
+        .await
+        .unwrap()
+        .unwrap();
+    let granted = session(&db, "dev").await;
+    for grant in [
+        Grant::new(capability::DOCS, json!({})),
+        Grant::new(capability::GITHUB, json!({})),
+        definitions::grant(&defined),
+    ] {
+        db::grant(&db, granted, &grant, None).await.unwrap();
+    }
+    let grants = db::get_session(&db, granted)
+        .await
+        .unwrap()
+        .unwrap()
+        .context()
+        .grants;
+    let upstream = |grants: Vec<Grant>, name: &'static str| {
+        let db = db.clone();
+        async move {
+            definitions::upstream(&db, "dev", &grants, name)
+                .await
+                .unwrap()
+                .map_err(|(status, _)| status)
+        }
+    };
+
+    // A docs grant puts docs in the agent's servers, served by the runtime like a definition's.
+    assert_eq!(
+        definitions::servers(&grants, "http://127.0.0.1:7777"),
+        [
+            (
+                "docs".to_owned(),
+                "http://127.0.0.1:7777/servers/docs".to_owned()
+            ),
+            (
+                "victorialogs".to_owned(),
+                "http://127.0.0.1:7777/servers/victorialogs".to_owned()
+            )
+        ]
+    );
+    assert_eq!(
+        upstream(grants.clone(), "docs").await,
+        Ok(Upstream {
+            mcp_url: "https://mcp.context7.com/mcp".into(),
+            credential_id: None
+        })
+    );
+    assert_eq!(
+        upstream(grants.clone(), "victorialogs").await,
+        Ok(Upstream {
+            mcp_url: new.mcp_url.clone(),
+            credential_id: None
+        })
+    );
+    // A grant that isn't of a server, and names it doesn't hold, reach nothing.
+    for name in ["github", "model", "sloppod", "metrics"] {
+        assert_eq!(
+            upstream(grants.clone(), name).await,
+            Err(StatusCode::FORBIDDEN),
+            "{name}"
+        );
+    }
+    // Nor does a session without the grants.
+    for name in ["docs", "victorialogs"] {
+        assert_eq!(
+            upstream(Vec::new(), name).await,
+            Err(StatusCode::FORBIDDEN),
+            "{name}"
+        );
+    }
+
+    // Deleted, the definition is gone; made again under its name, it isn't the one granted.
+    assert!(definitions::delete(&db, "dev", defined.id).await.unwrap());
+    assert_eq!(
+        upstream(grants.clone(), "victorialogs").await,
+        Err(StatusCode::NOT_FOUND)
+    );
+    definitions::create(&db, "dev", &new)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        upstream(grants.clone(), "victorialogs").await,
+        Err(StatusCode::FORBIDDEN)
+    );
+}
