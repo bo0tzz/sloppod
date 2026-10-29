@@ -12,8 +12,11 @@ use sqlx::types::Json;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::credentials::{Account, CHATGPT, CLAUDE, CredentialRow};
+use crate::credentials::{CHATGPT, CLAUDE, CredentialRow};
 use crate::{AppState, db};
+
+/// How long a limit whose reset nobody reported lasts: after it, the credential is tried again (#251, #252).
+pub const PROBE_AFTER: Duration = Duration::minutes(30);
 
 /// Where the Codex CLI reads a ChatGPT login's limits.
 const CHATGPT_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -288,7 +291,10 @@ impl QuotaRow {
     /// As it stands at `now`: a limit whose reset has passed is over, and a window that has reset since is unused.
     fn into_quota(self, now: DateTime<Utc>) -> Quota {
         let over = |at: Option<DateTime<Utc>>| at.is_some_and(|at| at <= now);
-        let (limited, resets_at) = if over(self.resets_at) {
+        // A limit whose reset isn't known is over after a while, so the credential is tried again.
+        let probed =
+            self.limited && self.resets_at.is_none() && self.observed_at + PROBE_AFTER <= now;
+        let (limited, resets_at) = if over(self.resets_at) || probed {
             (false, None)
         } else {
             (self.limited, self.resets_at)
@@ -362,31 +368,32 @@ pub async fn is_limited(db: &PgPool, credential: Uuid, now: DateTime<Utc>) -> sq
         .is_some_and(|quota| quota.limited))
 }
 
-/// A turn failed on a credential's usage limit (#252): it's kept as limited, until `until` when nothing says when the
-/// limit resets, so sessions move to their next account and come back to it once it may have reset. A quota that
-/// already says it's limited is left as it is.
-pub async fn hit(
-    state: &AppState,
-    credential: &CredentialRow,
-    now: DateTime<Utc>,
-    until: DateTime<Utc>,
-) {
-    match is_limited(&state.db, credential.id, now).await {
-        Ok(true) => return,
-        Ok(false) => {}
-        Err(e) => {
-            tracing::warn!(credential = %credential.id, error = %e, "reading a credential's quota");
-            return;
-        }
+/// A turn failed on a credential's usage limit (#252): it's kept as limited, until [`PROBE_AFTER`] from now when
+/// nothing says when the limit resets. A quota that already says it's limited is left as it is. Says whether it changed.
+pub async fn mark_limited(db: &PgPool, credential: Uuid, now: DateTime<Utc>) -> sqlx::Result<bool> {
+    if is_limited(db, credential, now).await? {
+        return Ok(false);
     }
     let observation = Observation {
         observed_at: now,
         limited: true,
-        resets_at: Some(until),
+        resets_at: Some(now + PROBE_AFTER),
         windows: BTreeMap::new(),
     };
-    record(state, credential.id, &credential.owner, observation).await;
+    store(db, credential, &observation).await?;
+    Ok(true)
 }
+
+/// Tells whoever follows quotas that a credential's changed.
+pub async fn announce(state: &AppState, credential: &CredentialRow) {
+    if let Ok(Some(quota)) = for_credential(&state.db, credential.id, Utc::now()).await {
+        let _ = state.quotas.changed.send(Change {
+            owner: credential.owner.clone(),
+            quota,
+        });
+    }
+}
+
 async fn record(state: &AppState, credential: Uuid, owner: &str, observation: Observation) {
     if let Err(e) = store(&state.db, credential, &observation).await {
         tracing::warn!(%credential, error = %e, "keeping a credential's quota");
@@ -401,7 +408,7 @@ async fn record(state: &AppState, credential: Uuid, owner: &str, observation: Ob
 }
 
 /// A `usage_update` from a session's agent: Claude Code's carry the rate limits of the Claude subscription the
-/// session used, the one its model grant names (ADR 29). `at` is when it came, taken before anything here waits.
+/// session used, the one last attached to its requests (ADR 29, #252). `at` is when it came, taken before anything here waits.
 pub async fn seen(state: &AppState, session: Uuid, update: Value, at: DateTime<Utc>) {
     let Some(observation) = from_claude(&update["_meta"]["_claude/rateLimit"], at) else {
         return;
@@ -414,11 +421,9 @@ pub async fn seen(state: &AppState, session: Uuid, update: Value, at: DateTime<U
             return;
         }
     };
-    match state.credentials.account(&session, CLAUDE).await {
-        Ok(Account::Found(credential)) => {
-            record(state, credential.id, &credential.owner, observation).await
-        }
-        Ok(_) => {}
+    match state.credentials.used(&session, CLAUDE).await {
+        Ok(Some(credential)) => record(state, credential.id, &credential.owner, observation).await,
+        Ok(None) => {}
         Err(e) => {
             tracing::warn!(session = %session.session_id, error = %e, "finding the Claude credential a session used")
         }

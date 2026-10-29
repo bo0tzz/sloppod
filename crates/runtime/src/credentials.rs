@@ -145,6 +145,9 @@ pub struct Credentials {
     /// Held per login while refreshing it, so a single-use refresh token is only ever spent once, and a slow refresh
     /// holds up only that login's requests.
     chatgpt_refresh: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
+    /// The account last attached to each session's requests, by session and kind: what a quota report or a failed
+    /// turn is about, whichever account would be chosen now (#252). Lost on a restart, when the choice stands in.
+    attached: std::sync::Mutex<HashMap<(String, String), Uuid>>,
     http: reqwest::Client,
 }
 
@@ -208,6 +211,7 @@ impl Credentials {
             vault,
             github: Mutex::default(),
             chatgpt_refresh: Mutex::default(),
+            attached: Default::default(),
             // The refresh runs while a session's request waits on the authorizer, which Envoy gives 10 s.
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
@@ -464,6 +468,42 @@ impl Credentials {
         };
         let secret = self.vault.decrypt_string(&row.secret)?;
         Ok(Some((row, secret)))
+    }
+
+    /// [`Self::account`], for a request it's attached to: kept as the account the session last used.
+    pub async fn attach(&self, session: &SessionContext, kind: &str) -> sqlx::Result<Account> {
+        let account = self.account(session, kind).await?;
+        if let Account::Found(row) = &account {
+            self.attached
+                .lock()
+                .unwrap()
+                .insert((session.session_id.clone(), kind.to_owned()), row.id);
+        }
+        Ok(account)
+    }
+
+    /// The account a session last used for a kind: the one last attached to its requests, if it's still there,
+    /// otherwise the one it would use now.
+    pub async fn used(
+        &self,
+        session: &SessionContext,
+        kind: &str,
+    ) -> sqlx::Result<Option<CredentialRow>> {
+        let attached = self
+            .attached
+            .lock()
+            .unwrap()
+            .get(&(session.session_id.clone(), kind.to_owned()))
+            .copied();
+        if let Some(id) = attached
+            && let Some(row) = self.owned(&session.owner, kind, &id.to_string()).await?
+        {
+            return Ok(Some(row));
+        }
+        Ok(match self.account(session, kind).await? {
+            Account::Found(row) => Some(row),
+            _ => None,
+        })
     }
 
     /// The account a session's model grant acts with (ADR 29), for a kind of account (`claude`, `chatgpt`): the first
@@ -1050,6 +1090,108 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[sqlx::test]
+    async fn a_limit_is_kept_against_the_account_that_was_used(db: PgPool) {
+        let credentials = credentials(db.clone()).await;
+        let work = add(&credentials, "dev", claude("Work")).await;
+        let personal = add(&credentials, "dev", claude("Personal")).await;
+        let session = SessionContext {
+            session_id: "s".into(),
+            owner: "dev".into(),
+            grants: vec![Grant::new(
+                "model",
+                json!({"credentials": [work.id.to_string(), personal.id.to_string()]}),
+            )],
+            role: SessionRole::Work,
+        };
+        let name = |row: Option<CredentialRow>| row.map(|r| r.name);
+        let attached = match credentials.attach(&session, CLAUDE).await.unwrap() {
+            Account::Found(row) => row.name,
+            _ => unreachable!(),
+        };
+        assert_eq!(attached, "Work");
+        // Work's report that it's limited comes before the turn fails: the account chosen now moves on, but the
+        // failure is still Work's.
+        let rejected = crate::quota::Observation {
+            observed_at: Utc::now(),
+            limited: true,
+            resets_at: Some(Utc::now() + chrono::Duration::hours(1)),
+            windows: Default::default(),
+        };
+        crate::quota::store(&db, work.id, &rejected).await.unwrap();
+        assert_eq!(
+            name(credentials.used(&session, CLAUDE).await.unwrap()).as_deref(),
+            Some("Work")
+        );
+        let (used, next) =
+            crate::limits::fall_back(&credentials, &db, &session, CLAUDE, Utc::now())
+                .await
+                .unwrap();
+        assert_eq!(
+            (name(used).as_deref(), name(next).as_deref()),
+            (Some("Work"), Some("Personal"))
+        );
+        assert!(
+            !crate::quota::is_limited(&db, personal.id, Utc::now())
+                .await
+                .unwrap()
+        );
+
+        // Then Personal is attached, and hits its limit too: nothing is left to fall back to.
+        credentials.attach(&session, CLAUDE).await.unwrap();
+        let (used, next) =
+            crate::limits::fall_back(&credentials, &db, &session, CLAUDE, Utc::now())
+                .await
+                .unwrap();
+        assert_eq!(
+            (name(used).as_deref(), name(next).as_deref()),
+            (Some("Personal"), None)
+        );
+        assert!(
+            crate::quota::is_limited(&db, personal.id, Utc::now())
+                .await
+                .unwrap()
+        );
+    }
+
+    #[sqlx::test]
+    async fn a_limit_with_no_known_reset_is_tried_again_after_a_while(db: PgPool) {
+        let credentials = credentials(db.clone()).await;
+        let work = add(&credentials, "dev", claude("Work")).await;
+        let personal = add(&credentials, "dev", claude("Personal")).await;
+        let session = SessionContext {
+            session_id: "s".into(),
+            owner: "dev".into(),
+            grants: vec![Grant::new(
+                "model",
+                json!({"credentials": [work.id.to_string(), personal.id.to_string()]}),
+            )],
+            role: SessionRole::Work,
+        };
+        let used = async || match credentials.account(&session, CLAUDE).await.unwrap() {
+            Account::Found(row) => row.name,
+            _ => unreachable!(),
+        };
+        let reported = |minutes_ago: i64| crate::quota::Observation {
+            observed_at: Utc::now() - chrono::Duration::minutes(minutes_ago),
+            limited: true,
+            resets_at: None,
+            windows: Default::default(),
+        };
+        crate::quota::store(&db, work.id, &reported(10))
+            .await
+            .unwrap();
+        assert_eq!(used().await, "Personal");
+        sqlx::query("delete from credential_quotas")
+            .execute(&db)
+            .await
+            .unwrap();
+        crate::quota::store(&db, work.id, &reported(31))
+            .await
+            .unwrap();
+        assert_eq!(used().await, "Work");
     }
     #[sqlx::test]
     async fn the_owner_gives_a_model_grant_only_their_own_accounts_of_its_kind(db: PgPool) {

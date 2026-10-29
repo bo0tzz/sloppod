@@ -64,7 +64,7 @@ impl RequestPolicy for CodexPolicy {
         }
         let login = match self
             .credentials
-            .account(session, CHATGPT)
+            .attach(session, CHATGPT)
             .await
             .map_err(|e| Error::new(e.to_string()))?
         {
