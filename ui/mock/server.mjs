@@ -1592,7 +1592,10 @@ async function handleApi(req, res, url) {
       const turnId = starts[chosen].entry.update.messageId;
       const turns = starts.slice(Math.max(0, chosen - 3), chosen + 1).map(({ entry, index }, k, window) => {
         const next = starts[starts.indexOf(window[k]) + 1];
-        const events = session.log.slice(index, next?.index).map((e) => e.update);
+        // As the runtime has them: each event with its sequence number and when it was recorded.
+        const events = session.log
+          .slice(index, next?.index)
+          .map((e, i) => ({ seq: index + i + 1, at: new Date().toISOString(), update: e.update }));
         return { message_id: entry.update.messageId, model_calls: [{ request_id: `req_mock_${index}` }], events };
       });
       res.writeHead(200, {

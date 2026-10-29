@@ -103,9 +103,9 @@ test("downloads a debug bundle for an agent message's turn", async ({ page }) =>
   const bundle = JSON.parse(await readFile(await file.path(), 'utf8'));
   // The turn is the one the user's message started.
   const first = bundle.turns.at(-1).events[0];
-  expect(first.sessionUpdate).toBe('user_message_chunk');
-  expect(first.content.text).toBe('Add backoff to the reconnect logic in sloppod');
-  expect(bundle.turn).toBe(first.messageId);
+  expect(first.update.sessionUpdate).toBe('user_message_chunk');
+  expect(first.update.content.text).toBe('Add backoff to the reconnect logic in sloppod');
+  expect(bundle.turn).toBe(first.update.messageId);
   expect(bundle.turns.at(-1).model_calls.length).toBeGreaterThan(0);
 
   await expect(userMessages(page).getByRole('link', { name: 'Download debug bundle' })).toHaveCount(0);
@@ -128,7 +128,7 @@ test('a debug bundle finds the turn of a message loaded without the message that
   await page.reload();
   await expect(page.getByText('The end.')).toBeVisible();
   await expect(userMessages(page)).toHaveCount(0);
-  expect((await firstEvent()).content.text).toBe(prompt);
+  expect((await firstEvent()).update.content.text).toBe(prompt);
 
   // And then inside the turn before the first message loaded.
   const box = page.getByRole('textbox', { name: 'Prompt' });
@@ -138,7 +138,7 @@ test('a debug bundle finds the turn of a message loaded without the message that
   await page.reload();
   await expect(agentMessages(page).filter({ hasText: FINAL })).toBeVisible();
   await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(0);
-  expect((await firstEvent()).content.text).toBe(prompt);
+  expect((await firstEvent()).update.content.text).toBe(prompt);
 });
 
 test('touch screens always show the copy button', async ({ page, browser }) => {
