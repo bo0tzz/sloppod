@@ -187,6 +187,8 @@ export type CredentialKindSpec = {
   empty: string;
   fields: { key: string; label: string; type?: string; placeholder?: string; description?: string; optional?: boolean }[];
   secret: { label: string; description?: string; multiline?: boolean; placeholder?: string };
+  /** What deleting one does, when it isn't only that new sessions can't use it. */
+  deletion?: string;
 };
 
 export const credentialKinds: CredentialKindSpec[] = [
@@ -244,6 +246,25 @@ export const credentialKinds: CredentialKindSpec[] = [
       description:
         'Make one under GitHub → Settings → Developer settings → Fine-grained tokens, limited to the repositories sessions may work on as you. Classic tokens are refused: they reach everything you can.',
     },
+  },
+  {
+    kind: 'token',
+    title: 'Capability tokens',
+    noun: 'token',
+    description: "Secrets your own capabilities' servers take. A capability below can send one with every request.",
+    empty: 'No token yet.',
+    fields: [
+      {
+        key: 'header',
+        label: 'Header',
+        placeholder: 'X-API-Key',
+        description: 'Sent as this header. Left out, the token is sent as Authorization: Bearer.',
+        optional: true,
+      },
+    ],
+    secret: { label: 'Token' },
+    deletion:
+      'Capabilities that use it stop sending it at once, also to sessions that already have them, and their servers may refuse those requests. Its secret is deleted with it.',
   },
   {
     kind: 'chatgpt',
