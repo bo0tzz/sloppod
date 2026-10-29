@@ -312,6 +312,19 @@ pub struct Hub {
     /// The time the tests say it is, instead of the clock's.
     now: StdMutex<Option<DateTime<Utc>>>,
     limit_hit: StdMutex<Option<LimitHit>>,
+    /// Holds a turn between sending its prompt and noting it was sent, until released; for tests of what happens
+    /// in between.
+    #[cfg(test)]
+    pub(crate) send_gate: SendGate,
+}
+
+/// See `Hub::send_gate`.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct SendGate {
+    pub(crate) on: std::sync::atomic::AtomicBool,
+    pub(crate) reached: Notify,
+    pub(crate) released: Notify,
 }
 
 fn notification(method: &str, params: Value) -> Value {
@@ -344,6 +357,8 @@ impl Hub {
             agent_capabilities: StdMutex::default(),
             limit_hit: StdMutex::default(),
             now: StdMutex::default(),
+            #[cfg(test)]
+            send_gate: SendGate::default(),
         }
     }
 
@@ -914,16 +929,25 @@ impl Hub {
         (Some(key), kept)
     }
 
-    /// A held batch was sent as `request`, a turn or a steer.
-    async fn sent(&self, id: Uuid, key: Option<Uuid>, request: i64, turn: bool) {
+    /// A held batch was sent as `request`: as a turn on `turn_on`, or as a steer.
+    async fn sent(
+        &self,
+        id: Uuid,
+        key: Option<Uuid>,
+        request: i64,
+        turn_on: Option<&Arc<AgentConn>>,
+    ) {
         let Some(key) = key else {
             return;
         };
         let live = self.live(id);
         let mut state = live.state.lock().await;
+        // A link that went between sending the turn and now didn't mark it for the next link to settle.
+        let gone = turn_on.is_some_and(|agent| !state.ends_on(agent));
         if let Some(held) = state.in_flight.iter_mut().find(|h| h.key == key) {
             held.request = Some(request);
-            held.turn = turn;
+            held.turn = turn_on.is_some();
+            held.restored |= gone;
             self.save_queue(id, &state).await;
         }
     }
@@ -1492,7 +1516,12 @@ impl Hub {
             "session/prompt",
             json!({"sessionId": agent_session_id, "prompt": prompt}),
         );
-        self.sent(id, held, request, true).await;
+        #[cfg(test)]
+        if self.send_gate.on.load(std::sync::atomic::Ordering::SeqCst) {
+            self.send_gate.reached.notify_one();
+            self.send_gate.released.notified().await;
+        }
+        self.sent(id, held, request, Some(agent)).await;
         let result = answer.await;
         {
             let live = self.live(id);
@@ -1769,7 +1798,7 @@ impl Hub {
                     "_meta": {"steering": {"idleBehavior": "promptRequired"}},
                 }),
             );
-            self.sent(id, held, request, false).await;
+            self.sent(id, held, request, None).await;
             let result = answer.await?;
             if result["outcome"] != "promptRequired" {
                 let live = self.live(id);
