@@ -16,6 +16,7 @@ Concepts:
 
 - [1. Sessions are decoupled from directories and owned by the runtime](docs/adr/0001-sessions-decoupled-from-directories.md)
 - [2. Capabilities are composable, requestable grants](docs/adr/0002-capabilities.md)
+- [30. Capabilities are definitions, not code](docs/adr/0030-capabilities-are-definitions.md)
 - [3. Outward actions are proposals executed by the runtime](docs/adr/0003-proposals-and-trusted-executor.md)
 - [4. Interaction is asynchronous](docs/adr/0004-asynchronous-interaction.md)
 - [5. Sessions can be parked and woken](docs/adr/0005-park-and-wake.md)
