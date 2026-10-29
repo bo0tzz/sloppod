@@ -721,14 +721,23 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
                     replaces,
                 )
                 .await;
-                match stored {
-                    Ok(true) => {}
-                    Ok(false) => {
+                if let Err(e) = &stored {
+                    tracing::error!(session = %session_id, file = %name, offset, error = %e, "storing transcript; asking for all of it again shortly");
+                    // Whatever was staged may be missing a piece too; the whole file comes again.
+                    staging.remove(&name);
+                }
+                match resync_after(&stored) {
+                    None => {}
+                    Some(Duration::ZERO) => {
                         tracing::warn!(session = %session_id, file = %name, offset, "transcript out of step; asking for all of it");
                         agent.resync_transcript(name);
                     }
-                    Err(e) => {
-                        tracing::error!(session = %session_id, error = %e, "storing transcript")
+                    Some(delay) => {
+                        let agent = agent.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            agent.resync_transcript(name);
+                        });
                     }
                 }
             }
@@ -779,6 +788,21 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
     agent.close();
     state.hub.detach_agent(session_id, &agent).await;
     writer.abort();
+}
+
+/// How long after a piece that couldn't be stored the whole file is asked for again: long enough for a database that
+/// failed for a moment to be back, and to keep a database that stays down from being asked every moment.
+const RESYNC_AFTER_ERROR: Duration = Duration::from_secs(5);
+
+/// When to ask the supervisor for the whole of a transcript file again, after storing a piece of it: at once when the
+/// piece was out of step with the stored copy, after a while when it couldn't be stored. The supervisor counts a piece
+/// as synced once it's sent, so a lost last piece would otherwise never come again (#350).
+pub(crate) fn resync_after(stored: &sqlx::Result<bool>) -> Option<Duration> {
+    match stored {
+        Ok(true) => None,
+        Ok(false) => Some(Duration::ZERO),
+        Err(_) => Some(RESYNC_AFTER_ERROR),
+    }
 }
 
 /// Stores a piece of a transcript sync; returns whether it was in step with the stored copy. A replacement that comes
