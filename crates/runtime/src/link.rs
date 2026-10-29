@@ -490,8 +490,7 @@ pub async fn agent_context(
         state.config.runtime_url()
     };
     let context = session.context();
-    let namespace = context
-        .grant(capability::MEMORY)
+    let namespace = crate::capabilities::grant_with(&context, &crate::capabilities::Part::Memory)
         .and_then(|g| g.param("namespace"))
         .map(str::to_owned);
     let memory = match namespace {

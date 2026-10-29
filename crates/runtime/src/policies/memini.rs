@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sloppod_contracts::capability;
 use sloppod_contracts::{
     Decision, Error, HttpRequest, Manifest, RequestPolicy, Result, SessionContext,
 };
@@ -63,9 +62,9 @@ impl RequestPolicy for MeminiPolicy {
                 request.method
             )));
         }
-        let Some(namespace) = session
-            .grant(capability::MEMORY)
-            .and_then(|g| g.param("namespace"))
+        let Some(namespace) =
+            crate::capabilities::grant_with(session, &crate::capabilities::Part::Memory)
+                .and_then(|g| g.param("namespace"))
         else {
             return Ok(Decision::deny(
                 "sloppod: this session has no memory access.\n",
