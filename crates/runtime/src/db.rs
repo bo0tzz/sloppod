@@ -80,6 +80,11 @@ impl SessionRow {
         }
     }
 
+    #[cfg(test)]
+    pub fn set_grants(&mut self, grants: &[Grant]) {
+        self.grants = serde_json::to_value(grants).expect("grants serialize");
+    }
+
     pub fn grants(&self) -> Vec<Grant> {
         serde_json::from_value(self.grants.clone()).unwrap_or_default()
     }

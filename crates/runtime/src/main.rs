@@ -411,12 +411,7 @@ async fn reconcile(state: &AppState) {
     match db::parked_sessions(&state.db).await {
         Ok(parked) => {
             for session in parked {
-                let id = session.id.to_string();
-                if let Err(e) = state
-                    .enforcer
-                    .release(&id, &lifecycle::pod_labels(&id))
-                    .await
-                {
+                if let Err(e) = state.hub.release_egress(session.id, &*state.enforcer).await {
                     tracing::warn!(session = %session.id, error = %e, "releasing a parked session's egress");
                 }
             }
