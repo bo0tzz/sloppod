@@ -168,14 +168,20 @@ impl ProposalKind for IssueUpdates {
         updates::edit_updates(payload, edits, update_list)
     }
 
-    async fn execute(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
+    async fn execute(
+        &self,
+        session: &SessionContext,
+        proposal: uuid::Uuid,
+        payload: &Value,
+    ) -> Result<Value> {
         let repo = payload["repo"].as_str().unwrap_or_default();
         let updates = update_list(&payload["updates"])?;
         let app = super::github_for(&self.credentials, session, repo).await?;
 
-        updates::execute_all(&updates, "issues", describe, |number, update| {
+        updates::execute_all(&updates, "issues", describe, |item, number, update| {
             let (app, repo) = (app.clone(), repo.to_owned());
-            async move { apply(&app, &repo, number, &update).await }
+            let marker = super::marker(proposal, item);
+            async move { apply(&app, &repo, number, &update, &marker).await }
         })
         .await
     }
@@ -187,8 +193,9 @@ async fn apply(
     repo: &str,
     number: u64,
     update: &Value,
+    marker: &str,
 ) -> anyhow::Result<()> {
-    updates::comment_and_label(app, repo, number, update).await?;
+    updates::comment_and_label(app, repo, number, update, marker).await?;
     let mut patch = Map::new();
     for field in ["title", "body"] {
         if let Some(text) = update.get(field) {

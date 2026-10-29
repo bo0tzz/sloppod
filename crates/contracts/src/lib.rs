@@ -584,8 +584,15 @@ pub trait ProposalKind: Send + Sync {
             _ => Ok(payload.clone()),
         }
     }
-    /// Runs the approved action with the runtime's credentials.
-    async fn execute(&self, session: &SessionContext, payload: &Value) -> Result<Value>;
+    /// Runs the approved action with the runtime's credentials. It can run again for the same `proposal` (a restart
+    /// before its outcome was recorded), so what it does outside sloppod should be recognisable as this proposal's,
+    /// e.g. by marking it with the id, and not done twice.
+    async fn execute(
+        &self,
+        session: &SessionContext,
+        proposal: uuid::Uuid,
+        payload: &Value,
+    ) -> Result<Value>;
 }
 
 #[cfg(test)]
