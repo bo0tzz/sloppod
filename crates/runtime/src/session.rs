@@ -209,6 +209,19 @@ struct LiveState {
     stopped: bool,
 }
 
+impl LiveState {
+    /// Whether `agent` is the session's current agent connection; what an older one says is stale.
+    fn runs_on(&self, agent: &Arc<AgentConn>) -> bool {
+        self.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent))
+    }
+
+    /// Whether a turn's end on `agent` is the session's: the current link, and not closed, as one is just before
+    /// the hub hears it's gone. A closed link's turns didn't end; their answers were dropped.
+    fn ends_on(&self, agent: &Arc<AgentConn>) -> bool {
+        self.runs_on(agent) && !agent.is_closed()
+    }
+}
+
 impl Live {
     /// Nothing of the agent's work is under way any more: its turn ended, or it was replaced, parked or stopped.
     fn end_work(&self, state: &mut LiveState) {
@@ -534,7 +547,7 @@ impl Hub {
     pub async fn set_commands(&self, id: Uuid, agent: &Arc<AgentConn>, running: usize) {
         let live = self.live(id);
         let mut state = live.state.lock().await;
-        if state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
+        if state.runs_on(agent) {
             state.commands = Some(running);
         }
     }
@@ -637,7 +650,7 @@ impl Hub {
                 {
                     let live = self.live(id);
                     let mut state = live.state.lock().await;
-                    if !state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
+                    if !state.runs_on(agent) {
                         return;
                     }
                     state.agent_session_id = Some(running.ready.agent_session_id);
@@ -648,16 +661,14 @@ impl Hub {
                 }
                 let (hub, agent) = (self.clone(), agent.clone());
                 tokio::spawn(async move {
-                    let end = match turn.await {
-                        Ok(result) => {
-                            if let Err(e) = &result {
-                                tracing::warn!(session = %id, error = %e, "adopted turn failed");
-                            }
-                            TurnEnd::of(&result)
-                        }
-                        Err(_) => TurnEnd::Ended,
+                    // Unanswered, the link closed: the turn goes on under the agent's next one, if any.
+                    let Ok(result) = turn.await else {
+                        return;
                     };
-                    hub.turn_finished(id, end).await;
+                    if let Err(e) = &result {
+                        tracing::warn!(session = %id, error = %e, "adopted turn failed");
+                    }
+                    hub.turn_finished(id, &agent, TurnEnd::of(&result)).await;
                     hub.end_turn(id, &agent).await;
                 });
             }
@@ -679,7 +690,7 @@ impl Hub {
         let queued = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
-            if !state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
+            if !state.runs_on(agent) {
                 return;
             }
             state.agent_session_id = Some(agent_session_id);
@@ -1092,7 +1103,7 @@ impl Hub {
         let resolved: Vec<(u64, Option<String>)> = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
-            if !state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
+            if !state.runs_on(agent) {
                 return;
             }
             state.agent = None;
@@ -1188,7 +1199,7 @@ impl Hub {
         let pid = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
-            if !state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
+            if !state.runs_on(agent) {
                 agent.respond(
                     request_id,
                     Err(RpcError::new(-32002, "this agent connection was replaced")),
@@ -1443,7 +1454,7 @@ impl Hub {
             let mut state = live.state.lock().await;
             self.release(id, &mut state, held).await;
         }
-        self.turn_finished(id, TurnEnd::of(&result)).await;
+        self.turn_finished(id, agent, TurnEnd::of(&result)).await;
         self.end_turn(id, agent).await;
         result
     }
@@ -1454,7 +1465,7 @@ impl Hub {
         let next = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
-            if !state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
+            if !state.ends_on(agent) {
                 return;
             }
             live.end_work(&mut state);
@@ -1560,7 +1571,7 @@ impl Hub {
     pub async fn retire_agent(&self, id: Uuid, agent: &Arc<AgentConn>) {
         let live = self.live(id);
         let mut state = live.state.lock().await;
-        if state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
+        if state.runs_on(agent) {
             state.agent_session_id = None;
         }
     }
@@ -1939,9 +1950,14 @@ impl Hub {
         self.live(id).state.lock().await.turn_running
     }
 
-    /// Counts a turn the hub sent as ended. One that hit the usage limit leaves the session waiting for the reset;
-    /// one that ended well ends any such wait.
-    async fn turn_finished(self: &Arc<Self>, id: Uuid, end: TurnEnd) {
+    /// Counts a turn the hub sent to `agent` as ended, if that is still the current agent. One that hit the usage
+    /// limit leaves the session waiting for the reset; one that ended well ends any such wait.
+    async fn turn_finished(self: &Arc<Self>, id: Uuid, agent: &Arc<AgentConn>, end: TurnEnd) {
+        // A turn whose link was replaced or dropped hasn't ended: the agent may still be running it, under a newer
+        // link.
+        if !self.live(id).state.lock().await.ends_on(agent) {
+            return;
+        }
         self.heard_from_agent(id);
         let now = self.now();
         let limit_hit = self.limit_hit.lock().unwrap().clone();
@@ -1952,6 +1968,9 @@ impl Hub {
         let limited = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
+            if !state.ends_on(agent) {
+                return;
+            }
             state.turns_ended += 1;
             state.last_turn = Some(end.clone());
             let until = match end {

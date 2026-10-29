@@ -2083,6 +2083,89 @@ async fn a_steer_a_restart_left_open_and_the_agent_then_refuses_still_delivers_i
     );
 }
 
+impl Harness {
+    /// The supervisor reconnects on a new link, with the agent's `open` requests still unanswered.
+    async fn relink(&mut self, open: Vec<Value>) {
+        let (tx, to_agent) = mpsc::unbounded_channel();
+        self.agent = Arc::new(AgentConn::new(tx));
+        self.to_agent = to_agent;
+        self.hub.attach_agent(self.id, self.agent.clone()).await;
+        self.hub
+            .adopt_agent(self.id, &self.agent, running(open))
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn reconnects_during_an_adopted_turn_dont_end_it() {
+    let turn = json!({"jsonrpc": "2.0", "id": 7, "method": "session/prompt", "params": {"sessionId": "agent-session"}});
+    let mut h = Harness::adopted(vec![turn.clone()], Vec::new()).await;
+    let ended = Arc::new(std::sync::Mutex::new(0));
+    {
+        let ended = ended.clone();
+        h.hub.set_turn_ended(Arc::new(move |_| {
+            let ended = ended.clone();
+            Box::pin(async move { *ended.lock().unwrap() += 1 })
+        }));
+    }
+
+    // Each new link closes the one before, whose wait for the turn's answer ends unanswered.
+    h.relink(vec![turn.clone()]).await;
+    h.relink(vec![turn.clone()]).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.hub.turn_state(h.id).await, (0, true));
+    assert_eq!(h.phase().await, "working");
+    assert_eq!(*ended.lock().unwrap(), 0);
+
+    // The turn ends once, when the agent answers it on the current link.
+    h.respond(&turn, json!({"stopReason": "end_turn"})).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.hub.turn_state(h.id).await, (1, false));
+    assert_eq!(h.phase().await, "idle");
+    assert_eq!(*ended.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn a_reconnect_during_a_turn_doesnt_end_it() {
+    let mut h = Harness::ready().await;
+    let _turn = h.prompt("Work");
+    let turn = h.next().await;
+
+    // The agent outlives its link, and the new one adopts the turn.
+    h.relink(vec![turn.clone()]).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.hub.turn_state(h.id).await, (0, true));
+    assert_eq!(h.phase().await, "working");
+
+    h.respond(&turn, json!({"stopReason": "end_turn"})).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.hub.turn_state(h.id).await, (1, false));
+    assert_eq!(h.phase().await, "idle");
+}
+
+#[tokio::test]
+async fn a_link_that_drops_doesnt_end_its_turns() {
+    // The link closes (its pending answers dropped) before the hub hears it's gone.
+    let mut h = Harness::ready().await;
+    let _turn = h.prompt("Work");
+    h.next().await;
+    let _next = h.prompt("Queued");
+    wait_for_queue(&h, 1).await;
+    h.agent.close();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.hub.turns_ended(h.id).await.0, 0);
+    assert_eq!(h.queued().await.len(), 1, "not handed to the closed link");
+    h.hub.detach_agent(h.id, &h.agent).await;
+    assert_eq!(h.hub.turns_ended(h.id).await.0, 0);
+
+    let turn = json!({"jsonrpc": "2.0", "id": 7, "method": "session/prompt", "params": {"sessionId": "agent-session"}});
+    let h = Harness::adopted(vec![turn], Vec::new()).await;
+    h.agent.close();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    h.hub.detach_agent(h.id, &h.agent).await;
+    assert_eq!(h.hub.turns_ended(h.id).await.0, 0);
+}
+
 /// `START`, moved on by `minutes`.
 fn later(minutes: i64) -> chrono::DateTime<chrono::Utc> {
     START.parse::<chrono::DateTime<chrono::Utc>>().unwrap() + chrono::Duration::minutes(minutes)
