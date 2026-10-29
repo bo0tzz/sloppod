@@ -169,8 +169,8 @@ const OUTWARD: &str = "\n# Acting outside the pod\n\
     `propose_pull_request`; sloppod opens it once it's approved. For changes that build on each other, manage the \
     branches with `gh stack` (`init`, `add`, `rebase`, `push`) and propose them together with `propose_stack` \
     rather than `gh stack submit`. To file issues, call `propose_issues`; to comment on, edit or close existing \
-    ones, `propose_issue_updates`. Direct writes to GitHub (gh pr create, gh issue create, comments, API POSTs) are \
-    refused.\n\
+    ones, `propose_issue_updates`, and open pull requests, `propose_pull_request_updates` (also to mark a draft \
+    ready). Direct writes to GitHub (gh pr create, gh issue create, comments, API POSTs) are refused.\n\
     - For write access to another repository, call `request_repository`.\n";
 
 /// ADR 4's instructions: the user isn't watching, and nothing waits on them.
