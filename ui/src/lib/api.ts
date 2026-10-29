@@ -85,11 +85,13 @@ export type PullRequestPayload = {
 export type RepoGrantPayload = { repo: string; reason: string; branch: string };
 export type IssueDraft = { title: string; body: string; labels: string[] };
 export type IssuesPayload = { repo: string; issues: IssueDraft[] };
+/** An update to an issue, or to a pull request: a pull request's `close` is just `true`, and it can be marked `ready`. */
 export type IssueUpdate = {
   number: number;
   comment?: string;
-  close?: 'completed' | 'not_planned' | 'duplicate';
+  close?: 'completed' | 'not_planned' | 'duplicate' | true;
   reopen?: boolean;
+  ready?: boolean;
   title?: string;
   body?: string;
   add_labels?: string[];
@@ -176,7 +178,7 @@ export type Review = {
   finished_at?: string;
 };
 
-/** Pull requests add their diff and commits, issue updates the current text of the issues they rewrite. */
+/** Pull requests add their diff and commits, issue and pull request updates the current text of what they rewrite. */
 export type ProposalDetail = Proposal & {
   diff?: string;
   commits?: { sha: string; message: string }[];

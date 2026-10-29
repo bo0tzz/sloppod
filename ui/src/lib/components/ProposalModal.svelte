@@ -69,10 +69,14 @@
   const pr = $derived(detail?.kind === 'github.pr.create' ? (detail.payload as PullRequestPayload) : null);
   const grant = $derived(detail?.kind === 'sloppod.repo.grant' ? (detail.payload as RepoGrantPayload) : null);
   const issues = $derived(detail?.kind === 'github.issue.create' ? (detail.payload as IssuesPayload) : null);
+  // Updates to pull requests are shown like updates to issues: the same fields, and a draft can be marked ready.
   const issueUpdates = $derived(
-    detail?.kind === 'github.issue.update' ? (detail.payload as IssueUpdatesPayload) : null,
+    detail?.kind === 'github.issue.update' || detail?.kind === 'github.pr.update'
+      ? (detail.payload as IssueUpdatesPayload)
+      : null,
   );
   const closeReasons = { completed: 'completed', not_planned: 'not planned', duplicate: 'a duplicate' };
+  const closing = (close: NonNullable<IssueUpdate['close']>) => (close === true ? 'close' : `close as ${closeReasons[close]}`);
   const filing = $derived(drafts.filter((draft) => draft.file).length);
   let updateDrafts = $state<(IssueUpdate & { make: boolean })[]>([]);
   const making = $derived(updateDrafts.filter((draft) => draft.make).length);
@@ -115,7 +119,7 @@
   const diffCounts = (diff: string) => diffStats(parseUnifiedDiff(diff) ?? []);
 
   function resetDrafts() {
-    if (detail?.kind === 'github.issue.update') {
+    if (detail?.kind === 'github.issue.update' || detail?.kind === 'github.pr.update') {
       updateDrafts = (detail.payload as IssueUpdatesPayload).updates.map((update) => ({ ...update, make: true }));
     }
     if (detail?.kind !== 'github.issue.create') return;
@@ -278,8 +282,9 @@
                 <div class="flex items-center justify-between gap-2">
                   <Text fontWeight="semi-bold">
                     #{update.number}
-                    {#if update.close}<span class="text-muted font-normal">· close as {closeReasons[update.close]}</span>{/if}
+                    {#if update.close}<span class="text-muted font-normal">· {closing(update.close)}</span>{/if}
                     {#if update.reopen}<span class="text-muted font-normal">· reopen</span>{/if}
+                    {#if update.ready}<span class="text-muted font-normal">· mark ready for review</span>{/if}
                   </Text>
                   {#if pending}
                     <label class="text-muted flex shrink-0 items-center gap-2 text-xs">

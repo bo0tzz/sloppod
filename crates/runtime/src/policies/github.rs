@@ -362,9 +362,10 @@ fn proposal_hint(what: &str, session: &SessionContext) -> String {
     };
     format!(
         "sloppod: {what}. Outward actions go through human review: {pull_request}. Issues are filed with \
-         propose_issues, and comments on them with propose_issue_updates; propose_stack opens pull requests that \
-         build on each other, and request_code_review has a branch reviewed without proposing anything. Other \
-         GitHub writes (reviews, releases) aren't available to sessions yet.\n"
+         propose_issues; propose_issue_updates and propose_pull_request_updates comment on, edit and close existing \
+         issues and open pull requests; propose_stack opens pull requests that build on each other, and \
+         request_code_review has a branch reviewed without proposing anything. Other GitHub writes (reviews, \
+         releases) aren't available to sessions yet.\n"
     )
 }
 
@@ -640,6 +641,7 @@ mod tests {
         for tool in [
             "propose_issues",
             "propose_issue_updates",
+            "propose_pull_request_updates",
             "propose_stack",
             "request_code_review",
         ] {
