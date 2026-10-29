@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use sloppod_protocol::api::Phase;
 use sloppod_protocol::link::{AgentReady, RunningAgent, ToSupervisor};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -580,7 +581,7 @@ async fn stopping_a_session_mid_compaction_fails_waiting_steers() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!steer.is_finished());
 
-    h.hub.stop(h.id).await;
+    h.hub.stop(h.id).await.unwrap();
     let result = tokio::time::timeout(Duration::from_secs(5), steer)
         .await
         .expect("the steer is still waiting")
@@ -1076,6 +1077,62 @@ async fn a_wake_during_parking_runs_after_it() {
 }
 
 #[tokio::test]
+async fn parking_that_cant_be_saved_leaves_the_pod_and_the_agent() {
+    let mut h = Harness::ready().await;
+    *h.store.fail_phase.lock().unwrap() = Some(Phase::Parked);
+    let suspended = Arc::new(std::sync::Mutex::new(false));
+    let result = {
+        let suspended = suspended.clone();
+        h.hub
+            .park(h.id, || async move {
+                *suspended.lock().unwrap() = true;
+                Ok(())
+            })
+            .await
+    };
+    assert!(result.is_err());
+    assert!(
+        !*suspended.lock().unwrap(),
+        "suspended without being parked"
+    );
+    assert_eq!(h.phase().await, "idle");
+
+    // The agent is still the session's.
+    let turn = h.prompt("Still here?");
+    let request = h.next().await;
+    assert_eq!(prompt_text(&request), ["Still here?"]);
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn waking_that_cant_be_saved_doesnt_place_the_pod() {
+    let h = Harness::ready().await;
+    h.hub.park(h.id, || async { Ok(()) }).await.unwrap();
+    *h.store.fail_phase.lock().unwrap() = Some(Phase::Starting);
+    let placed = Arc::new(std::sync::Mutex::new(false));
+    let result = {
+        let placed = placed.clone();
+        h.hub
+            .wake(h.id, || async move {
+                *placed.lock().unwrap() = true;
+                Ok(())
+            })
+            .await
+    };
+    assert!(result.is_err());
+    assert!(!*placed.lock().unwrap());
+    assert_eq!(h.phase().await, "parked");
+}
+
+#[tokio::test]
+async fn stopping_that_cant_be_saved_says_so() {
+    let h = Harness::ready().await;
+    *h.store.fail_phase.lock().unwrap() = Some(Phase::Stopped);
+    assert!(h.hub.stop(h.id).await.is_err());
+}
+
+#[tokio::test]
 async fn a_failed_suspend_gives_the_session_its_agent_back() {
     let mut h = Harness::ready().await;
     let (release, released) = tokio::sync::oneshot::channel::<()>();
@@ -1434,7 +1491,7 @@ async fn a_first_message_that_cant_be_marked_taken_isnt_run() {
 async fn a_batch_that_can_no_longer_start_in_a_stopped_session_fails() {
     let h = Harness::ready().await;
     let agent = h.agent.clone();
-    h.hub.stop(h.id).await;
+    h.hub.stop(h.id).await.unwrap();
     let (queued, reply) = batch("Too late");
     h.hub
         .clone()

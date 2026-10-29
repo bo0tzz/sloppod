@@ -417,18 +417,26 @@ impl Hub {
         let _ = self.live(id).events.send(event);
     }
 
+    /// Saves the session's phase and tells its UIs; a failure is logged. Where what happens next depends on the phase
+    /// being saved, e.g. a pod ending because the session is parked, use `save_phase`.
     pub async fn set_phase(&self, id: Uuid, phase: Phase) {
-        match self.store.set_phase(id, phase).await {
-            Ok(Some(row)) => self.broadcast(
+        if let Err(e) = self.save_phase(id, phase).await {
+            tracing::error!(session = %id, error = %e, "setting phase");
+        }
+    }
+
+    /// Saves the session's phase and tells its UIs, or says why it couldn't.
+    pub async fn save_phase(&self, id: Uuid, phase: Phase) -> sqlx::Result<()> {
+        if let Some(row) = self.store.set_phase(id, phase).await? {
+            self.broadcast(
                 id,
                 UiEvent::Notification {
                     seq: None,
                     message: notification("_sloppod/session", json!({"session": row.to_api()})),
                 },
-            ),
-            Ok(None) => {}
-            Err(e) => tracing::error!(session = %id, error = %e, "setting phase"),
+            );
         }
+        Ok(())
     }
 
     pub async fn broadcast_session(&self, id: Uuid) {
@@ -2133,8 +2141,14 @@ impl Hub {
             live.end_work(&mut state);
             (state.agent.take(), state.agent_session_id.take())
         };
-        // Parked before the pod ends, so its supervisor's attempts to reconnect meanwhile are turned away.
-        self.set_phase(id, Phase::Parked).await;
+        // Parked before the pod ends, so its supervisor's attempts to reconnect meanwhile are turned away. Unsaved, the
+        // session would still look active with its pod gone: not woken, and placed again on the next startup.
+        if let Err(e) = self.save_phase(id, Phase::Parked).await {
+            self.unpark(id, agent, agent_session_id).await;
+            return Err(anyhow::Error::from(e)
+                .context("saving the parked phase")
+                .into());
+        }
         if let Err(e) = suspend().await {
             self.unpark(id, agent, agent_session_id).await;
             return Err(e.into());
@@ -2224,7 +2238,7 @@ impl Hub {
         if !parked {
             return Ok(());
         }
-        self.set_phase(id, Phase::Starting).await;
+        self.save_phase(id, Phase::Starting).await?;
         if let Err(e) = place().await {
             self.set_phase(id, Phase::Parked).await;
             return Err(e);
@@ -2232,7 +2246,8 @@ impl Hub {
         Ok(())
     }
 
-    pub async fn stop(&self, id: Uuid) {
+    /// Stops a session for good; errs if that couldn't be saved, when it would still look active to the next startup.
+    pub async fn stop(&self, id: Uuid) -> sqlx::Result<()> {
         let (agent, queued) = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
@@ -2249,7 +2264,7 @@ impl Hub {
         if let Some(agent) = agent {
             agent.close();
         }
-        self.set_phase(id, Phase::Stopped).await;
+        self.save_phase(id, Phase::Stopped).await
     }
 }
 

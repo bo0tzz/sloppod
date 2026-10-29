@@ -453,7 +453,7 @@ pub async fn wake(state: &AppState, session: &db::SessionRow) -> anyhow::Result<
 /// Stops a session and deletes its pod, volume, egress policy and keys.
 pub async fn remove_session(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
     let id = session.id;
-    state.hub.stop(id).await;
+    state.hub.stop(id).await?;
     state.placement.delete(&id.to_string()).await?;
     state.enforcer.remove(&id.to_string()).await?;
     if session.context().has(capability::MEMORY)

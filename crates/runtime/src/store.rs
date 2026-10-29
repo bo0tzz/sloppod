@@ -188,6 +188,8 @@ pub mod memory {
         pub zones: Mutex<HashMap<String, chrono_tz::Tz>>,
         /// Makes reading unanswered questions fail, as a lost database would.
         pub fail_reading_questions: std::sync::atomic::AtomicBool,
+        /// Makes saving this phase fail, as a lost database would.
+        pub fail_phase: Mutex<Option<Phase>>,
         /// Makes keeping a session's queue fail, as a lost database would.
         pub fail_saving_queues: std::sync::atomic::AtomicBool,
         /// Makes reading whether a message was taken back fail, as a lost database would.
@@ -232,6 +234,9 @@ pub mod memory {
         }
 
         async fn set_phase(&self, id: Uuid, phase: Phase) -> sqlx::Result<Option<SessionRow>> {
+            if *self.fail_phase.lock().unwrap() == Some(phase) {
+                return Err(sqlx::Error::PoolTimedOut);
+            }
             let mut sessions = self.sessions.lock().unwrap();
             Ok(sessions.get_mut(&id).map(|row| {
                 row.phase = phase.as_str().to_owned();
