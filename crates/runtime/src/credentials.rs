@@ -22,7 +22,10 @@ pub const MEMINI: &str = "memini";
 pub const CHATGPT: &str = "chatgpt";
 /// A user's fine-grained GitHub token, for acting as them where they grant it (ADR 28). Nothing uses it yet.
 pub const GITHUB_USER: &str = "github-user";
-const KINDS: &[&str] = &[CLAUDE, GITHUB_APP, MEMINI, CHATGPT, GITHUB_USER];
+/// A token an owner-defined capability's server takes (ADR 2, 2026-10-29): sent as `Authorization: Bearer <token>`,
+/// or as the value of the header its config names.
+pub const TOKEN: &str = "token";
+const KINDS: &[&str] = &[CLAUDE, GITHUB_APP, MEMINI, CHATGPT, GITHUB_USER, TOKEN];
 
 /// Codex's OAuth client and token endpoint, which refresh a ChatGPT login.
 const CHATGPT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -296,6 +299,21 @@ impl Credentials {
                     "more_repositories": token.more_repositories,
                 })
             }
+            TOKEN => match config("header") {
+                "" => serde_json::json!({}),
+                header
+                    if header
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-') =>
+                {
+                    serde_json::json!({"header": header.to_ascii_lowercase()})
+                }
+                _ => {
+                    return Ok(Err(Invalid(
+                        "a header name is letters, digits and dashes".into(),
+                    )));
+                }
+            },
             _ => serde_json::json!({}),
         };
         let sealed = self.vault.encrypt(secret.as_bytes())?;
@@ -566,6 +584,27 @@ impl Credentials {
         )?);
         cache.insert(row.id, client.clone());
         Ok(client)
+    }
+
+    /// One of the owner's `token` credentials, by id, with its secret.
+    pub async fn token(
+        &self,
+        owner: &str,
+        id: Uuid,
+    ) -> anyhow::Result<Option<(CredentialRow, String)>> {
+        let row: Option<CredentialRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "select {COLUMNS} from credentials where id = $1 and owner = $2 and kind = $3"
+        )))
+        .bind(id)
+        .bind(owner)
+        .bind(TOKEN)
+        .fetch_optional(&self.db)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let secret = self.vault.decrypt_string(&row.secret)?;
+        Ok(Some((row, secret)))
     }
 
     /// The owner's GitHub tokens (`github-user`), oldest first.

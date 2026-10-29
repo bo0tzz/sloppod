@@ -310,6 +310,10 @@ fn mcp_servers(context: &AgentContext) -> Value {
     if context.session.has(capability::DOCS) {
         servers.push(json!({"type": "http", "name": "docs", "url": crate::policies::docs::URL, "headers": []}));
     }
+    // Servers of capabilities the owner defined, which the runtime serves to the sessions granted them.
+    for (name, url) in crate::definitions::servers(&context.session.grants, &context.endpoints) {
+        servers.push(json!({"type": "http", "name": name, "url": url, "headers": []}));
+    }
     Value::Array(servers)
 }
 
@@ -418,6 +422,7 @@ mod tests {
             repo_dir: "/workspace/repo".into(),
             repos_dir: "/workspace/repos".into(),
             tools_url: "http://runtime/mcp".into(),
+            endpoints: "http://runtime".into(),
             instructions: Some("Be brief.".into()),
             model: Some("claude-haiku".into()),
             memory: None,

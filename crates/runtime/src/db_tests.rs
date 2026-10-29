@@ -1580,3 +1580,74 @@ async fn a_proposal_carries_over_the_review_its_sub_session_s_report_passed(db: 
         "a reviewer that's reviewing something isn't offered"
     );
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn an_owner_defines_a_capability_grants_it_and_deletes_it(db: PgPool) {
+    use crate::definitions::{self, NewDefinition};
+
+    let new = NewDefinition {
+        name: "victorialogs".into(),
+        description: "Production logs, through VictoriaLogs' MCP server".into(),
+        mcp_url: "http://vl-mcp.monitoring.svc:8080/mcp".into(),
+        credential_id: None,
+    };
+    let defined = definitions::create(&db, "dev", &new)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        definitions::create(&db, "dev", &new)
+            .await
+            .unwrap()
+            .is_none(),
+        "one per name"
+    );
+    assert!(
+        definitions::create(&db, "other", &new)
+            .await
+            .unwrap()
+            .is_some(),
+        "per owner"
+    );
+    assert_eq!(
+        definitions::named(&db, "dev", "victorialogs")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        defined.id
+    );
+    assert!(
+        definitions::named(&db, "nobody", "victorialogs")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Granted, it's the session's under its name, and says what it is.
+    let id = session(&db, "dev").await;
+    db::grant(&db, id, &definitions::grant(&defined), None)
+        .await
+        .unwrap();
+    let context = db::get_session(&db, id).await.unwrap().unwrap().context();
+    assert!(context.has("victorialogs"));
+    assert_eq!(
+        definitions::servers(&context.grants, "http://127.0.0.1:7777"),
+        [(
+            "victorialogs".to_owned(),
+            "http://127.0.0.1:7777/servers/victorialogs".to_owned()
+        )]
+    );
+
+    assert!(
+        !definitions::delete(&db, "other", defined.id).await.unwrap(),
+        "only its owner's"
+    );
+    assert!(definitions::delete(&db, "dev", defined.id).await.unwrap());
+    assert!(
+        definitions::named(&db, "dev", "victorialogs")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

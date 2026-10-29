@@ -7,6 +7,7 @@ mod credentials;
 mod db;
 #[cfg(test)]
 mod db_tests;
+mod definitions;
 mod enforcer;
 mod github;
 mod grants;
@@ -23,6 +24,7 @@ mod placement;
 mod pods;
 mod policies;
 mod proposals;
+mod proxy;
 mod pulls;
 mod questions;
 mod quota;
@@ -345,6 +347,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/mcp", post(mcp::handler))
         .route(memory::PREFIX, any(memory::proxy))
         .route(&format!("{}/{{*path}}", memory::PREFIX), any(memory::proxy))
+        .route(
+            &format!("{}/{{name}}", definitions::PREFIX),
+            any(definitions::proxy),
+        )
+        .route(
+            &format!("{}/{{name}}/{{*rest}}", definitions::PREFIX),
+            any(definitions::proxy),
+        )
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(config.listen).await?;

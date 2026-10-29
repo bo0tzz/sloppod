@@ -448,6 +448,9 @@ pub struct AgentContext {
     pub repos_dir: String,
     /// The runtime's MCP endpoint for this session's tools.
     pub tools_url: String,
+    /// Where the pod reaches the runtime's endpoints: the supervisor's local proxy, or the runtime itself.
+    #[serde(default)]
+    pub endpoints: String,
     pub instructions: Option<String>,
     pub model: Option<String>,
     pub memory: Option<MemoryContext>,

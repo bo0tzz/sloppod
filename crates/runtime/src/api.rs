@@ -43,6 +43,11 @@ pub fn routes() -> Router<AppState> {
             get(list_credentials).post(create_credential),
         )
         .route("/credentials/{id}", delete(delete_credential))
+        .route(
+            "/capabilities",
+            get(list_definitions).post(create_definition),
+        )
+        .route("/capabilities/{id}", delete(delete_definition))
         .route("/credentials/{id}/default", post(default_credential))
         .route("/quotas", get(list_quotas))
         .route(
@@ -352,7 +357,9 @@ async fn add_grant(
         .await?
         .ok_or_else(not_found)?;
     let capability = body.capability.trim();
-    if !crate::grants::grantable(capability) {
+    // A built-in, or one of the capabilities the owner defined.
+    let defined = crate::definitions::named(&state.db, &user, capability).await?;
+    if !crate::grants::grantable(capability) && defined.is_none() {
         return Err(bad_request(format!(
             "{capability} can't be granted here; repositories are added with POST /sessions/{{id}}/repos"
         )));
@@ -366,7 +373,10 @@ async fn add_grant(
     if body.expires_at.is_some_and(|at| at <= chrono::Utc::now()) {
         return Err(bad_request("expires_at is in the past"));
     }
-    let grant = Grant::new(capability, json!({}));
+    let grant = match &defined {
+        Some(definition) => crate::definitions::grant(definition),
+        None => Grant::new(capability, json!({})),
+    };
     db::grant(&state.db, id, &grant, body.expires_at).await?;
     let what = format!(
         "the user granted this session {capability}: {}",
@@ -740,6 +750,52 @@ async fn wake_session(
         .await?
         .ok_or_else(not_found)?;
     Ok(Json(session.to_api()))
+}
+
+/// The capabilities the user defined themselves (ADR 2): so far, MCP servers.
+async fn list_definitions(
+    State(state): State<AppState>,
+    User(user): User,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(crate::definitions::list(&state.db, &user).await?))
+}
+
+async fn create_definition(
+    State(state): State<AppState>,
+    User(user): User,
+    Json(new): Json<crate::definitions::NewDefinition>,
+) -> ApiResult<impl IntoResponse> {
+    if let Some(why) = crate::definitions::invalid(&new) {
+        return Err(bad_request(why));
+    }
+    if let Some(credential) = new.credential_id
+        && state.credentials.token(&user, credential).await?.is_none()
+    {
+        return Err(bad_request(
+            "credential_id isn't one of your token credentials",
+        ));
+    }
+    let definition = crate::definitions::create(&state.db, &user, &new)
+        .await?
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::CONFLICT,
+                format!("you have a capability called {} already", new.name),
+            )
+        })?;
+    Ok((StatusCode::CREATED, Json(definition)))
+}
+
+async fn delete_definition(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    if crate::definitions::delete(&state.db, &user, id).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(not_found())
+    }
 }
 
 async fn list_credentials(
