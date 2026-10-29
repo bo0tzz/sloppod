@@ -1,10 +1,11 @@
 <script lang="ts">
   import { Icon, IconButton } from '@immich/ui';
-  import { mdiAlertCircleOutline, mdiCheck, mdiContentCopy, mdiLinkVariant, mdiSteering } from '@mdi/js';
+  import { mdiAlertCircleOutline, mdiBugOutline, mdiCheck, mdiContentCopy, mdiLinkVariant, mdiSteering } from '@mdi/js';
   import { messageMarkdown, type MessageItem } from '#lib/acp/transcript.svelte.ts';
   import Markdown from './Markdown.svelte';
 
-  let { message }: { message: MessageItem } = $props();
+  /** `bundleUrl`: where the debug bundle of the message's turn downloads from (#378). */
+  let { message, bundleUrl }: { message: MessageItem; bundleUrl?: string } = $props();
 
   const user = $derived(message.type === 'user');
 
@@ -73,6 +74,20 @@
           onclick={copy}
         />
         <span class="sr-only" role="status">{copyFeedback[copyState].status}</span>
+        {#if bundleUrl}
+          <!-- For reporting a response that was stopped, e.g. by a safety classifier: a file the user reads first. -->
+          <IconButton
+            icon={mdiBugOutline}
+            aria-label="Download debug bundle"
+            title="Download debug bundle: this turn and the few before it, to read before sending it on"
+            variant="ghost"
+            shape="round"
+            color="secondary"
+            size="small"
+            href={bundleUrl}
+            download
+          />
+        {/if}
       </div>
     {/if}
   </div>

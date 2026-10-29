@@ -8,6 +8,7 @@ mod credentials;
 mod db;
 #[cfg(test)]
 mod db_tests;
+mod debug_bundle;
 mod definitions;
 mod enforcer;
 mod github;

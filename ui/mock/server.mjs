@@ -1575,6 +1575,38 @@ async function handleApi(req, res, url) {
       session.broadcast();
       return json(res, 200, session.data);
     }
+    if (parts.length === 3 && parts[2] === 'debug-bundle' && method === 'GET') {
+      const message = url.searchParams.get('message');
+      const starts = session.log
+        .map((entry, index) => ({ entry, index }))
+        .filter(
+          ({ entry }, i, all) =>
+            entry.update.sessionUpdate === 'user_message_chunk' &&
+            !entry.update._meta?.sloppod?.steering &&
+            all.findIndex(({ entry: e }) => e.update.messageId === entry.update.messageId) === i,
+        );
+      const chosen = starts.findIndex(({ entry }) => entry.update.messageId === message);
+      if (chosen < 0) return json(res, 404, { error: 'not found' });
+      const turns = starts.slice(Math.max(0, chosen - 3), chosen + 1).map(({ entry, index }, k, window) => {
+        const next = starts[starts.indexOf(window[k]) + 1];
+        const events = session.log.slice(index, next?.index).map((e) => e.update);
+        return { message_id: entry.update.messageId, model_calls: [{ request_id: `req_mock_${index}` }], events };
+      });
+      res.writeHead(200, {
+        'content-type': 'application/json',
+        'content-disposition': `attachment; filename="sloppod-debug-${session.data.id.slice(0, 8)}-${message.slice(0, 8)}.json"`,
+      });
+      return res.end(
+        JSON.stringify({
+          format: 'sloppod-debug-bundle/1',
+          session: { id: session.data.id, agent: session.data.agent, model: session.model },
+          turn: message,
+          turns,
+          transcript: { file: null, lines: [] },
+          unavailable: [],
+        }),
+      );
+    }
     if (parts.length === 3 && parts[2] === 'park' && method === 'POST') {
       if (session.data.phase === 'working' || session.data.phase === 'waiting') {
         return json(res, 409, { error: 'the session is in a turn; stop it or let it finish before parking' });

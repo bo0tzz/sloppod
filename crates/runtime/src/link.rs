@@ -903,7 +903,11 @@ async fn start_agent_session(
         }
         None => new_agent_session(agent, &session, launch).await?,
     };
-    let agent_state = adapter::agent_state(&response);
+    let mut agent_state = adapter::agent_state(&response);
+    // The adapter's name and version, for debug bundles (#378).
+    if let Some(info) = init.get("agentInfo") {
+        agent_state["agentInfo"] = info.clone();
+    }
     db::set_agent_session(&state.db, session.id, &agent_session_id, &agent_state).await?;
     db::clear_agent_status(&state.db, session.id).await?;
     // Cleared once a turn starts with it, so an agent that goes before then leaves it for the next.
