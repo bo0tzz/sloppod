@@ -146,8 +146,11 @@ struct Held {
     /// The request carrying it, once sent. After a restart, a held batch whose request the supervisor still has open
     /// reached the agent; any other is sent again.
     request: Option<i64>,
-    /// Left by the runtime before a restart, waiting to learn whether it reached the agent.
+    /// Left by the runtime before a restart, or by a link that went before the agent answered, waiting to learn
+    /// whether it reached the agent.
     restored: bool,
+    /// Sent as a turn, rather than a steer, whose answer its observer waits for.
+    turn: bool,
     stored: Vec<Value>,
 }
 
@@ -221,6 +224,18 @@ impl LiveState {
     /// the hub hears it's gone. A closed link's turns didn't end; their answers were dropped.
     fn ends_on(&self, agent: &Arc<AgentConn>) -> bool {
         self.runs_on(agent) && !agent.is_closed()
+    }
+
+    /// The agent's link went: the turns sent on it wait, held, for the next link to say whether the agent has them,
+    /// as after a restart. (A steer's sender puts it back itself when its answer is dropped.)
+    fn link_lost(&mut self) {
+        for held in self
+            .in_flight
+            .iter_mut()
+            .filter(|h| h.turn && h.request.is_some())
+        {
+            held.restored = true;
+        }
     }
 }
 
@@ -524,6 +539,7 @@ impl Hub {
             let mut state = live.state.lock().await;
             if let Some(old) = state.agent.replace(agent) {
                 old.close();
+                state.link_lost();
             }
             state.agent_session_id = None;
             state.turn_running = false;
@@ -616,9 +632,9 @@ impl Hub {
                 } else if request["method"] == "_session/steering" {
                     let hub = self.clone();
                     tokio::spawn(async move {
-                        let answer = reply.await.unwrap_or_else(|_| {
-                            Err(RpcError::new(-32002, "the session's agent disconnected"))
-                        });
+                        let answer = reply
+                            .await
+                            .unwrap_or_else(|_| Err(RpcError::disconnected()));
                         hub.steer_answered(id, request_id, answer).await;
                     });
                 }
@@ -736,9 +752,13 @@ impl Hub {
         held: Option<Uuid>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         Box::pin(async move {
-            for q in queued.iter().filter(|q| q.id.is_some()) {
-                self.record_user_message(id, &json!(q.blocks), false, q.id)
-                    .await;
+            // Logged once: one sent again, after its link or the runtime went, may be logged already.
+            for q in queued.iter() {
+                let Some(qid) = q.id else { continue };
+                if !self.store.has_message(id, qid).await.unwrap_or(false) {
+                    self.record_user_message(id, &json!(q.blocks), false, q.id)
+                        .await;
+                }
             }
             let mut blocks: Vec<Value> = pending
                 .iter()
@@ -887,14 +907,15 @@ impl Hub {
             key,
             request: None,
             restored: false,
+            turn: false,
             stored: batch.iter().map(stored).collect(),
         });
         let kept = self.save_queue(id, state).await;
         (Some(key), kept)
     }
 
-    /// A held batch was sent as `request`.
-    async fn sent(&self, id: Uuid, key: Option<Uuid>, request: i64) {
+    /// A held batch was sent as `request`, a turn or a steer.
+    async fn sent(&self, id: Uuid, key: Option<Uuid>, request: i64, turn: bool) {
         let Some(key) = key else {
             return;
         };
@@ -902,6 +923,7 @@ impl Hub {
         let mut state = live.state.lock().await;
         if let Some(held) = state.in_flight.iter_mut().find(|h| h.key == key) {
             held.request = Some(request);
+            held.turn = turn;
             self.save_queue(id, &state).await;
         }
     }
@@ -1038,6 +1060,7 @@ impl Hub {
                             key,
                             request: q["held"]["request"].as_i64(),
                             restored: true,
+                            turn: false,
                             stored: vec![entry],
                         }),
                     }
@@ -1112,6 +1135,7 @@ impl Hub {
                 return;
             }
             state.agent = None;
+            state.link_lost();
             state.agent_session_id = None;
             state.turn_running = false;
             state.commands = None;
@@ -1350,7 +1374,8 @@ impl Hub {
                 .map_err(failed)?,
             None => false,
         };
-        let (queued, behind_turn) = {
+        let logged_as = message_id.unwrap_or_else(Uuid::new_v4);
+        let (queued, behind_turn, held) = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
             // Nor does one the user took back out of the queue, sent again by a UI that didn't hear so. Read under
@@ -1373,25 +1398,32 @@ impl Hub {
             // While the session waits for its usage limit, messages queue as they do behind a turn.
             if agent_up && !state.turn_running && state.limited_until.is_none() {
                 state.turn_running = true;
-                (None, false)
+                let turn = Queued {
+                    id: Some(logged_as),
+                    blocks: blocks.clone(),
+                    notice: false,
+                    reply: None,
+                };
+                let held = self.hold(id, &mut state, std::slice::from_ref(&turn)).await;
+                (None, false, held)
             } else {
                 // Shown as waiting, and not waking a parked session, unless it waits only for the agent to be up.
                 let waiting = agent_up || state.limited_until.is_some();
                 let (reply, receiver) = oneshot::channel();
                 state.queue.push(Queued {
-                    id: waiting.then(|| message_id.unwrap_or_else(Uuid::new_v4)),
+                    id: waiting.then_some(logged_as),
                     blocks: blocks.clone(),
                     notice: false,
                     reply: Some(reply),
                 });
                 self.save_queue(id, &state).await;
-                (Some(receiver), waiting)
+                (Some(receiver), waiting, None)
             }
         };
         if behind_turn {
             self.broadcast_queue(id).await;
         } else {
-            self.record_user_message(id, &params["prompt"], false, message_id)
+            self.record_user_message(id, &params["prompt"], false, Some(logged_as))
                 .await;
         }
         if queued.is_some() && !behind_turn {
@@ -1404,20 +1436,28 @@ impl Hub {
                     "the session stopped before the prompt ran",
                 ))
             }),
-            None => self.run_turn(id, blocks).await,
+            None => self.run_turn(id, blocks, held).await,
         }
     }
 
     /// Runs one turn; the caller has set `turn_running`. Messages queued behind it run as the next turn.
-    async fn run_turn(self: &Arc<Self>, id: Uuid, blocks: Vec<Value>) -> Result<Value, RpcError> {
+    async fn run_turn(
+        self: &Arc<Self>,
+        id: Uuid,
+        blocks: Vec<Value>,
+        held: Option<Uuid>,
+    ) -> Result<Value, RpcError> {
         let Some((agent, agent_session_id)) = self.begin_turn(id).await else {
-            self.live(id).state.lock().await.turn_running = false;
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            state.turn_running = false;
+            self.release(id, &mut state, held).await;
             return Err(RpcError::new(
                 -32002,
                 "the session's agent isn't running yet; try again shortly",
             ));
         };
-        self.turn_on(id, &agent, &agent_session_id, blocks, false, None)
+        self.turn_on(id, &agent, &agent_session_id, blocks, false, held)
             .await
     }
 
@@ -1452,11 +1492,18 @@ impl Hub {
             "session/prompt",
             json!({"sessionId": agent_session_id, "prompt": prompt}),
         );
-        self.sent(id, held, request).await;
+        self.sent(id, held, request, true).await;
         let result = answer.await;
         {
             let live = self.live(id);
             let mut state = live.state.lock().await;
+            // Dropped with its link, it waits for the next one, which says whether the agent has it.
+            if matches!(&result, Err(e) if e.is_disconnected()) {
+                return Err(RpcError::new(
+                    -32002,
+                    "the agent's link dropped; the message is kept, and runs once the agent is back if it didn't get it",
+                ));
+            }
             self.release(id, &mut state, held).await;
         }
         self.turn_finished(id, agent, TurnEnd::of(&result)).await;
@@ -1722,7 +1769,7 @@ impl Hub {
                     "_meta": {"steering": {"idleBehavior": "promptRequired"}},
                 }),
             );
-            self.sent(id, held, request).await;
+            self.sent(id, held, request, false).await;
             let result = answer.await?;
             if result["outcome"] != "promptRequired" {
                 let live = self.live(id);
