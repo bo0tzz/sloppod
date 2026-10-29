@@ -44,8 +44,21 @@ fn child_grants(parent: &[Grant], keep: Option<&[String]>, child: Uuid) -> Vec<G
                 }
                 // A repository the parent acts on as the user, the child acts on as them too, but only to read it and push
                 // its own branches (ADR 29): proposals there stay the parent's. It can do nothing its parent couldn't.
-                if grant.param("credential").is_some() && grant.params.get("operations").is_none() {
-                    grant.params["operations"] = json!([operation::READ, operation::PUSH]);
+                if grant.param("credential").is_some() {
+                    let listed = grant
+                        .params
+                        .get("operations")
+                        .and_then(Value::as_array)
+                        .cloned();
+                    let kept: Vec<&str> = [operation::READ, operation::PUSH]
+                        .into_iter()
+                        .filter(|op| {
+                            listed
+                                .as_ref()
+                                .is_none_or(|ops| ops.iter().any(|o| o == op))
+                        })
+                        .collect();
+                    grant.params["operations"] = json!(kept);
                 }
             }
             grant
@@ -324,6 +337,18 @@ mod tests {
         // A grandchild keeps its parent's narrowing, and gets no more.
         let grandchild = child_grants(&all, None, child);
         assert_eq!(grandchild[4].params["operations"], json!(["read", "push"]));
+        // A parent grant that lists `propose` doesn't pass it on; one narrower than read and push stays narrower.
+        let mut listed = parent.clone();
+        listed[4].params["operations"] = json!(["read", "push", "propose"]);
+        assert_eq!(
+            child_grants(&listed, None, child)[4].params["operations"],
+            json!(["read", "push"])
+        );
+        listed[4].params["operations"] = json!(["read", "propose"]);
+        assert_eq!(
+            child_grants(&listed, None, child)[4].params["operations"],
+            json!(["read"])
+        );
 
         // A grant that runs out runs out for the child too.
         let mut expiring = parent.clone();

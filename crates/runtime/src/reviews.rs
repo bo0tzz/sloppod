@@ -5,7 +5,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use sloppod_contracts::capability;
-use sloppod_contracts::{Grant, READ_ONLY, ReviewSubject};
+use sloppod_contracts::{Grant, READ_ONLY, ReviewSubject, SessionContext, operation};
 use sloppod_protocol::api::{Phase, ProposalStatus, ReviewPolicy, SessionKind};
 use uuid::Uuid;
 
@@ -164,10 +164,7 @@ pub async fn start(
         Grant::new(capability::CODEX, json!({})),
         Grant::new(capability::GITHUB, json!({})),
         Grant::new(capability::PACKAGES, json!({})),
-        Grant::new(
-            capability::REPO,
-            json!({"repo": subject.repo, "access": READ_ONLY, "branch": subject.head, "commit": subject.head_sha}),
-        ),
+        reviewer_repo(&author.context(), subject),
     ];
     db::insert_session(
         &state.db,
@@ -1070,9 +1067,63 @@ pub fn end(state: &AppState, session: Uuid) {
     });
 }
 
+/// A reviewer's grant of the repository under review: read only, at the commit to review. Where the author reads it
+/// with the user's token (ADR 29), as a sub-session's inherited grant of a repository the App isn't installed on, the
+/// reviewer reads it with that token too, and only reads.
+fn reviewer_repo(author: &SessionContext, subject: &ReviewSubject) -> Grant {
+    let mut params = json!({
+        "repo": subject.repo, "access": READ_ONLY, "branch": subject.head, "commit": subject.head_sha,
+    });
+    if let Some(credential) = author.repo_credential(&subject.repo) {
+        params["credential"] = json!(credential);
+        params["as"] = json!(author.repo_acting_as(&subject.repo));
+        params["operations"] = json!([operation::READ]);
+    }
+    Grant::new(capability::REPO, params)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reviewer_reads_with_the_token_its_author_reads_with() {
+        let subject = ReviewSubject {
+            repo: "futo/kupra".into(),
+            base: "sloppod/p".into(),
+            head: "sloppod/p-0123abcd".into(),
+            head_sha: "f00".into(),
+            title: "t".into(),
+            body: String::new(),
+            describes_change: true,
+        };
+        let mut author = SessionContext {
+            session_id: "s".into(),
+            owner: "dev".into(),
+            role: Default::default(),
+            grants: vec![Grant::new(
+                capability::REPO,
+                json!({"repo": "futo/kupra", "access": "rw", "branch": "sloppod/p-0123abcd"}),
+            )],
+        };
+        let as_app = reviewer_repo(&author, &subject);
+        assert_eq!(as_app.param("credential"), None);
+        assert_eq!(as_app.param("access"), Some("ro"));
+        // A sub-session's inherited token grant: the reviewer reads with the token, and only reads.
+        author.grants[0].params["credential"] = json!("c1");
+        author.grants[0].params["as"] = json!("ada");
+        author.grants[0].params["operations"] = json!(["read", "push"]);
+        let reviewer = reviewer_repo(&author, &subject);
+        assert_eq!(reviewer.param("credential"), Some("c1"));
+        assert_eq!(reviewer.param("as"), Some("ada"));
+        assert_eq!(reviewer.params["operations"], json!(["read"]));
+        assert_eq!(reviewer.param("commit"), Some("f00"));
+        let context = SessionContext {
+            grants: vec![reviewer],
+            ..author
+        };
+        assert!(!context.repo_covers("futo/kupra", operation::PUSH));
+        assert!(context.repo_covers("futo/kupra", operation::READ));
+    }
 
     fn finding(extra: Value) -> Value {
         let mut f = json!({"severity": "p1", "category": "correctness", "title": "Off by one", "explanation": "The last item is skipped."});
