@@ -40,9 +40,19 @@
 
   let {
     proposal,
+    previous,
     onChange,
+    onDecided,
     onClose,
-  }: { proposal: Proposal; onChange: (proposal: Proposal) => void; onClose: () => void } = $props();
+  }: {
+    proposal: Proposal;
+    /** The proposal decided just before this one opened in its place, to confirm what became of it. */
+    previous?: Proposal;
+    onChange: (proposal: Proposal) => void;
+    /** A decision landed and didn't fail: the caller moves on to the next proposal waiting, or closes. */
+    onDecided: (proposal: Proposal) => void;
+    onClose: () => void;
+  } = $props();
   const as = $derived(actingAs(proposal));
 
   // svelte-ignore state_referenced_locally
@@ -126,11 +136,11 @@
     drafts = (detail.payload as IssuesPayload).issues.map((issue) => ({ ...issue, labels: [...issue.labels], file: true }));
   }
 
-  /** Records the decision; the modal only stays open to show a failure. */
+  /** Records the decision; the modal only stays on this proposal to show a failure. */
   function applyResult(proposal: Proposal) {
     if (detail) detail = { ...detail, ...proposal };
     onChange(proposal);
-    if (proposal.status !== 'failed') onClose();
+    if (proposal.status !== 'failed') onDecided(proposal);
   }
 
   async function approve() {
@@ -185,6 +195,21 @@
 <Modal title={proposalKinds[kind]?.title ?? `Proposal: ${kind}`} icon={summary.icon} size={pr || stack ? 'giant' : issues ? 'large' : 'medium'} {onClose}>
   <ModalBody>
     <div class="flex flex-col gap-5 pb-4" data-testid="proposal-detail">
+      {#if previous}
+        {@const previousStatus = proposalStatus(previous)}
+        {@const previousSummary = proposalSummary(previous)}
+        <div data-testid="proposal-previous">
+          <Alert color={previousStatus.color} size="small" title="{previousStatus.label}: {previousSummary.label.toLowerCase()}">
+            {previousSummary.title}
+            {#if previous.result?.url}
+              <a href={previous.result.url} target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-1 underline">
+                #{previous.result.number}
+                <Icon icon={mdiOpenInNew} aria-hidden />
+              </a>
+            {/if}
+          </Alert>
+        </div>
+      {/if}
       {#if loadError}
         <Alert color="danger" title="Couldn't load the proposal" size="small">{loadError}</Alert>
       {:else if !detail}
