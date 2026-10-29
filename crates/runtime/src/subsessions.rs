@@ -349,6 +349,7 @@ mod tests {
         // A grandchild keeps its parent's narrowing, and gets no more.
         let grandchild = child_grants(&all, None, child);
         assert_eq!(grandchild[4].params["operations"], json!(["read", "push"]));
+        assert_eq!(grandchild[5].param("level"), Some("track"));
         // A parent grant that lists `propose` doesn't pass it on; one narrower than read and push stays narrower.
         let mut listed = parent.clone();
         listed[4].params["operations"] = json!(["read", "push", "propose"]);
