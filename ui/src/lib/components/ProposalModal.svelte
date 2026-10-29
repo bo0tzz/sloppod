@@ -9,13 +9,13 @@
     Icon,
     Input,
     LoadingSpinner,
-    Modal,
     ModalBody,
     ModalFooter,
     Text,
     Textarea,
     modalManager,
   } from '@immich/ui';
+  import Dialog from './Dialog.svelte';
   import { mdiChevronRight, mdiOpenInNew } from '@mdi/js';
   import { tick } from 'svelte';
   import {
@@ -243,7 +243,7 @@
   }
 </script>
 
-<Modal
+<Dialog
   title={proposalKinds[kind]?.title ?? `Proposal: ${kind}`}
   icon={summary.icon}
   size={pr || stack ? 'giant' : issues ? 'large' : 'medium'}
@@ -500,7 +500,7 @@
       {/if}
     </div>
   </ModalFooter>
-</Modal>
+</Dialog>
 
 {#snippet issueList()}
   <div class="flex flex-col gap-3">

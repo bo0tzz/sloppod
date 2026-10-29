@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { Alert, Button, Field, Modal, ModalBody, Select, Text } from '@immich/ui';
+  import { Alert, Button, Field, ModalBody, Select, Text } from '@immich/ui';
+  import Dialog from './Dialog.svelte';
   import { mdiShieldKeyOutline } from '@mdi/js';
   import { onMount } from 'svelte';
   import { api, type Grant, type GrantChange, type Session } from '#lib/api.ts';
@@ -68,7 +69,7 @@
   }
 </script>
 
-<Modal title="Grants" icon={mdiShieldKeyOutline} size="medium" {onClose}>
+<Dialog title="Grants" icon={mdiShieldKeyOutline} size="medium" {onClose}>
   <ModalBody>
     <div class="flex flex-col gap-3 pb-4" data-testid="grants">
       <Text color="muted" size="small">What this session can reach and change. Anything else is refused.</Text>
@@ -131,4 +132,4 @@
       {/if}
     </div>
   </ModalBody>
-</Modal>
+</Dialog>

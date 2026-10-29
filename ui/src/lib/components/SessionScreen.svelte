@@ -3,7 +3,6 @@
   import {
     Alert,
     Button,
-    ContextMenuButton,
     Icon,
     IconButton,
     LoadingSpinner,
@@ -33,6 +32,7 @@
   import { sessions } from '#lib/sessions.svelte.ts';
   import AddRepoModal from './AddRepoModal.svelte';
   import ChatHeader from './ChatHeader.svelte';
+  import MenuButton from './MenuButton.svelte';
   import GrantsModal from './GrantsModal.svelte';
   import PermissionCard from './PermissionCard.svelte';
   import QuestionCard from './QuestionCard.svelte';
@@ -367,7 +367,7 @@
           indicator={pendingProposals.length > 0 ? 'warning' : undefined}
           onclick={() => (proposalList = 'all')}
         />
-        <ContextMenuButton
+        <MenuButton
           aria-label="Session actions"
           items={[
             {
