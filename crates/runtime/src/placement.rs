@@ -89,6 +89,10 @@ impl PlacementBackend for AgentSandbox {
                             "runAsUser": 1000,
                             "runAsGroup": 1000,
                             "fsGroup": 1000,
+                            // Re-own the volume only when its root isn't already the fsGroup, not on every mount:
+                            // a workdir with many files (node_modules, git objects) is slow to chown each time,
+                            // so a remounted session pod would otherwise stall while the kubelet walks it.
+                            "fsGroupChangePolicy": "OnRootMismatch",
                             "runAsNonRoot": true,
                             "seccompProfile": {"type": "RuntimeDefault"},
                         },
