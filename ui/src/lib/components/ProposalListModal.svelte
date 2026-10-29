@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { Modal, ModalBody, Text } from '@immich/ui';
+  import { ModalBody, Text } from '@immich/ui';
+  import Dialog from './Dialog.svelte';
   import { mdiSourcePull } from '@mdi/js';
   import type { Proposal } from '#lib/api.ts';
   import ProposalCard from './ProposalCard.svelte';
@@ -17,7 +18,7 @@
   } = $props();
 </script>
 
-<Modal title="Proposals" icon={mdiSourcePull} size="medium" {onClose}>
+<Dialog title="Proposals" icon={mdiSourcePull} size="medium" {onClose}>
   <ModalBody>
     <div class="flex flex-col gap-2 pb-4">
       {#each proposals as proposal (proposal.id)}
@@ -27,4 +28,4 @@
       {/each}
     </div>
   </ModalBody>
-</Modal>
+</Dialog>

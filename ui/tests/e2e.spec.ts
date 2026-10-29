@@ -2553,3 +2553,47 @@ test.describe('on a phone', () => {
     expect(Math.abs(revokeBox!.y + revokeBox!.height / 2 - (selectBox!.y + selectBox!.height / 2))).toBeLessThan(8);
   });
 });
+
+test('dialogs take focus when they open and give it back when they close', async ({ page }) => {
+  await createSession(page, 'Add backoff to the reconnect logic in sloppod');
+  await finishTurn(page);
+  const menu = page.getByRole('button', { name: 'Session actions' });
+  const focusInDialog = () => page.evaluate(() => Boolean(document.activeElement?.closest('[role="dialog"]')));
+
+  // From the session menu, every time: the first Esc closes the dialog, and focus goes back to ⋮.
+  for (let round = 0; round < 3; round++) {
+    await menu.click();
+    await page.getByRole('menuitem', { name: 'Grants' }).click();
+    await expect(page.getByTestId('grants')).toBeVisible();
+    await expect.poll(focusInDialog).toBe(true);
+    await page.keyboard.press('Escape');
+    await expect(page.getByTestId('grants')).toBeHidden();
+    await expect(menu).toBeFocused();
+  }
+
+  await menu.click();
+  await page.getByRole('menuitem', { name: 'Add repository…' }).click();
+  await expect(page.getByTestId('add-repo')).toBeVisible();
+  await expect.poll(focusInDialog).toBe(true);
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('dialog')).toBeHidden();
+  await expect(menu).toBeFocused();
+
+  // Opened with the keyboard, the menu focuses its first item, so Enter picks it.
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('menuitem', { name: 'Grants' })).toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(page.getByTestId('grants')).toBeVisible();
+  await expect.poll(focusInDialog).toBe(true);
+  await page.keyboard.press('Escape');
+  await expect(menu).toBeFocused();
+
+  // Not just from the menu: the proposals list gives focus back to its button.
+  const proposals = page.getByRole('button', { name: 'Proposals' });
+  await proposals.click();
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await expect.poll(focusInDialog).toBe(true);
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('dialog')).toBeHidden();
+  await expect(proposals).toBeFocused();
+});

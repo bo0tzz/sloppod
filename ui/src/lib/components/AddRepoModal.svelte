@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { Alert, Button, Field, Input, LoadingSpinner, Modal, ModalBody, ModalFooter, Select, Text } from '@immich/ui';
+  import { Alert, Button, Field, Input, LoadingSpinner, ModalBody, ModalFooter, Select, Text } from '@immich/ui';
+  import Dialog from './Dialog.svelte';
   import { mdiSourceRepository } from '@mdi/js';
   import { onMount } from 'svelte';
   import { api, type GitHubUserConfig, type Session } from '#lib/api.ts';
@@ -79,7 +80,7 @@
   }
 </script>
 
-<Modal title="Add repository" icon={mdiSourceRepository} size="small" {onClose}>
+<Dialog title="Add repository" icon={mdiSourceRepository} size="small" {onClose}>
   <ModalBody>
     <div class="flex flex-col gap-3 pb-4" data-testid="add-repo">
       <Text color="muted" size="small">The session gets write access to its own branch in the repository.</Text>
@@ -123,4 +124,4 @@
       <Button shape="round" disabled={!wanted} loading={saving} onclick={add}>Add</Button>
     </div>
   </ModalFooter>
-</Modal>
+</Dialog>

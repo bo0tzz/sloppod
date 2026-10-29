@@ -1,6 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
-  import { ContextMenuButton, Text } from '@immich/ui';
+  import { Text } from '@immich/ui';
+  import MenuButton from '#lib/components/MenuButton.svelte';
   import { mdiCogOutline, mdiSend } from '@mdi/js';
   import { onMount } from 'svelte';
   import { api, ApiError, type GitHubUserConfig, type StartingGrant, type StartingSet } from '#lib/api.ts';
@@ -203,7 +204,7 @@
 <div class="flex h-full min-h-0 flex-col" data-testid="new-session">
   <ChatHeader title="New session">
     {#snippet actions()}
-      <ContextMenuButton aria-label="More" items={[{ title: 'Settings', icon: mdiCogOutline, href: '/settings' }]} />
+      <MenuButton aria-label="More" items={[{ title: 'Settings', icon: mdiCogOutline, href: '/settings' }]} />
     {/snippet}
   </ChatHeader>
 
