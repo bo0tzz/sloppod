@@ -11,11 +11,14 @@
     locations = [],
     terminals = {},
     rawInput,
+    wrap = false,
   }: {
     content: ToolCallContent[];
     locations?: ToolCallLocation[];
     terminals?: Record<string, string>;
     rawInput?: unknown;
+    /** Wrap diff lines rather than scroll them sideways. */
+    wrap?: boolean;
   } = $props();
 
   // Adapters fence command output (```console … ```), but send descriptions and short results as plain text.
@@ -50,7 +53,7 @@
 
   {#each content as block, index (index)}
     {#if block.type === 'diff'}
-      <DiffView diff={diffTexts(block.path, block.oldText, block.newText)} />
+      <DiffView diff={diffTexts(block.path, block.oldText, block.newText)} {wrap} />
     {:else if block.type === 'terminal'}
       <pre class="tool-output" data-testid="tool-output">{terminals[block.terminalId] ?? '(no output yet)'}</pre>
     {:else if block.content.type === 'text'}

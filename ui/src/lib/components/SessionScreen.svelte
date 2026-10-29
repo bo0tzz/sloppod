@@ -13,6 +13,7 @@
   } from '@immich/ui';
   import {
     mdiArrowDown,
+    mdiChevronDown,
     mdiCheckDecagramOutline,
     mdiCogOutline,
     mdiPauseCircleOutline,
@@ -27,6 +28,7 @@
   import { onMount } from 'svelte';
   import { api, type Proposal } from '#lib/api.ts';
   import { absoluteTime, clockTime, countdown } from '#lib/format.ts';
+  import { toolTitle } from '#lib/presentation.ts';
   import { SessionView } from '#lib/session.svelte.ts';
   import { sessions } from '#lib/sessions.svelte.ts';
   import AddRepoModal from './AddRepoModal.svelte';
@@ -40,6 +42,7 @@
   import ProposalModal from './ProposalModal.svelte';
   import SessionComposer from './SessionComposer.svelte';
   import TranscriptView from './TranscriptView.svelte';
+  import WaitingSummary from './WaitingSummary.svelte';
 
   let { id }: { id: string } = $props();
 
@@ -122,6 +125,27 @@
   let width = $state(0);
   // Room for the chat at its full width (max-w-3xl and its padding) with the panel beside it.
   const sidePanel = $derived(width >= 1184);
+  // Below the chat on a narrower screen, the waiting panel folds to one line (#374). On a phone it starts folded
+  // while a question or a permission request waits, so the chat stays readable; what the user chose holds until
+  // nothing waits any more.
+  const small = $derived(width > 0 && width < 640);
+  let foldChoice = $state<boolean | null>(null);
+  $effect(() => {
+    if (!waiting) foldChoice = null;
+  });
+  const asking = $derived(view.questions.length > 0 || view.permissions.length > 0);
+  const folded = $derived(foldChoice ?? (small && asking));
+  const waitingSummary = $derived.by((): { kind: 'question' | 'permission' | 'proposal'; text: string } => {
+    const question = view.questions[0];
+    if (question) return { kind: 'question', text: `The agent asks: ${question.message.split('\n')[0]}` };
+    const permission = view.permissions[0];
+    if (permission) {
+      const tool = view.transcript.tool(permission.toolCall.toolCallId);
+      return { kind: 'permission', text: `Permission needed: ${toolTitle(permission.toolCall.title ?? tool?.title ?? 'a tool call').title}` };
+    }
+    const count = pendingProposals.length || openProposals.length;
+    return { kind: 'proposal', text: `${count} ${count === 1 ? 'proposal' : 'proposals'} ${pendingProposals.length ? 'to review' : 'being carried out'}` };
+  });
 
   let scroller = $state<HTMLElement | null>(null);
   let content = $state<HTMLElement | null>(null);
@@ -472,9 +496,32 @@
         </div>
 
         {#if waiting && !sidePanel}
-          <div class="border-light-200 max-h-[55dvh] shrink-0 overflow-y-auto border-t px-3 py-2">
+          <div
+            class={['border-light-200 shrink-0 border-t px-3 py-2', !folded && 'max-h-[40dvh] overflow-y-auto sm:max-h-[55dvh]']}
+            data-testid="waiting-panel"
+            data-folded={folded || undefined}
+          >
             <div class="mx-auto flex w-full max-w-3xl flex-col gap-2">
-              {@render waitingItems()}
+              {#if folded}
+                <!-- Keyed, so each new question takes focus as its card would. -->
+                {#key view.questions[0]?.key}
+                  <WaitingSummary {...waitingSummary} onUnfold={() => (foldChoice = false)} />
+                {/key}
+              {:else}
+                <div class="-mb-2 flex justify-end">
+                  <IconButton
+                    icon={mdiChevronDown}
+                    aria-label="Fold"
+                    title="Fold to one line"
+                    size="tiny"
+                    shape="round"
+                    variant="ghost"
+                    color="secondary"
+                    onclick={() => (foldChoice = true)}
+                  />
+                </div>
+                {@render waitingItems()}
+              {/if}
             </div>
           </div>
         {/if}

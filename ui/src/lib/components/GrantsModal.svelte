@@ -95,14 +95,17 @@
                     </Field>
                   {/key}
                 </div>
-                {#if narrowable(grant)}
-                  <Button size="tiny" variant="ghost" shape="round" disabled={busy} onclick={() => change(grant, { narrow: true })}>
-                    Make read only
+                <!-- Together, so Revoke never wraps onto a line of its own (#374). -->
+                <div class="flex shrink-0 items-center gap-1">
+                  {#if narrowable(grant)}
+                    <Button size="tiny" variant="ghost" shape="round" disabled={busy} onclick={() => change(grant, { narrow: true })}>
+                      Make read only
+                    </Button>
+                  {/if}
+                  <Button size="tiny" variant="ghost" color="danger" shape="round" disabled={busy} onclick={() => revoke(grant)}>
+                    Revoke
                   </Button>
-                {/if}
-                <Button size="tiny" variant="ghost" color="danger" shape="round" disabled={busy} onclick={() => revoke(grant)}>
-                  Revoke
-                </Button>
+                </div>
               </div>
             {/if}
           </li>
