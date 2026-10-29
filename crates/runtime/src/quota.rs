@@ -291,13 +291,16 @@ impl QuotaRow {
     /// As it stands at `now`: a limit whose reset has passed is over, and a window that has reset since is unused.
     fn into_quota(self, now: DateTime<Utc>) -> Quota {
         let over = |at: Option<DateTime<Utc>>| at.is_some_and(|at| at <= now);
-        // A limit whose reset isn't known is over after a while, so the credential is tried again.
-        let probed =
-            self.limited && self.resets_at.is_none() && self.observed_at + PROBE_AFTER <= now;
-        let (limited, resets_at) = if over(self.resets_at) || probed {
+        // A limit whose reset isn't known reads as resetting after a while, so the credential is tried again then,
+        // and a wait for it ends then too.
+        let resets_at = match self.resets_at {
+            None if self.limited => Some(self.observed_at + PROBE_AFTER),
+            known => known,
+        };
+        let (limited, resets_at) = if over(resets_at) {
             (false, None)
         } else {
-            (self.limited, self.resets_at)
+            (self.limited, resets_at)
         };
         Quota {
             credential_id: self.credential_id,

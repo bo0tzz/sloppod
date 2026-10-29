@@ -1193,6 +1193,49 @@ mod tests {
             .unwrap();
         assert_eq!(used().await, "Work");
     }
+
+    #[sqlx::test]
+    async fn a_wait_ends_when_a_limit_with_no_known_reset_is_tried_again(db: PgPool) {
+        let credentials = credentials(db.clone()).await;
+        let work = add(&credentials, "dev", claude("Work")).await;
+        let personal = add(&credentials, "dev", claude("Personal")).await;
+        let session = SessionContext {
+            session_id: "s".into(),
+            owner: "dev".into(),
+            grants: vec![Grant::new(
+                "model",
+                json!({"credentials": [work.id.to_string(), personal.id.to_string()]}),
+            )],
+            role: SessionRole::Work,
+        };
+        let now = Utc::now();
+        // Work said it's limited 20 minutes ago, without a reset; Personal is limited for five hours.
+        let unknown = crate::quota::Observation {
+            observed_at: now - chrono::Duration::minutes(20),
+            limited: true,
+            resets_at: None,
+            windows: Default::default(),
+        };
+        crate::quota::store(&db, work.id, &unknown).await.unwrap();
+        let known = crate::quota::Observation {
+            observed_at: now,
+            limited: true,
+            resets_at: Some(now + chrono::Duration::hours(5)),
+            windows: Default::default(),
+        };
+        crate::quota::store(&db, personal.id, &known).await.unwrap();
+        let lasts = crate::limits::lasts(&credentials, &db, CLAUDE, &session, now).await;
+        // Within the database's microseconds of Work's probe deadline, not Personal's reset.
+        let Some(crate::limits::Lasts::Until(until)) = lasts else {
+            panic!("{lasts:?}");
+        };
+        let deadline = unknown.observed_at + crate::quota::PROBE_AFTER;
+        assert!(
+            (until - deadline).num_milliseconds().abs() < 1,
+            "{until} {deadline}"
+        );
+    }
+
     #[sqlx::test]
     async fn the_owner_gives_a_model_grant_only_their_own_accounts_of_its_kind(db: PgPool) {
         let credentials = credentials(db.clone()).await;

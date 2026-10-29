@@ -63,27 +63,29 @@ async fn of_session(state: &AppState, session: Uuid) -> Option<(String, SessionC
 }
 
 /// How long the limit of a session's accounts lasts.
-enum Lasts {
+#[derive(Debug, PartialEq)]
+pub enum Lasts {
     /// One of them isn't limited.
     Not,
-    /// Until the earliest known reset of theirs.
+    /// Until the earliest reset of theirs.
     Until(DateTime<Utc>),
     /// No reset is known.
     Unknown,
 }
 
-async fn lasts(
-    state: &AppState,
+/// Until the earliest reset among a session's accounts, when they're all limited. A limit whose reset isn't known
+/// counts as resetting when it's tried again ([`PROBE_AFTER`] after it was reported).
+pub async fn lasts(
+    credentials: &Credentials,
+    db: &PgPool,
     kind: &str,
     session: &SessionContext,
     now: DateTime<Utc>,
 ) -> Option<Lasts> {
-    let accounts = state.credentials.accounts(session, kind).await.ok()?;
+    let accounts = credentials.accounts(session, kind).await.ok()?;
     let mut earliest: Option<DateTime<Utc>> = None;
     for account in accounts {
-        let quota = quota::for_credential(&state.db, account.id, now)
-            .await
-            .ok()?;
+        let quota = quota::for_credential(db, account.id, now).await.ok()?;
         match quota.filter(|q| q.limited) {
             None => return Some(Lasts::Not),
             Some(quota) => {
@@ -104,7 +106,7 @@ async fn wait_for(
     session: &SessionContext,
     now: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
-    match lasts(state, kind, session, now).await? {
+    match lasts(&state.credentials, &state.db, kind, session, now).await? {
         Lasts::Not => Some(now),
         Lasts::Until(reset) => Some(wait_until(Some(reset), now)),
         Lasts::Unknown => None,
@@ -168,7 +170,7 @@ pub async fn hit(state: &AppState, session: Uuid) -> Next {
         Ok((None, _)) => {}
         Err(e) => tracing::warn!(%session, error = %e, "finding an account to fall back to"),
     }
-    let reset = match lasts(state, &kind, &context, now).await {
+    let reset = match lasts(&state.credentials, &state.db, &kind, &context, now).await {
         Some(Lasts::Until(reset)) => Some(reset),
         _ => None,
     };
