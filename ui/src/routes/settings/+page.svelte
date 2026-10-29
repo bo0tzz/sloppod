@@ -4,6 +4,7 @@
   import { account } from '#lib/account.svelte.ts';
   import { api, type Credential } from '#lib/api.ts';
   import ChatHeader from '#lib/components/ChatHeader.svelte';
+  import CapabilitySection from '#lib/components/CapabilitySection.svelte';
   import CredentialSection from '#lib/components/CredentialSection.svelte';
   import SessionDefaults from '#lib/components/SessionDefaults.svelte';
   import TimezoneSetting from '#lib/components/TimezoneSetting.svelte';
@@ -56,6 +57,7 @@
             onChanged={refresh}
           />
         {/each}
+        <CapabilitySection tokens={credentials.filter((credential) => credential.kind === 'token')} />
       {/if}
     </div>
   </div>

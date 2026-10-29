@@ -236,6 +236,23 @@ export const credentialKinds: CredentialKindSpec[] = [
     },
   },
   {
+    kind: 'token',
+    title: 'Capability tokens',
+    noun: 'token',
+    description: "Secrets your own capabilities' servers take. A capability below can send one with every request.",
+    empty: 'No token yet.',
+    fields: [
+      {
+        key: 'header',
+        label: 'Header',
+        placeholder: 'X-API-Key',
+        description: 'Sent as this header. Left out, the token is sent as Authorization: Bearer.',
+        optional: true,
+      },
+    ],
+    secret: { label: 'Token' },
+  },
+  {
     kind: 'chatgpt',
     title: 'ChatGPT logins',
     noun: 'ChatGPT login',
