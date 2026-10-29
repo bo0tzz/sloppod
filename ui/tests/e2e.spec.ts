@@ -2475,3 +2475,81 @@ test.describe('in UTC', () => {
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('UTC');
   });
 });
+
+test.describe('on a phone', () => {
+  test.use({ viewport: { width: 390, height: 844 } });
+
+  test('a question waits folded to one line, and unfolded keeps its actions in view', async ({ page }) => {
+    await createSession(page, 'Please ask me how to do it');
+    const panel = page.getByTestId('waiting-panel');
+    const summary = page.getByTestId('waiting-summary');
+    await expect(summary).toContainText('The agent asks: Please answer the following questions.');
+    await expect(questionCard(page)).toBeHidden();
+    expect((await panel.boundingBox())!.height).toBeLessThan(80);
+    // Folded, it still takes focus the way the card would (#365), so a stray Esc keeps the questions.
+    await expect(summary).toBeFocused();
+    await page.keyboard.press('Escape');
+    await expect(phase(page)).toHaveAttribute('data-phase', 'waiting');
+
+    await summary.getByRole('button', { name: 'Answer' }).click();
+    await expect(questionCard(page)).toBeFocused();
+    expect((await panel.boundingBox())!.height).toBeLessThanOrEqual(844 * 0.4 + 1);
+    await expect(questionCard(page).getByTestId('question-actions')).toBeInViewport();
+    // No preview takes room until there's one to show: here, once an option is picked.
+    await expect(questionCard(page).getByTestId('option-preview')).toHaveCount(0);
+    await questionField(page, 'question_0').getByRole('radio', { name: /Exponential/ }).check();
+    await expect(questionCard(page).getByTestId('option-preview')).toContainText('Math.min(500 * 2 ** attempt');
+    await expect(questionCard(page).getByTestId('question-actions')).toBeInViewport();
+
+    // It folds away again, keeping what was picked.
+    await panel.getByRole('button', { name: 'Fold' }).click();
+    await expect(summary).toBeVisible();
+    await summary.getByRole('button', { name: 'Answer' }).click();
+    await expect(questionField(page, 'question_0').getByRole('radio', { name: /Exponential/ })).toBeChecked();
+  });
+
+  test('folding keeps a half-answered question, even when nothing can be stored', async ({ page }) => {
+    await page.addInitScript(() => {
+      Storage.prototype.setItem = () => {
+        throw new DOMException('Full', 'QuotaExceededError');
+      };
+    });
+    await createSession(page, 'Please ask me how to do it');
+    await page.getByTestId('waiting-summary').getByRole('button', { name: 'Answer' }).click();
+    await questionField(page, 'question_0').getByRole('radio', { name: /Exponential/ }).check();
+    await questionCard(page).getByRole('button', { name: 'Next' }).click();
+    await expect(questionCard(page).getByTestId('question-step')).toHaveText('Question 2 of 2');
+
+    await page.getByTestId('waiting-panel').getByRole('button', { name: 'Fold' }).click();
+    await page.getByTestId('waiting-summary').getByRole('button', { name: 'Answer' }).click();
+    await expect(questionCard(page)).toBeFocused();
+    await expect(questionCard(page).getByTestId('question-step')).toHaveText('Question 2 of 2');
+    await questionCard(page).getByRole('button', { name: 'Back' }).click();
+    await expect(questionField(page, 'question_0').getByRole('radio', { name: /Exponential/ })).toBeChecked();
+  });
+
+  test("a permission request's diff wraps", async ({ page }) => {
+    await createSession(page, 'Add backoff to the reconnect logic in sloppod');
+    await page.getByTestId('waiting-summary').getByRole('button', { name: 'Review' }).click();
+    const diff = permissionCard(page).getByTestId('diff').first();
+    await expect(diff).toBeVisible();
+    // Its lines wrap rather than scroll sideways.
+    const lines = diff.locator('table').locator('..');
+    expect(await lines.evaluate((element) => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(0);
+  });
+
+  test('the model selector and Revoke fit', async ({ page }) => {
+    await createSession(page, 'Add backoff to the reconnect logic in sloppod');
+    const model = page.getByTestId('model-select').getByRole('combobox');
+    await expect(model).toContainText('Default · Sonnet');
+    expect(await model.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+
+    await page.getByRole('button', { name: 'Session actions' }).click();
+    await page.getByRole('menuitem', { name: 'Grants' }).click();
+    const revoke = page.getByTestId('grants').getByRole('button', { name: 'Revoke' }).first();
+    const row = revoke.locator('xpath=ancestor::div[contains(@class, "flex-wrap")][1]');
+    const select = row.getByRole('combobox');
+    const [revokeBox, selectBox] = [await revoke.boundingBox(), await select.boundingBox()];
+    expect(Math.abs(revokeBox!.y + revokeBox!.height / 2 - (selectBox!.y + selectBox!.height / 2))).toBeLessThan(8);
+  });
+});

@@ -309,7 +309,7 @@
       />
     {/if}
     {#if model?.type === 'select' && modelOptions.length > 0}
-      <div class="w-32 shrink-0 sm:w-48" data-testid="model-select">
+      <div class="w-40 shrink-0 sm:w-48" data-testid="model-select">
         <Select size="tiny" options={modelOptions} value={model.currentValue} onChange={setModel} title={model.name} />
       </div>
     {/if}

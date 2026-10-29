@@ -48,7 +48,8 @@
   </div>
   {#if content.length > 0 || locations.length > 0 || hasInput(rawInput)}
     <div class="max-h-[40dvh] overflow-auto">
-      <ToolContent {content} {locations} {rawInput} />
+      <!-- Wrapped, so a narrow screen shows whole lines of what is to be approved (#374). -->
+      <ToolContent {content} {locations} {rawInput} wrap />
     </div>
   {/if}
   <p class="text-muted text-xs" data-testid="permission-scope">

@@ -4,6 +4,7 @@
   import type { ElicitationField, ElicitationResponse, EnumOption } from '#lib/acp/types.ts';
   import { loadAnswer, saveAnswer } from '#lib/drafts.ts';
   import type { PendingQuestion } from '#lib/session.svelte.ts';
+  import { claimsFocus } from '#lib/focus.ts';
   import Markdown from './Markdown.svelte';
 
   let {
@@ -124,27 +125,6 @@
 
   const answer = () => respond({ action: 'accept', content: content() });
 
-  // The card takes focus when it appears, so a stray Esc goes to it rather than stopping the turn, which would throw
-  // the questions away (#365). Someone part way through writing in a field elsewhere (the composer, say) keeps it.
-  let card = $state<HTMLElement>();
-  $effect(() => {
-    const active = document.activeElement;
-    const typing =
-      (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) && active.value.trim() !== '';
-    if (card && !typing) card.focus({ preventScroll: true });
-  });
-
-  // Esc on the card doesn't stop the turn (the composer's binding, which leaves an Esc already handled alone); Skip
-  // or the Stop button do what's meant.
-  $effect(() => {
-    const element = card;
-    const keepEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') event.preventDefault();
-    };
-    element?.addEventListener('keydown', keepEscape);
-    return () => element?.removeEventListener('keydown', keepEscape);
-  });
-
   /** Enter moves on to the next question, and on the last one sends the answers. */
   function submitOnEnter(event: KeyboardEvent) {
     if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return;
@@ -165,7 +145,7 @@
   data-stale={request.stale || undefined}
   aria-label="Question from the agent"
   tabindex="-1"
-  bind:this={card}
+  use:claimsFocus
 >
   <header class="flex items-start gap-2 text-sm">
     <Icon icon={mdiChatQuestionOutline} class="text-info-700 mt-0.5 shrink-0" size="1.25em" aria-hidden />
@@ -220,11 +200,12 @@
             </label>
           {/each}
         </div>
-        <!-- Its size is fixed, so previews coming and going with the pointer don't move the options under it. -->
-        {#if options.some((option) => preview(option))}
+        <!-- Only once there's something to show (#374), as a touch screen can't point: the option hovered or picked. Its
+             size is fixed, so previews coming and going with the pointer don't move what's under it. -->
+        {#if shown}
           <pre
-            class="bg-light-100 border-light-200 h-24 overflow-auto rounded-lg border px-3 py-2 font-mono text-xs {shown ? '' : 'text-muted'}"
-            data-testid="option-preview">{shown ?? 'Point at an option to preview it.'}</pre>
+            class="bg-light-100 border-light-200 h-24 overflow-auto rounded-lg border px-3 py-2 font-mono text-xs"
+            data-testid="option-preview">{shown}</pre>
         {/if}
       {:else if kind === 'other'}
         <label class="flex items-center gap-2" title={field.description}>
@@ -278,24 +259,28 @@
     </div>
   {/each}
 
-  <div class="flex flex-wrap items-center justify-end gap-2 pt-1">
-    {#if request.stale}
-      <span class="text-muted me-auto text-xs" data-testid="question-reconnecting">Reconnecting… your answer is kept</span>
-    {:else if queued > 0}
-      <span class="text-muted me-auto text-xs" data-testid="questions-queued">
-        {queued === 1 ? 'One more request after this' : `${queued} more requests after this`}
-      </span>
-    {/if}
-    <Button size="small" shape="round" variant="outline" color="secondary" disabled={request.stale} onclick={() => respond({ action: 'decline' })}>
-      Skip
-    </Button>
-    {#if current > 0}
-      <Button size="small" shape="round" variant="outline" onclick={() => current--}>Back</Button>
-    {/if}
-    {#if last}
-      <Button size="small" shape="round" disabled={missingRequired || request.stale} onclick={answer}>Answer</Button>
-    {:else}
-      <Button size="small" shape="round" disabled={stepMissing} onclick={() => current++}>Next</Button>
-    {/if}
+  <!-- Kept in view at the bottom of a waiting panel that scrolls, e.g. on a phone (#374). Two layers, so the card's
+       tint covers what scrolls under it in the dark theme too. -->
+  <div class="bg-light sticky bottom-0 -mx-3 -mb-3 rounded-b-2xl" data-testid="question-actions">
+    <div class="bg-info-50 dark:bg-info-100/40 flex flex-wrap items-center justify-end gap-2 rounded-b-2xl px-3 pt-1 pb-3">
+      {#if request.stale}
+        <span class="text-muted me-auto text-xs" data-testid="question-reconnecting">Reconnecting… your answer is kept</span>
+      {:else if queued > 0}
+        <span class="text-muted me-auto text-xs" data-testid="questions-queued">
+          {queued === 1 ? 'One more request after this' : `${queued} more requests after this`}
+        </span>
+      {/if}
+      <Button size="small" shape="round" variant="outline" color="secondary" disabled={request.stale} onclick={() => respond({ action: 'decline' })}>
+        Skip
+      </Button>
+      {#if current > 0}
+        <Button size="small" shape="round" variant="outline" onclick={() => current--}>Back</Button>
+      {/if}
+      {#if last}
+        <Button size="small" shape="round" disabled={missingRequired || request.stale} onclick={answer}>Answer</Button>
+      {:else}
+        <Button size="small" shape="round" disabled={stepMissing} onclick={() => current++}>Next</Button>
+      {/if}
+    </div>
   </div>
 </section>
