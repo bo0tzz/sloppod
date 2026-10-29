@@ -129,7 +129,12 @@ impl ProposalKind for PullRequest {
         edit_pull_request(payload, edits)
     }
 
-    async fn execute(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
+    async fn execute(
+        &self,
+        session: &SessionContext,
+        _proposal: uuid::Uuid,
+        payload: &Value,
+    ) -> Result<Value> {
         let request = json!({
             "title": payload["title"],
             "body": payload["body"],
@@ -421,7 +426,12 @@ impl ProposalKind for Stack {
         edit_stack(payload, edits)
     }
 
-    async fn execute(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
+    async fn execute(
+        &self,
+        session: &SessionContext,
+        _proposal: uuid::Uuid,
+        payload: &Value,
+    ) -> Result<Value> {
         let started = std::time::Instant::now();
         let repo = payload["repo"].as_str().unwrap_or_default();
         let app = self.app(session, repo).await?;

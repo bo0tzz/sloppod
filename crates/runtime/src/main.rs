@@ -56,6 +56,7 @@ use sloppod_protocol::api::Phase;
 use sqlx::PgPool;
 use tower_http::services::{ServeDir, ServeFile};
 
+use crate::capabilities::{Part, Provider};
 use crate::config::Config;
 use crate::credentials::Credentials;
 use crate::enforcer::Cilium;
@@ -78,6 +79,8 @@ pub struct Inner {
     pub placement: Arc<dyn PlacementBackend>,
     pub enforcer: Arc<dyn Enforcer>,
     pub cilium: Arc<Cilium>,
+    /// Where requests to owners' MCP servers may go: not back to the runtime.
+    pub reach: proxy::Reach,
     pub ca: tls::Ca,
     pub authz_addr: SocketAddr,
     pub agents: adapter::Agents,
@@ -153,15 +156,24 @@ async fn main() -> anyhow::Result<()> {
     let credentials = Arc::new(Credentials::new(db.clone(), vault).await?);
 
     let mut policies = Policies::default();
-    policies.register(Arc::new(ModelPolicy::new(credentials.clone())));
-    policies.register(Arc::new(CodexPolicy::new(credentials.clone())));
+    policies.register(
+        Part::Model(Provider::Anthropic),
+        Arc::new(ModelPolicy::new(credentials.clone())),
+    );
+    policies.register(
+        Part::Model(Provider::ChatGpt),
+        Arc::new(CodexPolicy::new(credentials.clone())),
+    );
     let pushes = Arc::new(github::PushLog::default());
     let (rechecks, pushes_to_recheck) = rebases::Rechecks::new(db.clone());
-    policies.register(Arc::new(GitHubPolicy::new(
-        credentials.clone(),
-        pushes.clone(),
-        rechecks.clone(),
-    )));
+    policies.register(
+        Part::Github,
+        Arc::new(GitHubPolicy::new(
+            credentials.clone(),
+            pushes.clone(),
+            rechecks.clone(),
+        )),
+    );
 
     let mut proposals = ProposalKinds::default();
     proposals.register(Arc::new(proposals::PullRequest::new(credentials.clone())));
@@ -232,6 +244,12 @@ async fn main() -> anyhow::Result<()> {
         enforcer: cilium.clone(),
         cilium,
         ca,
+        reach: proxy::Reach::new(
+            [Some(authz_addr.ip()), config.pod_ip]
+                .into_iter()
+                .flatten()
+                .collect(),
+        ),
         authz_addr,
         agents,
         instructions,
@@ -411,12 +429,7 @@ async fn reconcile(state: &AppState) {
     match db::parked_sessions(&state.db).await {
         Ok(parked) => {
             for session in parked {
-                let id = session.id.to_string();
-                if let Err(e) = state
-                    .enforcer
-                    .release(&id, &lifecycle::pod_labels(&id))
-                    .await
-                {
+                if let Err(e) = state.hub.release_egress(session.id, &*state.enforcer).await {
                     tracing::warn!(session = %session.id, error = %e, "releasing a parked session's egress");
                 }
             }

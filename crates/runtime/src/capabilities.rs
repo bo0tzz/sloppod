@@ -3,7 +3,7 @@
 //! own capabilities are definitions (`definitions.rs`); this is the built-ins' side of the same picture, and a
 //! built-in that's an MCP server is served like one of those.
 
-use sloppod_contracts::{SessionContext, capability};
+use sloppod_contracts::{Grant, SessionContext, capability};
 
 use crate::credentials::CHATGPT;
 
@@ -36,7 +36,7 @@ pub struct Builtin {
 
 /// One kind of part a capability is made of. The behaviour behind each stays code; which capability is made of
 /// which is data.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Part {
     /// An MCP server, served by the runtime at `/servers/<name>` to the sessions granted it, with no credential.
     Mcp(&'static str),
@@ -51,7 +51,7 @@ pub enum Part {
 }
 
 /// Whose models a model part reaches.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     /// Claude, on the owner's Claude account.
     Anthropic,
@@ -145,10 +145,15 @@ pub fn has_part(name: &str, kind: &Part) -> bool {
 
 /// Whether a session holds a grant with a part of this kind.
 pub fn holds(session: &SessionContext, kind: &Part) -> bool {
+    grant_with(session, kind).is_some()
+}
+
+/// The session's first grant with a part of this kind, for its params.
+pub fn grant_with<'a>(session: &'a SessionContext, kind: &Part) -> Option<&'a Grant> {
     session
         .grants
         .iter()
-        .any(|grant| has_part(&grant.capability, kind))
+        .find(|grant| has_part(&grant.capability, kind))
 }
 
 /// Whether a session keeps a capability of its parent's, whatever it's narrowed to.

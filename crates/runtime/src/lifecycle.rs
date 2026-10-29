@@ -6,6 +6,7 @@ use serde_json::json;
 use sloppod_contracts::capability;
 use sloppod_contracts::{EgressSpec, Grant, PlacementSpec};
 
+use crate::capabilities::Part;
 use crate::memini::MeminiAdmin;
 use crate::placement::{TOKEN_DIR, WORKDIR};
 use crate::pods::SESSION_LABEL;
@@ -45,8 +46,7 @@ async fn ensure_memini_key(state: &AppState, session: &db::SessionRow) -> anyhow
         return Ok(());
     }
     let context = session.context();
-    let granted = context
-        .grant(capability::MEMORY)
+    let granted = crate::capabilities::grant_with(&context, &crate::capabilities::Part::Memory)
         .and_then(|g| g.param("namespace"))
         .map(str::to_owned);
     if !mints_memory(session, granted.is_some()) {
@@ -150,27 +150,40 @@ pub async fn start_session(
     Ok(row)
 }
 
-/// Applies the egress policy a session's grants call for: direct access to package hosts with `packages`. Run when
-/// its pod is placed, and again when its grants change.
-pub async fn apply_egress(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
+/// The egress policy a session's grants call for: the deployment's `direct` package hosts for a grant with an egress
+/// part (`packages`), and every `intercepted` host through its listener.
+pub fn egress_spec(
+    session: &db::SessionRow,
+    intercepted: Vec<String>,
+    direct: &[String],
+) -> EgressSpec {
     let id = session.id.to_string();
+    EgressSpec {
+        session_id: id.clone(),
+        pod_labels: pod_labels(&id),
+        intercepted_hosts: intercepted,
+        direct_hosts: if crate::capabilities::holds(&session.context(), &Part::Egress) {
+            direct.to_vec()
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+/// Applies the egress policy an acting session's grants call for, from its grants and phase as they are when the
+/// write's turn comes (ADR 11). Says whether it did: a session that isn't acting gets none. Run when its pod is
+/// placed, and again when its grants change.
+pub async fn apply_egress(state: &AppState, id: Uuid) -> anyhow::Result<bool> {
     state
-        .enforcer
-        .apply(&EgressSpec {
-            session_id: id.clone(),
-            pod_labels: pod_labels(&id),
-            intercepted_hosts: state.policies.hosts(),
-            // The deployment's package hosts, for a session granted a capability with an egress part (`packages`).
-            direct_hosts: if session.context().grants.iter().any(|g| {
-                crate::capabilities::has_part(&g.capability, &crate::capabilities::Part::Egress)
-            }) {
-                state.config.direct_hosts.clone()
-            } else {
-                Vec::new()
-            },
+        .hub
+        .apply_egress(id, &*state.enforcer, |session| {
+            egress_spec(
+                session,
+                state.policies.hosts_for(&session.context()),
+                &state.config.direct_hosts,
+            )
         })
         .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 
 /// After a session's grants changed (`what`, for the agent): its egress policy follows them, its agent and UIs are
@@ -185,30 +198,17 @@ pub async fn grants_changed(state: &AppState, id: Uuid, what: &str) {
 }
 
 /// Applies an acting session's egress again after its grants changed, retrying until it lands: a revoked `packages`
-/// must not keep its direct access because the control plane was briefly unreachable. A session that stops acting
-/// needs nothing more, and startup applies every acting session's egress again anyway.
+/// must not keep its direct access because the control plane was briefly unreachable. Each attempt reads the session
+/// afresh, so a retry, or an attempt that overlaps a later change, never lands an older set of grants after it. A
+/// session that stops acting needs nothing more, and startup applies every acting session's egress again anyway.
 fn reapply_egress(state: &AppState, id: Uuid) {
     let state = state.clone();
     tokio::spawn(async move {
         let mut wait = std::time::Duration::from_secs(5);
-        loop {
-            let session = match db::get_session(&state.db, id).await {
-                Ok(Some(session)) if session.not_acting().is_none() => session,
-                Ok(_) => return,
-                Err(e) => {
-                    tracing::warn!(session = %id, error = %e, "loading a session to apply its egress");
-                    tokio::time::sleep(wait).await;
-                    continue;
-                }
-            };
-            match apply_egress(&state, &session).await {
-                Ok(()) => return,
-                Err(e) => {
-                    tracing::warn!(session = %id, error = %e, "applying egress after a grant change; trying again");
-                    tokio::time::sleep(wait).await;
-                    wait = (wait * 2).min(std::time::Duration::from_secs(60));
-                }
-            }
+        while let Err(e) = apply_egress(&state, id).await {
+            tracing::warn!(session = %id, error = %e, "applying egress after a grant change; trying again");
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(std::time::Duration::from_secs(60));
         }
     });
 }
@@ -236,10 +236,6 @@ pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result
     if let Err(e) = ensure_memini_key(state, session).await {
         tracing::warn!(session = %session.id, error = %e, "minting the session's memini key; no memory");
     }
-    // Minting may have added a memory grant, which the placement below must see.
-    let session = &db::get_session(&state.db, session.id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("session {} is gone", session.id))?;
     let id = session.id.to_string();
     let labels = BTreeMap::from([
         (SESSION_LABEL.to_owned(), id.clone()),
@@ -249,7 +245,10 @@ pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result
             "session".to_owned(),
         ),
     ]);
-    apply_egress(state, session).await?;
+    // Read afresh, so it sees a memory grant minting just added. No pod goes up without its policy.
+    if !apply_egress(state, session.id).await? {
+        anyhow::bail!("session {id} stopped acting while it was being placed");
+    }
     state
         .placement
         .ensure(&PlacementSpec {
@@ -300,13 +299,14 @@ pub async fn purge_deleted(state: &AppState) {
 
 /// Parks a session (ADR 5): its pod ends, and its volume, transcript, branch, grants and keys stay.
 pub async fn park(state: &AppState, session: &db::SessionRow) -> Result<(), ParkError> {
-    let id = session.id.to_string();
+    let id = session.id;
     state
         .hub
-        .park(session.id, || async {
-            state.placement.suspend(&id).await?;
+        .park(id, || async {
+            state.placement.suspend(&id.to_string()).await?;
             // A parked session holds no listener; waking applies its policy again. Startup releases what's left here.
-            if let Err(e) = state.enforcer.release(&id, &pod_labels(&id)).await {
+            // It's parked already, so no apply after this one gives its pod egress again.
+            if let Err(e) = state.hub.release_egress(id, &*state.enforcer).await {
                 tracing::warn!(session = %id, error = %e, "releasing a parked session's egress");
             }
             Ok(())
@@ -453,10 +453,10 @@ pub async fn wake(state: &AppState, session: &db::SessionRow) -> anyhow::Result<
 /// Stops a session and deletes its pod, volume, egress policy and keys.
 pub async fn remove_session(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
     let id = session.id;
-    state.hub.stop(id).await;
+    state.hub.stop(id).await?;
     state.placement.delete(&id.to_string()).await?;
-    state.enforcer.remove(&id.to_string()).await?;
-    if session.context().has(capability::MEMORY)
+    state.hub.remove_egress(id, &*state.enforcer).await?;
+    if crate::capabilities::holds(&session.context(), &crate::capabilities::Part::Memory)
         && let Some((admin, _)) = state.credentials.memini(&session.owner).await?
         && let Err(e) = admin
             .delete_key(&MeminiAdmin::key_name(&id.to_string()))
@@ -570,5 +570,93 @@ mod tests {
         // Without word on its commands, only after a long quiet.
         assert!(!due(&idle, Some("session:old"), None));
         assert!(due(&session(Phase::Idle, 150), Some("session:old"), None));
+    }
+
+    /// A request policy that only names its hosts.
+    struct Hosts(&'static [&'static str]);
+
+    #[async_trait::async_trait]
+    impl sloppod_contracts::RequestPolicy for Hosts {
+        fn manifest(&self) -> sloppod_contracts::Manifest {
+            sloppod_contracts::Manifest::builtin("hosts")
+        }
+
+        fn hosts(&self) -> Vec<String> {
+            self.0.iter().map(|h| (*h).to_owned()).collect()
+        }
+
+        async fn decide(
+            &self,
+            _: &sloppod_contracts::SessionContext,
+            _: &sloppod_contracts::HttpRequest,
+        ) -> sloppod_contracts::Result<sloppod_contracts::Decision> {
+            Ok(sloppod_contracts::Decision::allow())
+        }
+    }
+
+    #[test]
+    fn a_session_reaches_only_the_hosts_of_the_parts_it_holds() {
+        use crate::capabilities::{Part, Provider};
+        use sloppod_contracts::{Grant, capability};
+        use std::sync::Arc;
+
+        let mut policies = crate::policies::Policies::default();
+        policies.register(
+            Part::Model(Provider::Anthropic),
+            Arc::new(Hosts(&["api.anthropic.com"])),
+        );
+        policies.register(
+            Part::Model(Provider::ChatGpt),
+            Arc::new(Hosts(&["chatgpt.com"])),
+        );
+        policies.register(
+            Part::Github,
+            Arc::new(Hosts(&["api.github.com", "github.com"])),
+        );
+        let direct = ["crates.io".to_owned()];
+        let spec = |grants: &[&str]| {
+            let mut session = crate::db::SessionRow::for_test(uuid::Uuid::new_v4(), "dev");
+            let grants: Vec<Grant> = grants
+                .iter()
+                .map(|name| match *name {
+                    capability::REPO => {
+                        Grant::new(name, serde_json::json!({"repo": "o/r", "access": "rw"}))
+                    }
+                    _ => Grant::new(name, serde_json::json!({})),
+                })
+                .collect();
+            session.set_grants(&grants);
+            let spec =
+                super::egress_spec(&session, policies.hosts_for(&session.context()), &direct);
+            (spec.intercepted_hosts, spec.direct_hosts)
+        };
+
+        assert_eq!(
+            spec(&[capability::MODEL, capability::DOCS]),
+            (vec!["api.anthropic.com".to_owned()], vec![])
+        );
+        assert_eq!(
+            spec(&[capability::MODEL, capability::GITHUB, capability::REPO]),
+            (
+                vec![
+                    "api.anthropic.com".to_owned(),
+                    "api.github.com".to_owned(),
+                    "github.com".to_owned()
+                ],
+                vec![]
+            )
+        );
+        // A repository without github reaches no GitHub host: the repository is a param of github.
+        assert_eq!(
+            spec(&[capability::MODEL, capability::REPO]),
+            (vec!["api.anthropic.com".to_owned()], vec![])
+        );
+        assert_eq!(
+            spec(&[capability::CODEX, capability::PACKAGES]),
+            (vec!["chatgpt.com".to_owned()], vec!["crates.io".to_owned()])
+        );
+        assert_eq!(spec(&[]), (vec![], vec![]));
+        // The listeners' certificate still covers every policy's hosts.
+        assert_eq!(policies.hosts().len(), 4);
     }
 }

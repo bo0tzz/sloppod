@@ -150,7 +150,12 @@ impl ProposalKind for CodeReview {
         edit_code_review(payload, edits)
     }
 
-    async fn execute(&self, _session: &SessionContext, _payload: &Value) -> Result<Value> {
+    async fn execute(
+        &self,
+        _session: &SessionContext,
+        _proposal: uuid::Uuid,
+        _payload: &Value,
+    ) -> Result<Value> {
         Ok(json!({"message": "The review is over."}))
     }
 }

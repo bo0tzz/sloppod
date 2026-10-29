@@ -36,6 +36,10 @@ pub struct Config {
     #[arg(long, env = "SLOPPOD_SERVICE", default_value = "sloppod")]
     pub service: String,
 
+    /// The runtime pod's own IP, which servers an owner names can't be (the chart sets it from the downward API).
+    #[arg(long, env = "SLOPPOD_POD_IP")]
+    pub pod_ip: Option<std::net::IpAddr>,
+
     /// The cluster's DNS domain. Sessions may look up names under it, and otherwise only hosts they may reach.
     #[arg(long, env = "SLOPPOD_CLUSTER_DOMAIN", default_value = "cluster.local")]
     pub cluster_domain: String,

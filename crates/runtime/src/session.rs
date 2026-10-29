@@ -7,11 +7,13 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+use sloppod_contracts::{EgressSpec, Enforcer};
 use sloppod_protocol::api::{Phase, Proposal};
 use sloppod_protocol::link::RunningAgent;
 use tokio::sync::{Mutex, Notify, broadcast, oneshot};
 use uuid::Uuid;
 
+use crate::db::SessionRow;
 use crate::limits;
 use crate::link::{AgentConn, RpcError};
 use crate::store::SessionStore;
@@ -260,6 +262,19 @@ impl LiveState {
     }
 }
 
+impl LiveState {
+    /// Whether `agent` is the session's current agent connection; what an older one says is stale.
+    fn runs_on(&self, agent: &Arc<AgentConn>) -> bool {
+        self.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent))
+    }
+
+    /// Whether a turn's end on `agent` is the session's: the current link, and not closed, as one is just before
+    /// the hub hears it's gone. A closed link's turns didn't end; their answers were dropped.
+    fn ends_on(&self, agent: &Arc<AgentConn>) -> bool {
+        self.runs_on(agent) && !agent.is_closed()
+    }
+}
+
 impl Live {
     /// Nothing of the agent's work is under way any more: its turn ended, or it was replaced, parked or stopped.
     fn end_work(&self, state: &mut LiveState) {
@@ -275,6 +290,8 @@ pub struct Live {
     state: Mutex<LiveState>,
     /// Held while the session is parked or woken, so the two never overlap.
     transition: Mutex<()>,
+    /// Held while the session's egress is written, so writes land in the order they read the session (ADR 11).
+    egress: Mutex<()>,
     /// Notified when something a steer waits for ends: a compaction, a tool call, a permission request, the turn.
     boundary: Notify,
     /// When the agent was last heard from, for telling it the time after a gap; `None` until this runtime knows.
@@ -445,6 +462,7 @@ impl Hub {
                     events: broadcast::channel(4096).0,
                     state: Mutex::default(),
                     transition: Mutex::default(),
+                    egress: Mutex::default(),
                     boundary: Notify::new(),
                     heard_at: StdMutex::default(),
                 })
@@ -468,18 +486,26 @@ impl Hub {
         let _ = self.live(id).events.send(event);
     }
 
+    /// Saves the session's phase and tells its UIs; a failure is logged. Where what happens next depends on the phase
+    /// being saved, e.g. a pod ending because the session is parked, use `save_phase`.
     pub async fn set_phase(&self, id: Uuid, phase: Phase) {
-        match self.store.set_phase(id, phase).await {
-            Ok(Some(row)) => self.broadcast(
+        if let Err(e) = self.save_phase(id, phase).await {
+            tracing::error!(session = %id, error = %e, "setting phase");
+        }
+    }
+
+    /// Saves the session's phase and tells its UIs, or says why it couldn't.
+    pub async fn save_phase(&self, id: Uuid, phase: Phase) -> sqlx::Result<()> {
+        if let Some(row) = self.store.set_phase(id, phase).await? {
+            self.broadcast(
                 id,
                 UiEvent::Notification {
                     seq: None,
                     message: notification("_sloppod/session", json!({"session": row.to_api()})),
                 },
-            ),
-            Ok(None) => {}
-            Err(e) => tracing::error!(session = %id, error = %e, "setting phase"),
+            );
         }
+        Ok(())
     }
 
     pub async fn broadcast_session(&self, id: Uuid) {
@@ -577,7 +603,7 @@ impl Hub {
     pub async fn set_commands(&self, id: Uuid, agent: &Arc<AgentConn>, running: usize) {
         let live = self.live(id);
         let mut state = live.state.lock().await;
-        if state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
+        if state.runs_on(agent) {
             state.commands = Some(running);
         }
     }
@@ -680,7 +706,7 @@ impl Hub {
                 {
                     let live = self.live(id);
                     let mut state = live.state.lock().await;
-                    if !state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
+                    if !state.runs_on(agent) {
                         return;
                     }
                     state.agent_session_id = Some(running.ready.agent_session_id);
@@ -691,16 +717,14 @@ impl Hub {
                 }
                 let (hub, agent) = (self.clone(), agent.clone());
                 tokio::spawn(async move {
-                    let end = match turn.await {
-                        Ok(result) => {
-                            if let Err(e) = &result {
-                                tracing::warn!(session = %id, error = %e, "adopted turn failed");
-                            }
-                            TurnEnd::of(&result)
-                        }
-                        Err(_) => TurnEnd::Ended,
+                    // Unanswered, the link closed: the turn goes on under the agent's next one, if any.
+                    let Ok(result) = turn.await else {
+                        return;
                     };
-                    hub.turn_finished(id, end).await;
+                    if let Err(e) = &result {
+                        tracing::warn!(session = %id, error = %e, "adopted turn failed");
+                    }
+                    hub.turn_finished(id, &agent, TurnEnd::of(&result)).await;
                     hub.end_turn(id, &agent).await;
                 });
             }
@@ -722,7 +746,7 @@ impl Hub {
         let queued = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
-            if !state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
+            if !state.runs_on(agent) {
                 return;
             }
             state.agent_session_id = Some(agent_session_id);
@@ -1149,7 +1173,7 @@ impl Hub {
         let resolved: Vec<(u64, Option<String>)> = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
-            if !state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
+            if !state.runs_on(agent) {
                 return;
             }
             state.agent = None;
@@ -1245,7 +1269,7 @@ impl Hub {
         let pid = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
-            if !state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
+            if !state.runs_on(agent) {
                 agent.respond(
                     request_id,
                     Err(RpcError::new(-32002, "this agent connection was replaced")),
@@ -1501,7 +1525,7 @@ impl Hub {
             let mut state = live.state.lock().await;
             self.release(id, &mut state, held).await;
         }
-        self.turn_finished(id, TurnEnd::of(&result)).await;
+        self.turn_finished(id, agent, TurnEnd::of(&result)).await;
         self.end_turn(id, agent).await;
         result
     }
@@ -1512,7 +1536,7 @@ impl Hub {
         let next = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
-            if !state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
+            if !state.ends_on(agent) {
                 return;
             }
             live.end_work(&mut state);
@@ -1650,7 +1674,7 @@ impl Hub {
     pub async fn retire_agent(&self, id: Uuid, agent: &Arc<AgentConn>) {
         let live = self.live(id);
         let mut state = live.state.lock().await;
-        if state.agent.as_ref().is_some_and(|a| Arc::ptr_eq(a, agent)) {
+        if state.runs_on(agent) {
             state.agent_session_id = None;
         }
     }
@@ -2057,9 +2081,14 @@ impl Hub {
         self.live(id).state.lock().await.turn_running
     }
 
-    /// Counts a turn the hub sent as ended. One that hit the usage limit leaves the session waiting for the reset;
-    /// one that ended well ends any such wait.
-    async fn turn_finished(self: &Arc<Self>, id: Uuid, end: TurnEnd) {
+    /// Counts a turn the hub sent to `agent` as ended, if that is still the current agent. One that hit the usage
+    /// limit leaves the session waiting for the reset; one that ended well ends any such wait.
+    async fn turn_finished(self: &Arc<Self>, id: Uuid, agent: &Arc<AgentConn>, end: TurnEnd) {
+        // A turn whose link was replaced or dropped hasn't ended: the agent may still be running it, under a newer
+        // link.
+        if !self.live(id).state.lock().await.ends_on(agent) {
+            return;
+        }
         self.heard_from_agent(id);
         let now = self.now();
         let limit_hit = self.limit_hit.lock().unwrap().clone();
@@ -2070,6 +2099,9 @@ impl Hub {
         let limited = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
+            if !state.ends_on(agent) {
+                return;
+            }
             state.turns_ended += 1;
             state.last_turn = Some(end.clone());
             let until = match end {
@@ -2259,8 +2291,14 @@ impl Hub {
             live.end_work(&mut state);
             (state.agent.take(), state.agent_session_id.take())
         };
-        // Parked before the pod ends, so its supervisor's attempts to reconnect meanwhile are turned away.
-        self.set_phase(id, Phase::Parked).await;
+        // Parked before the pod ends, so its supervisor's attempts to reconnect meanwhile are turned away. Unsaved, the
+        // session would still look active with its pod gone: not woken, and placed again on the next startup.
+        if let Err(e) = self.save_phase(id, Phase::Parked).await {
+            self.unpark(id, agent, agent_session_id).await;
+            return Err(anyhow::Error::from(e)
+                .context("saving the parked phase")
+                .into());
+        }
         if let Err(e) = suspend().await {
             self.unpark(id, agent, agent_session_id).await;
             return Err(e.into());
@@ -2333,6 +2371,50 @@ impl Hub {
         }
     }
 
+    /// Applies the egress `spec` makes of the session as it is now, read under its egress lock: writes to a session's
+    /// egress land one at a time, each with what it read, so the last to land reflects the current grants and phase.
+    /// A session that isn't acting gets none, and `false` says so; waking applies its egress again.
+    pub async fn apply_egress(
+        &self,
+        id: Uuid,
+        enforcer: &dyn Enforcer,
+        spec: impl FnOnce(&SessionRow) -> EgressSpec,
+    ) -> anyhow::Result<bool> {
+        let live = self.live(id);
+        let _egress = live.egress.lock().await;
+        match self.store.get_session(id).await? {
+            Some(row) if row.not_acting().is_none() => {
+                enforcer
+                    .apply(&spec(&row))
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Denies a stopping session's pod all egress, once any apply already under way has landed.
+    pub async fn release_egress(&self, id: Uuid, enforcer: &dyn Enforcer) -> anyhow::Result<()> {
+        let live = self.live(id);
+        let _egress = live.egress.lock().await;
+        let session = id.to_string();
+        enforcer
+            .release(&session, &crate::lifecycle::pod_labels(&session))
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+
+    /// Removes a stopped session's egress for good, once any apply already under way has landed.
+    pub async fn remove_egress(&self, id: Uuid, enforcer: &dyn Enforcer) -> anyhow::Result<()> {
+        let live = self.live(id);
+        let _egress = live.egress.lock().await;
+        enforcer
+            .remove(&id.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+
     /// Wakes a parked session: `place` brings its pod back. A failure leaves it parked, so waking can be retried.
     /// Sessions that aren't parked are left as they are.
     pub async fn wake<F, Fut>(&self, id: Uuid, place: F) -> anyhow::Result<()>
@@ -2350,7 +2432,7 @@ impl Hub {
         if !parked {
             return Ok(());
         }
-        self.set_phase(id, Phase::Starting).await;
+        self.save_phase(id, Phase::Starting).await?;
         if let Err(e) = place().await {
             self.set_phase(id, Phase::Parked).await;
             return Err(e);
@@ -2358,7 +2440,8 @@ impl Hub {
         Ok(())
     }
 
-    pub async fn stop(&self, id: Uuid) {
+    /// Stops a session for good; errs if that couldn't be saved, when it would still look active to the next startup.
+    pub async fn stop(&self, id: Uuid) -> sqlx::Result<()> {
         let (agent, queued) = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
@@ -2375,7 +2458,7 @@ impl Hub {
         if let Some(agent) = agent {
             agent.close();
         }
-        self.set_phase(id, Phase::Stopped).await;
+        self.save_phase(id, Phase::Stopped).await
     }
 }
 

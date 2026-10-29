@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use sloppod_protocol::api::Phase;
 use sloppod_protocol::link::{AgentReady, RunningAgent, ToSupervisor};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -816,7 +817,7 @@ async fn stopping_a_session_mid_compaction_fails_waiting_steers() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!steer.is_finished());
 
-    h.hub.stop(h.id).await;
+    h.hub.stop(h.id).await.unwrap();
     let result = tokio::time::timeout(Duration::from_secs(5), steer)
         .await
         .expect("the steer is still waiting")
@@ -1312,6 +1313,62 @@ async fn a_wake_during_parking_runs_after_it() {
 }
 
 #[tokio::test]
+async fn parking_that_cant_be_saved_leaves_the_pod_and_the_agent() {
+    let mut h = Harness::ready().await;
+    *h.store.fail_phase.lock().unwrap() = Some(Phase::Parked);
+    let suspended = Arc::new(std::sync::Mutex::new(false));
+    let result = {
+        let suspended = suspended.clone();
+        h.hub
+            .park(h.id, || async move {
+                *suspended.lock().unwrap() = true;
+                Ok(())
+            })
+            .await
+    };
+    assert!(result.is_err());
+    assert!(
+        !*suspended.lock().unwrap(),
+        "suspended without being parked"
+    );
+    assert_eq!(h.phase().await, "idle");
+
+    // The agent is still the session's.
+    let turn = h.prompt("Still here?");
+    let request = h.next().await;
+    assert_eq!(prompt_text(&request), ["Still here?"]);
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn waking_that_cant_be_saved_doesnt_place_the_pod() {
+    let h = Harness::ready().await;
+    h.hub.park(h.id, || async { Ok(()) }).await.unwrap();
+    *h.store.fail_phase.lock().unwrap() = Some(Phase::Starting);
+    let placed = Arc::new(std::sync::Mutex::new(false));
+    let result = {
+        let placed = placed.clone();
+        h.hub
+            .wake(h.id, || async move {
+                *placed.lock().unwrap() = true;
+                Ok(())
+            })
+            .await
+    };
+    assert!(result.is_err());
+    assert!(!*placed.lock().unwrap());
+    assert_eq!(h.phase().await, "parked");
+}
+
+#[tokio::test]
+async fn stopping_that_cant_be_saved_says_so() {
+    let h = Harness::ready().await;
+    *h.store.fail_phase.lock().unwrap() = Some(Phase::Stopped);
+    assert!(h.hub.stop(h.id).await.is_err());
+}
+
+#[tokio::test]
 async fn a_failed_suspend_gives_the_session_its_agent_back() {
     let mut h = Harness::ready().await;
     let (release, released) = tokio::sync::oneshot::channel::<()>();
@@ -1671,7 +1728,7 @@ async fn a_first_message_that_cant_be_marked_taken_isnt_run() {
 async fn a_batch_that_can_no_longer_start_in_a_stopped_session_fails() {
     let h = Harness::ready().await;
     let agent = h.agent.clone();
-    h.hub.stop(h.id).await;
+    h.hub.stop(h.id).await.unwrap();
     let (queued, reply) = batch("Too late");
     h.hub
         .clone()
@@ -2327,6 +2384,89 @@ async fn a_steered_message_a_restart_left_open_is_logged_once_the_agent_takes_it
     );
 }
 
+impl Harness {
+    /// The supervisor reconnects on a new link, with the agent's `open` requests still unanswered.
+    async fn relink(&mut self, open: Vec<Value>) {
+        let (tx, to_agent) = mpsc::unbounded_channel();
+        self.agent = Arc::new(AgentConn::new(tx));
+        self.to_agent = to_agent;
+        self.hub.attach_agent(self.id, self.agent.clone()).await;
+        self.hub
+            .adopt_agent(self.id, &self.agent, running(open))
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn reconnects_during_an_adopted_turn_dont_end_it() {
+    let turn = json!({"jsonrpc": "2.0", "id": 7, "method": "session/prompt", "params": {"sessionId": "agent-session"}});
+    let mut h = Harness::adopted(vec![turn.clone()], Vec::new()).await;
+    let ended = Arc::new(std::sync::Mutex::new(0));
+    {
+        let ended = ended.clone();
+        h.hub.set_turn_ended(Arc::new(move |_| {
+            let ended = ended.clone();
+            Box::pin(async move { *ended.lock().unwrap() += 1 })
+        }));
+    }
+
+    // Each new link closes the one before, whose wait for the turn's answer ends unanswered.
+    h.relink(vec![turn.clone()]).await;
+    h.relink(vec![turn.clone()]).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.hub.turn_state(h.id).await, (0, true));
+    assert_eq!(h.phase().await, "working");
+    assert_eq!(*ended.lock().unwrap(), 0);
+
+    // The turn ends once, when the agent answers it on the current link.
+    h.respond(&turn, json!({"stopReason": "end_turn"})).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.hub.turn_state(h.id).await, (1, false));
+    assert_eq!(h.phase().await, "idle");
+    assert_eq!(*ended.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn a_reconnect_during_a_turn_doesnt_end_it() {
+    let mut h = Harness::ready().await;
+    let _turn = h.prompt("Work");
+    let turn = h.next().await;
+
+    // The agent outlives its link, and the new one adopts the turn.
+    h.relink(vec![turn.clone()]).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.hub.turn_state(h.id).await, (0, true));
+    assert_eq!(h.phase().await, "working");
+
+    h.respond(&turn, json!({"stopReason": "end_turn"})).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.hub.turn_state(h.id).await, (1, false));
+    assert_eq!(h.phase().await, "idle");
+}
+
+#[tokio::test]
+async fn a_link_that_drops_doesnt_end_its_turns() {
+    // The link closes (its pending answers dropped) before the hub hears it's gone.
+    let mut h = Harness::ready().await;
+    let _turn = h.prompt("Work");
+    h.next().await;
+    let _next = h.prompt("Queued");
+    wait_for_queue(&h, 1).await;
+    h.agent.close();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.hub.turns_ended(h.id).await.0, 0);
+    assert_eq!(h.queued().await.len(), 1, "not handed to the closed link");
+    h.hub.detach_agent(h.id, &h.agent).await;
+    assert_eq!(h.hub.turns_ended(h.id).await.0, 0);
+
+    let turn = json!({"jsonrpc": "2.0", "id": 7, "method": "session/prompt", "params": {"sessionId": "agent-session"}});
+    let h = Harness::adopted(vec![turn], Vec::new()).await;
+    h.agent.close();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    h.hub.detach_agent(h.id, &h.agent).await;
+    assert_eq!(h.hub.turns_ended(h.id).await.0, 0);
+}
+
 /// `START`, moved on by `minutes`.
 fn later(minutes: i64) -> chrono::DateTime<chrono::Utc> {
     START.parse::<chrono::DateTime<chrono::Utc>>().unwrap() + chrono::Duration::minutes(minutes)
@@ -2832,4 +2972,127 @@ async fn the_time_is_in_the_owners_timezone() {
         time_line(&request).as_deref(),
         Some("[sloppod: it's 2026-10-28 00:05 CET, 15 minutes since the last message]")
     );
+}
+
+/// An enforcer that records what lands, in order, and can hold the next apply mid-write, as a slow patch would.
+#[derive(Default)]
+struct GatedEnforcer {
+    landed: std::sync::Mutex<Vec<Option<Vec<String>>>>,
+    hold_next: std::sync::atomic::AtomicBool,
+    held: tokio::sync::Notify,
+    go_on: tokio::sync::Notify,
+}
+
+impl GatedEnforcer {
+    /// What landed last: the direct hosts of an apply, or `None` for a release.
+    fn last(&self) -> Option<Option<Vec<String>>> {
+        self.landed.lock().unwrap().last().cloned()
+    }
+}
+
+#[async_trait::async_trait]
+impl sloppod_contracts::Enforcer for GatedEnforcer {
+    fn manifest(&self) -> sloppod_contracts::Manifest {
+        sloppod_contracts::Manifest::builtin("gated")
+    }
+
+    async fn apply(&self, egress: &sloppod_contracts::EgressSpec) -> sloppod_contracts::Result<()> {
+        if self.hold_next.swap(false, Ordering::SeqCst) {
+            self.held.notify_one();
+            self.go_on.notified().await;
+        }
+        self.landed
+            .lock()
+            .unwrap()
+            .push(Some(egress.direct_hosts.clone()));
+        Ok(())
+    }
+
+    async fn release(
+        &self,
+        _: &str,
+        _: &std::collections::BTreeMap<String, String>,
+    ) -> sloppod_contracts::Result<()> {
+        self.landed.lock().unwrap().push(None);
+        Ok(())
+    }
+
+    async fn remove(&self, _: &str) -> sloppod_contracts::Result<()> {
+        Ok(())
+    }
+}
+
+impl Harness {
+    async fn set_grants(&self, grants: &[sloppod_contracts::Grant]) {
+        let mut row = self.store.get_session(self.id).await.unwrap().unwrap();
+        row.set_grants(grants);
+        self.store.add_session(row);
+    }
+
+    /// Applies the session's egress as the runtime does, with `crates.io` as the deployment's package host.
+    fn apply_egress(&self, enforcer: &Arc<GatedEnforcer>) -> JoinHandle<bool> {
+        let (hub, enforcer, id) = (self.hub.clone(), enforcer.clone(), self.id);
+        tokio::spawn(async move {
+            hub.apply_egress(id, &*enforcer, |row| {
+                crate::lifecycle::egress_spec(row, Vec::new(), &["crates.io".to_owned()])
+            })
+            .await
+            .unwrap()
+        })
+    }
+}
+
+fn packages() -> sloppod_contracts::Grant {
+    sloppod_contracts::Grant::new(sloppod_contracts::capability::PACKAGES, json!({}))
+}
+
+#[tokio::test]
+async fn a_revocation_lands_after_an_apply_already_under_way() {
+    let h = Harness::ready().await;
+    let enforcer = Arc::new(GatedEnforcer::default());
+    h.set_grants(&[packages()]).await;
+    enforcer.hold_next.store(true, Ordering::SeqCst);
+    let granted = h.apply_egress(&enforcer);
+    enforcer.held.notified().await;
+
+    h.set_grants(&[]).await;
+    let revoked = h.apply_egress(&enforcer);
+    // The revocation's apply gets every chance to land first, as it would if nothing ordered them.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    enforcer.go_on.notify_one();
+    assert!(granted.await.unwrap());
+    assert!(revoked.await.unwrap());
+
+    assert_eq!(enforcer.last(), Some(Some(Vec::new())));
+}
+
+#[tokio::test]
+async fn parking_releases_egress_after_an_apply_already_under_way() {
+    let h = Harness::ready().await;
+    let enforcer = Arc::new(GatedEnforcer::default());
+    h.set_grants(&[packages()]).await;
+    enforcer.hold_next.store(true, Ordering::SeqCst);
+    let applied = h.apply_egress(&enforcer);
+    enforcer.held.notified().await;
+
+    let parked = tokio::spawn({
+        let (hub, enforcer, id) = (h.hub.clone(), enforcer.clone(), h.id);
+        async move {
+            hub.clone()
+                .park(
+                    id,
+                    || async move { hub.release_egress(id, &*enforcer).await },
+                )
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    enforcer.go_on.notify_one();
+    assert!(applied.await.unwrap());
+    parked.await.unwrap().unwrap();
+    assert_eq!(enforcer.last(), Some(None));
+
+    // A grant change's apply that comes after the park, a retry among them, gives the stopping pod nothing.
+    assert!(!h.apply_egress(&enforcer).await.unwrap());
+    assert_eq!(enforcer.last(), Some(None));
 }

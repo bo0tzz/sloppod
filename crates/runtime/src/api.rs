@@ -793,6 +793,9 @@ async fn create_definition(
     if let Some(why) = crate::definitions::invalid(&new) {
         return Err(bad_request(why));
     }
+    if let Some(why) = state.reach.refuses(&new.mcp_url).await {
+        return Err(bad_request(why));
+    }
     if let Some(credential) = new.credential_id
         && state.credentials.token(&user, credential).await?.is_none()
     {

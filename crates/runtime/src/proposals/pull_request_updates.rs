@@ -172,13 +172,19 @@ impl ProposalKind for PullRequestUpdates {
         updates::edit_updates(payload, edits, update_list)
     }
 
-    async fn execute(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
+    async fn execute(
+        &self,
+        session: &SessionContext,
+        proposal: uuid::Uuid,
+        payload: &Value,
+    ) -> Result<Value> {
         let repo = payload["repo"].as_str().unwrap_or_default();
         let list = update_list(&payload["updates"])?;
         let app = super::github_for(&self.credentials, session, repo).await?;
-        updates::execute_all(&list, "pull requests", describe, |number, update| {
+        updates::execute_all(&list, "pull requests", describe, |item, number, update| {
             let (app, repo) = (app.clone(), repo.to_owned());
-            async move { apply(&app, &repo, number, &update).await }
+            let marker = super::marker(proposal, item);
+            async move { apply(&app, &repo, number, &update, &marker).await }
         })
         .await
     }
@@ -194,9 +200,10 @@ async fn apply(
     repo: &str,
     number: u64,
     update: &Value,
+    marker: &str,
 ) -> anyhow::Result<()> {
     let pull = app.pull(repo, number).await?;
-    updates::comment_and_label(app, repo, number, update).await?;
+    updates::comment_and_label(app, repo, number, update, marker).await?;
     if update.get("reopen").is_some() {
         app.update_issue(repo, number, &json!({"state": "open"}))
             .await?;
@@ -238,8 +245,11 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         pulls: Mutex<HashMap<u64, Value>>,
+        comments: Mutex<HashMap<u64, Vec<String>>>,
         writes: Mutex<Vec<String>>,
     }
+
+    const MARK: &str = "<!-- sloppod:proposal/p/0 -->";
 
     type Shared = State<Arc<Fake>>;
 
@@ -255,8 +265,18 @@ mod tests {
             .ok_or(StatusCode::NOT_FOUND)
     }
 
-    async fn no_comments() -> Json<Value> {
-        Json(json!([]))
+    async fn comments(
+        State(fake): Shared,
+        Path((_, _, number)): Path<(String, String, u64)>,
+    ) -> Json<Value> {
+        let comments = fake.comments.lock().unwrap();
+        let bodies = comments.get(&number).cloned().unwrap_or_default();
+        Json(json!(
+            bodies
+                .iter()
+                .map(|body| json!({"body": body}))
+                .collect::<Vec<_>>()
+        ))
     }
 
     async fn comment(
@@ -268,6 +288,12 @@ mod tests {
             "comment #{number}: {}",
             body["body"].as_str().unwrap_or_default()
         ));
+        fake.comments
+            .lock()
+            .unwrap()
+            .entry(number)
+            .or_default()
+            .push(body["body"].as_str().unwrap_or_default().to_owned());
         Json(json!({}))
     }
 
@@ -316,7 +342,7 @@ mod tests {
             .route("/repos/{owner}/{name}/issues/{number}", patch(edit))
             .route(
                 "/repos/{owner}/{name}/issues/{number}/comments",
-                get(no_comments).post(comment),
+                get(comments).post(comment),
             )
             .route("/graphql", post(graphql))
             .with_state(fake.clone());
@@ -335,7 +361,10 @@ mod tests {
             json!({"number": 9, "title": "New", "close": true}),
             json!({"number": 9, "ready": true, "comment": "Hello"}),
         ] {
-            assert!(apply(&app, "o/r", 9, &update).await.is_err(), "{update}");
+            assert!(
+                apply(&app, "o/r", 9, &update, MARK).await.is_err(),
+                "{update}"
+            );
         }
         assert_eq!(*fake.writes.lock().unwrap(), Vec::<String>::new());
     }
@@ -344,7 +373,7 @@ mod tests {
     async fn a_closed_draft_is_reopened_before_it_is_marked_ready() {
         let (fake, app) = github().await;
         let update = json!({"number": 6, "reopen": true, "ready": true, "title": "Ready"});
-        apply(&app, "o/r", 6, &update).await.unwrap();
+        apply(&app, "o/r", 6, &update, MARK).await.unwrap();
         assert_eq!(
             *fake.writes.lock().unwrap(),
             [
@@ -356,7 +385,7 @@ mod tests {
         // Closed and not reopened, it can't be marked ready.
         let (_, app) = github().await;
         assert!(
-            apply(&app, "o/r", 6, &json!({"number": 6, "ready": true}))
+            apply(&app, "o/r", 6, &json!({"number": 6, "ready": true}), MARK)
                 .await
                 .is_err()
         );
@@ -366,10 +395,27 @@ mod tests {
     async fn carrying_an_update_out_again_repeats_nothing() {
         let (fake, app) = github().await;
         let update = json!({"number": 5, "ready": true});
-        apply(&app, "o/r", 5, &update).await.unwrap();
-        apply(&app, "o/r", 5, &update).await.unwrap();
+        apply(&app, "o/r", 5, &update, MARK).await.unwrap();
+        apply(&app, "o/r", 5, &update, MARK).await.unwrap();
         // Marked ready once: the second time it isn't a draft any more.
         assert_eq!(*fake.writes.lock().unwrap(), ["ready PR5"]);
+    }
+
+    #[tokio::test]
+    async fn a_comment_is_known_by_its_mark_not_by_what_it_says() {
+        let (fake, app) = github().await;
+        // Someone else said the same already; this update's comment is still its own.
+        fake.comments
+            .lock()
+            .unwrap()
+            .insert(5, vec!["Replaced by #9".into()]);
+        let update = json!({"number": 5, "comment": "Replaced by #9"});
+        apply(&app, "o/r", 5, &update, MARK).await.unwrap();
+        apply(&app, "o/r", 5, &update, MARK).await.unwrap();
+        assert_eq!(
+            *fake.writes.lock().unwrap(),
+            [format!("comment #5: Replaced by #9\n\n{MARK}")]
+        );
     }
 
     #[test]

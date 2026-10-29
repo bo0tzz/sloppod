@@ -21,6 +21,7 @@ Concepts:
 - [5. Sessions can be parked and woken](docs/adr/0005-park-and-wake.md)
 - [25. Sessions move through their lifecycle by themselves](docs/adr/0025-session-lifecycle.md)
 - [27. Sessions fan out work to sub-sessions](docs/adr/0027-sub-sessions.md)
+- [30. Work is tracked in sloppod as a graph of items](docs/adr/0030-work-items.md)
 - [6. The runtime is self-referential](docs/adr/0006-self-reference.md)
 - [7. Extension points have plugin-shaped boundaries](docs/adr/0007-extension-points.md)
 - [23. Users and ownership](docs/adr/0023-users-and-ownership.md)
