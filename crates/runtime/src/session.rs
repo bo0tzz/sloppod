@@ -312,8 +312,7 @@ pub struct Hub {
     /// The time the tests say it is, instead of the clock's.
     now: StdMutex<Option<DateTime<Utc>>>,
     limit_hit: StdMutex<Option<LimitHit>>,
-    /// Holds a turn between sending its prompt and noting it was sent, until released; for tests of what happens
-    /// in between.
+    /// Holds a turn just before it's sent, until released; for tests of a link going meanwhile.
     #[cfg(test)]
     pub(crate) send_gate: SendGate,
 }
@@ -929,26 +928,29 @@ impl Hub {
         (Some(key), kept)
     }
 
-    /// A held batch was sent as `request`: as a turn on `turn_on`, or as a steer.
-    async fn sent(
+    /// A held batch was sent as `request`, a turn or a steer.
+    async fn sent(&self, id: Uuid, key: Option<Uuid>, request: i64, turn: bool) {
+        let live = self.live(id);
+        let mut state = live.state.lock().await;
+        self.note_sent(id, &mut state, key, request, turn).await;
+    }
+
+    /// `sent`, under the state lock.
+    async fn note_sent(
         &self,
         id: Uuid,
+        state: &mut LiveState,
         key: Option<Uuid>,
         request: i64,
-        turn_on: Option<&Arc<AgentConn>>,
+        turn: bool,
     ) {
         let Some(key) = key else {
             return;
         };
-        let live = self.live(id);
-        let mut state = live.state.lock().await;
-        // A link that went between sending the turn and now didn't mark it for the next link to settle.
-        let gone = turn_on.is_some_and(|agent| !state.ends_on(agent));
         if let Some(held) = state.in_flight.iter_mut().find(|h| h.key == key) {
             held.request = Some(request);
-            held.turn = turn_on.is_some();
-            held.restored |= gone;
-            self.save_queue(id, &state).await;
+            held.turn = turn;
+            self.save_queue(id, state).await;
         }
     }
 
@@ -997,9 +999,14 @@ impl Hub {
         }
     }
 
-    /// A held notice that couldn't be delivered goes back to the queue, and runs now if the agent is idle, e.g.
-    /// because the turn it was steered into ended meanwhile.
-    async fn requeue_held(self: &Arc<Self>, id: Uuid, key: Uuid) {
+    /// What was held and couldn't be delivered goes back to the queue, `put` there with what the store kept of it,
+    /// and runs now if the agent is idle, e.g. because the turn it was steered into ended meanwhile.
+    async fn requeue_held(
+        self: &Arc<Self>,
+        id: Uuid,
+        key: Uuid,
+        put: impl FnOnce(&mut Vec<Queued>, Vec<Queued>),
+    ) {
         let next = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
@@ -1007,7 +1014,7 @@ impl Hub {
                 return;
             };
             let back: Vec<Queued> = held.stored.iter().map(unstored).collect();
-            state.queue.extend(back);
+            put(&mut state.queue, back);
             self.release(id, &mut state, Some(key)).await;
             let idle = state.agent_session_id.is_some()
                 && !state.turn_running
@@ -1054,7 +1061,10 @@ impl Hub {
                 let mut state = live.state.lock().await;
                 self.release(id, &mut state, Some(key)).await;
             }
-            _ => self.requeue_held(id, key).await,
+            _ => {
+                self.requeue_held(id, key, |queue, back| queue.extend(back))
+                    .await
+            }
         }
     }
 
@@ -1512,16 +1522,41 @@ impl Hub {
         held: Option<Uuid>,
     ) -> Result<Value, RpcError> {
         let prompt = self.with_time(id, blocks, notice).await;
-        let (request, answer) = agent.send_request(
-            "session/prompt",
-            json!({"sessionId": agent_session_id, "prompt": prompt}),
-        );
         #[cfg(test)]
         if self.send_gate.on.load(std::sync::atomic::Ordering::SeqCst) {
             self.send_gate.reached.notify_one();
             self.send_gate.released.notified().await;
         }
-        self.sent(id, held, request, Some(agent)).await;
+        // Sent and noted under the lock a link's going takes, so that either finds the other done: a turn sent on a
+        // link that then goes is settled by the next one, and one whose link went first isn't sent on it.
+        let answer = {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            if state.ends_on(agent) {
+                let (request, answer) = agent.send_request(
+                    "session/prompt",
+                    json!({"sessionId": agent_session_id, "prompt": prompt}),
+                );
+                self.note_sent(id, &mut state, held, request, true).await;
+                Some(answer)
+            } else {
+                None
+            }
+        };
+        let Some(answer) = answer else {
+            // Back at the front of the queue, for the agent that's up now, or the next.
+            if let Some(key) = held {
+                self.requeue_held(id, key, |queue, back| {
+                    let since = std::mem::take(queue);
+                    *queue = back.into_iter().chain(since).collect();
+                })
+                .await;
+            }
+            return Err(RpcError::new(
+                -32002,
+                "the agent's link dropped; the message is kept, and runs once the agent is back",
+            ));
+        };
         let result = answer.await;
         {
             let live = self.live(id);
@@ -1749,7 +1784,8 @@ impl Hub {
                     if let Err(e) = hub.steer_in(id, blocks.clone(), true, held).await {
                         tracing::warn!(session = %id, error = %e, "steering a notice in");
                         if let Some(key) = held {
-                            hub.requeue_held(id, key).await;
+                            hub.requeue_held(id, key, |queue, back| queue.extend(back))
+                                .await;
                         }
                     }
                 });
@@ -1798,7 +1834,7 @@ impl Hub {
                     "_meta": {"steering": {"idleBehavior": "promptRequired"}},
                 }),
             );
-            self.sent(id, held, request, None).await;
+            self.sent(id, held, request, false).await;
             let result = answer.await?;
             if result["outcome"] != "promptRequired" {
                 let live = self.live(id);
