@@ -242,8 +242,8 @@ async fn check(state: &AppState, pull: &db::WatchedPull) -> anyhow::Result<()> {
         .observed
         .clone()
         .and_then(|seen| serde_json::from_value(seen).ok());
-    // An answer without the pull request (GraphQL errors come with a 200) isn't an observation: read as one, it would
-    // say it has no reviews or checks.
+    // An answer without errors but without the pull request either isn't an observation: read as one, it would say it
+    // has no reviews or checks.
     let found = &response["data"]["repository"]["pullRequest"];
     if !found.is_object() {
         anyhow::bail!(
