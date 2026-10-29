@@ -127,13 +127,18 @@ async fn forward(state: &AppState, peer: SocketAddr, request: Request) -> anyhow
         }
     };
 
+    let url = format!("{base}{path}");
     crate::proxy::forward(
-        parts.method,
-        &parts.headers,
-        &format!("{base}{path}"),
-        body,
-        set_headers,
-        remove_headers,
+        &crate::proxy::HTTP,
+        crate::proxy::Forward {
+            method: parts.method,
+            headers: &parts.headers,
+            url: &url,
+            body,
+            set: set_headers,
+            remove: remove_headers,
+            user_header: &state.config.user_header,
+        },
     )
     .await
 }
