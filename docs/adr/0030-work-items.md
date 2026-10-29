@@ -67,9 +67,9 @@ Open questions:
 
 2026-10-29: stage 1 is built ([#384](https://github.com/bo0tzz/sloppod/issues/384)): graphs, items, edges, links and events in the database, the rules in one module, and the owner's REST API (`docs/api.md`, "Work"). Choices this ADR left open:
 
-- **`part of` is a parent column.** An item is part of at most one other, so the parts form a tree. `part of` and `blocks` edges are kept acyclic together, so a parent can't block its own part. An item waits on what blocks the items it's part of.
+- **`part of` is a parent column.** An item is part of at most one other, so the parts form a tree. A part waits on what blocks the items it's part of, and an item waits on its parts. No edge may leave an item waiting on itself that way, so neither a parent nor a part can block the other.
 - **Ranks are numbers.** A placed item gets a rank between its neighbours'. When there's no room left, the siblings are spread out again. Across the graph, the frontier orders items by their ancestors' ranks first.
-- **Links carry a status:** `open`, `finished` or `abandoned`. Later stages set it by watching what the link points at; for now the owner sets it. A session link that's open makes its item active, as does an open completing pull request or proposal.
+- **Links carry a status:** `open`, `finished` or `abandoned`. Later stages set it by watching what the link points at; for now the owner sets it. A session link that's open makes its item active, as does an open completing pull request or proposal. Items remember whether the rules or a person set their state: what the rules made done or active goes back to open once nothing makes it so, while an item done by hand with nothing linked stays done.
 - **Undo is an inverse event.** Undoing a change makes the inverse change and records it as an event that names the one it undoes. Undoing that event redoes the change.
   - A change can be undone only while its effect is still there.
   - Items are never deleted. Undoing an item's creation drops it.

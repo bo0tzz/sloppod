@@ -15,6 +15,8 @@ create table work_items (
     title text not null,
     description text not null default '',
     state text not null default 'open' check (state in ('open', 'active', 'done', 'dropped')),
+    -- Whether the rules set the state, following links and parts, rather than someone by hand.
+    state_by_rules boolean not null default false,
     rank double precision not null,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()

@@ -355,11 +355,12 @@ async fn lock_item_graph(tx: &mut PgConnection, owner: &str, item: Uuid) -> Work
 
 /// The graph as the rules see it.
 async fn snapshot(tx: &mut PgConnection, graph: Uuid) -> sqlx::Result<rules::Graph> {
-    let items: Vec<(Uuid, Option<Uuid>, String, f64)> =
-        sqlx::query_as("select id, parent_id, state, rank from work_items where graph_id = $1")
-            .bind(graph)
-            .fetch_all(&mut *tx)
-            .await?;
+    let items: Vec<(Uuid, Option<Uuid>, String, f64, bool)> = sqlx::query_as(
+        "select id, parent_id, state, rank, state_by_rules from work_items where graph_id = $1",
+    )
+    .bind(graph)
+    .fetch_all(&mut *tx)
+    .await?;
     let blocks: Vec<(Uuid, Uuid)> =
         sqlx::query_as("select blocker_id, blocked_id from work_edges where graph_id = $1")
             .bind(graph)
@@ -375,11 +376,12 @@ async fn snapshot(tx: &mut PgConnection, graph: Uuid) -> sqlx::Result<rules::Gra
     Ok(rules::Graph::new(
         items
             .into_iter()
-            .map(|(id, parent, state, rank)| rules::Item {
+            .map(|(id, parent, state, rank, automatic)| rules::Item {
                 id,
                 parent,
                 state: State::parse(&state).unwrap_or(State::Open),
                 rank,
+                automatic,
             })
             .collect(),
         blocks,
@@ -444,13 +446,22 @@ async fn record_as(
 const EVENT_COLUMNS: &str =
     "id, graph_id, item_id, actor, session_id, kind, before, after, automatic, undoes, at";
 
-async fn set_state(tx: &mut PgConnection, item: Uuid, state: State) -> sqlx::Result<()> {
-    sqlx::query("update work_items set state = $2, updated_at = now() where id = $1")
-        .bind(item)
-        .bind(state.as_str())
-        .execute(&mut *tx)
-        .await
-        .map(|_| ())
+/// Sets an item's state, by the rules or by hand.
+async fn set_state(
+    tx: &mut PgConnection,
+    item: Uuid,
+    state: State,
+    by_rules: bool,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "update work_items set state = $2, state_by_rules = $3, updated_at = now() where id = $1",
+    )
+    .bind(item)
+    .bind(state.as_str())
+    .bind(by_rules)
+    .execute(&mut *tx)
+    .await
+    .map(|_| ())
 }
 
 /// Brings the items in `from`, and the items they're part of, into the state the rules put them in, recording each
@@ -474,7 +485,7 @@ async fn settle(
             if now == was {
                 continue;
             }
-            set_state(tx, id, now).await?;
+            set_state(tx, id, now, true).await?;
             record_as(
                 tx,
                 actor,
@@ -488,7 +499,7 @@ async fn settle(
             )
             .await?;
             if let Some(item) = rules.items.get_mut(&id) {
-                item.state = now;
+                (item.state, item.automatic) = (now, true);
             }
         }
     }
@@ -736,7 +747,7 @@ pub async fn move_state(db: &PgPool, actor: Actor<'_>, id: Uuid, to: State) -> W
         return conflict(why);
     }
     if was != to {
-        set_state(&mut tx, id, to).await?;
+        set_state(&mut tx, id, to, false).await?;
         record(
             &mut tx,
             actor,
@@ -1125,7 +1136,7 @@ pub async fn undo(db: &PgPool, actor: Actor<'_>, id: Uuid) -> WorkResult<Event> 
             kind = "state";
             before = Some(json!({"state": current.state}));
             after = Some(json!({"state": State::Dropped}));
-            set_state(&mut tx, current.id, State::Dropped).await?;
+            set_state(&mut tx, current.id, State::Dropped, false).await?;
             touched.push(current.id);
         }
         "edit" => {
@@ -1154,7 +1165,7 @@ pub async fn undo(db: &PgPool, actor: Actor<'_>, id: Uuid) -> WorkResult<Event> 
                 .and_then(|a| a["state"].as_str())
                 .and_then(State::parse)
                 .unwrap_or(State::Open);
-            set_state(&mut tx, current.id, to).await?;
+            set_state(&mut tx, current.id, to, false).await?;
             touched.push(current.id);
         }
         "move" => {
@@ -1214,14 +1225,20 @@ pub async fn undo(db: &PgPool, actor: Actor<'_>, id: Uuid) -> WorkResult<Event> 
             let Some(link) = uuid_at(&before, "id") else {
                 return Err(WorkError::NotFound);
             };
-            let deleted = sqlx::query("delete from work_links where id = $1")
-                .bind(link)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
-            if deleted == 0 {
+            // Only the link as it was made: once its status has changed, undoing that comes first.
+            let current: Option<Link> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "select {LINK_COLUMNS} from work_links where id = $1"
+            )))
+            .bind(link)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if current.map(|l| json!(l)) != before {
                 return changed_since();
             }
+            sqlx::query("delete from work_links where id = $1")
+                .bind(link)
+                .execute(&mut *tx)
+                .await?;
             kind = "unlink";
             touched.extend(item);
         }

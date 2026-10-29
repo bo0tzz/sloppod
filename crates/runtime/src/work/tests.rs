@@ -221,7 +221,7 @@ async fn links_and_parts_move_items(db: PgPool) {
     set_link_status(&db, DEV, closed.id, LinkStatus::Abandoned)
         .await
         .unwrap();
-    assert_eq!(state(&db, retry.id).await, "active");
+    assert_eq!(state(&db, retry.id).await, "open");
     move_state(&db, DEV, retry.id, State::Done).await.unwrap();
     assert_eq!(state(&db, retry.id).await, "done");
 }
@@ -332,5 +332,82 @@ async fn changes_are_recorded_and_undone_by_their_inverse(db: PgPool) {
             .unwrap()
             .len()
             > 10
+    );
+}
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+async fn what_the_rules_finished_reopens_when_its_cause_goes(db: PgPool) {
+    let graph = create_graph(&db, "dev", "g").await.unwrap().id;
+    let fix = add(&db, graph, "fix", None).await;
+    let finish = |link: Uuid| set_link_status(&db, DEV, link, LinkStatus::Finished);
+
+    // Its completing link removed, or abandoned.
+    let link = add_link(&db, DEV, fix.id, &pull("o/r#1")).await.unwrap();
+    finish(link.id).await.unwrap();
+    assert_eq!(state(&db, fix.id).await, "done");
+    remove_link(&db, DEV, link.id).await.unwrap();
+    assert_eq!(state(&db, fix.id).await, "open");
+    let link = add_link(&db, DEV, fix.id, &pull("o/r#2")).await.unwrap();
+    finish(link.id).await.unwrap();
+    set_link_status(&db, DEV, link.id, LinkStatus::Abandoned)
+        .await
+        .unwrap();
+    assert_eq!(state(&db, fix.id).await, "open");
+
+    // Its last part moved away.
+    let epic = add(&db, graph, "epic", None).await;
+    let part = add(&db, graph, "part", Some(epic.id)).await;
+    move_state(&db, DEV, part.id, State::Done).await.unwrap();
+    assert_eq!(state(&db, epic.id).await, "done");
+    let out = ItemMove {
+        parent_id: Some(None),
+        after: None,
+    };
+    move_item(&db, DEV, part.id, &out).await.unwrap();
+    assert_eq!(state(&db, epic.id).await, "open");
+
+    // Done by hand, with nothing linked, it stays done.
+    move_state(&db, DEV, epic.id, State::Done).await.unwrap();
+    let related = NewLink {
+        role: Role::Related,
+        ..pull("o/r#3")
+    };
+    let link = add_link(&db, DEV, epic.id, &related).await.unwrap();
+    remove_link(&db, DEV, link.id).await.unwrap();
+    assert_eq!(state(&db, epic.id).await, "done");
+
+    // A part can't block what it's part of: it waits on what blocks its parent.
+    let child = add(&db, graph, "child", Some(fix.id)).await;
+    assert!(matches!(
+        add_block(&db, DEV, child.id, fix.id).await,
+        Err(WorkError::Conflict(_))
+    ));
+}
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+async fn a_link_whose_status_changed_isnt_unmade_over_it(db: PgPool) {
+    let graph = create_graph(&db, "dev", "g").await.unwrap().id;
+    let item = add(&db, graph, "item", None).await;
+    let link = add_link(&db, DEV, item.id, &pull("o/r#1")).await.unwrap();
+    set_link_status(&db, DEV, link.id, LinkStatus::Finished)
+        .await
+        .unwrap();
+    let history = item_history(&db, "dev", item.id).await.unwrap().unwrap();
+    let linked = history.iter().find(|e| e.kind == "link").unwrap();
+    assert!(matches!(
+        undo(&db, DEV, linked.id).await,
+        Err(WorkError::Conflict(_))
+    ));
+    // Undoing the status change first, then the link, works.
+    let changed = history.iter().find(|e| e.kind == "link_status").unwrap();
+    undo(&db, DEV, changed.id).await.unwrap();
+    undo(&db, DEV, linked.id).await.unwrap();
+    assert!(
+        super::item(&db, "dev", item.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .links
+            .is_empty()
     );
 }

@@ -3,7 +3,7 @@
 //! API, and later agents' tools and the watchers that move links) applies the same ones.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -77,6 +77,8 @@ pub struct Item {
     pub parent: Option<Uuid>,
     pub state: State,
     pub rank: f64,
+    /// Whether the rules set its state, rather than someone by hand.
+    pub automatic: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -124,51 +126,77 @@ impl Graph {
         chain
     }
 
-    /// What has to finish before an item can: what blocks it, and its children. Both kinds of edge are kept acyclic
-    /// together, so no item ends up waiting on itself however the two mix.
+    /// What has to finish before an item can start or finish: what blocks it or any item it's part of (blockers are
+    /// inherited), and its children.
     fn waits_on(&self, id: Uuid) -> Vec<Uuid> {
+        let waiting: Vec<Uuid> = std::iter::once(id).chain(self.ancestors(id)).collect();
         self.blocks
             .iter()
-            .filter(|(_, blocked)| *blocked == id)
+            .filter(|(_, blocked)| waiting.contains(blocked))
             .map(|(blocker, _)| *blocker)
             .chain(self.children(id).map(|child| child.id))
             .collect()
     }
 
-    /// Whether `from` waits on `to`, directly or through others.
-    fn waits_for(&self, from: Uuid, to: Uuid) -> bool {
-        let mut seen = HashSet::new();
-        let mut stack = vec![from];
-        while let Some(at) = stack.pop() {
-            if at == to {
-                return true;
+    /// Whether some item ends up waiting on itself, so it and what waits on it could never start or finish.
+    fn deadlocked(&self) -> bool {
+        // Depth-first, colouring each item: on the stack (`false`) or finished (`true`).
+        let mut colour: HashMap<Uuid, bool> = HashMap::new();
+        for &start in self.items.keys() {
+            if colour.contains_key(&start) {
+                continue;
             }
-            if seen.insert(at) {
-                stack.extend(self.waits_on(at));
+            let mut stack = vec![(start, self.waits_on(start))];
+            colour.insert(start, false);
+            while let Some((at, pending)) = stack.last_mut() {
+                let (at, next) = (*at, pending.pop());
+                match next {
+                    Some(next) => match colour.get(&next) {
+                        Some(false) => return true,
+                        Some(true) => {}
+                        None => {
+                            colour.insert(next, false);
+                            let waits = self.waits_on(next);
+                            stack.push((next, waits));
+                        }
+                    },
+                    None => {
+                        colour.insert(at, true);
+                        stack.pop();
+                    }
+                }
             }
         }
         false
     }
 
-    /// Why `blocker` can't be made to block `blocked`, if it can't: it would close a cycle.
+    /// Why `blocker` can't be made to block `blocked`, if it can't: something would end up waiting on itself,
+    /// counting what blocks an item as blocking its parts too.
     pub fn refuse_block(&self, blocker: Uuid, blocked: Uuid) -> Option<String> {
         if blocker == blocked {
             return Some("an item can't block itself".into());
         }
-        // `blocked` will wait on `blocker`, so `blocker` mustn't already wait on `blocked`.
-        self.waits_for(blocker, blocked).then(|| {
-            "that would close a cycle: the blocker already waits on the item it would block".into()
+        let mut after = self.clone();
+        after.blocks.push((blocker, blocked));
+        after.deadlocked().then(|| {
+            "that would close a cycle: the blocker already waits on the item it would block, or on what blocks it"
+                .into()
         })
     }
 
-    /// Why `item` can't be made part of `parent`, if it can't: it would close a cycle.
+    /// Why `item` can't be made part of `parent`, if it can't: it would be part of itself, or something would end up
+    /// waiting on itself.
     pub fn refuse_parent(&self, item: Uuid, parent: Uuid) -> Option<String> {
-        if item == parent {
-            return Some("an item can't be part of itself".into());
+        if item == parent || self.ancestors(parent).contains(&item) {
+            return Some("an item can't be part of itself or of one of its parts".into());
         }
-        // `parent` will wait on `item`, so `item` mustn't already wait on `parent`.
-        self.waits_for(item, parent).then(|| {
-            "that would close a cycle: the item already waits on the one it would be part of".into()
+        let mut after = self.clone();
+        if let Some(moved) = after.items.get_mut(&item) {
+            moved.parent = Some(parent);
+        }
+        after.deadlocked().then(|| {
+            "that would close a cycle: the item already waits on the one it would be part of, or on what blocks it"
+                .into()
         })
     }
 
@@ -213,8 +241,9 @@ impl Graph {
     }
 
     /// The state an item's links and children put it in. A dropped item stays dropped; one they finish is done; one
-    /// they made done and no longer finish goes back to active or open; one something works on is active. Otherwise
-    /// it keeps the state it was given by hand.
+    /// something works on is active. One the rules made done or active, and that no longer is, goes back to open,
+    /// as does one done by hand that gains an unfinished part or a completing link. Otherwise it keeps the state it was
+    /// given by hand.
     pub fn settle(&self, id: Uuid) -> State {
         let Some(item) = self.items.get(&id) else {
             return State::Open;
@@ -225,13 +254,14 @@ impl Graph {
         if self.finished(id) {
             return State::Done;
         }
-        let follows_links = self.completing(id).next().is_some() || self.has_children(id);
         if self.worked_on(id) {
-            State::Active
-        } else if item.state == State::Done && follows_links {
-            State::Open
-        } else {
-            item.state
+            return State::Active;
+        }
+        let follows_links = self.completing(id).next().is_some() || self.has_children(id);
+        match item.state {
+            State::Done | State::Active if item.automatic => State::Open,
+            State::Done if follows_links => State::Open,
+            state => state,
         }
     }
 
@@ -336,6 +366,7 @@ mod tests {
             parent: parent.map(id),
             state,
             rank,
+            automatic: false,
         }
     }
 
@@ -370,13 +401,26 @@ mod tests {
         assert!(graph.refuse_block(id(3), id(1)).is_some());
         assert!(graph.refuse_block(id(1), id(1)).is_some());
         assert!(graph.refuse_block(id(1), id(3)).is_none());
-        // A parent blocking its own part would never finish.
+        // A parent blocking its own part would never finish, nor would a part blocking its parent, since a part
+        // waits on what blocks its parent.
         assert!(graph.refuse_block(id(5), id(4)).is_some());
-        assert!(graph.refuse_block(id(4), id(5)).is_none());
-        // Making 5 part of 4, its own part, or 3 part of 1, which 3 waits on.
+        assert!(graph.refuse_block(id(4), id(5)).is_some());
+        // 1 blocks 5, so 4 waits on 1 too: 4 can't block 1, nor can anything 4 blocks.
+        let mut inherited = graph.clone();
+        inherited.blocks.push((id(1), id(5)));
+        assert!(inherited.refuse_block(id(4), id(1)).is_some());
+        inherited.blocks.push((id(4), id(3)));
+        assert!(inherited.refuse_block(id(3), id(1)).is_some());
+        assert!(inherited.refuse_block(id(3), id(4)).is_some());
+        // Making 1 part of 5 means it waits on itself, through 5's blocker.
+        assert!(inherited.refuse_parent(id(1), id(5)).is_some());
+        assert!(inherited.refuse_parent(id(2), id(5)).is_none());
+        // Making 5 part of 4, its own part; 3 part of 1, which 3 waits on; or 1 part of 3, when 1 would then wait on
+        // 3's blocker 2, which waits on 1.
         assert!(graph.refuse_parent(id(5), id(4)).is_some());
         assert!(graph.refuse_parent(id(3), id(1)).is_some());
-        assert!(graph.refuse_parent(id(1), id(3)).is_none());
+        assert!(graph.refuse_parent(id(1), id(3)).is_some());
+        assert!(graph.refuse_parent(id(3), id(5)).is_none());
         assert!(graph.refuse_parent(id(5), id(5)).is_some());
     }
 
@@ -426,6 +470,16 @@ mod tests {
         by_hand.items.get_mut(&id(1)).unwrap().state = Dropped;
         by_hand.links.push(pr(Finished));
         assert_eq!(by_hand.settle(id(1)), Dropped);
+        // One the rules made done or active goes back to open once nothing makes it so: its completing link removed
+        // or abandoned, or its last part moved away.
+        let mut was_finished = graph(vec![], vec![]);
+        let item = was_finished.items.get_mut(&id(1)).unwrap();
+        (item.state, item.automatic) = (Done, true);
+        assert_eq!(was_finished.settle(id(1)), Open);
+        was_finished.links.push(pr(Abandoned));
+        assert_eq!(was_finished.settle(id(1)), Open);
+        was_finished.items.get_mut(&id(1)).unwrap().state = Active;
+        assert_eq!(was_finished.settle(id(1)), Open);
     }
 
     #[test]

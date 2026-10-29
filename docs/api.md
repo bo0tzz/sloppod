@@ -332,7 +332,7 @@ type StandingApproval = {
 
 ### Work
 
-The owner's work graphs ([ADR 30](adr/0030-work-items.md)). Each graph holds items. An item can be part of one other item, its parent, and can block others. Blocking edges and parent edges together never form a cycle: adding one that would is refused (`409`), and so is an edge between graphs (`400`). An item links the issues, pull requests, sessions and proposals that carry it out (`completes`) or relate to it (`related`). Every change is an event in the item's history, and a change can be undone from there. Owners see and change only their own graphs. So far the owner is the only one who changes them, and a link's `status` is set through this API; later stages give sessions a `work` grant and have the runtime move links as it watches pull requests, sessions and proposals.
+The owner's work graphs ([ADR 30](adr/0030-work-items.md)). Each graph holds items. An item can be part of one other item, its parent, and can block others. A part waits on what blocks the items it's part of, and an item on its parts. No edge may leave an item waiting on itself that way, through blocks, parts or inherited blockers: adding one that would is refused (`409`), as is making an item part of one of its own parts, and so is an edge between graphs (`400`). An item links the issues, pull requests, sessions and proposals that carry it out (`completes`) or relate to it (`related`). Every change is an event in the item's history, and a change can be undone from there. Owners see and change only their own graphs. So far the owner is the only one who changes them, and a link's `status` is set through this API; later stages give sessions a `work` grant and have the runtime move links as it watches pull requests, sessions and proposals.
 
 ```
 GET    /api/v1/work/graphs                     -> WorkGraph[]
@@ -407,7 +407,7 @@ type WorkEvent = {
 **State.** Items start `open`. The rules move them as their links and parts change, and each such move is an `automatic` event:
 
 - An item is `done` once every child is `done` or `dropped` and every completing link is `finished`. An abandoned completing link no longer counts. An item without completing links is done this way only if it has children.
-- An item that the rules made done, and that they no longer find done, goes back to `active` or `open`, for instance when a part is added or a link reopens.
+- An item that the rules made done or active, and that nothing makes so any more, goes back to `open`: for instance when its completing link is removed or abandoned, its last part is moved away, or the session working on it ends. An item made done by hand goes back to `open` when it gains an unfinished part or a completing link.
 - An item is `active` while a linked session is open (working), or a completing pull request or proposal is open.
 - A `dropped` item stays dropped. Otherwise an item keeps the state it was last given by hand.
 
