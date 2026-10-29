@@ -114,6 +114,9 @@ fn how_long(gap: chrono::Duration) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TurnEnd {
     Ended,
+    /// Someone stopped it (`stopReason: cancelled`). It counts as ended, except that nothing reads into what the
+    /// agent said last: it was cut off, by someone who knows.
+    Cancelled,
     /// It failed, with this error.
     Failed(String),
     /// It failed on the account's usage limit; the session carries on once that resets.
@@ -123,6 +126,7 @@ pub enum TurnEnd {
 impl TurnEnd {
     fn of(result: &Result<Value, RpcError>) -> Self {
         match result {
+            Ok(result) if result["stopReason"] == "cancelled" => TurnEnd::Cancelled,
             Ok(_) => TurnEnd::Ended,
             Err(e) if limits::is_usage_limit(e) => TurnEnd::Limited,
             Err(e) => TurnEnd::Failed(e.message.clone()),
@@ -1944,7 +1948,7 @@ impl Hub {
             state.last_turn = Some(end.clone());
             let until = match end {
                 TurnEnd::Limited => Some(limits::wait_until(reset, now)),
-                TurnEnd::Ended => None,
+                TurnEnd::Ended | TurnEnd::Cancelled => None,
                 TurnEnd::Failed(_) => state.limited_until,
             };
             let changed = until != state.limited_until;
