@@ -2049,11 +2049,11 @@ test("a model grant names the user's accounts, and the user picks which one it u
   try {
     await createSession(page, 'Fix the build in bo0tzz/sloppod');
     const model = (await openGrants(page)).getByTestId('grant-model');
-    // Made with all of the user's Claude accounts, the default first, which is the one in use.
+    // Made with all of the user's Claude accounts, the default first.
     const accounts = model.getByTestId('grant-account');
     await expect(accounts).toHaveCount(3);
     await expect(accounts.nth(0)).toContainText('Personal');
-    await expect(accounts.nth(0)).toContainText('in use');
+    await expect(accounts.nth(0)).toContainText('used first');
 
     // The third goes to the front, the others keep their order.
     const changing = page.waitForRequest((request) => request.method() === 'PATCH');
@@ -2062,7 +2062,7 @@ test("a model grant names the user's accounts, and the user picks which one it u
     expect(sent[0]).toBe(spare);
     expect(sent[2]).toBe(work);
     await expect(accounts.nth(0)).toContainText('Spare');
-    await expect(accounts.nth(0)).toContainText('in use');
+    await expect(accounts.nth(0)).toContainText('used first');
     await expect(accounts.nth(1)).toContainText('Personal');
 
     await accounts.nth(1).getByRole('button', { name: 'Remove' }).click();
@@ -2101,7 +2101,7 @@ test('a model grant whose accounts were all deleted is given another', async ({ 
   expect((await changing).postDataJSON().credentials).toHaveLength(1);
   await expect(accounts).toHaveCount(1);
   await expect(accounts.nth(0)).toContainText('Personal');
-  await expect(accounts.nth(0)).toContainText('in use');
+  await expect(accounts.nth(0)).toContainText('used first');
 });
 
 test('a grant made before the user had an account of its kind is given one later', async ({ page }) => {

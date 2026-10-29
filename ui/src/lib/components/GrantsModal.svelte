@@ -136,7 +136,7 @@
                     {#if live.includes(id)}
                       <span>{accountName(id) ?? ''}</span>
                       {#if live[0] === id}
-                        <Text color="muted" size="small">in use</Text>
+                        <Text color="muted" size="small">used first, the next while it's at its limit</Text>
                       {/if}
                     {:else}
                       <Text color="danger" size="small">A deleted account</Text>

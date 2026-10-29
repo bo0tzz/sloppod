@@ -13,6 +13,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::db::SessionRow;
+use crate::limits;
 use crate::link::{AgentConn, RpcError, from_agent};
 use crate::session::{Hub, TurnEnd};
 use crate::store::SessionStore;
@@ -2816,8 +2817,9 @@ async fn limited(h: &Harness) -> chrono::DateTime<chrono::Utc> {
 async fn a_session_at_its_usage_limit_waits_then_carries_on_with_what_queued() {
     let mut h = Harness::ready().await;
     let reset = chrono::Utc::now() + chrono::Duration::hours(2);
-    h.hub
-        .set_limit_hit(Arc::new(move |_| Box::pin(async move { Some(reset) })));
+    h.hub.set_limit_hit(Arc::new(move |_| {
+        Box::pin(async move { limits::Next::Wait(Some(reset)) })
+    }));
     let turn = h.prompt("Work");
     let request = h.next().await;
     hit_the_limit(&h, &request).await;
@@ -2909,6 +2911,37 @@ async fn a_message_steered_in_while_limited_tries_now_and_ends_the_wait() {
     h.agent_sent_nothing();
 }
 
+#[tokio::test]
+async fn a_session_at_one_account_s_limit_carries_on_at_once_with_the_next() {
+    let mut h = Harness::ready().await;
+    let notice = "sloppod: this session's Claude account Work hit its usage limit; carrying on with Personal. Carry on \
+                  where you left off.";
+    h.hub.set_limit_hit(Arc::new(move |_| {
+        Box::pin(async move { limits::Next::Fallback(notice.to_owned()) })
+    }));
+    let turn = h.prompt("Work");
+    let request = h.next().await;
+    hit_the_limit(&h, &request).await;
+    assert!(turn.await.unwrap().is_err());
+
+    // No wait for the reset: the next turn goes out at once, telling the agent which account it carries on with.
+    let request = h.next().await;
+    assert_eq!(request["method"], "session/prompt");
+    assert_eq!(prompt_text(&request), [notice]);
+    assert_eq!(h.hub.limited_until(h.id).await, None);
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+
+    // A later wait for a reset is told the usual notice, not this one.
+    h.hub
+        .set_limit_hit(Arc::new(|_| Box::pin(async { limits::Next::Wait(None) })));
+    let _turn = h.prompt("More");
+    let request = h.next().await;
+    hit_the_limit(&h, &request).await;
+    let until = limited(&h).await;
+    h.hub.resume_after_limit(h.id, until).await;
+    let request = h.next().await;
+    assert!(prompt_text(&request)[0].contains("should have reset"));
+}
 #[tokio::test]
 async fn a_wait_for_the_usage_limit_moves_with_the_quota() {
     let mut h = Harness::ready().await;

@@ -1,17 +1,20 @@
-//! Usage limits: telling a turn that failed on the account's usage limit from other failures, and when a session
-//! that hit one tries again (#251). What the agents report about the limits themselves is kept by `quota` (#140).
+//! Usage limits: telling a turn that failed on the account's usage limit from other failures, carrying on with the
+//! next account on the session's grant (#252), and when a session whose accounts are all limited tries again (#251).
+//! What the agents report about the limits themselves is kept by `quota` (#140).
 
 use chrono::{DateTime, Duration, Utc};
 use uuid::Uuid;
 
-use crate::credentials::{Account, CredentialRow};
+use sloppod_contracts::SessionContext;
+use sqlx::PgPool;
+
+use crate::credentials::{Account, CHATGPT, CredentialRow, Credentials};
 use crate::link::RpcError;
-use crate::{AppState, db, quota};
+use crate::quota::{self, PROBE_AFTER};
+use crate::{AppState, db};
 
 /// After the reported reset, so the first request after it isn't refused by a clock a little behind.
 const MARGIN: Duration = Duration::minutes(1);
-/// How long a session waits before trying again when nothing says when the limit resets.
-const PROBE_AFTER: Duration = Duration::minutes(30);
 
 /// How claude-agent-acp's synthetic usage-limit messages start (the Claude Agent SDK's
 /// `USAGE_LIMIT_ERROR_PREFIXES`) that reset in time, for when the failed prompt's error carries no kind.
@@ -43,68 +46,158 @@ pub fn wait_until(reset: Option<DateTime<Utc>>, now: DateTime<Utc>) -> DateTime<
         .map_or(now + PROBE_AFTER, |reset| reset + MARGIN)
 }
 
-/// The credential a session's agent uses: the account of the kind its agent needs that its grant names (ADR 29).
-async fn credential(state: &AppState, session: &db::SessionRow) -> Option<CredentialRow> {
-    let kind = state.agents.get(&session.agent)?.credential().kind;
-    match state
-        .credentials
-        .account(&session.context(), &kind)
-        .await
-        .ok()?
-    {
-        Account::Found(row) => Some(row),
-        _ => None,
+/// What a session whose turn hit its usage limit does next.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Next {
+    /// Another account on its grant isn't at its limit: the session carries on at once with it, told this (#252).
+    Fallback(String),
+    /// Every account on its grant is: it waits for the earliest reset, if one is known (#251).
+    Wait(Option<DateTime<Utc>>),
+}
+
+/// The session's agent's kind of account, and the session, for looking up its accounts.
+async fn of_session(state: &AppState, session: Uuid) -> Option<(String, SessionContext)> {
+    let row = db::get_session(&state.db, session).await.ok()??;
+    let kind = state.agents.get(&row.agent)?.credential().kind;
+    Some((kind, row.context()))
+}
+
+/// How long the limit of a session's accounts lasts.
+#[derive(Debug, PartialEq)]
+pub enum Lasts {
+    /// One of them isn't limited.
+    Not,
+    /// Until the earliest reset of theirs.
+    Until(DateTime<Utc>),
+    /// No reset is known.
+    Unknown,
+}
+
+/// Until the earliest reset among a session's accounts, when they're all limited. A limit whose reset isn't known
+/// counts as resetting when it's tried again ([`PROBE_AFTER`] after it was reported).
+pub async fn lasts(
+    credentials: &Credentials,
+    db: &PgPool,
+    kind: &str,
+    session: &SessionContext,
+    now: DateTime<Utc>,
+) -> Option<Lasts> {
+    let accounts = credentials.accounts(session, kind).await.ok()?;
+    let mut earliest: Option<DateTime<Utc>> = None;
+    for account in accounts {
+        let quota = quota::for_credential(db, account.id, now).await.ok()?;
+        match quota.filter(|q| q.limited) {
+            None => return Some(Lasts::Not),
+            Some(quota) => {
+                if let Some(reset) = quota.resets_at.as_deref().and_then(|r| r.parse().ok()) {
+                    earliest = Some(earliest.map_or(reset, |e: DateTime<Utc>| e.min(reset)));
+                }
+            }
+        }
+    }
+    Some(earliest.map_or(Lasts::Unknown, Lasts::Until))
+}
+
+/// When a session waiting for its usage limit carries on: now if one of its accounts isn't limited, else just after
+/// the earliest known reset of theirs; `None` when none is known.
+async fn wait_for(
+    state: &AppState,
+    kind: &str,
+    session: &SessionContext,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    match lasts(&state.credentials, &state.db, kind, session, now).await? {
+        Lasts::Not => Some(now),
+        Lasts::Until(reset) => Some(wait_until(Some(reset), now)),
+        Lasts::Unknown => None,
     }
 }
 
-/// A session's turn hit its usage limit: a review round it works on stops running out of time from now, kept at
-/// once so a restart doesn't lose the wait. Says when the limit resets, if that's known.
-pub async fn hit(state: &AppState, session: Uuid) -> Option<DateTime<Utc>> {
+/// The notice a session that moved to another account carries on with.
+fn fallback_notice(kind: &str, from: &CredentialRow, to: &CredentialRow) -> String {
+    let noun = match kind {
+        CHATGPT => "ChatGPT login",
+        _ => "Claude account",
+    };
+    format!(
+        "sloppod: this session's {noun} {} hit its usage limit; carrying on with {}. Carry on where you left off.",
+        from.name, to.name
+    )
+}
+
+/// After a session's turn failed on its usage limit: the account it used then, kept as limited, and the next on its
+/// grant that isn't limited, if there is one. The account used is the one last attached to its requests, not the one
+/// that would be chosen now, which a quota report from that turn may already have moved on.
+pub async fn fall_back(
+    credentials: &Credentials,
+    db: &PgPool,
+    session: &SessionContext,
+    kind: &str,
+    now: DateTime<Utc>,
+) -> sqlx::Result<(Option<CredentialRow>, Option<CredentialRow>)> {
+    let Some(used) = credentials.used(session, kind).await? else {
+        return Ok((None, None));
+    };
+    quota::mark_limited(db, used.id, now).await?;
+    let next = match credentials.account(session, kind).await? {
+        Account::Found(next)
+            if next.id != used.id && !quota::is_limited(db, next.id, now).await? =>
+        {
+            Some(next)
+        }
+        _ => None,
+    };
+    Ok((Some(used), next))
+}
+
+/// A session's turn hit its usage limit (#251, #252). The account it used is kept as limited, and if another account
+/// on its grant isn't, the session carries on with that one at once: the authorizer attaches it from the next
+/// request. Otherwise it waits for the earliest reset, and a review round it works on stops running out of time from
+/// now, kept at once so a restart doesn't lose the wait.
+pub async fn hit(state: &AppState, session: Uuid) -> Next {
+    let now = Utc::now();
+    let Some((kind, context)) = of_session(state, session).await else {
+        return wait(state, session, None).await;
+    };
+    match fall_back(&state.credentials, &state.db, &context, &kind, now).await {
+        Ok((Some(used), next)) => {
+            quota::announce(state, &used).await;
+            if let Some(next) = next {
+                tracing::info!(%session, from = %used.id, to = %next.id, "the session's account hit its usage limit; it carries on with the next");
+                return Next::Fallback(fallback_notice(&kind, &used, &next));
+            }
+        }
+        Ok((None, _)) => {}
+        Err(e) => tracing::warn!(%session, error = %e, "finding an account to fall back to"),
+    }
+    let reset = match lasts(&state.credentials, &state.db, &kind, &context, now).await {
+        Some(Lasts::Until(reset)) => Some(reset),
+        _ => None,
+    };
+    wait(state, session, reset).await
+}
+
+async fn wait(state: &AppState, session: Uuid, reset: Option<DateTime<Utc>>) -> Next {
     if let Err(e) = db::pause_reviewer(&state.db, session, Utc::now()).await {
         tracing::warn!(%session, error = %e, "pausing the review a session works on");
     }
-    reset(state, session).await
+    Next::Wait(reset)
 }
 
-/// When the limit the session's credential is at resets, if its quota says it's at one.
-pub async fn reset(state: &AppState, session: Uuid) -> Option<DateTime<Utc>> {
-    let row = db::get_session(&state.db, session).await.ok()??;
-    let credential = credential(state, &row).await?;
-    let quota = quota::for_credential(&state.db, credential.id, Utc::now())
-        .await
-        .ok()??;
-    quota.limited.then_some(())?;
-    quota.resets_at?.parse().ok()
-}
-
-/// A session's model grant was switched to another account (ADR 20, 29): a session waiting for the old account's
-/// limit waits for the new one's instead, and carries on now if the new one isn't at its limit.
+/// A session's model grant has other accounts, or in another order (ADR 20, 29): a session waiting for its usage
+/// limit waits for its accounts' earliest reset instead, and carries on now if one of them isn't limited.
 pub async fn switched(state: &AppState, session: Uuid) {
-    let Ok(Some(row)) = db::get_session(&state.db, session).await else {
+    let Some((kind, context)) = of_session(state, session).await else {
         return;
     };
-    let now = Utc::now();
-    let quota = match credential(state, &row).await {
-        Some(credential) => quota::for_credential(&state.db, credential.id, now)
-            .await
-            .ok()
-            .flatten(),
-        None => return,
-    };
-    let until = match quota.filter(|q| q.limited) {
-        None => now,
-        Some(quota) => match quota.resets_at.as_deref().and_then(|r| r.parse().ok()) {
-            Some(reset) => wait_until(Some(reset), now),
-            // Limited with no reset known: it waits as it was.
-            None => return,
-        },
-    };
-    state.hub.move_limit(session, until).await;
+    if let Some(until) = wait_for(state, &kind, &context, Utc::now()).await {
+        state.hub.move_limit(session, until).await;
+    }
 }
 
-/// Keeps the sessions waiting for a usage limit in step with their credentials' quotas: one whose credential
-/// is limited until a known time waits until just after it, and one whose credential isn't limited any more
-/// carries on now.
+/// Keeps the sessions waiting for a usage limit in step with their accounts' quotas: one whose accounts are all
+/// limited until known times waits until just after the earliest, and one with an account that isn't limited any
+/// more carries on now.
 pub fn follow_quotas(state: &AppState) {
     let state = state.clone();
     let mut changes = state.quotas.subscribe();
@@ -115,20 +208,6 @@ pub fn follow_quotas(state: &AppState) {
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             };
-            let now = Utc::now();
-            let until = if change.quota.limited {
-                let reset = change
-                    .quota
-                    .resets_at
-                    .as_deref()
-                    .and_then(|r| r.parse().ok());
-                match reset {
-                    Some(reset) => wait_until(Some(reset), now),
-                    None => continue,
-                }
-            } else {
-                now
-            };
             let waiting = match db::limited_sessions(&state.db).await {
                 Ok(waiting) => waiting,
                 Err(e) => {
@@ -137,16 +216,24 @@ pub fn follow_quotas(state: &AppState) {
                 }
             };
             for (id, _) in waiting {
-                let Ok(Some(row)) = db::get_session(&state.db, id).await else {
+                let Some((kind, context)) = of_session(&state, id).await else {
                     continue;
                 };
-                if row.owner != change.owner {
+                if context.owner != change.owner {
                     continue;
                 }
-                if credential(&state, &row)
-                    .await
-                    .is_some_and(|c| c.id == change.quota.credential_id)
-                {
+                let uses =
+                    state
+                        .credentials
+                        .accounts(&context, &kind)
+                        .await
+                        .is_ok_and(|accounts| {
+                            accounts.iter().any(|a| a.id == change.quota.credential_id)
+                        });
+                if !uses {
+                    continue;
+                }
+                if let Some(until) = wait_for(&state, &kind, &context, Utc::now()).await {
                     state.hub.move_limit(id, until).await;
                 }
             }

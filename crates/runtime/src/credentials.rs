@@ -145,6 +145,9 @@ pub struct Credentials {
     /// Held per login while refreshing it, so a single-use refresh token is only ever spent once, and a slow refresh
     /// holds up only that login's requests.
     chatgpt_refresh: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
+    /// The account last attached to each session's requests, by session and kind: what a quota report or a failed
+    /// turn is about, whichever account would be chosen now (#252). Lost on a restart, when the choice stands in.
+    attached: std::sync::Mutex<HashMap<(String, String), Uuid>>,
     http: reqwest::Client,
 }
 
@@ -208,6 +211,7 @@ impl Credentials {
             vault,
             github: Mutex::default(),
             chatgpt_refresh: Mutex::default(),
+            attached: Default::default(),
             // The refresh runs while a session's request waits on the authorizer, which Envoy gives 10 s.
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
@@ -466,24 +470,93 @@ impl Credentials {
         Ok(Some((row, secret)))
     }
 
+    /// [`Self::account`], for a request it's attached to: kept as the account the session last used.
+    pub async fn attach(&self, session: &SessionContext, kind: &str) -> sqlx::Result<Account> {
+        let account = self.account(session, kind).await?;
+        if let Account::Found(row) = &account {
+            self.attached
+                .lock()
+                .unwrap()
+                .insert((session.session_id.clone(), kind.to_owned()), row.id);
+        }
+        Ok(account)
+    }
+
+    /// The id of the account last attached to a session's requests for a kind. Read when something about those
+    /// requests arrives (a quota report), before anything waits: a fallback meanwhile attaches another (#252).
+    pub fn attached(&self, session_id: &str, kind: &str) -> Option<Uuid> {
+        self.attached
+            .lock()
+            .unwrap()
+            .get(&(session_id.to_owned(), kind.to_owned()))
+            .copied()
+    }
+
+    /// The account a session last used for a kind: the one last attached to its requests, if it's still there,
+    /// otherwise the one it would use now.
+    pub async fn used(
+        &self,
+        session: &SessionContext,
+        kind: &str,
+    ) -> sqlx::Result<Option<CredentialRow>> {
+        let attached = self.attached(&session.session_id, kind);
+        self.used_as_of(session, kind, attached).await
+    }
+
+    /// [`Self::used`], with the account that was attached when it was read.
+    pub async fn used_as_of(
+        &self,
+        session: &SessionContext,
+        kind: &str,
+        attached: Option<Uuid>,
+    ) -> sqlx::Result<Option<CredentialRow>> {
+        if let Some(id) = attached
+            && let Some(row) = self.owned(&session.owner, kind, &id.to_string()).await?
+        {
+            return Ok(Some(row));
+        }
+        Ok(match self.account(session, kind).await? {
+            Account::Found(row) => Some(row),
+            _ => None,
+        })
+    }
+
     /// The account a session's model grant acts with (ADR 29), for a kind of account (`claude`, `chatgpt`): the first
-    /// of the accounts it names that's still there. A grant that names none, made before the owner had an account of
-    /// the kind, uses the owner's default, and so do the runtime's judgements (ADR 26), whatever their session's
-    /// grant says.
+    /// of [`Self::accounts`] that isn't at its usage limit (#252), or the first if they all are.
     pub async fn account(&self, session: &SessionContext, kind: &str) -> sqlx::Result<Account> {
+        let accounts = self.accounts(session, kind).await?;
+        let now = Utc::now();
+        for account in &accounts {
+            if !crate::quota::is_limited(&self.db, account.id, now).await? {
+                return Ok(Account::Found(account.clone()));
+            }
+        }
+        Ok(match accounts.into_iter().next() {
+            Some(first) => Account::Found(first),
+            None if self.named_accounts(session, kind).await?.is_some() => Account::Gone,
+            None => Account::None,
+        })
+    }
+
+    /// The accounts of a kind a session can use, in order: those its model grant names that are still there. A grant
+    /// that names none, made before the owner had an account of the kind, uses the owner's default, and so do the
+    /// runtime's judgements (ADR 26), whatever their session's grant says.
+    pub async fn accounts(
+        &self,
+        session: &SessionContext,
+        kind: &str,
+    ) -> sqlx::Result<Vec<CredentialRow>> {
         let named = match session.role {
             SessionRole::Utility => None,
             _ => self.named_accounts(session, kind).await?,
         };
         Ok(match named {
-            Some(accounts) => accounts
-                .into_iter()
-                .next()
-                .map_or(Account::Gone, Account::Found),
+            Some(accounts) => accounts,
             None => self
                 .default_row(&session.owner, kind)
                 .await?
-                .map_or(Account::None, Account::Found),
+                .into_iter()
+                .collect(),
         })
     }
 
@@ -980,6 +1053,236 @@ mod tests {
         assert_eq!(used(&unnamed).await.as_deref(), Some("Another"));
     }
 
+    #[sqlx::test]
+    async fn a_session_moves_to_the_next_account_while_one_is_at_its_limit(db: PgPool) {
+        let credentials = credentials(db.clone()).await;
+        let work = add(&credentials, "dev", claude("Work")).await;
+        let personal = add(&credentials, "dev", claude("Personal")).await;
+        let session = SessionContext {
+            session_id: "s".into(),
+            owner: "dev".into(),
+            grants: vec![Grant::new(
+                "model",
+                json!({"credentials": [work.id.to_string(), personal.id.to_string()]}),
+            )],
+            role: SessionRole::Work,
+        };
+        let used = async || match credentials.account(&session, CLAUDE).await.unwrap() {
+            Account::Found(row) => row.name,
+            _ => unreachable!(),
+        };
+        let limit = async |id: Uuid, minutes: i64| {
+            let observation = crate::quota::Observation {
+                observed_at: Utc::now(),
+                limited: true,
+                resets_at: Some(Utc::now() + chrono::Duration::minutes(minutes)),
+                windows: Default::default(),
+            };
+            crate::quota::store(&db, id, &observation).await.unwrap();
+        };
+        assert_eq!(used().await, "Work");
+        limit(work.id, 60).await;
+        assert_eq!(used().await, "Personal");
+        // With every account limited, the first is used; requests on it are refused until a reset.
+        limit(personal.id, 30).await;
+        assert_eq!(used().await, "Work");
+        // A limit whose reset has passed is over, and the first account is used again.
+        let over = crate::quota::Observation {
+            observed_at: Utc::now(),
+            limited: true,
+            resets_at: Some(Utc::now() - chrono::Duration::minutes(1)),
+            windows: Default::default(),
+        };
+        crate::quota::store(&db, work.id, &over).await.unwrap();
+        assert_eq!(used().await, "Work");
+        assert!(
+            !crate::quota::is_limited(&db, work.id, Utc::now())
+                .await
+                .unwrap()
+        );
+        assert!(
+            crate::quota::is_limited(&db, personal.id, Utc::now())
+                .await
+                .unwrap()
+        );
+    }
+
+    #[sqlx::test]
+    async fn a_limit_is_kept_against_the_account_that_was_used(db: PgPool) {
+        let credentials = credentials(db.clone()).await;
+        let work = add(&credentials, "dev", claude("Work")).await;
+        let personal = add(&credentials, "dev", claude("Personal")).await;
+        let session = SessionContext {
+            session_id: "s".into(),
+            owner: "dev".into(),
+            grants: vec![Grant::new(
+                "model",
+                json!({"credentials": [work.id.to_string(), personal.id.to_string()]}),
+            )],
+            role: SessionRole::Work,
+        };
+        let name = |row: Option<CredentialRow>| row.map(|r| r.name);
+        let attached = match credentials.attach(&session, CLAUDE).await.unwrap() {
+            Account::Found(row) => row.name,
+            _ => unreachable!(),
+        };
+        assert_eq!(attached, "Work");
+        // Work's report that it's limited comes before the turn fails: the account chosen now moves on, but the
+        // failure is still Work's.
+        let rejected = crate::quota::Observation {
+            observed_at: Utc::now(),
+            limited: true,
+            resets_at: Some(Utc::now() + chrono::Duration::hours(1)),
+            windows: Default::default(),
+        };
+        crate::quota::store(&db, work.id, &rejected).await.unwrap();
+        assert_eq!(
+            name(credentials.used(&session, CLAUDE).await.unwrap()).as_deref(),
+            Some("Work")
+        );
+        let (used, next) =
+            crate::limits::fall_back(&credentials, &db, &session, CLAUDE, Utc::now())
+                .await
+                .unwrap();
+        assert_eq!(
+            (name(used).as_deref(), name(next).as_deref()),
+            (Some("Work"), Some("Personal"))
+        );
+        assert!(
+            !crate::quota::is_limited(&db, personal.id, Utc::now())
+                .await
+                .unwrap()
+        );
+
+        // Then Personal is attached, and hits its limit too: nothing is left to fall back to.
+        credentials.attach(&session, CLAUDE).await.unwrap();
+        let (used, next) =
+            crate::limits::fall_back(&credentials, &db, &session, CLAUDE, Utc::now())
+                .await
+                .unwrap();
+        assert_eq!(
+            (name(used).as_deref(), name(next).as_deref()),
+            (Some("Personal"), None)
+        );
+        assert!(
+            crate::quota::is_limited(&db, personal.id, Utc::now())
+                .await
+                .unwrap()
+        );
+    }
+
+    #[sqlx::test]
+    async fn a_limit_with_no_known_reset_is_tried_again_after_a_while(db: PgPool) {
+        let credentials = credentials(db.clone()).await;
+        let work = add(&credentials, "dev", claude("Work")).await;
+        let personal = add(&credentials, "dev", claude("Personal")).await;
+        let session = SessionContext {
+            session_id: "s".into(),
+            owner: "dev".into(),
+            grants: vec![Grant::new(
+                "model",
+                json!({"credentials": [work.id.to_string(), personal.id.to_string()]}),
+            )],
+            role: SessionRole::Work,
+        };
+        let used = async || match credentials.account(&session, CLAUDE).await.unwrap() {
+            Account::Found(row) => row.name,
+            _ => unreachable!(),
+        };
+        let reported = |minutes_ago: i64| crate::quota::Observation {
+            observed_at: Utc::now() - chrono::Duration::minutes(minutes_ago),
+            limited: true,
+            resets_at: None,
+            windows: Default::default(),
+        };
+        crate::quota::store(&db, work.id, &reported(10))
+            .await
+            .unwrap();
+        assert_eq!(used().await, "Personal");
+        sqlx::query("delete from credential_quotas")
+            .execute(&db)
+            .await
+            .unwrap();
+        crate::quota::store(&db, work.id, &reported(31))
+            .await
+            .unwrap();
+        assert_eq!(used().await, "Work");
+    }
+
+    #[sqlx::test]
+    async fn a_wait_ends_when_a_limit_with_no_known_reset_is_tried_again(db: PgPool) {
+        let credentials = credentials(db.clone()).await;
+        let work = add(&credentials, "dev", claude("Work")).await;
+        let personal = add(&credentials, "dev", claude("Personal")).await;
+        let session = SessionContext {
+            session_id: "s".into(),
+            owner: "dev".into(),
+            grants: vec![Grant::new(
+                "model",
+                json!({"credentials": [work.id.to_string(), personal.id.to_string()]}),
+            )],
+            role: SessionRole::Work,
+        };
+        let now = Utc::now();
+        // Work said it's limited 20 minutes ago, without a reset; Personal is limited for five hours.
+        let unknown = crate::quota::Observation {
+            observed_at: now - chrono::Duration::minutes(20),
+            limited: true,
+            resets_at: None,
+            windows: Default::default(),
+        };
+        crate::quota::store(&db, work.id, &unknown).await.unwrap();
+        let known = crate::quota::Observation {
+            observed_at: now,
+            limited: true,
+            resets_at: Some(now + chrono::Duration::hours(5)),
+            windows: Default::default(),
+        };
+        crate::quota::store(&db, personal.id, &known).await.unwrap();
+        let lasts = crate::limits::lasts(&credentials, &db, CLAUDE, &session, now).await;
+        // Within the database's microseconds of Work's probe deadline, not Personal's reset.
+        let Some(crate::limits::Lasts::Until(until)) = lasts else {
+            panic!("{lasts:?}");
+        };
+        let deadline = unknown.observed_at + crate::quota::PROBE_AFTER;
+        assert!(
+            (until - deadline).num_milliseconds().abs() < 1,
+            "{until} {deadline}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn a_report_is_kept_against_the_account_attached_when_it_came(db: PgPool) {
+        let credentials = credentials(db.clone()).await;
+        let work = add(&credentials, "dev", claude("Work")).await;
+        let personal = add(&credentials, "dev", claude("Personal")).await;
+        let session = SessionContext {
+            session_id: "s".into(),
+            owner: "dev".into(),
+            grants: vec![Grant::new(
+                "model",
+                json!({"credentials": [work.id.to_string(), personal.id.to_string()]}),
+            )],
+            role: SessionRole::Work,
+        };
+        credentials.attach(&session, CLAUDE).await.unwrap();
+        // Work's report arrives; before it's handled, Work's turn fails and the session falls back to Personal.
+        let arrived = credentials.attached("s", CLAUDE);
+        crate::quota::mark_limited(&db, work.id, Utc::now())
+            .await
+            .unwrap();
+        credentials.attach(&session, CLAUDE).await.unwrap();
+        let name = |row: Option<CredentialRow>| row.map(|r| r.name);
+        assert_eq!(
+            name(credentials.used(&session, CLAUDE).await.unwrap()).as_deref(),
+            Some("Personal")
+        );
+        let reported = credentials
+            .used_as_of(&session, CLAUDE, arrived)
+            .await
+            .unwrap();
+        assert_eq!(name(reported).as_deref(), Some("Work"));
+    }
     #[sqlx::test]
     async fn the_owner_gives_a_model_grant_only_their_own_accounts_of_its_kind(db: PgPool) {
         let credentials = credentials(db.clone()).await;

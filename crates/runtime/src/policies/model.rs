@@ -53,7 +53,7 @@ impl RequestPolicy for ModelPolicy {
         }
         let account = match self
             .credentials
-            .account(session, CLAUDE)
+            .attach(session, CLAUDE)
             .await
             .map_err(|e| Error::new(e.to_string()))?
         {
