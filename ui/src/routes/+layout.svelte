@@ -3,7 +3,7 @@
   import { afterNavigate } from '$app/navigation';
   import { page } from '$app/state';
   import { AppShell, AppShellSidebar, IconButton, TooltipProvider } from '@immich/ui';
-  import { mdiCogOutline, mdiMenuOpen, mdiPlus } from '@mdi/js';
+  import { mdiCogOutline, mdiFileTreeOutline, mdiMenuOpen, mdiPlus } from '@mdi/js';
   import { onMount, type Snippet } from 'svelte';
   import { account, sourceLink } from '#lib/account.svelte.ts';
   import AppIcon from '#lib/components/AppIcon.svelte';
@@ -80,6 +80,7 @@
                 >
               {/if}
             </div>
+            <IconButton href="/work" icon={mdiFileTreeOutline} aria-label="Work" variant="ghost" shape="round" size="small" color="secondary" />
             <IconButton href="/settings" icon={mdiCogOutline} aria-label="Settings" variant="ghost" shape="round" size="small" color="secondary" />
           </div>
         </nav>

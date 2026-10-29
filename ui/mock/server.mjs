@@ -14,6 +14,7 @@ import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { formatPatch, structuredPatch } from 'diff';
 import { WebSocketServer } from 'ws';
+import { handleWork, workGraphs } from './work.mjs';
 
 const { values: args } = parseArgs({
   options: {
@@ -307,8 +308,6 @@ const grantable = {
   codex: "Codex's API on chatgpt.com, with the owner's ChatGPT login.",
 };
 
-/** The user's work graphs (ADR 30). */
-const workGraphs = [{ id: '0192f000-0000-7000-8000-000000000001', name: 'sloppod', created_at: '2026-10-29T10:00:00Z' }];
 
 /** What the runtime says of a `work` grant (`grants::describe`). */
 const workDescription = (graph, level) =>
@@ -1503,7 +1502,7 @@ async function handleApi(req, res, url) {
 
   if (parts[0] === 'credentials') return handleCredentials(req, res, parts);
   if (parts[0] === 'capabilities') return handleCapabilities(req, res, parts);
-  if (parts[0] === 'work' && parts[1] === 'graphs' && parts.length === 2 && method === 'GET') return json(res, 200, workGraphs);
+  if (parts[0] === 'work') return handleWork(req, res, parts, { json, readBody, user: req.headers['x-forwarded-user'] ?? 'bo0tzz' });
   if (parts[0] === 'quotas' && parts.length === 1 && method === 'GET') return json(res, 200, quotas);
   if (parts[0] === 'standing-approvals') return handleStandingApprovals(req, res, parts);
 

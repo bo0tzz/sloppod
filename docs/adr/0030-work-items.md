@@ -95,3 +95,14 @@ Open questions:
 - **Proposals.** A pull request or stack that a proposal opens is linked to the items its session is linked to, with the same role as the session's link. So the pull request of a session that completes an item completes it too. A proposal is marked once that's done (`work_followed_proposals`). One carried out without the mark, however long ago, is linked by the next minute's pass, so a failure or a restart in between loses nothing; those carried out before following existed were marked when it arrived. After that it's left alone, even once someone unlinks what it linked.
 - **Sessions.** Links to sessions and proposals store the id in canonical form, however it was written, and older ones were rewritten to it. A session link is `open` while the session acts, and `finished` once it has an executed report (a sub-session's `report_done`). It's `abandoned` once the session is parked, stopped or deleted without one. This is checked every minute, and at once when a report is carried out. A sub-session that's given more work after reporting stays `finished`.
 
+
+2026-10-29: stage 4 is built ([#387](https://github.com/bo0tzz/sloppod/issues/387)): the work graph in the UI.
+- **Pages:** `/work` lists the owner's graphs and makes new ones. `/work/<id>` shows a graph: its ready list (the frontier, by rank) first, then the rest grouped by state with what blocks each, and a structure view. The structure view is the graph's edges as a list, not a diagram: parts are indented under what they're part of, by rank, and each item says what blocks it.
+- **An item's detail:**
+  - description and state;
+  - links, each opening where it lives (GitHub for issues and pull requests, a session's page);
+  - blockers and parts;
+  - its history, with undo for each change except the rules' own.
+- **Editing as the owner:** add items and blockers, link, change state (dropping included), reparent, and rank. Ranking is by dragging an item onto a sibling, or with the item's move up and down buttons, which also work on a phone.
+- **Home page:** shows the first five ready items of each graph, as the dashboard ([#137](https://github.com/bo0tzz/sloppod/issues/137)) begins. The sidebar links to `/work`.
+

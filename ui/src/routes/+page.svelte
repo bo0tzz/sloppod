@@ -1,11 +1,12 @@
 <script lang="ts">
   import { Alert, Button, Heading, IconButton, LoadingSpinner } from '@immich/ui';
-  import { mdiCogOutline, mdiPlus } from '@mdi/js';
+  import { mdiCogOutline, mdiFileTreeOutline, mdiPlus } from '@mdi/js';
   import { onMount } from 'svelte';
   import { api } from '#lib/api.ts';
   import AppIcon from '#lib/components/AppIcon.svelte';
   import QuotaMeters from '#lib/components/QuotaMeters.svelte';
   import SessionList from '#lib/components/SessionList.svelte';
+  import WorkFrontier from '#lib/components/WorkFrontier.svelte';
   import { sessions } from '#lib/sessions.svelte.ts';
 
   let noClaude = $state(false);
@@ -27,6 +28,7 @@
     <AppIcon class="size-8" />
     <Heading tag="h1" size="small" class="grow">Sessions</Heading>
     <Button href="/new" leadingIcon={mdiPlus} shape="round" size="small">New session</Button>
+    <IconButton href="/work" icon={mdiFileTreeOutline} aria-label="Work" variant="ghost" shape="round" color="secondary" />
     <IconButton href="/settings" icon={mdiCogOutline} aria-label="Settings" variant="ghost" shape="round" color="secondary" />
   </header>
 
@@ -47,6 +49,8 @@
 
   <!-- The sidebar, where they are elsewhere, isn't on this page, and on a phone it isn't anywhere. -->
   <QuotaMeters framed />
+
+  <WorkFrontier />
 
   {#if sessions.error}
     <Alert color="danger" title="Couldn't load sessions" size="small">{sessions.error}</Alert>

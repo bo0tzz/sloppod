@@ -2075,9 +2075,14 @@ test('grants a session one of the work graphs at a level', async ({ page }) => {
   await add.getByRole('button', { name: 'Grant' }).click();
   await expect(grants.getByTestId('grant-work')).toContainText('The work graph sloppod');
   await expect(grants.getByTestId('grant-work')).toContainText('propose plan changes');
-  // Its only graph is granted, so work isn't offered again.
+  // The granted graph isn't offered again; work is, only while other graphs (from other tests) are left.
   await add.getByRole('combobox', { name: 'Grant' }).click();
-  await expect(page.getByRole('option', { name: 'work' })).toHaveCount(0);
+  const work = page.getByRole('option', { name: 'work' });
+  if ((await work.count()) > 0) {
+    await work.click();
+    await add.getByRole('combobox', { name: 'Graph' }).click();
+    await expect(page.getByRole('option', { name: 'sloppod', exact: true })).toHaveCount(0);
+  }
 });
 
 test('a grant gets a new expiry, and a refused change can be tried again', async ({ page }) => {
@@ -2618,4 +2623,170 @@ test('dialogs take focus when they open and give it back when they close', async
   await page.keyboard.press('Escape');
   await expect(page.getByRole('dialog')).toBeHidden();
   await expect(proposals).toBeFocused();
+});
+
+/** A new work graph with these items, made through the UI; returns the graph's page. Names are unique per test run. */
+async function workGraph(page: Page, items: string[]): Promise<string> {
+  const name = `plan-${Math.random().toString(36).slice(2, 8)}`;
+  await page.goto('/work');
+  await page.getByRole('textbox', { name: 'New graph' }).fill(name);
+  await page.getByRole('button', { name: 'Create' }).click();
+  await page.getByTestId('work-graphs').getByRole('link', { name }).click();
+  await expect(page.getByTestId('session-title')).toHaveText(name);
+  for (const title of items) {
+    await page.getByRole('textbox', { name: 'New item' }).fill(title);
+    await page.getByRole('button', { name: 'Add', exact: true }).click();
+    await expect(page.getByTestId('work-tree').getByRole('button', { name: title, exact: true })).toBeVisible();
+  }
+  return name;
+}
+
+const workItemIn = (page: Page, section: string, title: string) =>
+  page.getByTestId(section).locator(`[data-testid="work-item"][data-title="${title}"]`);
+
+async function openWorkItem(page: Page, title: string) {
+  await page.getByTestId('work-tree').getByRole('button', { name: title, exact: true }).click();
+  const detail = page.getByTestId('work-item-detail');
+  await expect(detail).toBeVisible();
+  return detail;
+}
+
+test('a work graph shows what is ready first, then the rest by state, and its structure', async ({ page }) => {
+  await workGraph(page, ['Design', 'Build', 'Ship']);
+  const ready = page.getByTestId('work-ready');
+  await expect(ready.getByTestId('work-item')).toHaveText([/Design/, /Build/, /Ship/]);
+
+  // Build waits on Design: it leaves the ready list and says why.
+  const build = await openWorkItem(page, 'Build');
+  await build.getByRole('combobox', { name: 'Add a blocker' }).click();
+  await page.getByRole('option', { name: 'Design' }).click();
+  await build.getByRole('button', { name: 'Block' }).click();
+  await expect(build.getByTestId('work-blockers')).toContainText('Design');
+  await page.keyboard.press('Escape');
+  await expect(ready.getByTestId('work-item')).toHaveText([/Design/, /Ship/]);
+  await expect(workItemIn(page, 'work-open', 'Build').getByTestId('blocked-by')).toHaveText('Blocked by Design');
+
+  // A cycle is refused, with the reason.
+  const design = await openWorkItem(page, 'Design');
+  await design.getByRole('combobox', { name: 'Add a blocker' }).click();
+  await page.getByRole('option', { name: 'Build' }).click();
+  await design.getByRole('button', { name: 'Block' }).click();
+  await expect(design).toContainText('would close a cycle');
+
+  // Design done releases Build.
+  await design.getByRole('combobox', { name: 'State' }).click();
+  await page.getByRole('option', { name: 'done' }).click();
+  await page.keyboard.press('Escape');
+  await expect(ready.getByTestId('work-item')).toHaveText([/Build/, /Ship/]);
+  await expect(workItemIn(page, 'work-done', 'Design')).toBeVisible();
+
+  // A finished blocker blocks nothing: Build's row no longer names Design.
+  await expect(workItemIn(page, 'work-tree', 'Build').getByTestId('blocked-by')).toHaveCount(0);
+  // What blocks an item blocks its parts too: Docs, part of Ship, waits on what blocks Ship.
+  await page.getByRole('textbox', { name: 'New item' }).fill('Docs');
+  await page.getByRole('combobox', { name: 'Part of' }).click();
+  await page.getByRole('option', { name: 'Ship' }).click();
+  await page.getByRole('button', { name: 'Add', exact: true }).click();
+  await expect(workItemIn(page, 'work-ready', 'Docs')).toBeVisible();
+  const ship = await openWorkItem(page, 'Ship');
+  await ship.getByRole('combobox', { name: 'Add a blocker' }).click();
+  await page.getByRole('option', { name: 'Build' }).click();
+  await ship.getByRole('button', { name: 'Block' }).click();
+  await page.keyboard.press('Escape');
+  await expect(workItemIn(page, 'work-ready', 'Docs')).toHaveCount(0);
+  await expect(workItemIn(page, 'work-open', 'Docs').getByTestId('blocked-by')).toHaveText('Blocked by Build (through Ship)');
+
+  // Parts sit under what they're part of.
+  await page.getByRole('textbox', { name: 'New item' }).fill('Tests');
+  await page.getByRole('combobox', { name: 'Part of' }).click();
+  await page.getByRole('option', { name: 'Ship' }).click();
+  await page.getByRole('button', { name: 'Add', exact: true }).click();
+  const tests = page.getByTestId('work-tree').locator('[data-testid="work-item"][data-title="Tests"]');
+  await expect(tests).toHaveAttribute('style', /padding-inline-start: 1\.25rem/);
+});
+
+test("an item's detail links, changes and undoes from its history", async ({ page }) => {
+  await workGraph(page, ['Fix the build']);
+  const detail = await openWorkItem(page, 'Fix the build');
+
+  // A completing pull request: it opens on GitHub, and makes the item active.
+  await detail.getByRole('textbox', { name: 'Target' }).fill('bo0tzz/sloppod#12');
+  await detail.getByRole('combobox', { name: 'Link' }).click();
+  await page.getByRole('option', { name: 'Pull request' }).click();
+  await detail.getByRole('button', { name: 'Add link' }).click();
+  const pull = detail.getByTestId('work-links').getByRole('link', { name: 'Pull request bo0tzz/sloppod#12' });
+  await expect(pull).toHaveAttribute('href', 'https://github.com/bo0tzz/sloppod/pull/12');
+  await expect(detail.getByRole('combobox', { name: 'State' })).toContainText('active');
+
+  // Edited, then undone from the history.
+  await detail.getByRole('button', { name: 'Edit' }).click();
+  await detail.getByRole('textbox', { name: 'Title' }).fill('Fix the flaky build');
+  await detail.getByRole('button', { name: 'Save' }).click();
+  await expect(page.getByRole('dialog').getByRole('paragraph').first()).toHaveText('Fix the flaky build');
+  const renamed = detail.getByTestId('work-event').filter({ hasText: 'renamed it' });
+  await renamed.getByRole('button', { name: 'Undo' }).click();
+  await expect(page.getByRole('dialog').getByRole('paragraph').first()).toHaveText('Fix the build');
+  // The rules' own change has no undo; it follows the link.
+  await expect(detail.getByTestId('work-event').filter({ hasText: '(by the rules)' }).getByRole('button', { name: 'Undo' })).toHaveCount(0);
+
+  // Merged: the owner says so on the link, and the item is done by it.
+  await detail.getByTestId('work-links').getByRole('combobox').first().click();
+  await page.getByRole('option', { name: 'finished' }).click();
+  await expect(detail.getByRole('combobox', { name: 'State' })).toContainText('done');
+  // Reopened, it's active again.
+  await detail.getByTestId('work-links').getByRole('combobox').first().click();
+  await page.getByRole('option', { name: 'open', exact: true }).click();
+  await expect(detail.getByRole('combobox', { name: 'State' })).toContainText('active');
+
+  // Done by hand isn't allowed while the pull request decides; dropping is.
+  await detail.getByRole('combobox', { name: 'State' }).click();
+  await page.getByRole('option', { name: 'done' }).click();
+  await expect(detail).toContainText("it's done when its completing links are finished");
+  await detail.getByRole('combobox', { name: 'State' }).click();
+  await page.getByRole('option', { name: 'dropped' }).click();
+  await page.keyboard.press('Escape');
+  await expect(workItemIn(page, 'work-dropped', 'Fix the build')).toBeVisible();
+});
+
+test('items rerank by dragging, and the home page shows what is ready', async ({ page }) => {
+  const name = await workGraph(page, ['First', 'Second', 'Third']);
+  const tree = page.getByTestId('work-tree').getByTestId('work-tree-item');
+  await tree.filter({ hasText: 'Third' }).dragTo(tree.filter({ hasText: 'First' }));
+  await expect(page.getByTestId('work-ready').getByTestId('work-item')).toHaveText([/Third/, /First/, /Second/]);
+  // Without dragging, from an item's detail.
+  const second = await openWorkItem(page, 'Second');
+  await second.getByRole('button', { name: 'Move up' }).click();
+  await page.keyboard.press('Escape');
+  await expect(page.getByTestId('work-ready').getByTestId('work-item')).toHaveText([/Third/, /Second/, /First/]);
+
+  await page.goto('/');
+  const frontier = page.locator(`[data-testid="work-frontier-graph"][data-graph="${name}"]`);
+  await expect(frontier.getByRole('link')).toHaveText([name, 'Third', 'Second', 'First']);
+  await frontier.getByRole('link', { name }).click();
+  await expect(page.getByTestId('session-title')).toHaveText(name);
+});
+
+test('work graphs are a click away in the sidebar', async ({ page }) => {
+  await page.goto('/settings');
+  await page.getByTestId('sidebar').getByRole('link', { name: 'Work' }).click();
+  await expect(page).toHaveURL(/\/work$/);
+  await expect(page.getByTestId('work-graphs')).toBeVisible();
+});
+
+test.describe('work on a phone', () => {
+  test.use({ viewport: { width: 390, height: 844 } });
+
+  test('a work graph and an item fit, and change', async ({ page }) => {
+    await page.goto('/');
+    await page.getByRole('link', { name: 'Work' }).click();
+    await expect(page).toHaveURL(/\/work$/);
+    await workGraph(page, ['Read the issue', 'Write the fix']);
+    const fits = async () => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth);
+    expect(await fits()).toBe(true);
+    const detail = await openWorkItem(page, 'Write the fix');
+    expect(await fits()).toBe(true);
+    await detail.getByRole('button', { name: 'Move up' }).click();
+    await page.keyboard.press('Escape');
+    await expect(page.getByTestId('work-ready').getByTestId('work-item')).toHaveText([/Write the fix/, /Read the issue/]);
+  });
 });

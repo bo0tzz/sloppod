@@ -77,6 +77,49 @@ export type WorkGraph = { id: string; name: string; created_at: string };
 /** What a `work` grant lets a session do with its graph. */
 export type WorkLevel = 'read' | 'track' | 'plan';
 
+export type WorkState = 'open' | 'active' | 'done' | 'dropped';
+export type WorkLinkKind = 'issue' | 'pull_request' | 'session' | 'proposal';
+/** What an item links to (`docs/api.md`, "Work"). */
+export type WorkLink = {
+  id: string;
+  item_id: string;
+  kind: WorkLinkKind;
+  /** `owner/repo#n` for issues and pull requests; an id otherwise. */
+  target: string;
+  role: 'completes' | 'related';
+  status: 'open' | 'finished' | 'abandoned';
+  created_at: string;
+};
+export type WorkItem = {
+  id: string;
+  graph_id: string;
+  parent_id: string | null;
+  title: string;
+  description: string;
+  state: WorkState;
+  rank: number;
+  links: WorkLink[];
+  /** The items it blocks. */
+  blocks: string[];
+  /** The items that block it. */
+  blocked_by: string[];
+  created_at: string;
+  updated_at: string;
+};
+export type WorkEvent = {
+  id: string;
+  graph_id: string;
+  item_id: string | null;
+  actor: string;
+  session_id: string | null;
+  kind: string;
+  before: Record<string, unknown> | null;
+  after: Record<string, unknown> | null;
+  automatic: boolean;
+  undoes: string | null;
+  at: string;
+};
+
 export type ProposalStatus =
   | 'in_review'
   | 'changes_requested'
@@ -339,6 +382,29 @@ export const api = {
   grantSession: (id: string, capability: string, expires_at?: string, params?: { graph: string; level: WorkLevel }) =>
     call<Session>('POST', `/sessions/${encodeURIComponent(id)}/grants`, { capability, expires_at, params }),
   listWorkGraphs: () => call<WorkGraph[]>('GET', '/work/graphs'),
+  createWorkGraph: (name: string) => call<WorkGraph>('POST', '/work/graphs', { name }),
+  getWorkGraph: (id: string) => call<WorkGraph & { items: WorkItem[] }>('GET', `/work/graphs/${encodeURIComponent(id)}`),
+  workFrontier: (id: string) => call<WorkItem[]>('GET', `/work/graphs/${encodeURIComponent(id)}/frontier`),
+  /** `after`: the sibling it goes right after; `null` for first, left out for last. */
+  addWorkItem: (graph: string, item: { title: string; description?: string; parent_id?: string | null; after?: string | null }) =>
+    call<WorkItem>('POST', `/work/graphs/${encodeURIComponent(graph)}/items`, item),
+  editWorkItem: (id: string, edit: { title?: string; description?: string }) =>
+    call<WorkItem>('PATCH', `/work/items/${encodeURIComponent(id)}`, edit),
+  setWorkState: (id: string, state: WorkState) => call<WorkItem>('POST', `/work/items/${encodeURIComponent(id)}/state`, { state }),
+  /** Reparents and reranks: `parent_id` `null` for the top level, left out to stay; `after` as for `addWorkItem`. */
+  moveWorkItem: (id: string, to: { parent_id?: string | null; after?: string | null }) =>
+    call<WorkItem>('POST', `/work/items/${encodeURIComponent(id)}/move`, to),
+  addWorkBlock: (blocker: string, blocked: string) =>
+    call<WorkItem>('POST', `/work/items/${encodeURIComponent(blocker)}/blocks`, { item: blocked }),
+  removeWorkBlock: (blocker: string, blocked: string) =>
+    call<WorkItem>('DELETE', `/work/items/${encodeURIComponent(blocker)}/blocks/${encodeURIComponent(blocked)}`),
+  addWorkLink: (item: string, link: { kind: WorkLinkKind; target: string; role: 'completes' | 'related' }) =>
+    call<WorkLink>('POST', `/work/items/${encodeURIComponent(item)}/links`, link),
+  setWorkLinkStatus: (id: string, status: WorkLink['status']) =>
+    call<WorkLink>('PATCH', `/work/links/${encodeURIComponent(id)}`, { status }),
+  removeWorkLink: (id: string) => call<void>('DELETE', `/work/links/${encodeURIComponent(id)}`),
+  workItemHistory: (id: string) => call<WorkEvent[]>('GET', `/work/items/${encodeURIComponent(id)}/history`),
+  undoWorkEvent: (id: string) => call<WorkEvent>('POST', `/work/events/${encodeURIComponent(id)}/undo`, {}),
   changeGrant: (id: string, grant: string, change: GrantChange) =>
     call<Session>('PATCH', `/sessions/${encodeURIComponent(id)}/grants/${encodeURIComponent(grant)}`, change),
   revokeGrant: (id: string, grant: string) =>
