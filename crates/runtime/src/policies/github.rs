@@ -71,6 +71,30 @@ impl GitHubPolicy {
         }
     }
 
+    /// Whether the owner's token the session acts with on `repo` reaches nothing the session isn't granted with it:
+    /// every repository it listed when it was added is granted with that token, and it listed them all.
+    async fn reaches_only_grants(&self, session: &SessionContext, repo: &str) -> bool {
+        let Some(credential) = session.repo_credential(repo) else {
+            return false;
+        };
+        let Ok(Some(row)) = self
+            .credentials
+            .github_user(&session.owner, credential)
+            .await
+        else {
+            return false;
+        };
+        let Some(reach) = row.config["repositories"].as_array() else {
+            return false;
+        };
+        row.config["more_repositories"].as_bool() == Some(false)
+            && reach.iter().all(|reached| {
+                reached
+                    .as_str()
+                    .is_some_and(|r| session.repo_credential(r) == Some(credential))
+            })
+    }
+
     async fn git(
         &self,
         session: &SessionContext,
@@ -270,14 +294,29 @@ impl GitHubPolicy {
         // granted repository whose installation still works. A session with no repository it reads as the App gets a
         // token for public data only. Without a GitHub App, or when minting fails, reads are unauthenticated.
         // Repositories the session acts on with one of the owner's tokens are read with that token, and only when the
-        // request names nothing else; the App's tokens never cover them.
+        // request names nothing else; the App's tokens never cover them. GraphQL also needs a token that reaches nothing
+        // beyond what it's granted for, since a query can go on from a repository it names to others.
         let granted: Vec<&str> = session.repos().collect();
-        let named: Vec<String> = if path == "/graphql" {
+        let graphql = path == "/graphql";
+        let named: Vec<String> = if graphql {
             graphql_repos(&request.body).unwrap_or_default()
         } else {
             named_repo(path).into_iter().collect()
         };
-        if let Some(repo) = user_token_repo(session, &granted, &named) {
+        let mut as_user = user_token_repo(session, &granted, &named);
+        if let Some(repo) = as_user
+            && graphql
+            && !self.reaches_only_grants(session, repo).await
+        {
+            tracing::info!(
+                session = %session.session_id,
+                %repo,
+                "GraphQL read as the App: the owner's token reaches more than this session is granted with it; \
+                 REST reads of the repository use the token"
+            );
+            as_user = None;
+        }
+        if let Some(repo) = as_user {
             return match self.acting_as(session, repo).await {
                 Ok(Some(client)) => {
                     let token = client.read_token(repo, &[]).await.map_err(err)?;
@@ -794,17 +833,13 @@ mod tests {
         assert!(!refused(policy.decide(&session, &fetch).await.unwrap()));
     }
 
-    /// A policy over the fake GitHub, with the owner's App and two of their tokens, `github_pat_u` and
-    /// `github_pat_v`, whose credential ids it returns.
+    /// A policy over the fake GitHub, with the owner's App and one token of theirs for each of `reaches` (the
+    /// repositories it reaches, and whether there are more), `github_pat_0` on, whose credential ids it returns.
     async fn reads_policy(
         db: sqlx::PgPool,
         fake: crate::github::tests::Fake,
-    ) -> (
-        GitHubPolicy,
-        Arc<crate::github::tests::Fake>,
-        String,
-        String,
-    ) {
+        reaches: &[(&[&str], bool)],
+    ) -> (GitHubPolicy, Arc<crate::github::tests::Fake>, Vec<String>) {
         use crate::credentials::{GITHUB_APP, GITHUB_USER};
         use crate::github::GitHubApp;
 
@@ -814,21 +849,30 @@ mod tests {
                 .await
                 .unwrap();
         let (fake, app) = crate::github::tests::serve(fake).await;
-        credentials.add_github_client("dev", GITHUB_APP, app).await;
+        credentials
+            .add_github_client("dev", GITHUB_APP, serde_json::json!({}), app)
+            .await;
         let mut users = Vec::new();
-        for token in ["github_pat_u", "github_pat_v"] {
-            let client =
-                GitHubApp::for_user_with_api(crate::github::API, token.into(), "octo".into())
-                    .unwrap();
+        for (n, (repositories, more)) in reaches.iter().enumerate() {
+            let client = GitHubApp::for_user_with_api(
+                crate::github::API,
+                format!("github_pat_{n}"),
+                "octo".into(),
+            )
+            .unwrap();
+            let config = serde_json::json!({
+                "login": "octo",
+                "repositories": repositories,
+                "more_repositories": more,
+            });
             let id = credentials
-                .add_github_client("dev", GITHUB_USER, client)
+                .add_github_client("dev", GITHUB_USER, config, client)
                 .await;
             users.push(id.to_string());
         }
         let (rechecks, _) = Rechecks::new(db);
         let policy = GitHubPolicy::new(Arc::new(credentials), Arc::default(), rechecks);
-        let v = users.pop().unwrap();
-        (policy, fake, users.pop().unwrap(), v)
+        (policy, fake, users)
     }
 
     /// A session holding `github` and read grants on `repos`, each with the credential it names, if any.
@@ -899,12 +943,24 @@ mod tests {
     async fn graphql_reads_with_the_owners_token_only_on_its_grants(db: sqlx::PgPool) {
         use serde_json::json;
 
-        let (policy, fake, u, v) = reads_policy(db, Default::default()).await;
+        let (policy, fake, users) = reads_policy(
+            db,
+            Default::default(),
+            &[
+                (&["u/mine", "U/Two"], false),
+                (&["u/three"], false),
+                (&["u/four", "u/secret"], false),
+                (&["u/five"], true),
+            ],
+        )
+        .await;
         let session = reading(&[
             ("o/r", None),
-            ("u/mine", Some(&u)),
-            ("u/two", Some(&u)),
-            ("u/three", Some(&v)),
+            ("u/mine", Some(&users[0])),
+            ("u/two", Some(&users[0])),
+            ("u/three", Some(&users[1])),
+            ("u/four", Some(&users[2])),
+            ("u/five", Some(&users[3])),
         ]);
         let decide = |request: HttpRequest| {
             let (policy, session) = (&policy, &session);
@@ -916,11 +972,11 @@ mod tests {
 
         assert_eq!(
             decide(pr_view("u/mine")).await.as_deref(),
-            Some("github_pat_u")
+            Some("github_pat_0")
         );
         assert_eq!(
             decide(pr_view("U/Mine")).await.as_deref(),
-            Some("github_pat_u")
+            Some("github_pat_0")
         );
         let both = api_request(
             "POST",
@@ -928,7 +984,7 @@ mod tests {
             json!({"query": "{ a: repository(owner: \"u\", name: \"mine\") { id } \
                     b: repository(owner: \"u\", name: \"two\") { id } }"}),
         );
-        assert_eq!(decide(both).await.as_deref(), Some("github_pat_u"));
+        assert_eq!(decide(both).await.as_deref(), Some("github_pat_0"));
 
         // An App-granted or ungranted repository, or one named alongside a token-granted one, reads as the App.
         for request in [
@@ -967,9 +1023,26 @@ mod tests {
             assert_eq!(decide(request).await.as_deref(), Some("token-1"), "{query}");
         }
 
+        // A token that reaches an ungranted repository, or more than it listed, could take a query on from a granted
+        // repository to anything it reaches, so GraphQL reads as the App; REST still uses the token.
+        for (repo, pat) in [("u/four", "github_pat_2"), ("u/five", "github_pat_3")] {
+            assert_eq!(
+                decide(pr_view(repo)).await.as_deref(),
+                Some("token-1"),
+                "{repo}"
+            );
+            assert_eq!(last_minted(&fake), app_read);
+            let rest = api_request(
+                "GET",
+                &format!("/repos/{repo}/pulls"),
+                serde_json::Value::Null,
+            );
+            assert_eq!(decide(rest).await.as_deref(), Some(pat));
+        }
+
         // REST reads as before.
         let rest = api_request("GET", "/repos/u/mine/pulls", serde_json::Value::Null);
-        assert_eq!(decide(rest).await.as_deref(), Some("github_pat_u"));
+        assert_eq!(decide(rest).await.as_deref(), Some("github_pat_0"));
         let mutation = api_request(
             "POST",
             "/graphql",
@@ -985,9 +1058,11 @@ mod tests {
     async fn a_session_with_no_app_repository_reads_public_data_as_the_app(db: sqlx::PgPool) {
         use serde_json::json;
 
-        let (policy, fake, u, _) = reads_policy(db, Default::default()).await;
+        let (policy, fake, users) =
+            reads_policy(db, Default::default(), &[(&["u/mine"], false)]).await;
+        let u = &users[0];
         let public = json!({"repositories": ["site"], "permissions": {"metadata": "read"}});
-        for session in [reading(&[("u/mine", Some(&u))]), reading(&[])] {
+        for session in [reading(&[("u/mine", Some(u))]), reading(&[])] {
             for request in [
                 pr_view("x/y"),
                 api_request("POST", "/graphql", json!({"query": "{ viewer { login } }"})),

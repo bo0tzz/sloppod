@@ -689,22 +689,25 @@ impl Credentials {
 
 #[cfg(test)]
 impl Credentials {
-    /// Stores `client` as one of the owner's GitHub credentials of `kind` without asking GitHub, the App as the
-    /// default, and returns its id.
+    /// Stores `client` as one of the owner's GitHub credentials of `kind`, with `config`, without asking GitHub, the
+    /// App as the default, and returns its id.
     pub(crate) async fn add_github_client(
         &self,
         owner: &str,
         kind: &str,
+        config: Value,
         client: GitHubApp,
     ) -> Uuid {
         let id = Uuid::new_v4();
         sqlx::query(
-            "insert into credentials (id, owner, kind, name, secret, is_default) values ($1, $2, $3, $4, '', $5)",
+            "insert into credentials (id, owner, kind, name, config, secret, is_default) \
+             values ($1, $2, $3, $4, $5, '', $6)",
         )
         .bind(id)
         .bind(owner)
         .bind(kind)
         .bind(id.to_string())
+        .bind(config)
         .bind(kind == GITHUB_APP)
         .execute(&self.db)
         .await
