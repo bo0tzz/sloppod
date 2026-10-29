@@ -296,7 +296,7 @@ pub async fn call(
                 return Err(plan_change(level));
             }
             done(
-                super::move_state(db, actor, item.id, to)
+                super::track_state(db, actor, item.id, to)
                     .await
                     .map_err(work_error)?,
             )
@@ -604,6 +604,15 @@ impl ProposalKind for WorkPlan {
             .as_str()
             .and_then(|g| g.parse().ok())
             .ok_or_else(|| Error::new("the proposal names no graph"))?;
+        // The grant may have been revoked or narrowed while the proposal waited: it acts only with `plan` now.
+        match graph_for(session, &json!({"graph": graph})) {
+            Ok((_, Level::Plan)) => {}
+            _ => {
+                return Err(Error::new(
+                    "this session no longer holds a plan-level work grant of that graph, so nothing was changed",
+                ));
+            }
+        }
         let actor = Actor {
             user: &session.owner,
             session: session.session_id.parse().ok(),
@@ -893,6 +902,103 @@ mod tests {
         );
     }
 
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_plan_carries_out_only_while_the_grant_still_covers_it(db: PgPool) {
+        let graph = super::super::create_graph(&db, "dev", "g")
+            .await
+            .unwrap()
+            .id;
+        let planner = granted_at(&db, graph, "plan").await;
+        let item = update(&db, &planner, json!({"action": "add_item", "title": "x"}))
+            .await
+            .unwrap();
+        let plan = WorkPlan::new(db.clone());
+        let payload = plan
+            .prepare(
+                &planner,
+                json!({"changes": [{"item": item["id"], "action": "drop"}], "reason": "r"}),
+            )
+            .await
+            .unwrap();
+        // Revoked, then narrowed to track, while it waited.
+        let revoked = SessionContext {
+            grants: vec![],
+            ..planner.clone()
+        };
+        let narrowed = granted_at(&db, graph, "track").await;
+        let narrowed = SessionContext {
+            session_id: planner.session_id.clone(),
+            ..narrowed
+        };
+        for session in [&revoked, &narrowed] {
+            assert!(
+                plan.execute(session, Uuid::now_v7(), &payload)
+                    .await
+                    .is_err()
+            );
+        }
+        let id = item["id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(
+            super::super::item(&db, "dev", id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "open"
+        );
+        plan.execute(&planner, Uuid::now_v7(), &payload)
+            .await
+            .unwrap();
+        assert_eq!(
+            super::super::item(&db, "dev", id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "dropped"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn tracking_never_reopens_a_drop_that_landed_first(db: PgPool) {
+        // The agent's read saw it open; the owner's drop lands before its change takes the graph's lock.
+        let graph = super::super::create_graph(&db, "dev", "g")
+            .await
+            .unwrap()
+            .id;
+        let tracker = granted_at(&db, graph, "track").await;
+        let item = update(&db, &tracker, json!({"action": "add_item", "title": "x"}))
+            .await
+            .unwrap();
+        let id = item["id"].as_str().unwrap().parse().unwrap();
+        let owner = Actor {
+            user: "dev",
+            session: None,
+        };
+        super::super::move_state(&db, owner, id, State::Dropped)
+            .await
+            .unwrap();
+        let agent = Actor {
+            user: "dev",
+            session: tracker.session_id.parse().ok(),
+        };
+        assert!(matches!(
+            super::super::track_state(&db, agent, id, State::Active).await,
+            Err(WorkError::Conflict(_))
+        ));
+        assert!(matches!(
+            super::super::track_state(&db, agent, id, State::Dropped).await,
+            Err(WorkError::Conflict(_))
+        ));
+        assert_eq!(
+            super::super::item(&db, "dev", id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "dropped"
+        );
+    }
     #[test]
     fn a_sub_session_tracks_at_most() {
         let mut plan = Grant::new(capability::WORK, json!({"graph": "g", "level": "plan"}));
