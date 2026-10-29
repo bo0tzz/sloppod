@@ -640,44 +640,55 @@ impl GitHubApp {
         {
             return Ok((id, repo));
         }
-        let installations: Vec<Value> = self
-            .app_get(&format!("/app/installations?per_page={PAGE}"))
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        let mut chosen = None;
-        let mut fallback = None;
-        for id in installations.iter().filter_map(|i| i["id"].as_u64()) {
-            let Some(token) = self.mint(TokenScope::full(id)).await? else {
-                continue;
-            };
-            let listed: Value = self
-                .http
-                .get(self.url(&format!("/installation/repositories?per_page={PAGE}")))
-                .bearer_auth(token)
-                .header("accept", "application/vnd.github+json")
-                .timeout(AUTHZ_TIMEOUT)
-                .send()
+        let installations = all_pages(|page| async move {
+            Ok(self
+                .app_get(&format!("/app/installations?per_page={PAGE}&page={page}"))
                 .await?
                 .error_for_status()?
                 .json()
-                .await?;
-            let repos = listed["repositories"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            let name = |r: &Value| Some((id, r["name"].as_str()?.to_lowercase()));
-            if let Some(public) = repos
-                .iter()
-                .filter(|r| r["private"] == Value::Bool(false))
-                .find_map(name)
-            {
-                chosen = Some(public);
-                break;
-            }
-            if fallback.is_none() {
-                fallback = repos.iter().find_map(name);
+                .await?)
+        })
+        .await?;
+        let mut chosen = None;
+        let mut fallback = None;
+        // Every page, until a public repository turns up: settling for a private one means its metadata is readable.
+        'installations: for id in installations.iter().filter_map(|i| i["id"].as_u64()) {
+            let Some(token) = self.mint(TokenScope::full(id)).await? else {
+                continue;
+            };
+            for page in 1.. {
+                let listed: Value = self
+                    .http
+                    .get(self.url(&format!(
+                        "/installation/repositories?per_page={PAGE}&page={page}"
+                    )))
+                    .bearer_auth(&token)
+                    .header("accept", "application/vnd.github+json")
+                    .timeout(AUTHZ_TIMEOUT)
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                let repos = listed["repositories"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let name = |r: &Value| Some((id, r["name"].as_str()?.to_lowercase()));
+                if let Some(public) = repos
+                    .iter()
+                    .filter(|r| r["private"] == Value::Bool(false))
+                    .find_map(name)
+                {
+                    chosen = Some(public);
+                    break 'installations;
+                }
+                if fallback.is_none() {
+                    fallback = repos.iter().find_map(name);
+                }
+                if repos.len() < PAGE {
+                    break;
+                }
             }
         }
         let (id, repo) = chosen
@@ -1614,21 +1625,41 @@ pub(crate) mod tests {
         readied: Mutex<Vec<String>>,
         /// The current installation has no public repository; otherwise `o/site` is one.
         pub(crate) all_private: bool,
+        /// How many more private repositories, `p<n>`, come between `o/r2` and `o/site`.
+        pub(crate) more_private: usize,
     }
 
-    async fn installations(State(fake): State<Arc<Fake>>) -> Json<Value> {
+    async fn installations(
+        State(fake): State<Arc<Fake>>,
+        axum::extract::Query(page): axum::extract::Query<HashMap<String, usize>>,
+    ) -> Json<Value> {
+        if page["page"] > 1 {
+            return Json(json!([]));
+        }
         Json(json!([{"id": fake.installation.load(Ordering::SeqCst)}]))
     }
 
-    /// The current installation's repositories.
-    async fn installation_repositories(State(fake): State<Arc<Fake>>) -> Json<Value> {
+    /// The current installation's repositories, a page at a time.
+    async fn installation_repositories(
+        State(fake): State<Arc<Fake>>,
+        axum::extract::Query(page): axum::extract::Query<HashMap<String, usize>>,
+    ) -> Json<Value> {
         let mut repos = vec![
             json!({"name": "r", "private": true}),
             json!({"name": "r2", "private": true}),
         ];
+        repos.extend(
+            (0..fake.more_private).map(|n| json!({"name": format!("p{n}"), "private": true})),
+        );
         if !fake.all_private {
             repos.push(json!({"name": "site", "private": false}));
         }
+        let (per_page, page) = (page["per_page"], page["page"]);
+        let repos: Vec<Value> = repos
+            .into_iter()
+            .skip((page - 1) * per_page)
+            .take(per_page)
+            .collect();
         Json(json!({"repositories": repos}))
     }
 
@@ -2215,6 +2246,15 @@ pub(crate) mod tests {
         .await;
         app.public_read_token().await.unwrap();
         assert_eq!(fake.minted.lock().unwrap()[1], (1, metadata_of("r")));
+
+        // A public repository past the first pages is still found.
+        let (fake, app) = serve(Fake {
+            more_private: 2 * PAGE,
+            ..Fake::default()
+        })
+        .await;
+        app.public_read_token().await.unwrap();
+        assert_eq!(fake.minted.lock().unwrap()[1], (1, metadata_of("site")));
 
         let user = GitHubApp::for_user_with_api(API, "t".into(), "octo".into()).unwrap();
         assert!(user.public_read_token().await.is_err());
