@@ -14,8 +14,10 @@
     ModalFooter,
     Text,
     Textarea,
+    modalManager,
   } from '@immich/ui';
   import { mdiChevronRight, mdiOpenInNew } from '@mdi/js';
+  import { tick } from 'svelte';
   import {
     api,
     type IssueDraft,
@@ -190,9 +192,64 @@
     resetDrafts();
     editing = false;
   }
+
+  /** Whether there are edits that closing the modal, or leaving editing, would throw away. */
+  const dirty = $derived.by(() => {
+    if (!editing) return false;
+    if (pr) return title !== pr.title || body !== pr.body;
+    const strip = <T extends object>(items: T[], key: string) =>
+      JSON.stringify(items.map((item) => Object.fromEntries(Object.entries(item).filter(([k]) => k !== key))));
+    if (issues) return strip(drafts, 'file') !== JSON.stringify(issues.issues);
+    if (issueUpdates) return strip(updateDrafts, 'make') !== JSON.stringify(issueUpdates.updates);
+    return false;
+  });
+
+  /** Asks before unsaved edits are thrown away; says whether to go on. */
+  async function mayDiscard(action: string): Promise<boolean> {
+    if (!dirty) return true;
+    return (
+      (await modalManager.showDialog({
+        title: 'Discard your edits?',
+        prompt: `Your edits haven't been used yet. ${action} throws them away.`,
+        confirmText: 'Discard edits',
+      })) === true
+    );
+  }
+
+  async function requestClose() {
+    if (await mayDiscard('Closing')) onClose();
+  }
+
+  async function leaveEditing() {
+    if (await mayDiscard('Leaving editing')) discardEdits();
+  }
+
+  function startRejecting() {
+    rejecting = true;
+    void tick().then(() => document.querySelector<HTMLTextAreaElement>('textarea[name="reason"]')?.focus());
+  }
+
+  function cancelRejecting() {
+    rejecting = false;
+    void tick().then(() => document.querySelector<HTMLButtonElement>('[data-testid="proposal-reject"]')?.focus());
+  }
+
+  // Esc undoes one step before it closes anything: it cancels a rejection, then leaves editing, then closes (#366).
+  function onEscape(event: KeyboardEvent) {
+    event.preventDefault();
+    if (rejecting) cancelRejecting();
+    else if (editing) void leaveEditing();
+    else void requestClose();
+  }
 </script>
 
-<Modal title={proposalKinds[kind]?.title ?? `Proposal: ${kind}`} icon={summary.icon} size={pr || stack ? 'giant' : issues ? 'large' : 'medium'} {onClose}>
+<Modal
+  title={proposalKinds[kind]?.title ?? `Proposal: ${kind}`}
+  icon={summary.icon}
+  size={pr || stack ? 'giant' : issues ? 'large' : 'medium'}
+  onClose={requestClose}
+  onEscapeKeydown={onEscape}
+>
   <ModalBody>
     <div class="flex flex-col gap-5 pb-4" data-testid="proposal-detail">
       {#if previous}
@@ -398,7 +455,7 @@
           <Textarea bind:value={reason} rows={2} name="reason" placeholder="Tell the agent why" />
         </Field>
         <div class="flex justify-end gap-2">
-          <Button color="secondary" variant="ghost" shape="round" onclick={() => (rejecting = false)}>Cancel</Button>
+          <Button color="secondary" variant="ghost" shape="round" onclick={cancelRejecting}>Cancel</Button>
           <Button color="danger" shape="round" loading={busy === 'reject'} onclick={reject}>Reject</Button>
         </div>
       {:else}
@@ -409,7 +466,14 @@
               {stack ? 'Merge the stack when checks pass' : 'Merge when checks pass'}
             </label>
           {/if}
-          <Button color="danger" variant="outline" shape="round" disabled={busy !== null} onclick={() => (rejecting = true)}>
+          <Button
+            color="danger"
+            variant="outline"
+            shape="round"
+            disabled={busy !== null}
+            onclick={startRejecting}
+            data-testid="proposal-reject"
+          >
             Reject…
           </Button>
           {#if editing}
