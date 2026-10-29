@@ -9,6 +9,8 @@ What bo0tzz and the sessions working on sloppod have learned about working toget
 - **A new idea becomes a labelled issue, not work.** Start on something at once only when it's called urgent ("first priority", "fix this now").
 - **Labels:** every issue gets an area label (`ui`, `harness`, `proposals`, `security`, `credentials`, `memory`, `ci`, `adr`, `prompt`, `testing`, `enforcement`), plus `dogfood` when it came from using sloppod, and `priority` or `needs discussion` where they apply. Check `gh label list`; don't invent labels.
 - **Design first where it's needed:** a change that contradicts or extends an ADR gets the ADR (or an amendment) proposed and discussed before it's built.
+- **Look before adding:** search the issues before filing one, and the ADRs before proposing one. A new ADR that restates an existing one is a dated amendment to that one instead, with only what's new.
+- **Decide what you can:** within agreed work, make the design calls yourself, say what you decided in the PR, and move on. Ask only what only the user can answer.
 
 ## Talking to the user
 
@@ -49,6 +51,7 @@ The parent session manages, and sub-sessions ([ADR 27](adr/0027-sub-sessions.md)
   - Squash-merged bases leave their children conflicting, though main has the same content: merge main in and keep the child's side where `git diff <base> origin/main -- <file>` is empty.
   - A conflict-free merge can still be wrong: read the result, e.g. an early return from one change that defeats another.
   - `git checkout --theirs <file>` takes the other side's whole file and silently drops this branch's other changes in it.
+  - When a pull request merges, GitHub deletes its head branch. A sub-session building on it has to move to `origin/main`, so tell it as soon as it merges.
   - Never build a commit from a sub-session's whole tree; its base may be older than main, which would revert what merged since. Cherry-pick or merge, then check `git diff origin/main --stat` lists only the change's files.
 
 ## Environment
@@ -56,3 +59,5 @@ The parent session manages, and sub-sessions ([ADR 27](adr/0027-sub-sessions.md)
 - Put work in `/workspace` (e.g. git worktrees under `/workspace/wt/`), never `/tmp`, which a pod restart wipes.
 - "The user doesn't want to take this action right now. STOP…" as a tool result is Claude Code's cancel text, not a rejection: something cancelled the running tool call. On 2026-10-28 that was usually a notice steered into the call ([#259](https://github.com/bo0tzz/sloppod/issues/259), fixed by #264, which makes notices wait). But a user's own steer still interrupts a tool call on purpose, and Esc or Stop cancel the turn. So before calling it the bug, check what came in at that moment: a steered message from the user, or a cancel in the runtime's log (cancels and permission answers are logged with who sent them). If it was the user, treat it as their instruction.
 - Sessions can push workflow files once the push token asks for `workflows: write` (in progress).
+- **After a cluster roll** (node drains, upgrades): look for proposals stuck at `approved`, whose outcome couldn't be recorded (#326), and for pull requests whose head push guard turned auto-merge off. An MCP server that failed to connect when the agent started stays gone until its next start; memini can still be reached directly at `$MEMINI_BASE_URL/mcp` meanwhile.
+- **When a safety classifier stops a response** mid-edit, its content mustn't be produced again, even reworded. Hand that piece of work to a sub-session with a brief instead of retrying it. On 2026-10-29 it fired on ordinary refactors, more often late in a long session.
