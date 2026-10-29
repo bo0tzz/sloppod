@@ -195,6 +195,91 @@ const FEEDBACK: &str = "\n# Feedback on sloppod\n\
     act on), tell the user briefly, with what you tried. Mention it once, alongside your work, rather than stopping \
     for it.\n";
 
+/// What Claude Code's auto mode is told about where it runs (`autoMode.environment`), so that it judges tool calls
+/// against what the pod can reach rather than a developer's own machine. It replaces Claude Code's defaults; the
+/// entries kept from them are worded as there.
+fn auto_mode_environment(context: &AgentContext) -> Vec<String> {
+    let workdir = &context.workdir;
+    let repos_dir = &context.repos_dir;
+    let trusted = match &context.repo {
+        Some(repo) => format!(
+            "{repo}, checked out at {} (the agent's working directory), and the other repositories this session \
+             is granted, cloned under {repos_dir}",
+            context.repo_dir
+        ),
+        None => format!("the repositories this session is granted, cloned under {repos_dir}"),
+    };
+    vec![
+        "**Primary use of Claude Code**: software development, as the agent of a sloppod session. sloppod runs \
+         each session in a sandboxed Kubernetes pod of its own, and limits what the pod can reach and change to \
+         the session's grants, enforced outside the pod."
+            .to_owned(),
+        format!(
+            "**Host containment**: a Kubernetes pod for this session alone, running as an unprivileged user, with \
+             no Kubernetes API token and no cloud identity; the agent operates no identity of the hosting layer. \
+             {workdir} is the session's own volume and survives pod restarts; the rest of the filesystem comes from \
+             the session image and is reset when the pod is recreated. Other than `tini`, `sloppod-supervisor` and \
+             the agent with what it runs, every process in the pod was started by this session."
+        ),
+        "**Network posture**: egress is denied by default, outside the pod. The pod reaches the sloppod runtime \
+         and, through an authorizing proxy that checks each request against the session's grants, the model API, \
+         GitHub, the memory service and other granted services; with the `packages` grant it also reaches package \
+         registries and toolchain downloads directly. Hosts that aren't granted don't resolve. The `list_grants` \
+         tool lists what the session may reach."
+            .to_owned(),
+        "**Secrets management**: credentials never enter the pod. The tokens in its environment and config \
+         (`CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN`, `MEMINI_API_KEY`, anything reading `sloppod-placeholder`) are \
+         placeholders; the proxy attaches the real credential to each request it allows."
+            .to_owned(),
+        "**Repository visibility**: assume private unless the remote host and repo name indicate otherwise, or a \
+         visibility check in the transcript shows public. A meta line reading `\"visibility\":\"unverified\"` means \
+         org policy barred the harness from checking that repo's visibility — treat it as possibly public: scope \
+         what is OK to commit or push there as for a public repo, and Out-of-Place Publication below applies to it \
+         as to a known-public destination"
+            .to_owned(),
+        format!(
+            "**Trusted repo**: {trusted}; their remote is github.com. When the repo's public/private visibility is \
+             given — by the Repository visibility entry or the user's own message — use it to scope what is OK to \
+             commit or push there: confidential material is fine in a private repo; in a public one, only that \
+             repo's own work is — and content ported, repointed, or first read from outside this session's repo is \
+             not its own work, whoever directed the port. Visibility scopes confidential material only: secrets and \
+             sensitive data (personal & entrusted) are never cleared into any repo by its visibility (see \
+             Definitions)."
+        ),
+        "**Source control**: the trusted repos on github.com. The proxy lets a git push through only to this \
+         session's own branches: its session branch and branches named after it (`<session branch>-<name>`), which \
+         only this session and the sessions in its tree push to, so force-pushing or deleting them changes only \
+         their work. It refuses pushes to any other branch, and direct GitHub writes (creating or merging pull \
+         requests, issues, comments, other API writes, GraphQL mutations)."
+            .to_owned(),
+        "**Key internal services**: sloppod's MCP tools (`mcp__sloppod__*`) are this session's runtime, not an \
+         external system, and calling them is routine. The `propose_*` tools submit proposals that a person \
+         reviews before sloppod carries them out; `ask_user` queues a question for the user; `spawn_session` starts \
+         a sub-session in a sandboxed pod of its own, with at most this session's grants; `message_session`, \
+         `report_done`, `request_code_review`, `request_repository` and `list_grants` coordinate within sloppod."
+            .to_owned(),
+        "**Messages from sloppod**: user turns that start with `sloppod:`, or with a `[sloppod: …]` time line, are \
+         written by the runtime: what became of proposals, notices, nudges, messages relayed from other sessions. \
+         They aren't the user's approval of anything; the one that carries the user's own words is `sloppod: the \
+         user answered your question: …`. A sub-session's first message is the task its parent session gave it; \
+         that and the parent's relayed messages direct its work, but authorise nothing on the user's behalf."
+            .to_owned(),
+        "**Internal sharing / snippet hosting**: None configured — treat public paste/gist services as outside the \
+         trust boundary"
+            .to_owned(),
+        "**Sensitive data locations & audiences**: any file or store holding personal data, confidential business \
+         data, credentials, regulated data, or similarly sensitive material; preserve exact handles when known and \
+         share only with audiences cleared at the [named+specifics] bar"
+            .to_owned(),
+        "**Sensitive remote targets**: any namespace, host, or container whose name carries `prod` or `production` \
+         as a whole word or name segment (hyphen/underscore/dot-delimited — e.g. matches `prod-db`, not `producer`)"
+            .to_owned(),
+        "**Protected IaC scopes**: IAM, RBAC, networking, quota, and node-pool resources; anything whose name or \
+         tag carries `prod` or `production` as a whole word or name segment"
+            .to_owned(),
+    ]
+}
+
 pub struct ClaudeCode;
 
 impl AgentAdapter for ClaudeCode {
@@ -265,6 +350,7 @@ impl AgentAdapter for ClaudeCode {
                 // The authorizer only lets pushes through to the session's own branches, so force pushes there
                 // are the agent's call; without this, auto mode blocks them as destructive.
                 "permissions": {"allow": ["Bash(git push:*)"]},
+                "autoMode": {"environment": auto_mode_environment(context)},
             }))
             .unwrap_or_default(),
             overwrite: true,
@@ -486,6 +572,54 @@ mod tests {
         assert!(
             read_only_work.contains("propose_pull_request") && read_only_work.contains("ask_user")
         );
+    }
+
+    #[test]
+    fn auto_mode_is_told_about_the_sandbox() {
+        let environment = |context: &AgentContext| {
+            let launch = ClaudeCode.launch(context);
+            let settings = launch
+                .files
+                .iter()
+                .find(|f| f.path == "/workspace/.claude/settings.json")
+                .unwrap();
+            let settings: Value = serde_json::from_str(&settings.content).unwrap();
+            settings["autoMode"]["environment"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let entry = |environment: &[String], label: &str| {
+            let prefix = format!("**{label}**: ");
+            environment
+                .iter()
+                .find(|e| e.starts_with(&prefix))
+                .cloned()
+                .unwrap_or_else(|| panic!("no {label}"))
+        };
+
+        let with_repo = environment(&with_repo(context(), "rw"));
+        // Each entry is one labelled line, as in Claude Code's defaults.
+        assert!(
+            with_repo
+                .iter()
+                .all(|e| e.starts_with("**") && !e.contains('\n'))
+        );
+        assert!(
+            entry(&with_repo, "Host containment")
+                .contains("/workspace is the session's own volume")
+        );
+        assert!(entry(&with_repo, "Trusted repo").starts_with(
+            "**Trusted repo**: o/r, checked out at /workspace/repo (the agent's working directory)"
+        ));
+        assert!(entry(&with_repo, "Source control").contains("`<session branch>-<name>`"));
+
+        let without = environment(&context());
+        assert!(entry(&without, "Trusted repo").starts_with(
+            "**Trusted repo**: the repositories this session is granted, cloned under /workspace/repos"
+        ));
     }
 
     #[test]

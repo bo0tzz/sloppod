@@ -449,7 +449,7 @@ UI → runtime:
 | `_session/steering` `{sessionId, prompt: ContentBlock[]}` | Delivers a message into the running turn. Before the agent is up it joins the queue like a prompt and returns `{outcome: "queued"}`. Otherwise it responds once the agent has it, and is echoed (with `_meta.sloppod.steering`) then; until then it's kept with the session's queue, so a runtime restart in between delivers it rather than losing it. If it can't be delivered it errors and isn't echoed or kept, for the client to send again. |
 | `session/set_config_option` `{sessionId, configId, value}` | Changes one of the session's config options from the load response's `configOptions`, e.g. `model`. Responds `{configOptions}`. The session keeps its model across restarts. |
 
-Sessions always run in their agent's most autonomous mode, Claude Code's auto mode or Codex's full access: the sandbox and the session's grants bound what any tool call can reach. Mode isn't configurable.
+Sessions always run in their agent's most autonomous mode, Claude Code's auto mode or Codex's full access: the sandbox and the session's grants bound what any tool call can reach. Mode isn't configurable. Claude Code's auto mode is told what the sandbox is (its `autoMode.environment` setting, from `auto_mode_environment` in `adapter.rs`): an unprivileged pod with default-deny egress, placeholder credentials, pushes only to the session's own branches, sloppod's tools as its own runtime, and `sloppod:` messages that aren't the user's approval. Its checks then judge a tool call against what the pod can reach, not against a developer's own machine.
 
 Runtime → UI:
 
