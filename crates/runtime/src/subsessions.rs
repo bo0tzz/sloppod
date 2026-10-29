@@ -26,7 +26,7 @@ fn child_name(child: Uuid) -> String {
 /// to on a branch named after the parent's, starting from it, so the parent can integrate and propose its work.
 fn child_grants(parent: &[Grant], keep: Option<&[String]>, child: Uuid) -> Vec<Grant> {
     let kept = |capability: &str| {
-        matches!(capability, capability::MODEL | capability::CODEX)
+        crate::capabilities::always_inherited(capability)
             || keep.is_none_or(|keep| keep.iter().any(|k| k == capability))
     };
     parent

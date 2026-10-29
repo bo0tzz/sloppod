@@ -4,17 +4,9 @@ use serde_json::{Value, json};
 use sloppod_contracts::capability;
 use sloppod_contracts::{Grant, READ_ONLY, READ_WRITE};
 
-/// The capabilities the owner can grant a session mid-session from its grants list. Repositories go through
-/// `POST /sessions/{id}/repos`; memory needs a key minted when the session's pod is placed, so it isn't here.
+/// The built-ins the owner can grant a session mid-session from its grants list (`capabilities::BUILTINS`).
 pub fn grantable(capability: &str) -> bool {
-    matches!(
-        capability,
-        capability::MODEL
-            | capability::GITHUB
-            | capability::PACKAGES
-            | capability::DOCS
-            | capability::CODEX
-    )
+    crate::capabilities::builtin(capability).is_some_and(|b| b.grantable)
 }
 
 /// A narrower version of a grant, if it has one: a repository the session can push to becomes read only.

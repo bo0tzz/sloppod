@@ -2,6 +2,7 @@ mod acp;
 mod adapter;
 mod api;
 mod authz;
+mod capabilities;
 mod config;
 mod credentials;
 mod db;
