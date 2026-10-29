@@ -1752,6 +1752,39 @@ async fn every_turn_that_ends_is_counted_with_its_error() {
     );
 }
 
+#[tokio::test]
+async fn a_turn_someone_stopped_isnt_checked_for_unfinished_work() {
+    let mut h = Harness::ready().await;
+    let checked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = checked.clone();
+    h.hub.set_turn_ended(Arc::new(move |_| {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async {})
+    }));
+
+    let _stopped = h.prompt("Do a long thing");
+    let request = next_prompt(&mut h.to_agent).await;
+    h.respond(&request, json!({"stopReason": "cancelled"}))
+        .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(h.hub.turns_ended(h.id).await, (1, Some(TurnEnd::Cancelled)));
+    assert_eq!(
+        checked.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no nudge after a stop"
+    );
+
+    let _done = h.prompt("Now a short one");
+    let request = next_prompt(&mut h.to_agent).await;
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        checked.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a turn that ends is checked"
+    );
+}
+
 /// The texts the store keeps for the session's queue.
 async fn kept_texts(h: &Harness) -> Vec<String> {
     h.store
