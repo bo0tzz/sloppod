@@ -688,6 +688,36 @@ impl Credentials {
 }
 
 #[cfg(test)]
+impl Credentials {
+    /// Stores `client` as one of the owner's GitHub credentials of `kind`, with `config`, without asking GitHub, the
+    /// App as the default, and returns its id.
+    pub(crate) async fn add_github_client(
+        &self,
+        owner: &str,
+        kind: &str,
+        config: Value,
+        client: GitHubApp,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "insert into credentials (id, owner, kind, name, config, secret, is_default) \
+             values ($1, $2, $3, $4, $5, '', $6)",
+        )
+        .bind(id)
+        .bind(owner)
+        .bind(kind)
+        .bind(id.to_string())
+        .bind(config)
+        .bind(kind == GITHUB_APP)
+        .execute(&self.db)
+        .await
+        .unwrap();
+        self.github.lock().await.insert(id, Arc::new(client));
+        id
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use base64::Engine;
 
