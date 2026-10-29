@@ -5,6 +5,7 @@
 //! One task polls, one pull request at a time, and is the only writer of what was last seen, kept in the database so
 //! a restart neither repeats nor misses a change.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -107,12 +108,12 @@ fn failed(checks: &str) -> bool {
     matches!(checks, "FAILURE" | "ERROR")
 }
 
-/// What to tell the session about pull request `number` going from `before` to `now`. The first sight of it says
-/// nothing: there's no change to report.
+/// What to tell the session about pull request `number` going from `before` to `now`. At the first sight of it,
+/// what's already wrong is news too (it conflicts, its checks failed, it's already merged or closed); its reviews and
+/// comments so far aren't.
 fn changes(repo: &str, number: u64, before: Option<&Seen>, now: &Seen) -> Vec<String> {
-    let Some(before) = before else {
-        return Vec::new();
-    };
+    let first = before.is_none();
+    let before = before.cloned().unwrap_or_default();
     let pull = pull_ref(repo, number);
     let mut changes = Vec::new();
     match now.state.as_str() {
@@ -141,7 +142,7 @@ fn changes(repo: &str, number: u64, before: Option<&Seen>, now: &Seen) -> Vec<St
                 "{pull} conflicts with its base branch; merge the base into it, or rebase, and push."
             ));
         }
-        if now.feedback > before.feedback {
+        if !first && now.feedback > before.feedback {
             changes.push(format!(
                 "{pull} has new reviews or comments; read them with `gh pr view {number} --repo {repo} --comments`."
             ));
@@ -152,13 +153,40 @@ fn changes(repo: &str, number: u64, before: Option<&Seen>, now: &Seen) -> Vec<St
 
 pub async fn run(state: AppState) {
     let mut every = tokio::time::interval(POLL);
+    let mut failures = Failures::default();
     loop {
         every.tick().await;
-        poll(&state).await;
+        poll(&state, &mut failures).await;
     }
 }
 
-async fn poll(state: &AppState) {
+/// How many polls of each pull request have failed in a row.
+#[derive(Default)]
+struct Failures(HashMap<(String, i64), u32>);
+
+/// After how many failed polls in a row it's worth a warning, and then how often again: one failure is usually
+/// GitHub being briefly unavailable, but a pull request that's never read again is never told about (#377).
+const WARN_AFTER: u32 = 3;
+const WARN_EVERY: u32 = 30;
+
+impl Failures {
+    /// Counts a failed poll, and says whether to warn about it.
+    fn failed(&mut self, repo: &str, number: i64) -> bool {
+        let count = self.0.entry((repo.to_owned(), number)).or_default();
+        *count += 1;
+        *count == WARN_AFTER
+            || (*count > WARN_AFTER && (*count - WARN_AFTER).is_multiple_of(WARN_EVERY))
+    }
+
+    /// A poll that worked; says how many had failed before it, if any had been warned about.
+    fn worked(&mut self, repo: &str, number: i64) -> Option<u32> {
+        self.0
+            .remove(&(repo.to_owned(), number))
+            .filter(|count| *count >= WARN_AFTER)
+    }
+}
+
+async fn poll(state: &AppState, failures: &mut Failures) {
     let watched = match db::watched_pulls(&state.db).await {
         Ok(watched) => watched,
         Err(e) => {
@@ -168,8 +196,18 @@ async fn poll(state: &AppState) {
     };
     for pull in watched {
         let span = crate::github::acting_span(&pull.session_id.to_string(), None);
-        if let Err(e) = check(state, &pull).instrument(span).await {
-            tracing::debug!(repo = %pull.repo, number = pull.number, error = %e, "checking a pull request");
+        match check(state, &pull).instrument(span).await {
+            Ok(()) => {
+                if let Some(count) = failures.worked(&pull.repo, pull.number) {
+                    tracing::info!(repo = %pull.repo, number = pull.number, failed = count, "checking a pull request works again");
+                }
+            }
+            Err(e) if failures.failed(&pull.repo, pull.number) => {
+                tracing::warn!(repo = %pull.repo, number = pull.number, error = %e, "checking a pull request keeps failing; its session isn't told what changes")
+            }
+            Err(e) => {
+                tracing::debug!(repo = %pull.repo, number = pull.number, error = %e, "checking a pull request")
+            }
         }
     }
 }
@@ -204,10 +242,16 @@ async fn check(state: &AppState, pull: &db::WatchedPull) -> anyhow::Result<()> {
         .observed
         .clone()
         .and_then(|seen| serde_json::from_value(seen).ok());
-    let now = observe(
-        before.as_ref(),
-        &response["data"]["repository"]["pullRequest"],
-    );
+    // An answer without the pull request (GraphQL errors come with a 200) isn't an observation: read as one, it would
+    // say it has no reviews or checks.
+    let found = &response["data"]["repository"]["pullRequest"];
+    if !found.is_object() {
+        anyhow::bail!(
+            "GitHub's answer has no pull request: {}",
+            response["errors"]
+        );
+    }
+    let now = observe(before.as_ref(), found);
     let changes = changes(&pull.repo, pull.number as u64, before.as_ref(), &now);
     // Items linked to it move with it (ADR 30).
     let status = crate::work::follow::pull_status(&now.state);
@@ -288,7 +332,14 @@ mod tests {
     #[test]
     fn tells_what_changed_and_nothing_else() {
         let ok = seen("SUCCESS", "MERGEABLE", 0);
-        assert!(changes("o/r", 7, None, &ok).is_empty(), "first sight");
+        assert!(
+            changes("o/r", 7, None, &ok).is_empty(),
+            "first sight of a good one"
+        );
+        assert!(
+            changes("o/r", 7, None, &seen("SUCCESS", "MERGEABLE", 3)).is_empty(),
+            "nor its reviews so far"
+        );
         assert!(changes("o/r", 7, Some(&ok), &ok).is_empty());
 
         let mut red = ok.clone();
@@ -318,5 +369,76 @@ mod tests {
             ["o/r#7 was closed without being merged."],
             "only the closing, not the checks of a closed pull request"
         );
+    }
+
+    /// The notices a watched pull request's polls give, from GitHub's answers in turn, as `check` keeps them.
+    fn told(answers: &[Value]) -> Vec<String> {
+        let mut before: Option<Seen> = None;
+        let mut told = Vec::new();
+        for answer in answers {
+            let now = observe(before.as_ref(), answer);
+            told.extend(changes("o/r", 7, before.as_ref(), &now));
+            before = Some(now);
+        }
+        told
+    }
+
+    fn mergeable(m: &str) -> Value {
+        json!({"state": "OPEN", "mergeable": m})
+    }
+
+    #[test]
+    fn a_conflict_is_told_once_however_it_was_seen_before() {
+        let conflicts = |told: &[String]| {
+            told.iter()
+                .filter(|t| t.contains("conflicts with its base"))
+                .count()
+        };
+        for answers in [
+            // Mergeable, then a base change: GitHub works it out again, then conflicts.
+            vec![
+                "MERGEABLE",
+                "UNKNOWN",
+                "CONFLICTING",
+                "UNKNOWN",
+                "CONFLICTING",
+            ],
+            // Never known to be mergeable: first seen while GitHub still works it out.
+            vec!["UNKNOWN", "UNKNOWN", "CONFLICTING", "CONFLICTING"],
+            // Conflicting from the first look (#377).
+            vec!["CONFLICTING", "UNKNOWN", "CONFLICTING"],
+        ] {
+            let answers: Vec<Value> = answers.into_iter().map(mergeable).collect();
+            let told = told(&answers);
+            assert_eq!(conflicts(&told), 1, "{answers:?}: {told:?}");
+            assert_eq!(told.len(), 1, "{told:?}");
+        }
+        // Resolved and conflicting again is told again.
+        let again = told(&["CONFLICTING", "MERGEABLE", "CONFLICTING"].map(mergeable));
+        assert_eq!(conflicts(&again), 2);
+    }
+
+    #[test]
+    fn failed_polls_warn_when_they_repeat() {
+        let mut failures = Failures::default();
+        let warned: Vec<bool> = (0..40).map(|_| failures.failed("o/r", 7)).collect();
+        let at: Vec<usize> = warned
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| **w)
+            .map(|(i, _)| i + 1)
+            .collect();
+        assert_eq!(
+            at,
+            [WARN_AFTER as usize, (WARN_AFTER + WARN_EVERY) as usize]
+        );
+        assert!(!failures.failed("o/r", 8), "counted per pull request");
+        assert_eq!(failures.worked("o/r", 7), Some(40));
+        assert_eq!(
+            failures.worked("o/r", 8),
+            None,
+            "one failure wasn't warned about"
+        );
+        assert!(!failures.failed("o/r", 7), "counted afresh");
     }
 }
