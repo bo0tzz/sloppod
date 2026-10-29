@@ -301,11 +301,11 @@ const hasRepoGrant = (session, repo) =>
 
 /** What the runtime says of each capability that can be granted while a session runs (`grants::describe`). */
 const grantable = {
-  model: "Claude's API, with the owner's Claude account.",
+  model: "Claude's API, with the first of the owner's Claude accounts this grant names.",
   github: "GitHub's API and git.",
   packages: 'Package registries and tool downloads.',
   docs: 'Library documentation, through Context7.',
-  codex: "Codex's API on chatgpt.com, with the owner's ChatGPT login.",
+  codex: "Codex's API on chatgpt.com, with the first of the owner's ChatGPT logins this grant names.",
 };
 
 
@@ -315,10 +315,21 @@ const workDescription = (graph, level) =>
     { plan: 'read it, track work in it, and propose plan changes (ranking, reparenting, dropping)', track: 'read it and track work in it: add items and edges, link work, move items between open, active and done', read: 'read it' }[level]
   }.`;
 
+/** The kind of account a model grant names (`capabilities::account_kind`). */
+const accountKinds = { model: 'claude', codex: 'chatgpt' };
+
+function withAccount(capability, params) {
+  const kind = accountKinds[capability];
+  if (!kind || params.credentials) return params;
+  const accounts = credentials.filter((c) => c.kind === kind).sort((a, b) => Number(b.default) - Number(a.default));
+  return accounts.length ? { ...params, credentials: accounts.map((c) => c.id) } : params;
+}
+
+// A model grant names all the owner's accounts of its kind when it's made, the default first, and keeps them (ADR 29).
 const newGrant = (capability, params, description, expires_at) => ({
   id: randomUUID(),
   capability,
-  params,
+  params: withAccount(capability, params),
   description,
   created_at: now(),
   ...(expires_at ? { expires_at } : {}),
@@ -1698,7 +1709,19 @@ async function handleApi(req, res, url) {
         return json(res, 200, session.data);
       }
       const body = await readBody(req);
-      if (!body.narrow && body.expires_at === undefined) return json(res, 400, { error: 'give expires_at or narrow' });
+      if (!body.narrow && body.expires_at === undefined && body.credentials === undefined) {
+        return json(res, 400, { error: 'give expires_at, narrow or credentials' });
+      }
+      const kind = accountKinds[grant.capability];
+      if (body.credentials !== undefined) {
+        if (!kind) return json(res, 400, { error: `a ${grant.capability} grant doesn't name accounts` });
+        if (!Array.isArray(body.credentials) || body.credentials.length === 0) {
+          return json(res, 400, { error: 'a model grant names at least one account' });
+        }
+        const unknown = body.credentials.find((id) => !credentials.some((c) => c.id === id && c.kind === kind));
+        if (unknown) return json(res, 400, { error: `${unknown} isn't one of your ${kind} credentials` });
+        if (new Set(body.credentials).size !== body.credentials.length) return json(res, 400, { error: 'an account is in the list twice' });
+      }
       if (body.expires_at && Date.parse(body.expires_at) <= Date.now()) {
         return json(res, 400, { error: 'expires_at is in the past; revoke the grant instead' });
       }
@@ -1709,6 +1732,7 @@ async function handleApi(req, res, url) {
         grant.params = { repo: grant.params.repo, access: 'ro' };
         grant.description = `${grant.params.repo}: read only.`;
       }
+      if (body.credentials) grant.params = { ...grant.params, credentials: body.credentials };
       if (body.expires_at === null) delete grant.expires_at;
       else if (body.expires_at) grant.expires_at = body.expires_at;
       session.broadcast();

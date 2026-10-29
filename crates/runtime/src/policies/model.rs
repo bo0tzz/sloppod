@@ -6,11 +6,14 @@ use sloppod_contracts::{
 };
 
 use crate::capabilities::{Part, Provider, holds};
-use crate::credentials::{CLAUDE, Credentials};
+use crate::credentials::{Account, CLAUDE, Credentials};
 
 const INFERENCE: &[&str] = &["/v1/messages", "/v1/messages/count_tokens"];
 
-/// The Anthropic API: inference only, with the owner's Claude account (ADR 11 spike results).
+/// A model grant whose account was deleted: it isn't replaced by another behind the owner's back (ADR 29).
+const GONE: &str = "sloppod: the Claude account this session's model grant names was deleted; the user can switch the grant to another account in the session's grants list.\n";
+
+/// The Anthropic API: inference only, with the Claude account the session's grant names (ADR 11 spike results, ADR 29).
 pub struct ModelPolicy {
     credentials: Arc<Credentials>,
 }
@@ -48,17 +51,25 @@ impl RequestPolicy for ModelPolicy {
                 request.path_only()
             )));
         }
-        let account = self
+        let account = match self
             .credentials
-            .secret(&session.owner, CLAUDE)
+            .account(session, CLAUDE)
             .await
-            .map_err(|e| Error::new(e.to_string()))?;
-        let Some((_, token)) = account else {
-            return Ok(Decision::deny(format!(
-                "sloppod: {} has no Claude account configured; add one in sloppod's settings.\n",
-                session.owner
-            )));
+            .map_err(|e| Error::new(e.to_string()))?
+        {
+            Account::Found(row) => row,
+            Account::Gone => return Ok(Decision::deny(GONE)),
+            Account::None => {
+                return Ok(Decision::deny(format!(
+                    "sloppod: {} has no Claude account configured; add one in sloppod's settings.\n",
+                    session.owner
+                )));
+            }
         };
+        let token = self
+            .credentials
+            .reveal(&account)
+            .map_err(|e| Error::new(e.to_string()))?;
         Ok(Decision::allow_with(
             vec![("authorization".into(), format!("Bearer {token}"))],
             Vec::new(),
@@ -93,5 +104,59 @@ mod tests {
         ] {
             assert!(!is_inference(&request(method, path)), "{method} {path}");
         }
+    }
+
+    #[sqlx::test]
+    async fn attaches_the_account_the_grant_names_and_refuses_one_deleted(db: sqlx::PgPool) {
+        use base64::Engine;
+        use sloppod_contracts::Grant;
+        use sloppod_protocol::api::NewCredential;
+        let key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let credentials = Arc::new(
+            Credentials::new(db, crate::vault::Vault::from_base64(&key).unwrap())
+                .await
+                .unwrap(),
+        );
+        let add = async |name: &str| {
+            let new = NewCredential {
+                kind: CLAUDE.into(),
+                name: name.into(),
+                config: Default::default(),
+                secret: format!("sk-{name}"),
+            };
+            credentials.create("dev", new).await.unwrap().unwrap().id
+        };
+        let _default = add("personal").await;
+        let work = add("work").await;
+        let policy = ModelPolicy::new(credentials.clone());
+        let session = SessionContext {
+            session_id: "s".into(),
+            owner: "dev".into(),
+            grants: vec![Grant::new(
+                "model",
+                serde_json::json!({"credentials": [work.to_string()]}),
+            )],
+            role: Default::default(),
+        };
+        let decision = policy
+            .decide(&session, &request("POST", "/v1/messages"))
+            .await
+            .unwrap();
+        assert_eq!(
+            decision,
+            Decision::allow_with(
+                vec![("authorization".into(), "Bearer sk-work".into())],
+                Vec::new()
+            )
+        );
+        credentials.delete("dev", work).await.unwrap();
+        let decision = policy
+            .decide(&session, &request("POST", "/v1/messages"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&decision, Decision::Deny { message, .. } if message.contains("was deleted")),
+            "{decision:?}"
+        );
     }
 }

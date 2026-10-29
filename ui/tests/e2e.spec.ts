@@ -2028,8 +2028,44 @@ test('lists the session grants from the session menu', async ({ page }) => {
   await page.getByRole('button', { name: 'Session actions' }).click();
   await page.getByRole('menuitem', { name: 'Grants' }).click();
   const grants = page.getByTestId('grants');
-  await expect(grants.getByText("Claude's API, with the owner's Claude account.")).toBeVisible();
+  await expect(grants.getByText("Claude's API, with the first of the owner's Claude accounts this grant names.")).toBeVisible();
   await expect(grants.getByText(/^bo0tzz\/sloppod: read, and push the session branch `sloppod\//)).toBeVisible();
+});
+
+test("a model grant names the user's accounts, and the user picks which one it uses", async ({ page }) => {
+  const work = (await (
+    await page.request.post('/api/v1/credentials', { data: { kind: 'claude', name: 'Work', secret: 'sk-ant-work', config: {} } })
+  ).json()) as { id: string };
+  try {
+    await createSession(page, 'Fix the build in bo0tzz/sloppod');
+    await page.getByRole('button', { name: 'Session actions' }).click();
+    await page.getByRole('menuitem', { name: 'Grants' }).click();
+    const model = page.getByTestId('grants').getByTestId('grant-model');
+    // Made with all of the user's Claude accounts, the default first, which is the one in use.
+    const accounts = model.getByTestId('grant-account');
+    await expect(accounts).toHaveCount(2);
+    await expect(accounts.nth(0)).toContainText('Personal');
+    await expect(accounts.nth(0)).toContainText('in use');
+    await expect(accounts.nth(1)).toHaveText(/Work/);
+
+    const changing = page.waitForRequest((request) => request.method() === 'PATCH');
+    await accounts.nth(1).getByRole('button', { name: 'Use first' }).click();
+    expect((await changing).postDataJSON().credentials[0]).toBe(work.id);
+    await expect(accounts.nth(0)).toContainText('Work');
+    await expect(accounts.nth(0)).toContainText('in use');
+
+    await accounts.nth(1).getByRole('button', { name: 'Remove' }).click();
+    await expect(accounts).toHaveCount(1);
+    await expect(accounts.nth(0)).toContainText('Work');
+    // The last account can't be removed, and the one removed can be added back.
+    await expect(accounts.getByRole('button', { name: 'Remove' })).toHaveCount(0);
+    await model.getByRole('combobox', { name: 'Add an account' }).click();
+    await page.getByRole('option', { name: 'Personal' }).click();
+    await expect(accounts).toHaveCount(2);
+    await expect(accounts.nth(1)).toContainText('Personal');
+  } finally {
+    await page.request.delete(`/api/v1/credentials/${work.id}`);
+  }
 });
 
 test('grants, narrows, times and revokes the grants of a running session', async ({ page }) => {

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use sloppod_contracts::{SessionContext, SessionRole};
 use sloppod_protocol::api::{Credential, NewCredential};
 use sqlx::{FromRow, PgPool};
 use tokio::sync::Mutex;
@@ -118,6 +119,16 @@ impl CredentialRow {
             .and_then(Value::as_str)
             .filter(|v| !v.is_empty())
     }
+}
+
+/// The account a session's model grant acts with.
+pub enum Account {
+    /// Still sealed.
+    Found(CredentialRow),
+    /// Every account the grant names was deleted since: it's refused until the owner gives it another (ADR 29).
+    Gone,
+    /// The owner has none of the kind.
+    None,
 }
 
 /// A credential request that can't be stored, with a reason for the user.
@@ -417,11 +428,11 @@ impl Credentials {
         Ok(self.default_row(owner, kind).await?.is_some())
     }
 
-    /// The owners who have a default credential of a kind.
-    pub async fn owners_with_default(&self, kind: &str) -> sqlx::Result<Vec<String>> {
-        sqlx::query_scalar(
-            "select owner from credentials where kind = $1 and is_default order by owner",
-        )
+    /// Every owner's credentials of a kind, still sealed.
+    pub async fn of_kind(&self, kind: &str) -> sqlx::Result<Vec<CredentialRow>> {
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "select {COLUMNS} from credentials where kind = $1 order by owner, created_at"
+        )))
         .bind(kind)
         .fetch_all(&self.db)
         .await
@@ -455,22 +466,89 @@ impl Credentials {
         Ok(Some((row, secret)))
     }
 
-    /// The owner's ChatGPT access token and account id, refreshed first when it's about to expire.
-    pub async fn chatgpt(&self, owner: &str) -> anyhow::Result<Option<ChatGptTokens>> {
-        Ok(self.chatgpt_login(owner).await?.map(|(_, tokens)| tokens))
+    /// The account a session's model grant acts with (ADR 29), for a kind of account (`claude`, `chatgpt`): the first
+    /// of the accounts it names that's still there. A grant that names none, made before the owner had an account of
+    /// the kind, uses the owner's default, and so do the runtime's judgements (ADR 26), whatever their session's
+    /// grant says.
+    pub async fn account(&self, session: &SessionContext, kind: &str) -> sqlx::Result<Account> {
+        let named = match session.role {
+            SessionRole::Utility => None,
+            _ => self.named_accounts(session, kind).await?,
+        };
+        Ok(match named {
+            Some(accounts) => accounts
+                .into_iter()
+                .next()
+                .map_or(Account::Gone, Account::Found),
+            None => self
+                .default_row(&session.owner, kind)
+                .await?
+                .map_or(Account::None, Account::Found),
+        })
     }
 
-    /// The same, with the id of the login they're from: the default when it was read, which may change meanwhile.
-    pub async fn chatgpt_login(
+    /// The accounts of a kind a session's model grant names, in its order, leaving out those deleted since; `None`
+    /// if it names none.
+    pub async fn named_accounts(
         &self,
-        owner: &str,
-    ) -> anyhow::Result<Option<(Uuid, ChatGptTokens)>> {
-        let Some((login, secret)) = self.secret(owner, CHATGPT).await? else {
+        session: &SessionContext,
+        kind: &str,
+    ) -> sqlx::Result<Option<Vec<CredentialRow>>> {
+        let Some(ids) = session
+            .grants
+            .iter()
+            .find(|g| crate::capabilities::account_kind(&g.capability) == Some(kind))
+            .and_then(crate::grants::accounts)
+        else {
             return Ok(None);
         };
-        let tokens: ChatGptTokens = serde_json::from_str(&secret)?;
+        let ids: Vec<Uuid> = ids.iter().filter_map(|id| id.parse().ok()).collect();
+        let rows: Vec<CredentialRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "select {COLUMNS} from credentials where owner = $1 and kind = $2 and id = any($3)"
+        )))
+        .bind(&session.owner)
+        .bind(kind)
+        .bind(&ids)
+        .fetch_all(&self.db)
+        .await?;
+        Ok(Some(
+            ids.iter()
+                .filter_map(|id| rows.iter().find(|row| row.id == *id).cloned())
+                .collect(),
+        ))
+    }
+
+    /// One of the owner's credentials of a kind, by id.
+    pub async fn owned(
+        &self,
+        owner: &str,
+        kind: &str,
+        id: &str,
+    ) -> sqlx::Result<Option<CredentialRow>> {
+        let Ok(id) = id.parse::<Uuid>() else {
+            return Ok(None);
+        };
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "select {COLUMNS} from credentials where id = $1 and owner = $2 and kind = $3"
+        )))
+        .bind(id)
+        .bind(owner)
+        .bind(kind)
+        .fetch_optional(&self.db)
+        .await
+    }
+
+    /// A credential's secret.
+    pub fn reveal(&self, row: &CredentialRow) -> anyhow::Result<String> {
+        self.vault.decrypt_string(&row.secret)
+    }
+
+    /// A ChatGPT login's access token and account id, refreshed first when it's about to expire. `None` if it was
+    /// deleted meanwhile.
+    pub async fn chatgpt(&self, login: &CredentialRow) -> anyhow::Result<Option<ChatGptTokens>> {
+        let tokens: ChatGptTokens = serde_json::from_str(&self.reveal(login)?)?;
         if !tokens.expires_soon() {
-            return Ok(Some((login.id, tokens)));
+            return Ok(Some(tokens));
         }
         let lock = self
             .chatgpt_refresh
@@ -480,8 +558,7 @@ impl Credentials {
             .or_default()
             .clone();
         let _refreshing = lock.lock().await;
-        // Someone may have refreshed it while this waited for the lock. Reloaded by id, not as the default: the default
-        // may have changed meanwhile, and this lock only covers this login.
+        // Someone may have refreshed it while this waited for the lock.
         let row: Option<CredentialRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "select {COLUMNS} from credentials where id = $1"
         )))
@@ -494,7 +571,7 @@ impl Credentials {
         let secret = self.vault.decrypt_string(&row.secret)?;
         let mut tokens: ChatGptTokens = serde_json::from_str(&secret)?;
         if !tokens.expires_soon() {
-            return Ok(Some((row.id, tokens)));
+            return Ok(Some(tokens));
         }
         let response = self
             .http
@@ -533,10 +610,10 @@ impl Credentials {
             .execute(&self.db)
             .await
         {
-            tracing::error!(%owner, credential = %row.id, error = %e, "storing a refreshed ChatGPT login; it will need signing in again");
+            tracing::error!(owner = %row.owner, credential = %row.id, error = %e, "storing a refreshed ChatGPT login; it will need signing in again");
             return Err(e.into());
         }
-        Ok(Some((row.id, tokens)))
+        Ok(Some(tokens))
     }
 
     pub async fn github(&self, owner: &str) -> anyhow::Result<Arc<GitHubApp>> {
@@ -619,17 +696,7 @@ impl Credentials {
 
     /// One of the owner's GitHub tokens (`github-user`), by id.
     pub async fn github_user(&self, owner: &str, id: &str) -> sqlx::Result<Option<CredentialRow>> {
-        let Ok(id) = id.parse::<Uuid>() else {
-            return Ok(None);
-        };
-        sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "select {COLUMNS} from credentials where id = $1 and owner = $2 and kind = $3"
-        )))
-        .bind(id)
-        .bind(owner)
-        .bind(GITHUB_USER)
-        .fetch_optional(&self.db)
-        .await
+        self.owned(owner, GITHUB_USER, id).await
     }
 
     pub async fn memini(
@@ -720,6 +787,8 @@ impl Credentials {
 #[cfg(test)]
 mod tests {
     use base64::Engine;
+    use serde_json::json;
+    use sloppod_contracts::Grant;
 
     use super::*;
 
@@ -739,6 +808,220 @@ mod tests {
         }
     }
 
+    async fn add(credentials: &Credentials, owner: &str, new: NewCredential) -> CredentialRow {
+        credentials.create(owner, new).await.unwrap().unwrap()
+    }
+
+    async fn session_with(db: &PgPool, owner: &str, grants: &[Grant]) -> Uuid {
+        let id = Uuid::now_v7();
+        crate::db::insert_session(
+            db,
+            crate::db::NewSessionRow {
+                id,
+                owner,
+                title: "test",
+                custom_title: false,
+                pending_prompt: "",
+                agent: "claude-code",
+                kind: sloppod_protocol::api::SessionKind::Work,
+                review: sloppod_protocol::api::ReviewPolicy::Off,
+                model: None,
+                repo: None,
+                grants,
+            },
+        )
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn grant_of(db: &PgPool, session: Uuid, capability: &str) -> Grant {
+        let row = crate::db::get_session(db, session).await.unwrap().unwrap();
+        row.grants()
+            .into_iter()
+            .find(|g| g.capability == capability)
+            .unwrap()
+    }
+
+    fn named(grant: &Grant) -> Vec<String> {
+        crate::grants::accounts(grant)
+            .unwrap_or_default()
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[sqlx::test]
+    async fn a_model_grant_names_every_account_default_first_and_keeps_them(db: PgPool) {
+        let credentials = credentials(db.clone()).await;
+        let personal = add(&credentials, "dev", claude("Personal")).await;
+        let work = add(&credentials, "dev", claude("Work")).await;
+        add(&credentials, "someone", claude("Theirs")).await;
+        credentials.set_default("dev", work.id).await.unwrap();
+        let repo = json!({"repo": "a/b", "access": "ro"});
+        let session = session_with(
+            &db,
+            "dev",
+            &[
+                Grant::new("model", json!({})),
+                Grant::new("codex", json!({})),
+                Grant::new("repo", repo.clone()),
+            ],
+        )
+        .await;
+        let ids = [work.id.to_string(), personal.id.to_string()];
+        assert_eq!(named(&grant_of(&db, session, "model").await), ids);
+        // No ChatGPT login: nothing to name. A repository names a credential only when the owner picks one.
+        assert!(
+            grant_of(&db, session, "codex")
+                .await
+                .params
+                .get("credentials")
+                .is_none()
+        );
+        assert_eq!(grant_of(&db, session, "repo").await.params, repo);
+
+        // Another default changes what new grants get, not what this one uses.
+        credentials.set_default("dev", personal.id).await.unwrap();
+        assert_eq!(named(&grant_of(&db, session, "model").await), ids);
+        let later = session_with(&db, "dev", &[]).await;
+        crate::db::add_grant(&db, later, &Grant::new("model", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(
+            named(&grant_of(&db, later, "model").await),
+            [personal.id.to_string(), work.id.to_string()]
+        );
+        // A grant that names its accounts, like a sub-session's copy of its parent's, keeps them.
+        let child = session_with(
+            &db,
+            "dev",
+            &[Grant::new(
+                "model",
+                json!({"credentials": [work.id.to_string()]}),
+            )],
+        )
+        .await;
+        assert_eq!(
+            named(&grant_of(&db, child, "model").await),
+            [work.id.to_string()]
+        );
+    }
+
+    #[sqlx::test]
+    async fn a_session_uses_the_first_account_its_grant_names_that_is_still_there(db: PgPool) {
+        let credentials = credentials(db.clone()).await;
+        let personal = add(&credentials, "dev", claude("Personal")).await;
+        let work = add(&credentials, "dev", claude("Work")).await;
+        let theirs = add(&credentials, "someone", claude("Theirs")).await;
+        let context = |ids: &[Uuid], role: SessionRole| SessionContext {
+            session_id: "s".into(),
+            owner: "dev".into(),
+            grants: vec![Grant::new(
+                "model",
+                json!({"credentials": ids.iter().map(Uuid::to_string).collect::<Vec<_>>()}),
+            )],
+            role,
+        };
+        let used = async |session: &SessionContext| match credentials
+            .account(session, CLAUDE)
+            .await
+            .unwrap()
+        {
+            Account::Found(row) => Some(row.name),
+            Account::Gone => Some("gone".into()),
+            Account::None => None,
+        };
+        let session = context(&[work.id, personal.id], SessionRole::Work);
+        assert_eq!(used(&session).await.as_deref(), Some("Work"));
+        // The runtime's judgements use the default, whatever their grant says.
+        let utility = context(&[work.id], SessionRole::Utility);
+        assert_eq!(used(&utility).await.as_deref(), Some("Personal"));
+        // Another owner's account is never used.
+        assert_eq!(
+            used(&context(&[theirs.id], SessionRole::Work))
+                .await
+                .as_deref(),
+            Some("gone")
+        );
+
+        // Usage is kept under the account used.
+        let account = match credentials.account(&session, CLAUDE).await.unwrap() {
+            Account::Found(row) => row,
+            _ => unreachable!(),
+        };
+        let observation = crate::quota::Observation {
+            observed_at: Utc::now(),
+            limited: true,
+            resets_at: Some(Utc::now() + chrono::Duration::hours(1)),
+            windows: Default::default(),
+        };
+        crate::quota::store(&db, account.id, &observation)
+            .await
+            .unwrap();
+        let quotas = crate::quota::list(&db, "dev", Utc::now()).await.unwrap();
+        assert_eq!(quotas.len(), 1);
+        assert_eq!(
+            (quotas[0].credential_id, quotas[0].limited),
+            (work.id, true)
+        );
+
+        // Deleted, the next one is used; with none left, the grant is refused rather than given the default.
+        credentials.delete("dev", work.id).await.unwrap();
+        assert_eq!(used(&session).await.as_deref(), Some("Personal"));
+        add(&credentials, "dev", claude("Another")).await;
+        credentials.delete("dev", personal.id).await.unwrap();
+        assert_eq!(used(&session).await.as_deref(), Some("gone"));
+        // A grant made before the owner had an account uses the default.
+        let unnamed = SessionContext {
+            grants: vec![Grant::new("model", json!({}))],
+            ..session.clone()
+        };
+        assert_eq!(used(&unnamed).await.as_deref(), Some("Another"));
+    }
+
+    #[sqlx::test]
+    async fn the_owner_gives_a_model_grant_only_their_own_accounts_of_its_kind(db: PgPool) {
+        let credentials = credentials(db.clone()).await;
+        let personal = add(&credentials, "dev", claude("Personal")).await;
+        let work = add(&credentials, "dev", claude("Work")).await;
+        let theirs = add(&credentials, "someone", claude("Theirs")).await;
+        let model = Grant::new("model", json!({}));
+        let given = async |grant: &Grant, ids: &[Uuid]| {
+            let ids: Vec<String> = ids.iter().map(Uuid::to_string).collect();
+            crate::grants::accounts_given(&credentials, "dev", grant, &ids)
+                .await
+                .unwrap()
+                .map(|rows| rows.into_iter().map(|r| r.name).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            given(&model, &[work.id, personal.id]).await.unwrap(),
+            ["Work", "Personal"]
+        );
+        assert!(
+            given(&model, &[])
+                .await
+                .unwrap_err()
+                .contains("at least one")
+        );
+        assert!(given(&model, &[theirs.id]).await.is_err());
+        assert!(
+            given(&model, &[work.id, work.id])
+                .await
+                .unwrap_err()
+                .contains("twice")
+        );
+        assert!(
+            given(&Grant::new("codex", json!({})), &[work.id])
+                .await
+                .is_err()
+        );
+        assert!(
+            given(&Grant::new("github", json!({})), &[work.id])
+                .await
+                .is_err()
+        );
+    }
     async fn defaults(credentials: &Credentials) -> Vec<String> {
         let rows = credentials.list("dev").await.unwrap();
         rows.into_iter()

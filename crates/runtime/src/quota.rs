@@ -12,7 +12,7 @@ use sqlx::types::Json;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::credentials::{CHATGPT, CLAUDE};
+use crate::credentials::{Account, CHATGPT, CLAUDE, CredentialRow};
 use crate::{AppState, db};
 
 /// Where the Codex CLI reads a ChatGPT login's limits.
@@ -369,43 +369,48 @@ async fn record(state: &AppState, credential: Uuid, owner: &str, observation: Ob
 }
 
 /// A `usage_update` from a session's agent: Claude Code's carry the rate limits of the Claude subscription the
-/// session used, its owner's default. `at` is when it came, taken before anything here waits.
+/// session used, the one its model grant names (ADR 29). `at` is when it came, taken before anything here waits.
 pub async fn seen(state: &AppState, session: Uuid, update: Value, at: DateTime<Utc>) {
     let Some(observation) = from_claude(&update["_meta"]["_claude/rateLimit"], at) else {
         return;
     };
-    let credential = match db::get_session(&state.db, session).await {
-        Ok(Some(session)) => state.credentials.default_row(&session.owner, CLAUDE).await,
+    let session = match db::get_session(&state.db, session).await {
+        Ok(Some(row)) => row.context(),
         Ok(None) => return,
-        Err(e) => Err(e),
-    };
-    match credential {
-        Ok(Some(credential)) => record(state, credential.id, &credential.owner, observation).await,
-        Ok(None) => {}
         Err(e) => {
-            tracing::warn!(%session, error = %e, "finding the Claude credential a session used")
+            tracing::warn!(%session, error = %e, "finding the Claude credential a session used");
+            return;
+        }
+    };
+    match state.credentials.account(&session, CLAUDE).await {
+        Ok(Account::Found(credential)) => {
+            record(state, credential.id, &credential.owner, observation).await
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(session = %session.session_id, error = %e, "finding the Claude credential a session used")
         }
     }
 }
 
-/// Reads the limits of every owner's default ChatGPT login.
+/// Reads every ChatGPT login's limits, whichever sessions use it.
 pub async fn read_chatgpt(state: &AppState) {
-    let owners = match state.credentials.owners_with_default(CHATGPT).await {
-        Ok(owners) => owners,
+    let logins = match state.credentials.of_kind(CHATGPT).await {
+        Ok(logins) => logins,
         Err(e) => {
             tracing::warn!(error = %e, "listing ChatGPT logins");
             return;
         }
     };
-    for owner in owners {
-        if let Err(e) = read_chatgpt_of(state, &owner).await {
-            tracing::warn!(%owner, error = %e, "reading a ChatGPT login's limits");
+    for login in logins {
+        if let Err(e) = read_chatgpt_of(state, &login).await {
+            tracing::warn!(owner = %login.owner, credential = %login.id, error = %e, "reading a ChatGPT login's limits");
         }
     }
 }
 
-async fn read_chatgpt_of(state: &AppState, owner: &str) -> anyhow::Result<()> {
-    let Some((credential, tokens)) = state.credentials.chatgpt_login(owner).await? else {
+async fn read_chatgpt_of(state: &AppState, login: &CredentialRow) -> anyhow::Result<()> {
+    let Some(tokens) = state.credentials.chatgpt(login).await? else {
         return Ok(());
     };
     let usage: Value = state
@@ -420,7 +425,7 @@ async fn read_chatgpt_of(state: &AppState, owner: &str) -> anyhow::Result<()> {
         .json()
         .await?;
     match from_codex(&usage, Utc::now()) {
-        Ok(Some(observation)) => record(state, credential, owner, observation).await,
+        Ok(Some(observation)) => record(state, login.id, &login.owner, observation).await,
         Ok(None) => {}
         Err(e) => anyhow::bail!("ChatGPT's report wasn't as expected, so it's ignored: {e}"),
     }

@@ -21,16 +21,52 @@ pub fn narrowed(grant: &Grant) -> Option<Value> {
     Some(params)
 }
 
+/// The accounts a model grant names, in the order they're used (ADR 29), if it names any.
+pub fn accounts(grant: &Grant) -> Option<Vec<&str>> {
+    let ids = grant.params.get("credentials")?.as_array()?;
+    Some(ids.iter().filter_map(Value::as_str).collect())
+}
+
+/// The accounts the owner gives a model grant, in order, checked (ADR 29): at least one, each one of theirs of the
+/// grant's kind, none twice. The first is the one it uses; putting another first is ADR 20's account switch.
+pub async fn accounts_given(
+    credentials: &crate::credentials::Credentials,
+    owner: &str,
+    grant: &Grant,
+    ids: &[String],
+) -> sqlx::Result<Result<Vec<crate::credentials::CredentialRow>, String>> {
+    let Some(kind) = crate::capabilities::account_kind(&grant.capability) else {
+        return Ok(Err(format!(
+            "a {} grant doesn't name accounts",
+            grant.capability
+        )));
+    };
+    if ids.is_empty() {
+        return Ok(Err("a model grant names at least one account".into()));
+    }
+    let mut accounts: Vec<crate::credentials::CredentialRow> = Vec::new();
+    for id in ids {
+        let Some(account) = credentials.owned(owner, kind, id).await? else {
+            return Ok(Err(format!("{id} isn't one of your {kind} credentials")));
+        };
+        if accounts.iter().any(|a| a.id == account.id) {
+            return Ok(Err(format!("{} is in the list twice", account.name)));
+        }
+        accounts.push(account);
+    }
+    Ok(Ok(accounts))
+}
+
 pub fn describe(grant: &Grant) -> String {
     match grant.capability.as_str() {
-        capability::MODEL => "Claude's API, with the owner's Claude account.".into(),
+        capability::MODEL => "Claude's API, with the first of the owner's Claude accounts this grant names.".into(),
         capability::GITHUB => "GitHub's API and git: reads of public repositories and the ones granted below, pushes to \
                      granted session branches. Other writes go through proposals."
             .into(),
         capability::PACKAGES => "Package registries and tool downloads (crates.io, npm, PyPI, Go, GitHub releases, mise and \
                        others)."
             .into(),
-        capability::CODEX => "Codex's API on chatgpt.com, with the owner's ChatGPT login.".into(),
+        capability::CODEX => "Codex's API on chatgpt.com, with the first of the owner's ChatGPT logins this grant names.".into(),
         capability::DOCS => "Library documentation, searched by library and topic, through Context7's MCP server (the `docs` \
                    tools)."
             .into(),

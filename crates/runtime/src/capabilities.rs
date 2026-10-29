@@ -5,7 +5,7 @@
 
 use sloppod_contracts::{Grant, SessionContext, capability};
 
-use crate::credentials::CHATGPT;
+use crate::credentials::{CHATGPT, CLAUDE};
 
 /// Where a capability stands in a new session's starting set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,10 +55,20 @@ pub enum Part {
 /// Whose models a model part reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
-    /// Claude, on the owner's Claude account.
+    /// Claude, on one of the owner's Claude accounts.
     Anthropic,
-    /// Codex's backend, on the owner's ChatGPT login.
+    /// Codex's backend, on one of the owner's ChatGPT logins.
     ChatGpt,
+}
+
+impl Provider {
+    /// The kind of credential it's reached with.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Provider::Anthropic => CLAUDE,
+            Provider::ChatGpt => CHATGPT,
+        }
+    }
 }
 
 pub const BUILTINS: &[Builtin] = &[
@@ -172,6 +182,16 @@ pub fn always_inherited(name: &str) -> bool {
     builtin(name).is_some_and(|b| b.always_inherited)
 }
 
+/// The kind of account a capability's grant names as its `credential` (ADR 29), filled in with the owner's default
+/// when the grant is made: a Claude account for `model`, a ChatGPT login for `codex`. Repository grants name a
+/// credential only when the owner picks one.
+pub fn account_kind(name: &str) -> Option<&'static str> {
+    builtin(name)?.parts.iter().find_map(|part| match part {
+        Part::Model(provider) => Some(provider.kind()),
+        _ => None,
+    })
+}
+
 /// The built-ins every new session has.
 pub fn always() -> impl Iterator<Item = &'static str> {
     BUILTINS
@@ -215,6 +235,9 @@ mod tests {
                 .collect(),
             role: Default::default(),
         };
+        assert_eq!(account_kind("model"), Some(CLAUDE));
+        assert_eq!(account_kind("codex"), Some(CHATGPT));
+        assert_eq!(account_kind("repo"), None);
         assert!(holds(&session(&["docs", "github"]), &Part::Github));
         assert!(!holds(&session(&["repo", "model"]), &Part::Github));
         assert!(!holds(&session(&["model"]), &chatgpt));

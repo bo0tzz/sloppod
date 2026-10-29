@@ -4,7 +4,7 @@
 use chrono::{DateTime, Duration, Utc};
 use uuid::Uuid;
 
-use crate::credentials::CredentialRow;
+use crate::credentials::{Account, CredentialRow};
 use crate::link::RpcError;
 use crate::{AppState, db, quota};
 
@@ -43,10 +43,18 @@ pub fn wait_until(reset: Option<DateTime<Utc>>, now: DateTime<Utc>) -> DateTime<
         .map_or(now + PROBE_AFTER, |reset| reset + MARGIN)
 }
 
-/// The credential a session's agent uses: its owner's default of the kind the agent needs.
-async fn credential(state: &AppState, owner: &str, agent: &str) -> Option<CredentialRow> {
-    let kind = state.agents.get(agent)?.credential().kind;
-    state.credentials.default_row(owner, &kind).await.ok()?
+/// The credential a session's agent uses: the account of the kind its agent needs that its grant names (ADR 29).
+async fn credential(state: &AppState, session: &db::SessionRow) -> Option<CredentialRow> {
+    let kind = state.agents.get(&session.agent)?.credential().kind;
+    match state
+        .credentials
+        .account(&session.context(), &kind)
+        .await
+        .ok()?
+    {
+        Account::Found(row) => Some(row),
+        _ => None,
+    }
 }
 
 /// A session's turn hit its usage limit: a review round it works on stops running out of time from now, kept at
@@ -61,12 +69,37 @@ pub async fn hit(state: &AppState, session: Uuid) -> Option<DateTime<Utc>> {
 /// When the limit the session's credential is at resets, if its quota says it's at one.
 pub async fn reset(state: &AppState, session: Uuid) -> Option<DateTime<Utc>> {
     let row = db::get_session(&state.db, session).await.ok()??;
-    let credential = credential(state, &row.owner, &row.agent).await?;
+    let credential = credential(state, &row).await?;
     let quota = quota::for_credential(&state.db, credential.id, Utc::now())
         .await
         .ok()??;
     quota.limited.then_some(())?;
     quota.resets_at?.parse().ok()
+}
+
+/// A session's model grant was switched to another account (ADR 20, 29): a session waiting for the old account's
+/// limit waits for the new one's instead, and carries on now if the new one isn't at its limit.
+pub async fn switched(state: &AppState, session: Uuid) {
+    let Ok(Some(row)) = db::get_session(&state.db, session).await else {
+        return;
+    };
+    let now = Utc::now();
+    let quota = match credential(state, &row).await {
+        Some(credential) => quota::for_credential(&state.db, credential.id, now)
+            .await
+            .ok()
+            .flatten(),
+        None => return,
+    };
+    let until = match quota.filter(|q| q.limited) {
+        None => now,
+        Some(quota) => match quota.resets_at.as_deref().and_then(|r| r.parse().ok()) {
+            Some(reset) => wait_until(Some(reset), now),
+            // Limited with no reset known: it waits as it was.
+            None => return,
+        },
+    };
+    state.hub.move_limit(session, until).await;
 }
 
 /// Keeps the sessions waiting for a usage limit in step with their credentials' quotas: one whose credential
@@ -110,7 +143,7 @@ pub fn follow_quotas(state: &AppState) {
                 if row.owner != change.owner {
                     continue;
                 }
-                if credential(&state, &row.owner, &row.agent)
+                if credential(&state, &row)
                     .await
                     .is_some_and(|c| c.id == change.quota.credential_id)
                 {

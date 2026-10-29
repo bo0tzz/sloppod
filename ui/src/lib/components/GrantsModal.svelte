@@ -3,7 +3,7 @@
   import Dialog from './Dialog.svelte';
   import { mdiShieldKeyOutline } from '@mdi/js';
   import { onMount } from 'svelte';
-  import { api, type Grant, type GrantChange, type Session, type WorkGraph, type WorkLevel } from '#lib/api.ts';
+  import { api, type Credential, type Grant, type GrantChange, type Session, type WorkGraph, type WorkLevel } from '#lib/api.ts';
   import { clockTime } from '#lib/format.ts';
 
   let {
@@ -18,6 +18,8 @@
   let own = $state<string[]>([]);
   /** The user's work graphs (ADR 30), for a `work` grant: one per graph. */
   let graphs = $state<WorkGraph[]>([]);
+  /** The user's credentials, for the accounts a model grant names (ADR 29). */
+  let credentials = $state<Credential[]>([]);
   onMount(() => {
     api.listCapabilities().then(
       (definitions) => (own = definitions.map((definition) => definition.name)),
@@ -25,6 +27,10 @@
     );
     api.listWorkGraphs().then(
       (listed) => (graphs = listed),
+      () => {},
+    );
+    api.listCredentials().then(
+      (listed) => (credentials = listed),
       () => {},
     );
   });
@@ -62,6 +68,22 @@
   let error = $state<string | null>(null);
 
   const narrowable = (grant: Grant) => grant.capability === 'repo' && grant.params.access === 'rw';
+
+  /** The kind of account a model grant names (`capabilities::account_kind`). */
+  const accountKinds: Record<string, string> = { model: 'claude', codex: 'chatgpt' };
+  /** The accounts a model grant names, in order: the first is the one it uses. */
+  const accountsOf = (grant: Grant) =>
+    Array.isArray(grant.params.credentials) ? (grant.params.credentials as string[]) : [];
+  const accountName = (id: string) => credentials.find((c) => c.id === id)?.name;
+  /** The user's accounts of the grant's kind that it doesn't name yet. */
+  const addable = (grant: Grant) =>
+    credentials.filter((c) => c.kind === accountKinds[grant.capability] && !accountsOf(grant).includes(c.id));
+  const setAccounts = (grant: Grant, ids: string[]) => change(grant, { credentials: ids });
+  const moveUp = (grant: Grant, index: number) => {
+    const ids = [...accountsOf(grant)];
+    [ids[index - 1], ids[index]] = [ids[index], ids[index - 1]];
+    return setAccounts(grant, ids);
+  };
 
   async function act(call: () => Promise<Session>): Promise<boolean> {
     if (busy) return false;
@@ -101,6 +123,55 @@
           <li class="flex flex-col gap-1" data-testid="grant-{grant.capability}">
             <span class="font-mono text-sm font-medium">{grant.capability}</span>
             <span class="text-sm">{grant.description ?? ''}</span>
+            {#if accountKinds[grant.capability] && accountsOf(grant).length > 0}
+              <ol class="flex flex-col gap-1 text-sm" data-testid="grant-accounts">
+                {#each accountsOf(grant) as id, index (id)}
+                  <li class="flex flex-wrap items-center gap-2" data-testid="grant-account">
+                    {#if accountName(id) !== undefined}
+                      <span>{accountName(id)}</span>
+                      {#if index === 0}
+                        <Text color="muted" size="small">in use</Text>
+                      {/if}
+                    {:else}
+                      <Text color="danger" size="small">A deleted account</Text>
+                    {/if}
+                    {#if changeable && grant.id}
+                      {#if index > 0}
+                        <Button size="tiny" variant="ghost" shape="round" disabled={busy} onclick={() => moveUp(grant, index)}>
+                          Use first
+                        </Button>
+                      {/if}
+                      {#if accountsOf(grant).length > 1}
+                        <Button
+                          size="tiny"
+                          variant="ghost"
+                          shape="round"
+                          disabled={busy}
+                          onclick={() => setAccounts(grant, accountsOf(grant).filter((other) => other !== id))}
+                        >
+                          Remove
+                        </Button>
+                      {/if}
+                    {/if}
+                  </li>
+                {/each}
+              </ol>
+              {#if changeable && grant.id && addable(grant).length > 0}
+                <div class="w-52">
+                  {#key settled}
+                    <Field disabled={busy}>
+                      <Select
+                        size="tiny"
+                        options={addable(grant).map((c) => ({ value: c.id, label: c.name }))}
+                        placeholder="Add an account"
+                        title="Add an account to {grant.capability}"
+                        onChange={(value) => void setAccounts(grant, [...accountsOf(grant), value as string])}
+                      />
+                    </Field>
+                  {/key}
+                </div>
+              {/if}
+            {/if}
             {#if grant.expires_at}
               <Text color="muted" size="small">Runs out {clockTime(grant.expires_at)}</Text>
             {/if}

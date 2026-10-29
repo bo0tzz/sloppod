@@ -6,12 +6,16 @@ use sloppod_contracts::{
 };
 
 use crate::capabilities::{Part, Provider, holds};
-use crate::credentials::Credentials;
+use crate::credentials::{Account, CHATGPT, Credentials};
 
-/// Codex's model API on the ChatGPT backend, reached with the owner's ChatGPT subscription (ADR 24).
+/// Codex's model API on the ChatGPT backend, reached with one of the owner's ChatGPT subscriptions (ADR 24).
 const CODEX_PATH: &str = "/backend-api/codex/";
 
-/// Codex through a ChatGPT login: only Codex's own backend API, with the owner's token and account attached.
+/// A codex grant whose login was deleted: it isn't replaced by another behind the owner's back (ADR 29).
+const GONE: &str = "sloppod: the ChatGPT login this session's codex grant names was deleted; the user can switch the grant to another login in the session's grants list.\n";
+
+/// Codex through a ChatGPT login: only Codex's own backend API, with the token and account of the login the session's
+/// grant names (ADR 29) attached.
 pub struct CodexPolicy {
     credentials: Arc<Credentials>,
 }
@@ -58,16 +62,28 @@ impl RequestPolicy for CodexPolicy {
                 request.path_only()
             )));
         }
-        let tokens = self
+        let login = match self
             .credentials
-            .chatgpt(&session.owner)
+            .account(session, CHATGPT)
             .await
-            .map_err(|e| Error::new(e.to_string()))?;
-        let Some(tokens) = tokens else {
-            return Ok(Decision::deny(format!(
-                "sloppod: {} has no ChatGPT login configured; add one in sloppod's settings.\n",
-                session.owner
-            )));
+            .map_err(|e| Error::new(e.to_string()))?
+        {
+            Account::Found(row) => row,
+            Account::Gone => return Ok(Decision::deny(GONE)),
+            Account::None => {
+                return Ok(Decision::deny(format!(
+                    "sloppod: {} has no ChatGPT login configured; add one in sloppod's settings.\n",
+                    session.owner
+                )));
+            }
+        };
+        let Some(tokens) = self
+            .credentials
+            .chatgpt(&login)
+            .await
+            .map_err(|e| Error::new(e.to_string()))?
+        else {
+            return Ok(Decision::deny(GONE));
         };
         Ok(Decision::allow_with(
             vec![
