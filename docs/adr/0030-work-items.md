@@ -22,20 +22,21 @@ Agents do most of the planning and bookkeeping, and a parent session's context i
 
 - **Items:** a title, a short description, a state (`open`, `active`, `done`, `dropped`), a rank among its siblings, and links. An item can stand for a piece of design, a bug, or a group of other items (a parent).
 - **Edges:** `blocks` (B can't start until A is done) and `part of` (A is a child of B). Both are acyclic; adding an edge that would close a cycle is refused. Order among items that are ready at once is their rank, so the graph says what *can* go next and the rank what *should*.
-- **A layer over issues, not a replacement.** An item can link a GitHub issue, which stays the record of what's wanted: its body, its discussion, outside contributors. The item holds what the issue can't: where it sits in the graph, its state, and what's working on it. An item needn't have an issue (a design step, a check), and an issue needn't have an item (the long tail).
-- **Not tied to a session.** Items belong to their owner ([ADR 23](0023-users-and-ownership.md)), and later to a project ([ADR 1](0001-sessions-decoupled-from-directories.md)); sessions come and go while an item stays. A session that works on an item is linked to it, as are the pull requests and proposals that carry it out.
+- **Several graphs.** An owner keeps as many graphs as they have separate lines of work, e.g. one per project or effort. Sessions on unrelated projects work in different graphs and don't see each other's items. An item and its edges belong to one graph, and a `work` grant names the graph it covers.
+- **A layer over issues, not a replacement.** An item should usually link a GitHub issue, which stays the record of what's wanted: its body, its discussion, outside contributors. The item holds what the issue can't: where it sits in the graph, its state, and what's working on it. An item needn't have an issue (a design step, a check), and an issue needn't have an item (the long tail).
+- **Not tied to a session.** Graphs belong to their owner ([ADR 23](0023-users-and-ownership.md)), and later to a project ([ADR 1](0001-sessions-decoupled-from-directories.md)); sessions come and go while an item stays. A session that works on an item is linked to it, as are the pull requests and proposals that carry it out.
 - **State follows what happens.** The runtime already watches pull requests ([ADR 4](0004-asynchronous-interaction.md), #107), sub-sessions' reports ([ADR 27](0027-sub-sessions.md)) and proposals ([ADR 3](0003-proposals-and-trusted-executor.md)), so items move with what's linked to them, and nobody has to rewrite a list for it to be true. A link either *completes* the item (the pull request or issue that finishes it) or is only *related* (earlier attempts, background, a session that looked into it). Then:
   - An item is `active` while a linked session works on it or a completing pull request is open.
   - An item is `done` once every completing link is finished (a pull request merged, an issue closed as completed) and every child is `done` or `dropped`. A completing pull request closed without merging stops counting as one, rather than finishing the item. A parent with no links of its own is done when its children are.
   - An item with no completing links is only done when someone says so, and saying so is refused while a child is unfinished.
   - Only `done` and `dropped` release what an item blocks, so a dependant never starts while part of the work it waits on is still open.
-- **Agents do most of the operating, under a grant.** Reading and changing the work graph is a capability ([ADR 2](0002-capabilities.md)), `work`, with a level:
+- **Agents do most of the operating, under a grant.** Reading and changing the work graph is a capability ([ADR 2](0002-capabilities.md)), `work`, for one graph, with a level:
   - `read`: see the graph.
   - `track`: also add items and edges, link sessions, pull requests and issues, and move items between `open`, `active` and `done` (within the rules above). Enough for a session doing its share and filing what it finds.
-  - `plan`: also rank, reparent and drop items (any move into `dropped`, by whichever tool), and reopen dropped ones. That's setting priorities.
+  - `plan`: also rank, reparent and drop items (any move into `dropped`, by whichever tool), and reopen dropped ones. That's setting priorities, so an agent's `plan` changes are proposals ([ADR 3](0003-proposals-and-trusted-executor.md)): the owner approves them, shown as a change to the graph, unless a standing approval for that session approves them automatically.
 
   The owner always has `plan`. A sub-session gets at most its parent's level (attenuation), by default `track`. Like any grant, the owner sets and changes it per session.
-- **Every change is recorded and can be undone.** Changes are events (who, which session, what, when), shown in the item's history, and a change can be reverted from there. That's what lets agents operate the graph without asking first: the owner sees and corrects after the fact, rather than approving each edit. A `plan` change by an agent is shown to the owner as a notice, so a reprioritisation doesn't go unseen.
+- **Every change is recorded and can be undone.** Changes are events (who, which session, what, when), shown in the item's history, and a change can be reverted from there. `track` changes apply at once: they're bookkeeping, and the owner sees and corrects them after the fact rather than approving each one. `plan` changes wait for approval as above, and one approved automatically is still shown to the owner as a notice, so a reprioritisation doesn't go unseen.
 - **Agents read it where they need it.** Tools on sloppod's MCP server (`list_work`, `update_work`, ...) at the session's level. A session linked to items is told them in its prompt, and the frontier (what's ready, by rank) is one call away, so a parent re-reads the plan after compaction instead of relying on memory.
 - **People see it in the UI** as the graph and as the ready list, next to the sessions and proposals working on each item; the home dashboard ([#137](https://github.com/bo0tzz/sloppod/issues/137)) shows the frontier.
 
@@ -45,7 +46,7 @@ Agents do most of the planning and bookkeeping, and a parent session's context i
 - Good: agents keep the plan in the runtime rather than in their context, so compaction and new parent sessions lose nothing.
 - Good: issues go back to being records of what's wanted; tracking issues that list other issues aren't needed.
 - Bad: two places to look, the issue for discussion and the item for state; the UI has to make the link obvious both ways.
-- Bad: agents can reorder work without asking. The `plan` level, the notices and undo bound that, but a bad reprioritisation can stand until the owner looks.
+- Bad: reprioritising by an agent waits for the owner unless they turn on auto-approval for the session, and with it on, a bad reprioritisation can stand until the owner looks (the notices and undo bound that).
 - Bad: one more model to build, store and show, with its own API, tools and UI.
 
 ## More Information
@@ -55,11 +56,11 @@ Considered and not chosen:
 - **GitHub issues only,** with labels and a tracking issue: what #255 was. No dependencies, whole-body edits, no link to sessions.
 - **GitHub Projects:** fields, iterations and a board, but no dependencies between items, nothing sloppod can tie to its sessions and proposals, and every change a GitHub write, which sessions make only through proposals.
 - **A flat ranked list:** simpler, but it loses why an item waits, which is the part that kept going stale in prose.
-- **Every agent change as a proposal** (as #255 was): safe, but most changes are bookkeeping, and approving each one is the friction this replaces. Undo and notices are the check instead.
+- **Every agent change as a proposal** (as #255 was): safe, but most changes are bookkeeping, and approving each one is the friction this replaces. Only `plan` changes are proposals; `track` changes rely on undo instead.
 
 Open questions:
 
 - Whether `blocks` should also be inferred, e.g. from stacked pull requests or a migration depending on another.
 - Whether an item that links an issue mirrors its title and closes it when done, or only reads from it.
 - How items move to projects once projects exist, and whether a sub-session's items are visible to its siblings.
-- Whether `plan` changes by agents need the owner's approval after all, at least at first; the levels allow tightening without a redesign.
+- Whether an item can block one in another graph, e.g. a shared dependency of two projects, or whether that's a sign they're one graph.
