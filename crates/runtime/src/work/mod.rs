@@ -478,11 +478,26 @@ async fn settle(
             .chain(rules.ancestors(start))
             .collect();
         for id in chain {
-            let Some(was) = rules.items.get(&id).map(|item| item.state) else {
+            let Some((was, automatic)) = rules
+                .items
+                .get(&id)
+                .map(|item| (item.state, item.automatic))
+            else {
                 continue;
             };
             let now = rules.settle(id);
             if now == was {
+                // A state set by hand (or restored by an undo) that the rules would set anyway is theirs from now on, so
+                // it follows its links and parts.
+                if !automatic && rules.derived(id) {
+                    sqlx::query("update work_items set state_by_rules = true where id = $1")
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await?;
+                    if let Some(item) = rules.items.get_mut(&id) {
+                        item.automatic = true;
+                    }
+                }
                 continue;
             }
             set_state(tx, id, now, true).await?;

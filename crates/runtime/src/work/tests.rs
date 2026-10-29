@@ -411,3 +411,21 @@ async fn a_link_whose_status_changed_isnt_unmade_over_it(db: PgPool) {
             .is_empty()
     );
 }
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+async fn a_state_an_undo_restores_still_follows_its_cause(db: PgPool) {
+    let graph = create_graph(&db, "dev", "g").await.unwrap().id;
+    let item = add(&db, graph, "item", None).await;
+    let link = add_link(&db, DEV, item.id, &pull("o/r#1")).await.unwrap();
+    set_link_status(&db, DEV, link.id, LinkStatus::Finished)
+        .await
+        .unwrap();
+    assert_eq!(state(&db, item.id).await, "done");
+    move_state(&db, DEV, item.id, State::Dropped).await.unwrap();
+    let history = item_history(&db, "dev", item.id).await.unwrap().unwrap();
+    undo(&db, DEV, history.last().unwrap().id).await.unwrap();
+    assert_eq!(state(&db, item.id).await, "done");
+    // Done by its link again, so it reopens when the link goes.
+    remove_link(&db, DEV, link.id).await.unwrap();
+    assert_eq!(state(&db, item.id).await, "open");
+}

@@ -265,6 +265,14 @@ impl Graph {
         }
     }
 
+    /// Whether the item's state is the rules' doing: what's linked to it finishes it, or works on it.
+    pub fn derived(&self, id: Uuid) -> bool {
+        self.items
+            .get(&id)
+            .is_some_and(|item| item.state != State::Dropped)
+            && (self.finished(id) || self.worked_on(id))
+    }
+
     /// Why an item can't be moved to `to` by hand, if it can't.
     pub fn refuse_move(&self, id: Uuid, to: State) -> Option<String> {
         let item = self.items.get(&id)?;
