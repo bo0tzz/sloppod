@@ -1632,6 +1632,31 @@ test('wide screens show what waits on the user in a side panel', async ({ page }
   await expect(page.getByTestId('proposals-bar')).toContainText('2 proposals to review');
 });
 
+test('deciding a proposal moves on to the next one waiting', async ({ page }) => {
+  await createSession(page, 'Propose a PR for sloppod');
+  await finishTurn(page);
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('File issues for sloppod');
+  await box.press('Enter');
+  await expect(page.getByTestId('proposals-bar')).toContainText('2 proposals to review');
+
+  await page.getByTestId('proposals-bar').getByRole('button').first().click();
+  await page.getByRole('dialog').locator('[data-kind="github.pr.create"]').getByRole('button', { name: 'Review' }).click();
+  const detail = page.getByTestId('proposal-detail');
+  await expect(detail.getByTestId('proposal-title')).toHaveText('Reconnect the ACP socket with exponential backoff');
+  await page.getByRole('button', { name: 'Approve', exact: true }).click();
+
+  // The oldest one decided, the issues show in its place, saying what became of the pull request.
+  await expect(detail.getByTestId('issue-draft')).toHaveCount(3);
+  const previous = page.getByTestId('proposal-previous');
+  await expect(previous).toContainText(/(Approved|Opened): pull request/);
+  await expect(previous).toContainText('Reconnect the ACP socket with exponential backoff');
+  await page.getByRole('button', { name: 'File 3 issues' }).click();
+
+  await expect(detail).toBeHidden();
+  await expect(page.getByTestId('proposal-card')).toHaveCount(0);
+});
+
 test('the sidebar folds away on narrow screens', async ({ page }) => {
   const sidebar = page.getByRole('navigation', { name: 'Sessions' });
   await page.setViewportSize({ width: 900, height: 800 });

@@ -25,7 +25,7 @@
     mdiTrashCanOutline,
   } from '@mdi/js';
   import { onMount } from 'svelte';
-  import { api } from '#lib/api.ts';
+  import { api, type Proposal } from '#lib/api.ts';
   import { absoluteTime, clockTime, countdown } from '#lib/format.ts';
   import { SessionView } from '#lib/session.svelte.ts';
   import { sessions } from '#lib/sessions.svelte.ts';
@@ -88,6 +88,23 @@
 
   let openProposalId = $state<string | null>(null);
   const openProposal = $derived(view.proposals.find((proposal) => proposal.id === openProposalId));
+  /** The proposal decided just before, when the modal moved on to the next one waiting. */
+  let decidedProposalId = $state<string | null>(null);
+  const decidedProposal = $derived(view.proposals.find((proposal) => proposal.id === decidedProposalId));
+
+  /** After a decision, the modal moves on to the oldest proposal still waiting for the user, or closes. */
+  function openNextProposal(decided: Proposal) {
+    const next = pendingProposals
+      .filter((proposal) => proposal.id !== decided.id)
+      .sort((a, b) => a.created_at.localeCompare(b.created_at))[0];
+    decidedProposalId = next ? decided.id : null;
+    openProposalId = next?.id ?? null;
+  }
+
+  function openProposalModal(proposalId: string) {
+    decidedProposalId = null;
+    openProposalId = proposalId;
+  }
   /** The proposals list: everything (from the menu), or just the open ones (from the bar above the composer). */
   let proposalList = $state<'all' | 'open' | null>(null);
   let showAddRepo = $state(false);
@@ -267,14 +284,14 @@
         {#each openProposals as proposal (proposal.id)}
           <ProposalCard
             {proposal}
-            onOpen={() => (openProposalId = proposal.id)}
+            onOpen={() => openProposalModal(proposal.id)}
             onChange={(updated) => view.upsertProposal(updated)}
           />
         {/each}
       {:else if openProposals.length === 1}
         <ProposalCard
           proposal={openProposals[0]}
-          onOpen={() => (openProposalId = openProposals[0].id)}
+          onOpen={() => openProposalModal(openProposals[0].id)}
           onChange={(proposal) => view.upsertProposal(proposal)}
         />
       {:else if openProposals.length > 1}
@@ -482,7 +499,7 @@
     proposals={[...(proposalList === 'open' ? openProposals : view.proposals)].reverse()}
     onOpen={(proposalId) => {
       proposalList = null;
-      openProposalId = proposalId;
+      openProposalModal(proposalId);
     }}
     onChange={(proposal) => view.upsertProposal(proposal)}
     onClose={() => (proposalList = null)}
@@ -505,9 +522,14 @@
 {/if}
 
 {#if openProposal}
-  <ProposalModal
-    proposal={openProposal}
-    onChange={(proposal) => view.upsertProposal(proposal)}
-    onClose={() => (openProposalId = null)}
-  />
+  <!-- Keyed, so moving on to the next proposal starts its form afresh. -->
+  {#key openProposal.id}
+    <ProposalModal
+      proposal={openProposal}
+      previous={decidedProposal}
+      onChange={(proposal) => view.upsertProposal(proposal)}
+      onDecided={openNextProposal}
+      onClose={() => (openProposalId = null)}
+    />
+  {/key}
 {/if}
