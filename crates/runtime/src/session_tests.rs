@@ -270,6 +270,124 @@ async fn a_queued_message_can_be_steered_into_the_turn() {
 }
 
 #[tokio::test]
+async fn a_steered_message_is_kept_until_the_agent_takes_it() {
+    let mut h = Harness::ready().await;
+    let first = h.prompt("First");
+    let first_request = h.next().await;
+    let second = h.prompt("Steered");
+    let queued = wait_for_queue(&h, 1).await;
+    let (hub, id, qid) = (h.hub.clone(), h.id, queued[0].clone());
+    let steer = tokio::spawn(async move { hub.steer_queued(id, json!({"id": qid})).await });
+    let steering = h.next().await;
+    assert_eq!(steering["method"], "_session/steering");
+
+    // Sent, but only in the runtime's hands until the agent answers: kept, and not in the log yet.
+    assert_eq!(kept_texts(&h).await, ["Steered"]);
+    assert_eq!(h.user_messages(), [("First".to_owned(), false)]);
+    // A UI that lost its connection meanwhile sends it again: it's had, and isn't queued twice.
+    let resent = h
+        .hub
+        .prompt(
+            h.id,
+            json!({"sessionId": h.id, "prompt": [{"type": "text", "text": "Steered"}],
+                "_meta": {"sloppod": {"messageId": queued[0]}}}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resent["_meta"]["sloppod"]["alreadyReceived"], true);
+    assert!(h.queued().await.is_empty());
+
+    h.respond(&steering, json!({"outcome": "injected"})).await;
+    steer.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+    assert!(h.store.queues().await.unwrap().is_empty());
+    assert_eq!(
+        h.user_messages(),
+        [("First".to_owned(), false), ("Steered".to_owned(), true)]
+    );
+    h.respond(&first_request, json!({"stopReason": "end_turn"}))
+        .await;
+    first.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_steered_message_the_agent_never_got_goes_back_to_its_place_in_the_queue() {
+    let mut h = Harness::ready().await;
+    let first = h.prompt("First");
+    let first_request = h.next().await;
+    let a = h.prompt("A");
+    wait_for_queue(&h, 1).await;
+    let b = h.prompt("B");
+    wait_for_queue(&h, 2).await;
+    let c = h.prompt("C");
+    let queued = wait_for_queue(&h, 3).await;
+
+    let (hub, id, qid) = (h.hub.clone(), h.id, queued[1].clone());
+    let steer = tokio::spawn(async move { hub.steer_queued(id, json!({"id": qid})).await });
+    let steering = h.next().await;
+    let failed = json!({"jsonrpc": "2.0", "id": steering["id"], "error": {"code": -32603, "message": "boom"}});
+    from_agent(&h.hub, h.id, &h.agent, failed).await;
+    let error = steer.await.unwrap().unwrap_err();
+    assert!(error.message.contains("queue"), "{}", error.message);
+
+    // Back where it was, waiting, and not shown as received.
+    assert_eq!(h.queued().await, queued);
+    assert_eq!(kept_texts(&h).await, ["A", "B", "C"]);
+    assert_eq!(h.user_messages(), [("First".to_owned(), false)]);
+
+    // It runs with the rest when the turn ends, and its own prompt is answered then.
+    h.respond(&first_request, json!({"stopReason": "end_turn"}))
+        .await;
+    first.await.unwrap().unwrap();
+    let next = h.next().await;
+    assert_eq!(prompt_text(&next), ["A", "B", "C"]);
+    h.respond(&next, json!({"stopReason": "end_turn"})).await;
+    for message in [a, b, c] {
+        assert_eq!(message.await.unwrap().unwrap()["stopReason"], "end_turn");
+    }
+    assert_eq!(
+        h.user_messages(),
+        [
+            ("First".to_owned(), false),
+            ("A".to_owned(), false),
+            ("B".to_owned(), false),
+            ("C".to_owned(), false)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn steering_a_message_while_the_agent_is_down_leaves_it_queued() {
+    let mut h = Harness::ready().await;
+    let _first = h.prompt("First");
+    h.next().await;
+    let second = h.prompt("Steered");
+    let queued = wait_for_queue(&h, 1).await;
+    h.hub.detach_agent(h.id, &h.agent).await;
+
+    assert!(
+        h.hub
+            .steer_queued(h.id, json!({"id": queued[0]}))
+            .await
+            .is_err()
+    );
+    assert_eq!(h.queued().await, queued);
+    assert_eq!(kept_texts(&h).await, ["Steered"]);
+    assert_eq!(h.user_messages(), [("First".to_owned(), false)]);
+
+    // The agent that comes back gets it.
+    h.replace_agent().await;
+    let request = h.next().await;
+    assert_eq!(prompt_text(&request), ["Steered"]);
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    second.await.unwrap().unwrap();
+    assert_eq!(
+        h.user_messages(),
+        [("First".to_owned(), false), ("Steered".to_owned(), false)]
+    );
+}
+
+#[tokio::test]
 async fn a_queued_message_can_be_taken_back() {
     let mut h = Harness::ready().await;
     let first = h.prompt("First");
@@ -2023,6 +2141,70 @@ async fn a_steer_a_restart_left_open_and_the_agent_then_refuses_still_delivers_i
     assert_eq!(
         prompt_text(&next_prompt(&mut to_agent).await),
         ["sloppod: approved."]
+    );
+}
+
+#[tokio::test]
+async fn a_steered_message_a_restart_cut_off_goes_back_to_the_queue() {
+    let mut h = Harness::ready().await;
+    let _first = h.prompt("First");
+    let turn_request = next_prompt(&mut h.to_agent).await;
+    let _second = h.prompt("Steered");
+    let queued = wait_for_queue(&h, 1).await;
+    let (hub, id, qid) = (h.hub.clone(), h.id, queued[0].clone());
+    tokio::spawn(async move { hub.steer_queued(id, json!({"id": qid})).await });
+    let _lost = h.next().await;
+
+    // The runtime restarts; the agent outlived it with its turn open, but never got the steer.
+    let (hub, agent, mut to_agent) = restarted(&h).await;
+    hub.adopt_agent(h.id, &agent, running(vec![turn_request.clone()]))
+        .await;
+    assert_eq!(kept_texts(&h).await, ["Steered"]);
+    assert_eq!(h.user_messages(), [("First".to_owned(), false)]);
+
+    let answer =
+        json!({"jsonrpc": "2.0", "id": turn_request["id"], "result": {"stopReason": "end_turn"}});
+    from_agent(&hub, h.id, &agent, answer).await;
+    let next = next_prompt(&mut to_agent).await;
+    assert_eq!(prompt_text(&next), ["Steered"]);
+    assert_eq!(
+        h.user_messages(),
+        [("First".to_owned(), false), ("Steered".to_owned(), false)]
+    );
+}
+
+#[tokio::test]
+async fn a_steered_message_a_restart_left_open_is_logged_once_the_agent_takes_it() {
+    let mut h = Harness::ready().await;
+    let _first = h.prompt("First");
+    let turn_request = next_prompt(&mut h.to_agent).await;
+    let _second = h.prompt("Steered");
+    let queued = wait_for_queue(&h, 1).await;
+    let (hub, id, qid) = (h.hub.clone(), h.id, queued[0].clone());
+    tokio::spawn(async move { hub.steer_queued(id, json!({"id": qid})).await });
+    let steering = h.next().await;
+
+    let (hub, agent, mut to_agent) = restarted(&h).await;
+    hub.adopt_agent(
+        h.id,
+        &agent,
+        running(vec![turn_request.clone(), steering.clone()]),
+    )
+    .await;
+    assert_eq!(kept_texts(&h).await, ["Steered"]);
+
+    let answer = json!({"jsonrpc": "2.0", "id": steering["id"], "result": {"outcome": "injected"}});
+    from_agent(&hub, h.id, &agent, answer).await;
+    wait_until_nothing_kept(&h).await;
+    assert_eq!(
+        h.user_messages(),
+        [("First".to_owned(), false), ("Steered".to_owned(), true)]
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !std::iter::from_fn(|| to_agent.try_recv().ok())
+            .any(|m| matches!(m, ToSupervisor::Acp { .. })),
+        "not sent twice"
     );
 }
 
