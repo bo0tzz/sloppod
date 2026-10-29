@@ -55,6 +55,14 @@ type NewSession = {
   agent?: string;        // the agent to run: "claude-code" (the default) or "codex"
   capabilities?: string[]; // what it starts with, from "github", "packages" and, with a ChatGPT login, "codex"; all of them when absent. Model access and "docs" always come, memory with the user's memini, and "github" with a repository. 400 for anything else
   model?: string;        // instead of the user's default model
+  grants?: StartingGrant[]; // the starting set as grants, instead of repo and capabilities (400 if both): see below
+};
+
+// One grant of a starting set (ADR 2, ADR 29). "model" and "docs" always come, and "github" with a repository.
+type StartingGrant = {
+  capability: string;    // one of the built-ins offered (github, packages, codex with a ChatGPT login), "repo", or one of the user's own capabilities by name
+  params?: { repo?: string }; // for "repo": which repository
+  credential?: string;   // for "repo" only: one of the user's github-user tokens that reaches it, to act as them there; else the GitHub App, which must reach it
 };
 
 // A suggested starting set (ADR 2, #232). Advisory: the UI shows it as a card the user edits, and sends what the

@@ -564,22 +564,41 @@ async fn create_session(
             format!("add {account} in settings before starting a session"),
         ));
     }
-    let repos = accessible_repos(&state, &user).await;
-    let repo = match &new.repo {
-        Some(None) => None,
-        Some(Some(wanted)) => {
-            Some(find_repo(&repos, wanted.trim()).cloned().ok_or_else(|| {
-                bad_request(format!("{wanted} isn't accessible to your GitHub App"))
-            })?)
-        }
-        None => derive_repo(prompt, &repos),
-    };
-
     let id = Uuid::new_v4();
-    let defaults = crate::starting::defaults(&state, &user).await?;
-    let grants =
-        crate::starting::grants(&defaults, new.capabilities.as_deref(), repo.as_deref(), id)
+    let (grants, repo) = match &new.grants {
+        // The starting set as grants: what the user chose, checked.
+        Some(wanted) => {
+            if new.repo.is_some() || new.capabilities.is_some() {
+                return Err(bad_request(
+                    "give grants, or repo and capabilities, not both",
+                ));
+            }
+            crate::starting::from_grants(&state, &user, wanted, id)
+                .await?
+                .map_err(bad_request)?
+        }
+        None => {
+            let repos = accessible_repos(&state, &user).await;
+            let repo = match &new.repo {
+                Some(None) => None,
+                Some(Some(wanted)) => {
+                    Some(find_repo(&repos, wanted.trim()).cloned().ok_or_else(|| {
+                        bad_request(format!("{wanted} isn't accessible to your GitHub App"))
+                    })?)
+                }
+                None => derive_repo(prompt, &repos),
+            };
+            let defaults = crate::starting::defaults(&state, &user).await?;
+            let grants = crate::starting::grants(
+                &defaults,
+                new.capabilities.as_deref(),
+                repo.as_deref(),
+                id,
+            )
             .map_err(bad_request)?;
+            (grants, repo)
+        }
+    };
     let model = match new
         .model
         .as_deref()

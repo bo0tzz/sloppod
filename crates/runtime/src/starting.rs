@@ -8,7 +8,10 @@ use serde_json::{Value, json};
 use sloppod_contracts::{Grant, READ_WRITE, capability, find_repo};
 use uuid::Uuid;
 
-use crate::credentials::CHATGPT;
+use sloppod_protocol::api::StartingGrant;
+
+use crate::credentials::{CHATGPT, CredentialRow, token_reaches};
+use crate::definitions::Definition;
 use crate::{AppState, api, proposals};
 
 /// The capabilities a new session gets unless the user leaves some out. Every session has model access and the
@@ -187,6 +190,109 @@ pub async fn suggest(state: &AppState, owner: &str, prompt: &str) -> anyhow::Res
     }
 }
 
+/// A starting set given as grants, checked and made into a new session's grants, with the repository it's about (the
+/// first one): every session's own (`capabilities::always`), then those asked for, in order.
+pub async fn from_grants(
+    state: &AppState,
+    owner: &str,
+    wanted: &[StartingGrant],
+    session: Uuid,
+) -> anyhow::Result<Result<(Vec<Grant>, Option<String>), String>> {
+    let offered = defaults(state, owner).await?;
+    let app_repos = api::accessible_repos(state, owner).await;
+    let tokens = state.credentials.github_users(owner).await?;
+    let definitions = crate::definitions::list(&state.db, owner).await?;
+    Ok(build(
+        wanted,
+        &offered,
+        &app_repos,
+        &tokens,
+        &definitions,
+        session,
+    ))
+}
+
+/// [`from_grants`], given what the owner has: the built-ins offered them, the repositories their GitHub App reaches,
+/// their GitHub tokens and their own capabilities. Only a repository names a credential, and only one of the owner's
+/// tokens that reaches it; a person's credential is never in a starting set unless the owner chose it (ADR 29).
+fn build(
+    wanted: &[StartingGrant],
+    offered: &[&str],
+    app_repos: &[String],
+    tokens: &[CredentialRow],
+    definitions: &[Definition],
+    session: Uuid,
+) -> Result<(Vec<Grant>, Option<String>), String> {
+    let mut grants: Vec<Grant> = crate::capabilities::always()
+        .map(|c| Grant::new(c, json!({})))
+        .collect();
+    let mut repo: Option<String> = None;
+    let has = |grants: &[Grant], c: &str| grants.iter().any(|g| g.capability == c);
+    for want in wanted {
+        let name = want.capability.trim();
+        if want.credential.is_some() && name != capability::REPO {
+            return Err(format!(
+                "only a repository grant names a credential, not {name}"
+            ));
+        }
+        match name {
+            capability::REPO => {
+                let Some(asked) = want.params["repo"].as_str().map(str::trim) else {
+                    return Err("a repository grant names its repository in params.repo".into());
+                };
+                let (found, token) = match &want.credential {
+                    Some(id) => {
+                        let token = tokens
+                            .iter()
+                            .find(|t| t.id.to_string() == *id)
+                            .ok_or("that isn't one of your GitHub tokens")?;
+                        let found = token_reaches(token, asked).ok_or_else(|| {
+                            format!("the token {} doesn't reach {asked}", token.name)
+                        })?;
+                        (found, Some(token))
+                    }
+                    None => (
+                        find_repo(app_repos, asked).cloned().ok_or_else(|| {
+                            format!("{asked} isn't accessible to your GitHub App")
+                        })?,
+                        None,
+                    ),
+                };
+                if grants.iter().any(|g| {
+                    g.capability == capability::REPO
+                        && g.param("repo")
+                            .is_some_and(|r| sloppod_contracts::same_repo(r, &found))
+                }) {
+                    return Err(format!("{found} is in the starting set twice"));
+                }
+                let mut params = json!({"repo": found, "access": READ_WRITE, "branch": proposals::session_branch(session)});
+                if let Some(token) = token {
+                    params["credential"] = json!(token.id.to_string());
+                    params["as"] = json!(token.config("login").unwrap_or_default());
+                }
+                grants.push(Grant::new(capability::REPO, params));
+                repo.get_or_insert(found);
+            }
+            name if has(&grants, name) => {}
+            name if offered.contains(&name) => grants.push(Grant::new(name, json!({}))),
+            name => match definitions.iter().find(|d| d.name == name) {
+                Some(definition) => grants.push(crate::definitions::grant(definition)),
+                None => {
+                    return Err(format!(
+                        "a new session can start with {}, a repository, or one of your own capabilities, not {name}",
+                        offered.join(", ")
+                    ));
+                }
+            },
+        }
+    }
+    // A repository needs GitHub, so it comes along.
+    if repo.is_some() && !has(&grants, capability::GITHUB) {
+        grants.push(Grant::new(capability::GITHUB, json!({})));
+    }
+    Ok((grants, repo))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +352,111 @@ mod tests {
         assert!(!suggestions.newest("dev", newer));
         let (other, _) = suggestions.ask("someone");
         assert!(suggestions.newest("someone", other), "per owner");
+    }
+
+    fn token(id: u128, login: &str, repositories: &[&str]) -> CredentialRow {
+        CredentialRow {
+            id: Uuid::from_u128(id),
+            owner: "dev".into(),
+            kind: crate::credentials::GITHUB_USER.into(),
+            name: format!("{login}'s token"),
+            config: json!({"login": login, "repositories": repositories, "more_repositories": false}),
+            secret: Vec::new(),
+            is_default: false,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn want(capability: &str, params: Value, credential: Option<u128>) -> StartingGrant {
+        StartingGrant {
+            capability: capability.into(),
+            params,
+            credential: credential.map(|id| Uuid::from_u128(id).to_string()),
+        }
+    }
+
+    #[test]
+    fn a_starting_set_of_grants_is_checked_and_completed() {
+        let id = Uuid::nil();
+        let app = ["bo0tzz/sloppod".to_owned()];
+        let tokens = [token(1, "bo0tzz", &["bo0tzz/private"])];
+        let logs = Definition {
+            id: Uuid::from_u128(9),
+            name: "victorialogs".into(),
+            description: "Production logs".into(),
+            mcp_url: "http://vl:8080/mcp".into(),
+            credential_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let defs = [logs];
+        let build = |wanted: &[StartingGrant]| build(wanted, DEFAULTS, &app, &tokens, &defs, id);
+        let names = |grants: &[Grant]| {
+            grants
+                .iter()
+                .map(|g| g.capability.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // A repository acting as the owner's token, and their own capability, chosen at the start.
+        let (grants, repo) = build(&[
+            want("repo", json!({"repo": "BO0TZZ/private"}), Some(1)),
+            want("victorialogs", json!({}), None),
+        ])
+        .unwrap();
+        assert_eq!(repo.as_deref(), Some("bo0tzz/private"));
+        assert_eq!(
+            names(&grants),
+            ["model", "docs", "repo", "victorialogs", "github"]
+        );
+        assert_eq!(grants[2].param("as"), Some("bo0tzz"));
+        assert_eq!(
+            grants[2].param("credential"),
+            Some(Uuid::from_u128(1).to_string().as_str())
+        );
+
+        // The App's repository, without a token; packages; model and docs asked for again change nothing.
+        let (grants, _) = build(&[
+            want("repo", json!({"repo": "bo0tzz/sloppod"}), None),
+            want("packages", json!({}), None),
+            want("docs", json!({}), None),
+        ])
+        .unwrap();
+        assert_eq!(
+            names(&grants),
+            ["model", "docs", "repo", "packages", "github"]
+        );
+        assert_eq!(grants[2].param("credential"), None);
+
+        for (wanted, why) in [
+            (
+                vec![want("repo", json!({"repo": "bo0tzz/private"}), None)],
+                "accessible to your GitHub App",
+            ),
+            (
+                vec![want("repo", json!({"repo": "bo0tzz/sloppod"}), Some(1))],
+                "doesn't reach",
+            ),
+            (
+                vec![want("repo", json!({"repo": "bo0tzz/private"}), Some(2))],
+                "isn't one of your GitHub tokens",
+            ),
+            (
+                vec![want("packages", json!({}), Some(1))],
+                "only a repository grant names a credential",
+            ),
+            (vec![want("repo", json!({}), None)], "params.repo"),
+            (vec![want("memory", json!({}), None)], "not memory"),
+            (
+                vec![
+                    want("repo", json!({"repo": "bo0tzz/sloppod"}), None),
+                    want("repo", json!({"repo": "BO0TZZ/sloppod"}), None),
+                ],
+                "twice",
+            ),
+        ] {
+            let refused = build(&wanted).unwrap_err();
+            assert!(refused.contains(why), "{refused}");
+        }
     }
 
     #[test]
