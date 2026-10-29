@@ -3,12 +3,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use base64::Engine;
 use graphql_parser::query::{Definition, OperationDefinition};
-use sloppod_contracts::capability;
 use sloppod_contracts::{
     Decision, Error, HttpRequest, Manifest, RequestPolicy, Result, SessionContext,
 };
 use sloppod_contracts::{repo_from_git_path, same_repo};
 
+use crate::capabilities::{Part, holds};
 use crate::credentials::Credentials;
 use tracing::Instrument;
 
@@ -315,7 +315,7 @@ impl RequestPolicy for GitHubPolicy {
     }
 
     async fn decide(&self, session: &SessionContext, request: &HttpRequest) -> Result<Decision> {
-        if !session.has(capability::GITHUB) {
+        if !holds(session, &Part::Github) {
             return Ok(Decision::deny(
                 "sloppod: this session has no GitHub access.\n",
             ));
@@ -632,6 +632,45 @@ mod tests {
             grants: vec![],
             role,
         }
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_repository_without_github_reaches_no_github(db: sqlx::PgPool) {
+        use base64::Engine;
+        use serde_json::json;
+        use sloppod_contracts::{Grant, capability};
+
+        let key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let credentials =
+            Credentials::new(db.clone(), crate::vault::Vault::from_base64(&key).unwrap())
+                .await
+                .unwrap();
+        let (rechecks, _) = Rechecks::new(db);
+        let policy = GitHubPolicy::new(Arc::new(credentials), Arc::default(), rechecks);
+        let fetch = HttpRequest {
+            method: "GET".into(),
+            host: "github.com".into(),
+            path: "/o/r.git/info/refs?service=git-upload-pack".into(),
+            headers: Default::default(),
+            body: Vec::new(),
+            body_truncated: false,
+        };
+        let refused = |decision: Decision| matches!(decision, Decision::Deny { message, .. } if message.contains("no GitHub access"));
+
+        // A sub-session narrowed to its repository, say, without github.
+        let mut session = context(Default::default());
+        session.grants = vec![
+            Grant::new(capability::MODEL, json!({})),
+            Grant::new(
+                capability::REPO,
+                json!({"repo": "o/r", "access": "rw", "branch": "sloppod/s"}),
+            ),
+        ];
+        assert!(refused(policy.decide(&session, &fetch).await.unwrap()));
+        session
+            .grants
+            .push(Grant::new(capability::GITHUB, json!({})));
+        assert!(!refused(policy.decide(&session, &fetch).await.unwrap()));
     }
 
     #[test]
