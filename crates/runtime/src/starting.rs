@@ -11,10 +11,10 @@ use uuid::Uuid;
 use crate::credentials::CHATGPT;
 use crate::{AppState, api, proposals};
 
-/// The capabilities a new session gets unless the user leaves some out. Model access isn't among them: every
-/// session has it. Memory comes with the owner's memini, as before.
+/// The capabilities a new session gets unless the user leaves some out. Every session has model access and the
+/// read-only utilities (`ALWAYS`), which aren't chosen; memory comes with the owner's memini, as before.
 pub async fn defaults(state: &AppState, owner: &str) -> anyhow::Result<Vec<&'static str>> {
-    let mut defaults = vec![capability::GITHUB, capability::PACKAGES, capability::DOCS];
+    let mut defaults = vec![capability::GITHUB, capability::PACKAGES];
     if state.credentials.has_default(owner, CHATGPT).await? {
         defaults.push(capability::CODEX);
     }
@@ -23,6 +23,10 @@ pub async fn defaults(state: &AppState, owner: &str) -> anyhow::Result<Vec<&'sta
 
 /// A new session's grants: model access, the `chosen` capabilities (all of `defaults` when not given; only ever
 /// some of them), and write access to its repository, which needs GitHub, so it brings it.
+/// What every new session gets, whatever its starting set: model access, and read-only utilities that reach one
+/// service each, which would cost the agent more mid-task than they ever save: library documentation.
+const ALWAYS: &[&str] = &[capability::MODEL, capability::DOCS];
+
 pub fn grants(
     defaults: &[&'static str],
     chosen: Option<&[String]>,
@@ -32,7 +36,7 @@ pub fn grants(
     if let Some(unknown) = chosen
         .into_iter()
         .flatten()
-        .find(|c| !defaults.contains(&c.as_str()) && c.as_str() != capability::MODEL)
+        .find(|c| !defaults.contains(&c.as_str()) && !ALWAYS.contains(&c.as_str()))
     {
         return Err(format!(
             "a new session can start with {}, not {unknown}",
@@ -43,7 +47,7 @@ pub fn grants(
         chosen.is_none_or(|chosen| chosen.iter().any(|c| c == capability))
             || (capability == capability::GITHUB && repo.is_some())
     };
-    let mut grants = vec![Grant::new(capability::MODEL, json!({}))];
+    let mut grants: Vec<Grant> = ALWAYS.iter().map(|c| Grant::new(c, json!({}))).collect();
     grants.extend(
         defaults
             .iter()
@@ -191,7 +195,7 @@ pub async fn suggest(state: &AppState, owner: &str, prompt: &str) -> anyhow::Res
 mod tests {
     use super::*;
 
-    const DEFAULTS: &[&str] = &[capability::GITHUB, capability::PACKAGES, capability::DOCS];
+    const DEFAULTS: &[&str] = &[capability::GITHUB, capability::PACKAGES];
 
     fn repos() -> Vec<String> {
         vec!["bo0tzz/sloppod".into(), "bo0tzz/dotfiles".into()]
@@ -256,17 +260,22 @@ mod tests {
         };
         assert_eq!(
             capabilities(grants(DEFAULTS, None, None, id).unwrap()),
-            ["model", "github", "packages", "docs"]
+            ["model", "docs", "github", "packages"]
         );
-        let docs = ["docs".to_owned()];
+        // Model access and docs come whatever's chosen, even nothing.
         assert_eq!(
-            capabilities(grants(DEFAULTS, Some(&docs), None, id).unwrap()),
+            capabilities(grants(DEFAULTS, Some(&[]), None, id).unwrap()),
             ["model", "docs"]
+        );
+        let packages = ["packages".to_owned()];
+        assert_eq!(
+            capabilities(grants(DEFAULTS, Some(&packages), None, id).unwrap()),
+            ["model", "docs", "packages"]
         );
         // A repository needs GitHub, so it comes along.
         assert_eq!(
-            capabilities(grants(DEFAULTS, Some(&docs), Some("o/r"), id).unwrap()),
-            ["model", "github", "docs", "repo"]
+            capabilities(grants(DEFAULTS, Some(&packages), Some("o/r"), id).unwrap()),
+            ["model", "docs", "github", "packages", "repo"]
         );
         let more = ["memory".to_owned()];
         assert!(grants(DEFAULTS, Some(&more), None, id).is_err());

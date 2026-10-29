@@ -999,7 +999,8 @@ const availableRepos = () => (credentials.some((c) => c.kind === 'github-app') ?
 
 /** An `owner/name` the user can access, or a bare name that matches exactly one of them. */
 /** What a new session can start with besides model access, memory and the repository: the runtime's `starting::defaults`. */
-const startingCapabilities = () => ['github', 'packages', 'docs', ...(credentials.some((c) => c.kind === 'chatgpt') ? ['codex'] : [])];
+// Model access and docs come with every session, so they aren't chosen.
+const startingCapabilities = () => ['github', 'packages', ...(credentials.some((c) => c.kind === 'chatgpt') ? ['codex'] : [])];
 
 /** How long a suggestion takes, so a test can see the pending hint and a later suggestion overtaking an edit. */
 const suggestDelay = 60;
@@ -1032,7 +1033,8 @@ function createSession({ prompt, repo, title, capabilities, parent }) {
     branch,
     grants: [
       newGrant('model', {}, grantable.model),
-      ...['github', 'packages', 'docs', 'codex'].filter(chosen).map((capability) => newGrant(capability, {}, grantable[capability])),
+      newGrant('docs', {}, grantable.docs),
+      ...['github', 'packages', 'codex'].filter(chosen).map((capability) => newGrant(capability, {}, grantable[capability])),
       ...(sessionRepo
         ? [
             newGrant(
@@ -1412,9 +1414,9 @@ async function handleApi(req, res, url) {
       const body = await readBody(req);
       const prompt = typeof body.prompt === 'string' ? body.prompt : '';
       await sleep(suggestDelay);
-      // A prompt with "question:" gets what a judgement would give for one: no repository, and docs alone.
+      // A prompt with "question:" gets what a judgement would give for one: no repository, and packages alone.
       if (/question:/i.test(prompt)) {
-        return json(res, 200, { title: defaultTitle(prompt), repo: null, capabilities: ['docs'], source: 'judgement' });
+        return json(res, 200, { title: defaultTitle(prompt), repo: null, capabilities: ['packages'], source: 'judgement' });
       }
       return json(res, 200, { title: defaultTitle(prompt), repo: deriveRepo(prompt), capabilities: startingCapabilities(), source: 'match' });
     }
