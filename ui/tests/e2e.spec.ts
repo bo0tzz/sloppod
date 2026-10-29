@@ -2432,7 +2432,7 @@ test.describe('on a phone', () => {
     const panel = page.getByTestId('waiting-panel');
     const summary = page.getByTestId('waiting-summary');
     await expect(summary).toContainText('The agent asks: Please answer the following questions.');
-    await expect(questionCard(page)).toHaveCount(0);
+    await expect(questionCard(page)).toBeHidden();
     expect((await panel.boundingBox())!.height).toBeLessThan(80);
     // Folded, it still takes focus the way the card would (#365), so a stray Esc keeps the questions.
     await expect(summary).toBeFocused();
@@ -2453,6 +2453,26 @@ test.describe('on a phone', () => {
     await panel.getByRole('button', { name: 'Fold' }).click();
     await expect(summary).toBeVisible();
     await summary.getByRole('button', { name: 'Answer' }).click();
+    await expect(questionField(page, 'question_0').getByRole('radio', { name: /Exponential/ })).toBeChecked();
+  });
+
+  test('folding keeps a half-answered question, even when nothing can be stored', async ({ page }) => {
+    await page.addInitScript(() => {
+      Storage.prototype.setItem = () => {
+        throw new DOMException('Full', 'QuotaExceededError');
+      };
+    });
+    await createSession(page, 'Please ask me how to do it');
+    await page.getByTestId('waiting-summary').getByRole('button', { name: 'Answer' }).click();
+    await questionField(page, 'question_0').getByRole('radio', { name: /Exponential/ }).check();
+    await questionCard(page).getByRole('button', { name: 'Next' }).click();
+    await expect(questionCard(page).getByTestId('question-step')).toHaveText('Question 2 of 2');
+
+    await page.getByTestId('waiting-panel').getByRole('button', { name: 'Fold' }).click();
+    await page.getByTestId('waiting-summary').getByRole('button', { name: 'Answer' }).click();
+    await expect(questionCard(page)).toBeFocused();
+    await expect(questionCard(page).getByTestId('question-step')).toHaveText('Question 2 of 2');
+    await questionCard(page).getByRole('button', { name: 'Back' }).click();
     await expect(questionField(page, 'question_0').getByRole('radio', { name: /Exponential/ })).toBeChecked();
   });
 

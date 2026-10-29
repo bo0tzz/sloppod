@@ -25,7 +25,7 @@
     mdiTimerSandComplete,
     mdiTrashCanOutline,
   } from '@mdi/js';
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { api, type Proposal } from '#lib/api.ts';
   import { absoluteTime, clockTime, countdown } from '#lib/format.ts';
   import { toolTitle } from '#lib/presentation.ts';
@@ -135,6 +135,13 @@
   });
   const asking = $derived(view.questions.length > 0 || view.permissions.length > 0);
   const folded = $derived(foldChoice ?? (small && asking));
+  let waitingItemsElement = $state<HTMLElement>();
+  /** Unfolds the panel; a question card that was there all along, hidden, takes focus as if it had just appeared. */
+  async function unfold() {
+    foldChoice = false;
+    await tick();
+    waitingItemsElement?.querySelector<HTMLElement>('[data-testid="question-card"]')?.focus({ preventScroll: true });
+  }
   const waitingSummary = $derived.by((): { kind: 'question' | 'permission' | 'proposal'; text: string } => {
     const question = view.questions[0];
     if (question) return { kind: 'question', text: `The agent asks: ${question.message.split('\n')[0]}` };
@@ -505,9 +512,12 @@
               {#if folded}
                 <!-- Keyed, so each new question takes focus as its card would. -->
                 {#key view.questions[0]?.key}
-                  <WaitingSummary {...waitingSummary} onUnfold={() => (foldChoice = false)} />
+                  <WaitingSummary {...waitingSummary} onUnfold={unfold} />
                 {/key}
-              {:else}
+              {/if}
+              <!-- Hidden rather than unmounted while folded, so a half-answered question keeps its answers and step
+                   whether or not they could be kept in storage. -->
+              <div class={['flex flex-col gap-2', folded && 'hidden']} bind:this={waitingItemsElement}>
                 <div class="-mb-2 flex justify-end">
                   <IconButton
                     icon={mdiChevronDown}
@@ -521,7 +531,7 @@
                   />
                 </div>
                 {@render waitingItems()}
-              {/if}
+              </div>
             </div>
           </div>
         {/if}
