@@ -41,6 +41,7 @@ mod subsessions;
 mod tls;
 mod users;
 mod vault;
+mod work;
 
 use std::net::SocketAddr;
 use std::ops::Deref;

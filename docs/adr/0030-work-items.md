@@ -64,3 +64,14 @@ Open questions:
 - Whether an item that links an issue mirrors its title and closes it when done, or only reads from it.
 - How items move to projects once projects exist, and whether a sub-session's items are visible to its siblings.
 - Whether an item can block one in another graph, e.g. a shared dependency of two projects, or whether that's a sign they're one graph.
+
+2026-10-29: stage 1 is built ([#384](https://github.com/bo0tzz/sloppod/issues/384)): graphs, items, edges, links and events in the database, the rules in one module, and the owner's REST API (`docs/api.md`, "Work"). Choices this ADR left open:
+
+- **`part of` is a parent column.** An item is part of at most one other, so the parts form a tree. `part of` and `blocks` edges are kept acyclic together, so a parent can't block its own part. An item waits on what blocks the items it's part of.
+- **Ranks are numbers.** A placed item gets a rank between its neighbours'. When there's no room left, the siblings are spread out again. Across the graph, the frontier orders items by their ancestors' ranks first.
+- **Links carry a status:** `open`, `finished` or `abandoned`. Later stages set it by watching what the link points at; for now the owner sets it. A session link that's open makes its item active, as does an open completing pull request or proposal.
+- **Undo is an inverse event.** Undoing a change makes the inverse change and records it as an event that names the one it undoes. Undoing that event redoes the change.
+  - A change can be undone only while its effect is still there.
+  - Items are never deleted. Undoing an item's creation drops it.
+  - State changes the rules make are recorded as automatic and can't be undone: they follow links and parts.
+- **What's ready** is the open items with no unfinished parts that nothing unfinished blocks, directly or through an item they're part of, and that aren't inside a done or dropped item. Active items are under way, so they aren't in it.
