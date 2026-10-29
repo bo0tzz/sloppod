@@ -613,6 +613,7 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
 
     // Transcript replacements being put together on this link: file name -> its whole length.
     let mut staging = HashMap::new();
+    let resyncs = PendingResyncs::default();
     // An agent that couldn't start its session ends the link, so the supervisor starts it again after a pause.
     let (start_failed, mut start_failures) = mpsc::unbounded_channel::<()>();
     loop {
@@ -728,17 +729,23 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
                 }
                 match resync_after(&stored) {
                     None => {}
+                    // A retry that's pending asks for all of it anyway.
+                    Some(Duration::ZERO) if resyncs.pending(&name) => {}
                     Some(Duration::ZERO) => {
                         tracing::warn!(session = %session_id, file = %name, offset, "transcript out of step; asking for all of it");
                         agent.resync_transcript(name);
                     }
-                    Some(delay) => {
-                        let agent = agent.clone();
+                    // One retry per file at a time: the other pieces of a transfer that fails all along wait for it
+                    // rather than each asking for the whole file again.
+                    Some(delay) if resyncs.schedule(&name) => {
+                        let (agent, resyncs) = (agent.clone(), resyncs.clone());
                         tokio::spawn(async move {
                             tokio::time::sleep(delay).await;
+                            resyncs.fired(&name);
                             agent.resync_transcript(name);
                         });
                     }
+                    Some(_) => {}
                 }
             }
             // Its name was refused above.
@@ -788,6 +795,26 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
     agent.close();
     state.hub.detach_agent(session_id, &agent).await;
     writer.abort();
+}
+
+/// The transcript files a retry is pending for after a storage error, so each has at most one (#350).
+#[derive(Clone, Default)]
+pub(crate) struct PendingResyncs(Arc<Mutex<std::collections::HashSet<String>>>);
+
+impl PendingResyncs {
+    /// Whether to schedule a retry for `name`: not if one is pending already.
+    pub(crate) fn schedule(&self, name: &str) -> bool {
+        self.0.lock().expect("resyncs lock").insert(name.to_owned())
+    }
+
+    pub(crate) fn pending(&self, name: &str) -> bool {
+        self.0.lock().expect("resyncs lock").contains(name)
+    }
+
+    /// The retry for `name` is being sent: a failure from here on is the new transfer's, and schedules another.
+    pub(crate) fn fired(&self, name: &str) {
+        self.0.lock().expect("resyncs lock").remove(name);
+    }
 }
 
 /// How long after a piece that couldn't be stored the whole file is asked for again: long enough for a database that

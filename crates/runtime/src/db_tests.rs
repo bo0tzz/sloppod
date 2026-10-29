@@ -629,6 +629,50 @@ async fn a_last_piece_that_could_not_be_stored_comes_again_whole(db: PgPool) {
     assert_eq!(resync_after(&Ok(false)), Some(std::time::Duration::ZERO));
     assert_eq!(resync_after(&Ok(true)), None);
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_transfer_that_keeps_failing_is_retried_once_at_a_time(db: PgPool) {
+    use std::collections::HashMap;
+
+    use crate::link::{PendingResyncs, resync_after, store_transcript_piece};
+
+    let s = session(&db, "dev").await;
+    let down = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy_with(db.connect_options().as_ref().clone());
+    down.close().await;
+    let resyncs = PendingResyncs::default();
+    let mut staging = HashMap::new();
+    // A file sent whole in three pieces while the database is down, twice: once before its retry is sent and once
+    // after, from that retry.
+    let mut scheduled = 0;
+    for round in 0..2 {
+        for (offset, piece, replaces) in [
+            (0, &b"aaaa"[..], Some(12)),
+            (4, &b"bbbb"[..], None),
+            (8, &b"cccc"[..], None),
+        ] {
+            let stored =
+                store_transcript_piece(&down, s, &mut staging, "t.jsonl", offset, piece, replaces)
+                    .await;
+            assert!(resync_after(&stored).is_some_and(|after| !after.is_zero()));
+            if resyncs.schedule("t.jsonl") {
+                scheduled += 1;
+            }
+            // Another file has a retry of its own.
+            if round == 0 && offset == 0 {
+                assert!(resyncs.schedule("other.jsonl"));
+            }
+        }
+        assert_eq!(
+            scheduled,
+            round + 1,
+            "one retry per transfer, not per piece"
+        );
+        assert!(resyncs.pending("t.jsonl"));
+        resyncs.fired("t.jsonl");
+    }
+    assert!(resyncs.pending("other.jsonl") && !resyncs.pending("t.jsonl"));
+}
 #[sqlx::test(migrator = "db::MIGRATOR")]
 async fn a_replacement_in_pieces_keeps_the_old_copy_until_it_is_whole(db: PgPool) {
     use std::collections::HashMap;
