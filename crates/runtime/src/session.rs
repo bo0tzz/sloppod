@@ -1846,9 +1846,27 @@ impl Hub {
             self.wake_for_message(id).await?;
             return Ok(json!({"outcome": "queued"}));
         }
-        self.record_user_message(id, &params["prompt"], true, message_id)
-            .await;
-        self.steer_in(id, blocks, false, None, None).await
+        // Kept until the agent takes it, and logged then; one it never gets is let go, for the client to send again.
+        let message = Some(message_id.unwrap_or_else(Uuid::new_v4));
+        let held = {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            let steer = Queued {
+                id: message,
+                blocks: blocks.clone(),
+                notice: false,
+                reply: None,
+            };
+            self.hold(id, &mut state, std::slice::from_ref(&steer))
+                .await
+        };
+        let result = self.steer_in(id, blocks, false, held, message).await;
+        if result.is_err() {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            self.release(id, &mut state, held).await;
+        }
+        result
     }
 
     /// Cancels the running turn; `by` says who did, for the log.

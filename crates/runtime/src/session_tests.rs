@@ -621,6 +621,46 @@ async fn a_relinked_agents_permission_request_holds_a_notice_only_until_it_is_an
 }
 
 #[tokio::test]
+async fn a_direct_steer_is_logged_once_the_agent_takes_it_and_not_if_it_fails() {
+    let mut h = Harness::ready().await;
+    let first = h.prompt("First");
+    let first_request = h.next().await;
+    let (hub, id) = (h.hub.clone(), h.id);
+    let steer = |text: &str| {
+        let hub = hub.clone();
+        let params = json!({"sessionId": id, "prompt": [{"type": "text", "text": text}],
+            "_meta": {"sloppod": {"messageId": Uuid::new_v4()}}});
+        tokio::spawn(async move { hub.steer(id, params).await })
+    };
+
+    // Kept while it's on its way, and logged once the agent has it.
+    let taken = steer("Taken");
+    let steering = h.next().await;
+    assert_eq!(kept_texts(&h).await, ["Taken"]);
+    assert_eq!(h.user_messages(), [("First".to_owned(), false)]);
+    h.respond(&steering, json!({"outcome": "injected"})).await;
+    taken.await.unwrap().unwrap();
+    assert!(h.store.queues().await.unwrap().is_empty());
+
+    // One the agent never got errors, isn't logged, and isn't kept: the client has it to send again.
+    let lost = steer("Lost");
+    let steering = h.next().await;
+    let failed = json!({"jsonrpc": "2.0", "id": steering["id"], "error": {"code": -32603, "message": "boom"}});
+    from_agent(&h.hub, h.id, &h.agent, failed).await;
+    assert!(lost.await.unwrap().is_err());
+    assert!(h.store.queues().await.unwrap().is_empty());
+    assert!(h.queued().await.is_empty());
+    assert_eq!(
+        h.user_messages(),
+        [("First".to_owned(), false), ("Taken".to_owned(), true)]
+    );
+
+    h.respond(&first_request, json!({"stopReason": "end_turn"}))
+        .await;
+    first.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn the_users_steer_goes_in_during_a_tool_call() {
     let mut h = Harness::ready().await;
     let _turn = h.prompt("First");
