@@ -390,6 +390,51 @@ async fn steers_that_fail_together_go_back_in_their_order() {
 }
 
 #[tokio::test]
+async fn a_failed_steer_of_a_restored_message_goes_back_in_its_place() {
+    let mut h = Harness::ready().await;
+    let _first = h.prompt("First");
+    let turn = next_prompt(&mut h.to_agent).await;
+    let _a = h.prompt("A");
+    wait_for_queue(&h, 1).await;
+    let _b = h.prompt("B");
+    let queued = wait_for_queue(&h, 2).await;
+
+    // The runtime restarts; the agent still has its turn open, with A and B waiting behind it.
+    let (hub, agent, mut to_agent) = restarted(&h).await;
+    hub.adopt_agent(h.id, &agent, running(vec![turn.clone()]))
+        .await;
+    let waiting = |hub: Arc<Hub>| async move {
+        let replay = hub.replay(h.id).await.unwrap();
+        replay.queue["params"]["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|m| m["id"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(waiting(hub.clone()).await, queued);
+
+    let steer = {
+        let (hub, id, qid) = (hub.clone(), h.id, queued[0].clone());
+        tokio::spawn(async move { hub.steer_queued(id, json!({"id": qid})).await })
+    };
+    let steering = loop {
+        if let Some(ToSupervisor::Acp { message }) = to_agent.recv().await {
+            break message;
+        }
+    };
+    assert_eq!(steering["method"], "_session/steering");
+    let failed = json!({"jsonrpc": "2.0", "id": steering["id"], "error": {"code": -32603, "message": "boom"}});
+    from_agent(&hub, h.id, &agent, failed).await;
+    assert!(steer.await.unwrap().is_err());
+    assert_eq!(waiting(hub.clone()).await, queued);
+
+    let answer = json!({"jsonrpc": "2.0", "id": turn["id"], "result": {"stopReason": "end_turn"}});
+    from_agent(&hub, h.id, &agent, answer).await;
+    assert_eq!(prompt_text(&next_prompt(&mut to_agent).await), ["A", "B"]);
+}
+
+#[tokio::test]
 async fn steering_a_message_while_the_agent_is_down_leaves_it_queued() {
     let mut h = Harness::ready().await;
     let _first = h.prompt("First");

@@ -42,7 +42,8 @@ pub(crate) struct Queued {
     pub(crate) notice: bool,
     pub(crate) reply: Option<oneshot::Sender<Result<Value, RpcError>>>,
     /// Where it joined the queue, counted per session; kept while it's held, so one that goes back after a failed
-    /// steer takes its old place. 0 for what was queued before this runtime started, or put at the front.
+    /// steer takes its old place. Kept with the queue, and numbered afresh when a restart restores it; 0 for what's
+    /// put at the front.
     pub(crate) seq: u64,
 }
 
@@ -58,7 +59,7 @@ fn has_queued(state: &LiveState, id: Uuid) -> bool {
 
 /// How a queued prompt is kept in the store.
 fn stored(q: &Queued) -> Value {
-    json!({"id": q.id, "blocks": q.blocks, "notice": q.notice})
+    json!({"id": q.id, "blocks": q.blocks, "notice": q.notice, "seq": q.seq})
 }
 
 /// A queued prompt from how it's kept in the store.
@@ -68,7 +69,7 @@ fn unstored(q: &Value) -> Queued {
         blocks: q["blocks"].as_array().cloned().unwrap_or_default(),
         notice: q["notice"] == true,
         reply: None,
-        seq: 0,
+        seq: q["seq"].as_u64().unwrap_or_default(),
     }
 }
 
@@ -240,6 +241,22 @@ impl LiveState {
         self.queued_seq += 1;
         queued.seq = self.queued_seq;
         self.queue.push(queued);
+    }
+
+    /// Numbers what's queued afresh, in its order, behind what a restart left held (taken earlier, so older): a
+    /// restart forgets the count, so what it restores couldn't otherwise be told apart.
+    fn renumber(&mut self) {
+        let mut seq = 0;
+        let held = self.in_flight.iter_mut().flat_map(|h| h.stored.iter_mut());
+        for q in held {
+            seq += 1;
+            q["seq"] = json!(seq);
+        }
+        for q in &mut self.queue {
+            seq += 1;
+            q.seq = seq;
+        }
+        self.queued_seq = seq;
     }
 }
 
@@ -1085,6 +1102,7 @@ impl Hub {
                 let since = std::mem::take(&mut state.queue);
                 state.queue = restored.into_iter().chain(since).collect();
                 state.in_flight.extend(held);
+                state.renumber();
                 self.save_queue(id, &state).await;
             }
             if nothing {
