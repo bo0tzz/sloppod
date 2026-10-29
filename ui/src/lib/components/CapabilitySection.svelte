@@ -1,11 +1,11 @@
 <script lang="ts">
   import { Alert, Button, Field, Heading, IconButton, Input, Select, Text, modalManager, toastManager } from '@immich/ui';
   import { mdiPlus, mdiTrashCanOutline } from '@mdi/js';
-  import { onMount } from 'svelte';
   import { api, type Credential, type Definition } from '#lib/api.ts';
 
-  /** The user's `token` credentials, which a definition can attach to its requests. */
-  let { tokens }: { tokens: Credential[] } = $props();
+  /** The user's `token` credentials, which a definition can attach to its requests; `version` changes when they do, which
+   * can detach one from a definition (deleting a token does). */
+  let { tokens, version }: { tokens: Credential[]; version: number } = $props();
 
   const NONE = '';
   let definitions = $state<Definition[] | null>(null);
@@ -35,7 +35,10 @@
     }
   }
 
-  onMount(() => void refresh());
+  $effect(() => {
+    void version;
+    void refresh();
+  });
 
   function reset() {
     adding = false;

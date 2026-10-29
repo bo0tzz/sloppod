@@ -1822,7 +1822,11 @@ async function handleCredentials(req, res, parts) {
     if (missing.length) return json(res, 400, { error: `missing config: ${missing.join(', ')}` });
     let config = Object.fromEntries(keys.map((key) => [key, String(body.config[key])]));
     // A token's header is optional: sent as that header, else as a bearer token.
-    if (body.kind === 'token' && body.config?.header) config.header = String(body.config.header);
+    if (body.kind === 'token' && body.config?.header) {
+      const header = String(body.config.header);
+      if (!/^[A-Za-z0-9-]+$/.test(header)) return json(res, 400, { error: 'a header name is letters, digits and dashes' });
+      config.header = header.toLowerCase();
+    }
     if (body.kind === 'github-user') {
       const inspected = inspectUserToken(body.secret.trim());
       if (inspected.error) return json(res, 400, { error: inspected.error });
@@ -1838,6 +1842,8 @@ async function handleCredentials(req, res, parts) {
   }
   if (parts.length === 2 && method === 'DELETE') {
     credentials.splice(credentials.indexOf(credential), 1);
+    // A capability that named it keeps existing without it (the runtime's `on delete set null`).
+    for (const definition of definitions) if (definition.credential_id === credential.id) delete definition.credential_id;
     // Assumed: deleting the default promotes the oldest remaining credential of that kind.
     const next = credentials.find((c) => c.kind === credential.kind);
     if (credential.default && next) next.default = true;

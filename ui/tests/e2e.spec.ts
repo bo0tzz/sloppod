@@ -1909,7 +1909,8 @@ test('a token for a capability is added in settings and chosen for the capabilit
   await tokens.getByLabel('Token', { exact: true }).fill('secret');
   await tokens.getByRole('button', { name: 'Save' }).click();
   await expect(tokens.getByTestId('credential')).toContainText('logs key');
-  await expect(tokens.getByTestId('credential')).toContainText('Header: X-API-Key');
+  // As the runtime keeps it: header names are lowercased.
+  await expect(tokens.getByTestId('credential')).toContainText('Header: x-api-key');
 
   const section = page.getByTestId('capabilities');
   await section.getByRole('button', { name: 'Add capability' }).click();
@@ -1921,12 +1922,26 @@ test('a token for a capability is added in settings and chosen for the capabilit
   await section.getByRole('button', { name: 'Save' }).click();
   await expect(section.getByTestId('capability')).toContainText('Token: logs key');
 
+  // Deleting the token says what it does to the capability that sends it, and detaches it there, as the runtime's
+  // foreign key does.
+  await tokens.getByRole('button', { name: 'Delete logs key' }).click();
+  await expect(page.getByText('stop sending it at once, also to sessions that already have them')).toBeVisible();
+  await page.getByRole('button', { name: 'Delete', exact: true }).click();
+  await expect(tokens.getByTestId('credential')).toHaveCount(0);
+  await expect(section.getByTestId('capability')).toContainText('metrics');
+  await expect(section.getByTestId('capability')).not.toContainText('Token:');
+
   await section.getByRole('button', { name: 'Delete metrics' }).click();
   await page.getByRole('button', { name: 'Delete', exact: true }).click();
   await expect(section.getByTestId('capability')).toHaveCount(0);
-  await tokens.getByRole('button', { name: 'Delete logs key' }).click();
-  await page.getByRole('button', { name: 'Delete', exact: true }).click();
-  await expect(tokens.getByTestId('credential')).toHaveCount(0);
+
+  // A header name is letters, digits and dashes.
+  await tokens.getByRole('button', { name: 'Add token' }).click();
+  await tokens.getByLabel('Name', { exact: true }).fill('odd');
+  await tokens.getByLabel('Header').fill('X API Key');
+  await tokens.getByLabel('Token', { exact: true }).fill('secret');
+  await tokens.getByRole('button', { name: 'Save' }).click();
+  await expect(tokens.getByText('a header name is letters, digits and dashes')).toBeVisible();
 });
 
 test('reviews and approves updates to existing issues', async ({ page }) => {

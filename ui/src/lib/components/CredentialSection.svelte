@@ -81,7 +81,7 @@
   async function remove(credential: Credential) {
     const confirmed = await modalManager.showDialog({
       title: `Delete ${credential.name}?`,
-      prompt: `New sessions can no longer use this ${spec.noun}. Its secret is deleted with it.`,
+      prompt: spec.deletion ?? `New sessions can no longer use this ${spec.noun}. Its secret is deleted with it.`,
       confirmText: 'Delete',
       icon: mdiTrashCanOutline,
     });

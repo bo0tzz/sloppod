@@ -177,6 +177,8 @@ export type CredentialKindSpec = {
   empty: string;
   fields: { key: string; label: string; type?: string; placeholder?: string; description?: string; optional?: boolean }[];
   secret: { label: string; description?: string; multiline?: boolean; placeholder?: string };
+  /** What deleting one does, when it isn't only that new sessions can't use it. */
+  deletion?: string;
 };
 
 export const credentialKinds: CredentialKindSpec[] = [
@@ -251,6 +253,8 @@ export const credentialKinds: CredentialKindSpec[] = [
       },
     ],
     secret: { label: 'Token' },
+    deletion:
+      'Capabilities that use it stop sending it at once, also to sessions that already have them, and their servers may refuse those requests. Its secret is deleted with it.',
   },
   {
     kind: 'chatgpt',
