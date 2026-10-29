@@ -280,7 +280,7 @@ async fn withdraw_proposal(
         Ok(Some(row)) => {
             state.hub.broadcast_proposal(&row.to_api());
             if let Some(review) = row.review_session_id {
-                reviews::end(state, review);
+                reviews::finish(state, review);
             }
             Ok(format!("Proposal {id} is withdrawn."))
         }
