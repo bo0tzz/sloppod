@@ -6,15 +6,15 @@ use chrono::{DateTime, Duration, Utc};
 use uuid::Uuid;
 
 use sloppod_contracts::SessionContext;
+use sqlx::PgPool;
 
-use crate::credentials::{Account, CHATGPT, CredentialRow};
+use crate::credentials::{Account, CHATGPT, CredentialRow, Credentials};
 use crate::link::RpcError;
-use crate::{AppState, db, quota};
+use crate::quota::{self, PROBE_AFTER};
+use crate::{AppState, db};
 
 /// After the reported reset, so the first request after it isn't refused by a clock a little behind.
 const MARGIN: Duration = Duration::minutes(1);
-/// How long a session waits before trying again when nothing says when the limit resets.
-const PROBE_AFTER: Duration = Duration::minutes(30);
 
 /// How claude-agent-acp's synthetic usage-limit messages start (the Claude Agent SDK's
 /// `USAGE_LIMIT_ERROR_PREFIXES`) that reset in time, for when the failed prompt's error carries no kind.
@@ -60,14 +60,6 @@ async fn of_session(state: &AppState, session: Uuid) -> Option<(String, SessionC
     let row = db::get_session(&state.db, session).await.ok()??;
     let kind = state.agents.get(&row.agent)?.credential().kind;
     Some((kind, row.context()))
-}
-
-/// The account a session's agent uses now (ADR 29, #252).
-async fn in_use(state: &AppState, kind: &str, session: &SessionContext) -> Option<CredentialRow> {
-    match state.credentials.account(session, kind).await.ok()? {
-        Account::Found(row) => Some(row),
-        _ => None,
-    }
 }
 
 /// How long the limit of a session's accounts lasts.
@@ -131,6 +123,31 @@ fn fallback_notice(kind: &str, from: &CredentialRow, to: &CredentialRow) -> Stri
     )
 }
 
+/// After a session's turn failed on its usage limit: the account it used then, kept as limited, and the next on its
+/// grant that isn't limited, if there is one. The account used is the one last attached to its requests, not the one
+/// that would be chosen now, which a quota report from that turn may already have moved on.
+pub async fn fall_back(
+    credentials: &Credentials,
+    db: &PgPool,
+    session: &SessionContext,
+    kind: &str,
+    now: DateTime<Utc>,
+) -> sqlx::Result<(Option<CredentialRow>, Option<CredentialRow>)> {
+    let Some(used) = credentials.used(session, kind).await? else {
+        return Ok((None, None));
+    };
+    quota::mark_limited(db, used.id, now).await?;
+    let next = match credentials.account(session, kind).await? {
+        Account::Found(next)
+            if next.id != used.id && !quota::is_limited(db, next.id, now).await? =>
+        {
+            Some(next)
+        }
+        _ => None,
+    };
+    Ok((Some(used), next))
+}
+
 /// A session's turn hit its usage limit (#251, #252). The account it used is kept as limited, and if another account
 /// on its grant isn't, the session carries on with that one at once: the authorizer attaches it from the next
 /// request. Otherwise it waits for the earliest reset, and a review round it works on stops running out of time from
@@ -140,17 +157,16 @@ pub async fn hit(state: &AppState, session: Uuid) -> Next {
     let Some((kind, context)) = of_session(state, session).await else {
         return wait(state, session, None).await;
     };
-    let used = in_use(state, &kind, &context).await;
-    if let Some(used) = &used {
-        quota::hit(state, used, now, now + PROBE_AFTER).await;
-    }
-    let next = in_use(state, &kind, &context).await;
-    if let (Some(used), Some(next)) = (&used, &next)
-        && used.id != next.id
-        && quota::is_limited(&state.db, next.id, now).await.ok() == Some(false)
-    {
-        tracing::info!(%session, from = %used.id, to = %next.id, "the session's account hit its usage limit; it carries on with the next");
-        return Next::Fallback(fallback_notice(&kind, used, next));
+    match fall_back(&state.credentials, &state.db, &context, &kind, now).await {
+        Ok((Some(used), next)) => {
+            quota::announce(state, &used).await;
+            if let Some(next) = next {
+                tracing::info!(%session, from = %used.id, to = %next.id, "the session's account hit its usage limit; it carries on with the next");
+                return Next::Fallback(fallback_notice(&kind, &used, &next));
+            }
+        }
+        Ok((None, _)) => {}
+        Err(e) => tracing::warn!(%session, error = %e, "finding an account to fall back to"),
     }
     let reset = match lasts(state, &kind, &context, now).await {
         Some(Lasts::Until(reset)) => Some(reset),
