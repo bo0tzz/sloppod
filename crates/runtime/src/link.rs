@@ -613,6 +613,7 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
 
     // Transcript replacements being put together on this link: file name -> its whole length.
     let mut staging = HashMap::new();
+    let resyncs = PendingResyncs::default();
     // An agent that couldn't start its session ends the link, so the supervisor starts it again after a pause.
     let (start_failed, mut start_failures) = mpsc::unbounded_channel::<()>();
     loop {
@@ -721,15 +722,30 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
                     replaces,
                 )
                 .await;
-                match stored {
-                    Ok(true) => {}
-                    Ok(false) => {
+                if let Err(e) = &stored {
+                    tracing::error!(session = %session_id, file = %name, offset, error = %e, "storing transcript; asking for all of it again shortly");
+                    // Whatever was staged may be missing a piece too; the whole file comes again.
+                    staging.remove(&name);
+                }
+                match resync_after(&stored) {
+                    None => {}
+                    // A retry that's pending asks for all of it anyway.
+                    Some(Duration::ZERO) if resyncs.pending(&name) => {}
+                    Some(Duration::ZERO) => {
                         tracing::warn!(session = %session_id, file = %name, offset, "transcript out of step; asking for all of it");
                         agent.resync_transcript(name);
                     }
-                    Err(e) => {
-                        tracing::error!(session = %session_id, error = %e, "storing transcript")
+                    // One retry per file at a time: the other pieces of a transfer that fails all along wait for it
+                    // rather than each asking for the whole file again.
+                    Some(delay) if resyncs.schedule(&name) => {
+                        let (agent, resyncs) = (agent.clone(), resyncs.clone());
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            resyncs.fired(&name);
+                            agent.resync_transcript(name);
+                        });
                     }
+                    Some(_) => {}
                 }
             }
             // Its name was refused above.
@@ -779,6 +795,41 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
     agent.close();
     state.hub.detach_agent(session_id, &agent).await;
     writer.abort();
+}
+
+/// The transcript files a retry is pending for after a storage error, so each has at most one (#350).
+#[derive(Clone, Default)]
+pub(crate) struct PendingResyncs(Arc<Mutex<std::collections::HashSet<String>>>);
+
+impl PendingResyncs {
+    /// Whether to schedule a retry for `name`: not if one is pending already.
+    pub(crate) fn schedule(&self, name: &str) -> bool {
+        self.0.lock().expect("resyncs lock").insert(name.to_owned())
+    }
+
+    pub(crate) fn pending(&self, name: &str) -> bool {
+        self.0.lock().expect("resyncs lock").contains(name)
+    }
+
+    /// The retry for `name` is being sent: a failure from here on is the new transfer's, and schedules another.
+    pub(crate) fn fired(&self, name: &str) {
+        self.0.lock().expect("resyncs lock").remove(name);
+    }
+}
+
+/// How long after a piece that couldn't be stored the whole file is asked for again: long enough for a database that
+/// failed for a moment to be back, and to keep a database that stays down from being asked every moment.
+const RESYNC_AFTER_ERROR: Duration = Duration::from_secs(5);
+
+/// When to ask the supervisor for the whole of a transcript file again, after storing a piece of it: at once when the
+/// piece was out of step with the stored copy, after a while when it couldn't be stored. The supervisor counts a piece
+/// as synced once it's sent, so a lost last piece would otherwise never come again (#350).
+pub(crate) fn resync_after(stored: &sqlx::Result<bool>) -> Option<Duration> {
+    match stored {
+        Ok(true) => None,
+        Ok(false) => Some(Duration::ZERO),
+        Err(_) => Some(RESYNC_AFTER_ERROR),
+    }
 }
 
 /// Stores a piece of a transcript sync; returns whether it was in step with the stored copy. A replacement that comes
