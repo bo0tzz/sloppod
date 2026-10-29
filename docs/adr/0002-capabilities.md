@@ -91,3 +91,13 @@ Still to decide: per-owner or deployment-wide definitions, MCP servers through t
 2026-10-29: the first owner-defined capabilities are built: MCP servers, per owner. Of the questions above, two are answered. The runtime proxies the server, at `/servers/<name>` on the sessions port, rather than the authorizer reaching it as egress. That way an in-cluster server needs no egress or certificate, and its credential (a new `token` kind) is attached outside the pod. Params don't narrow user definitions yet.
 
 2026-10-29: `docs` is the first built-in on the definitions' path. A built-in names its MCP server's URL, if it's one, and the runtime serves it at `/servers/<name>` to the sessions granted it, as it does an owner's definition, with no credential; the agent's MCP config lists it like one. Its request policy is gone, and with it Context7's host as one the authorizer intercepts: the session reaches Context7 only through the runtime. Agents already running keep the old URL (`mcp.context7.com` directly) until they next start, so their `docs` tools fail until then, e.g. until a park and wake.
+
+2026-10-29: what a definition's parts are. A definition is a list of parts, each of a kind that's an extension ([ADR 7](0007-extension-points.md)) and knows its own params:
+- **`mcp {url}`:** an MCP server the runtime serves at `/servers/<name>`, with the definition's credential if it has one. Owners' definitions are made of these, for now.
+- **`model {provider}`:** inference for the session's agent, with a credential of the provider's kind ([ADR 29](0029-grants-name-their-credential.md)). `model` and `codex` are this, for Anthropic and ChatGPT.
+- **`github`:** GitHub through tokens scoped to the session's repository grants, with push rules and proposals. `github` is this. A repository is a param of it, with the credential it acts with.
+- **`memory`:** a memini key minted at placement, the runtime's proxy, and the agent's plugin.
+- **`egress {hosts}`:** hosts the pod reaches directly, uninspected. `packages` is this. Owners can't define it yet: it's the one part that opens the boundary rather than going through the runtime.
+
+The core assembles a session's reach from its grants' parts without knowing which capability they came from. The behaviour behind each part, e.g. GitHub's request policy, stays code; what becomes data is which capability is made of which parts.
+
