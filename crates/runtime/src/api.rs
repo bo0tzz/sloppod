@@ -252,6 +252,9 @@ struct GrantChange {
     /// Narrows the grant, e.g. a repository the session can push to becomes read only.
     #[serde(default)]
     narrow: bool,
+    /// The accounts a model grant acts with, in order (ADR 29): putting another first is the account switch of ADR 20.
+    #[serde(default)]
+    credentials: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -418,7 +421,7 @@ async fn add_grant(
     Ok((StatusCode::CREATED, Json(session.to_api())))
 }
 
-/// Extends, shortens or clears a grant's expiry, or narrows it.
+/// Extends, shortens or clears a grant's expiry, narrows it, or changes the accounts a model grant acts with.
 async fn change_grant(
     State(state): State<AppState>,
     User(user): User,
@@ -432,8 +435,8 @@ async fn change_grant(
         .await?
         .ok_or_else(not_found)?;
     // Everything is checked before anything is written, and then written together.
-    if !body.narrow && body.expires_at.is_none() {
-        return Err(bad_request("give expires_at or narrow"));
+    if !body.narrow && body.expires_at.is_none() && body.credentials.is_none() {
+        return Err(bad_request("give expires_at, narrow or credentials"));
     }
     if body
         .expires_at
@@ -451,7 +454,28 @@ async fn change_grant(
         ),
         false => None,
     };
-    db::change_grant(&state.db, id, grant_id, narrower.as_ref(), body.expires_at).await?;
+    let accounts = match &body.credentials {
+        Some(ids) => Some(
+            crate::grants::accounts_given(&state.credentials, &user, &grant, ids)
+                .await?
+                .map_err(bad_request)?,
+        ),
+        None => None,
+    };
+    let params = match &accounts {
+        Some(accounts) => {
+            let mut params = narrower.clone().unwrap_or_else(|| grant.params.clone());
+            params["credentials"] = json!(
+                accounts
+                    .iter()
+                    .map(|a| a.id.to_string())
+                    .collect::<Vec<_>>()
+            );
+            Some(params)
+        }
+        None => narrower.clone(),
+    };
+    db::change_grant(&state.db, id, grant_id, params.as_ref(), body.expires_at).await?;
     let mut changes = Vec::new();
     if let Some(params) = narrower {
         let narrowed = Grant {
@@ -469,6 +493,19 @@ async fn change_grant(
             None => "no longer runs out".to_owned(),
         });
     }
+    if let Some(accounts) = &accounts {
+        let names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
+        changes.push(format!(
+            "now acts with the {} credential {} (then, in order: {})",
+            accounts[0].kind,
+            names[0],
+            if names.len() > 1 {
+                names[1..].join(", ")
+            } else {
+                "none".into()
+            }
+        ));
+    }
     let what = format!(
         "the user changed this session's grant {} ({}): {}.",
         grant.capability,
@@ -476,6 +513,9 @@ async fn change_grant(
         changes.join("; ")
     );
     lifecycle::grants_changed(&state, id, &what).await;
+    if accounts.is_some() {
+        crate::limits::switched(&state, id).await;
+    }
     let session = db::get_session(&state.db, id)
         .await?
         .ok_or_else(not_found)?;

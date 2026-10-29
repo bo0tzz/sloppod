@@ -271,15 +271,7 @@ pub async fn insert_session(db: &PgPool, new: NewSessionRow<'_>) -> sqlx::Result
     .execute(&mut *tx)
     .await?;
     for grant in new.grants {
-        sqlx::query(
-            "insert into session_grants (session_id, capability, params, expires_at) values ($1, $2, $3, $4::timestamptz)",
-        )
-        .bind(new.id)
-        .bind(&grant.capability)
-        .bind(&grant.params)
-        .bind(grant.expires_at.as_deref())
-        .execute(&mut *tx)
-        .await?;
+        insert_grant(&mut *tx, new.id, grant, grant.expires_at.as_deref()).await?;
     }
     tx.commit().await?;
     Ok(get_session(db, new.id)
@@ -1197,13 +1189,35 @@ pub async fn grant(
     grant: &Grant,
     expires_at: Option<DateTime<Utc>>,
 ) -> sqlx::Result<Uuid> {
+    let expires_at = expires_at.map(|at| at.to_rfc3339());
+    insert_grant(db, session, grant, expires_at.as_deref()).await
+}
+
+/// Every grant is stored through here. A model grant that names no accounts is given all of the owner's of its kind,
+/// the default first (ADR 29), and keeps that list until the owner changes it: making another account the default
+/// changes what new grants get, not what sessions use. One that names its accounts keeps them, e.g. a sub-session's
+/// copy of its parent's.
+async fn insert_grant(
+    db: impl sqlx::PgExecutor<'_>,
+    session: Uuid,
+    grant: &Grant,
+    expires_at: Option<&str>,
+) -> sqlx::Result<Uuid> {
     sqlx::query_scalar(
-        "insert into session_grants (session_id, capability, params, expires_at) values ($1, $2, $3, $4) returning id",
+        "insert into session_grants (session_id, capability, params, expires_at) \
+         select $1, $2, case when $5::text is null or $3 ? 'credentials' then $3 \
+           else $3 || coalesce((select jsonb_build_object('credentials', \
+               jsonb_agg(c.id::text order by c.is_default desc, c.created_at)) \
+             from credentials c join sessions s on s.owner = c.owner where s.id = $1 and c.kind = $5 \
+             having count(*) > 0), '{}') end, \
+           $4::timestamptz \
+         returning id",
     )
     .bind(session)
     .bind(&grant.capability)
     .bind(&grant.params)
     .bind(expires_at)
+    .bind(crate::capabilities::account_kind(&grant.capability))
     .fetch_one(db)
     .await
 }
@@ -1285,13 +1299,7 @@ pub async fn sweep_expired_grants(db: &PgPool) -> sqlx::Result<Vec<(Uuid, Grant)
 }
 
 pub async fn add_grant(db: &PgPool, session: Uuid, grant: &Grant) -> sqlx::Result<()> {
-    sqlx::query("insert into session_grants (session_id, capability, params) values ($1, $2, $3)")
-        .bind(session)
-        .bind(&grant.capability)
-        .bind(&grant.params)
-        .execute(db)
-        .await
-        .map(|_| ())
+    insert_grant(db, session, grant, None).await.map(|_| ())
 }
 
 /// Has the session act on `repo` with one of the owner's GitHub tokens (ADR 29), `credential` its id and `login` whose

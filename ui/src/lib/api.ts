@@ -69,8 +69,9 @@ export type Grant = {
   expires_at?: string;
 };
 
-/** A change to one of a session's grants: when it runs out (`null`: never), or narrowing it. */
-export type GrantChange = { expires_at?: string | null; narrow?: true };
+/** A change to one of a session's grants: when it runs out (`null`: never), narrowing it, or the accounts a model grant
+ * acts with, in order (ADR 29). */
+export type GrantChange = { expires_at?: string | null; narrow?: true; credentials?: string[] };
 
 /** One of the user's work graphs (ADR 30). */
 export type WorkGraph = { id: string; name: string; created_at: string };

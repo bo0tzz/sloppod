@@ -196,7 +196,8 @@ export const credentialKinds: CredentialKindSpec[] = [
     kind: 'claude',
     title: 'Claude accounts',
     noun: 'Claude account',
-    description: 'Model access for your sessions.',
+    description:
+      "Model access for your sessions. A new session's model grant lists them all, the default first, and uses the first; change a session's in its grants list. The runtime's own judgements use the default.",
     empty: "No Claude account yet. Sessions can't start without one.",
     fields: [],
     secret: { label: 'Token', description: 'Run `claude setup-token` and paste the token it prints.' },
@@ -270,7 +271,8 @@ export const credentialKinds: CredentialKindSpec[] = [
     kind: 'chatgpt',
     title: 'ChatGPT logins',
     noun: 'ChatGPT login',
-    description: 'Codex, for reviewing proposals before they reach you.',
+    description:
+      "Codex, for reviewing proposals before they reach you. A new codex grant lists them all, the default first, and uses the first.",
     empty: 'No ChatGPT login yet.',
     fields: [],
     secret: {
