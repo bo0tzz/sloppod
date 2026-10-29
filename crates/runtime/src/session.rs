@@ -7,11 +7,13 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+use sloppod_contracts::{EgressSpec, Enforcer};
 use sloppod_protocol::api::{Phase, Proposal};
 use sloppod_protocol::link::RunningAgent;
 use tokio::sync::{Mutex, Notify, broadcast, oneshot};
 use uuid::Uuid;
 
+use crate::db::SessionRow;
 use crate::limits;
 use crate::link::{AgentConn, RpcError};
 use crate::store::SessionStore;
@@ -237,6 +239,8 @@ pub struct Live {
     state: Mutex<LiveState>,
     /// Held while the session is parked or woken, so the two never overlap.
     transition: Mutex<()>,
+    /// Held while the session's egress is written, so writes land in the order they read the session (ADR 11).
+    egress: Mutex<()>,
     /// Notified when something a steer waits for ends: a compaction, a tool call, a permission request, the turn.
     boundary: Notify,
     /// When the agent was last heard from, for telling it the time after a gap; `None` until this runtime knows.
@@ -407,6 +411,7 @@ impl Hub {
                     events: broadcast::channel(4096).0,
                     state: Mutex::default(),
                     transition: Mutex::default(),
+                    egress: Mutex::default(),
                     boundary: Notify::new(),
                     heard_at: StdMutex::default(),
                 })
@@ -2238,6 +2243,50 @@ impl Hub {
             Some(_) => self.set_phase(id, Phase::Idle).await,
             None => self.set_phase(id, Phase::Disconnected).await,
         }
+    }
+
+    /// Applies the egress `spec` makes of the session as it is now, read under its egress lock: writes to a session's
+    /// egress land one at a time, each with what it read, so the last to land reflects the current grants and phase.
+    /// A session that isn't acting gets none, and `false` says so; waking applies its egress again.
+    pub async fn apply_egress(
+        &self,
+        id: Uuid,
+        enforcer: &dyn Enforcer,
+        spec: impl FnOnce(&SessionRow) -> EgressSpec,
+    ) -> anyhow::Result<bool> {
+        let live = self.live(id);
+        let _egress = live.egress.lock().await;
+        match self.store.get_session(id).await? {
+            Some(row) if row.not_acting().is_none() => {
+                enforcer
+                    .apply(&spec(&row))
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Denies a stopping session's pod all egress, once any apply already under way has landed.
+    pub async fn release_egress(&self, id: Uuid, enforcer: &dyn Enforcer) -> anyhow::Result<()> {
+        let live = self.live(id);
+        let _egress = live.egress.lock().await;
+        let session = id.to_string();
+        enforcer
+            .release(&session, &crate::lifecycle::pod_labels(&session))
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+
+    /// Removes a stopped session's egress for good, once any apply already under way has landed.
+    pub async fn remove_egress(&self, id: Uuid, enforcer: &dyn Enforcer) -> anyhow::Result<()> {
+        let live = self.live(id);
+        let _egress = live.egress.lock().await;
+        enforcer
+            .remove(&id.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
     }
 
     /// Wakes a parked session: `place` brings its pod back. A failure leaves it parked, so waking can be retried.
