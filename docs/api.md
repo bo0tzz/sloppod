@@ -25,7 +25,7 @@ POST   /api/v1/sessions/{id}/grants -> Session (201) body: {capability, expires_
 PATCH  /api/v1/sessions/{id}/grants/{grant} -> Session  body: {expires_at?: string | null, narrow?: true}; changes when it runs out (null: never), or narrows it (a repository it can push to becomes read only)
 DELETE /api/v1/sessions/{id}/grants/{grant} -> Session  revokes it
 PUT    /api/v1/sessions/{id}/review -> Session     body: {review: "off" | "required"}
-GET    /api/v1/sessions/{id}/debug-bundle?message={messageId} -> DebugBundle  downloads (`Content-Disposition: attachment`) a debug bundle of the turn the user message `messageId` started; 404 when the session has no such turn (below)
+GET    /api/v1/sessions/{id}/debug-bundle?message={messageId} -> DebugBundle  downloads (`Content-Disposition: attachment`) a debug bundle of the turn the user message `messageId` started; with `before={messageId}` instead, of the turn before that one; with neither, of the latest turn; 404 when the session has no such turn (below)
 GET    /api/v1/repos                -> string[]    repositories sessions can be granted, e.g. ["bo0tzz/sloppod"]
 GET    /api/v1/me                   -> {user: string, version: string | null, build: string | null}   version: the release, e.g. 0.1.2-main.153 (SLOPPOD_VERSION, the chart's version); build: the commit or tag it was built from (SLOPPOD_BUILD, the chart's app version)
 GET    /api/v1/settings             -> Settings
@@ -46,7 +46,7 @@ type Settings = {
 };
 ```
 
-**Debug bundles** ([#378](https://github.com/bo0tzz/sloppod/issues/378)) are for reporting a response the model provider stopped, e.g. with a safety classifier, to the provider. A bundle is one JSON file the user downloads, reads, and sends on themselves; sloppod never sends it anywhere. It covers the turn the user message `messageId` started (a turn runs from a message that isn't steered into a running turn to the next one; notices start turns too) and up to three turns before it. The chat offers it on each of the agent's messages, for the turn that message is in. Credentials never reach a session's pod (ADR 11); the placeholders that stand in for them, and anything shaped like an Anthropic or GitHub token, are redacted anyway.
+**Debug bundles** ([#378](https://github.com/bo0tzz/sloppod/issues/378)) are for reporting a response the model provider stopped, e.g. with a safety classifier, to the provider. A bundle is one JSON file the user downloads, reads, and sends on themselves; sloppod never sends it anywhere. It covers the turn the user message `messageId` started (a turn runs from a message that isn't steered into a running turn to the next one; notices start turns too) and up to three turns before it. The chat offers it on each of the agent's messages, for the turn that message is in; where the loaded history begins part way through a turn, the messages before the first user message loaded ask with `before` (or for the latest turn, when no user message is loaded). Redaction covers object keys as well as strings. Credentials never reach a session's pod (ADR 11); the placeholders that stand in for them, and anything shaped like an Anthropic or GitHub token, are redacted anyway.
 
 ```ts
 type DebugBundle = {

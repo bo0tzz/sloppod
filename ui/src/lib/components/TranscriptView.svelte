@@ -14,19 +14,24 @@
     sessionId,
   }: { items: TranscriptItem[]; running?: boolean; sessionId?: string } = $props();
 
-  // The turn each item is part of: the message that started it, steered messages aside.
+  // The turn each item is part of, as the debug bundle's query names it: the message that started it, steered
+  // messages aside. Loaded history can begin part way through a turn: what comes before the first message loaded is
+  // in the turn before that message's or, with no message loaded, in the latest.
   const turns = $derived.by(() => {
-    let turn: string | null = null;
+    const starts = (item: TranscriptItem) =>
+      item.type === 'user' && !item.steering && item.messageId ? item.messageId : null;
+    const first = items.map(starts).find((id) => id !== null);
+    let turn = first ? `?before=${encodeURIComponent(first)}` : '';
     return items.map((item) => {
-      if (item.type === 'user' && !item.steering) turn = item.messageId;
+      const id = starts(item);
+      if (id) turn = `?message=${encodeURIComponent(id)}`;
       return turn;
     });
   });
 
   function bundleUrl(index: number): string | undefined {
-    const turn = turns[index];
-    if (!sessionId || !turn) return undefined;
-    return `/api/v1/sessions/${encodeURIComponent(sessionId)}/debug-bundle?message=${encodeURIComponent(turn)}`;
+    if (!sessionId) return undefined;
+    return `/api/v1/sessions/${encodeURIComponent(sessionId)}/debug-bundle${turns[index]}`;
   }
 </script>
 

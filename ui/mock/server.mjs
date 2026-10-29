@@ -1577,6 +1577,7 @@ async function handleApi(req, res, url) {
     }
     if (parts.length === 3 && parts[2] === 'debug-bundle' && method === 'GET') {
       const message = url.searchParams.get('message');
+      const before = url.searchParams.get('before');
       const starts = session.log
         .map((entry, index) => ({ entry, index }))
         .filter(
@@ -1585,8 +1586,10 @@ async function handleApi(req, res, url) {
             !entry.update._meta?.sloppod?.steering &&
             all.findIndex(({ entry: e }) => e.update.messageId === entry.update.messageId) === i,
         );
-      const chosen = starts.findIndex(({ entry }) => entry.update.messageId === message);
+      const position = (id) => starts.findIndex(({ entry }) => entry.update.messageId === id);
+      const chosen = message ? position(message) : before ? position(before) - 1 : starts.length - 1;
       if (chosen < 0) return json(res, 404, { error: 'not found' });
+      const turnId = starts[chosen].entry.update.messageId;
       const turns = starts.slice(Math.max(0, chosen - 3), chosen + 1).map(({ entry, index }, k, window) => {
         const next = starts[starts.indexOf(window[k]) + 1];
         const events = session.log.slice(index, next?.index).map((e) => e.update);
@@ -1594,13 +1597,13 @@ async function handleApi(req, res, url) {
       });
       res.writeHead(200, {
         'content-type': 'application/json',
-        'content-disposition': `attachment; filename="sloppod-debug-${session.data.id.slice(0, 8)}-${message.slice(0, 8)}.json"`,
+        'content-disposition': `attachment; filename="sloppod-debug-${session.data.id.slice(0, 8)}-${turnId.slice(0, 8)}.json"`,
       });
       return res.end(
         JSON.stringify({
           format: 'sloppod-debug-bundle/1',
           session: { id: session.data.id, agent: session.data.agent, model: session.model },
-          turn: message,
+          turn: turnId,
           turns,
           transcript: { file: null, lines: [] },
           unavailable: [],

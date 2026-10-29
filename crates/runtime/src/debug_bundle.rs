@@ -16,15 +16,36 @@ pub struct Runtime<'a> {
     pub build: Option<&'a str>,
 }
 
-/// The bundle for the turn `message` (the id of the user message that started it) of `session`; none if the session
-/// has no such turn.
+/// Which of a session's turns a bundle is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Turn {
+    /// The one the user message with this id started.
+    Started(String),
+    /// The one before the turn the user message with this id started: for a UI whose history begins part way through
+    /// a turn, before the message that started it.
+    Before(String),
+    /// The latest, e.g. for a UI whose history begins part way through the latest turn.
+    Latest,
+}
+
+/// Where `turn` is among a session's `turns`, if it's there.
+pub fn find(turns: &[(i64, DateTime<Utc>, String)], turn: &Turn) -> Option<usize> {
+    let position = |message: &str| turns.iter().position(|(_, _, id)| id == message);
+    match turn {
+        Turn::Started(message) => position(message),
+        Turn::Before(message) => position(message)?.checked_sub(1),
+        Turn::Latest => turns.len().checked_sub(1),
+    }
+}
+
+/// The bundle for `turn` of `session`; none if the session has no such turn.
 pub async fn load(
     state: &AppState,
     session: &db::SessionRow,
-    message: &str,
+    turn: &Turn,
 ) -> anyhow::Result<Option<Value>> {
     let turns = db::turn_starts(&state.db, session.id).await?;
-    let Some(chosen) = turns.iter().position(|(_, _, id)| id == message) else {
+    let Some(chosen) = find(&turns, turn) else {
         return Ok(None);
     };
     let first = chosen.saturating_sub(TURNS_BEFORE);
@@ -240,18 +261,44 @@ const SECRET_PREFIXES: &[&str] = &[
 
 const REDACTED: &str = "[redacted]";
 
-/// Redacts credentials, and the placeholders that stand in for them, wherever they appear in `value`.
+/// Redacts credentials, and the placeholders that stand in for them, wherever they appear in `value`: in its strings
+/// and in its objects' keys. Keys that redact to the same text are numbered, so none is lost.
 pub fn redact(value: &mut Value) {
     match value {
         Value::String(s) => {
-            if SECRET_PREFIXES.iter().any(|p| s.contains(p)) {
+            if holds_secret(s) {
                 *s = redact_text(s);
             }
         }
         Value::Array(items) => items.iter_mut().for_each(redact),
-        Value::Object(map) => map.values_mut().for_each(redact),
+        Value::Object(map) => {
+            map.values_mut().for_each(redact);
+            if map.keys().any(|key| holds_secret(key)) {
+                let mut redacted = serde_json::Map::new();
+                for (key, value) in std::mem::take(map) {
+                    let key = if holds_secret(&key) {
+                        redact_text(&key)
+                    } else {
+                        key
+                    };
+                    let mut unique = key.clone();
+                    for n in 2.. {
+                        if !redacted.contains_key(&unique) {
+                            break;
+                        }
+                        unique = format!("{key} ({n})");
+                    }
+                    redacted.insert(unique, value);
+                }
+                *map = redacted;
+            }
+        }
         _ => {}
     }
+}
+
+fn holds_secret(text: &str) -> bool {
+    SECRET_PREFIXES.iter().any(|p| text.contains(p))
 }
 
 fn redact_text(text: &str) -> String {
@@ -400,12 +447,34 @@ mod tests {
     }
 
     #[test]
+    fn finds_the_turn_asked_for() {
+        let turns: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .enumerate()
+            .map(|(k, id)| (k as i64, at(k as u32), id.to_string()))
+            .collect();
+        assert_eq!(find(&turns, &Turn::Started("b".into())), Some(1));
+        assert_eq!(find(&turns, &Turn::Before("b".into())), Some(0));
+        assert_eq!(find(&turns, &Turn::Before("a".into())), None);
+        assert_eq!(find(&turns, &Turn::Latest), Some(2));
+        assert_eq!(find(&turns, &Turn::Started("z".into())), None);
+        assert_eq!(find(&[], &Turn::Latest), None);
+    }
+
+    #[test]
     fn redacts_tokens_and_placeholders() {
         let mut value = json!({"a": ["Bearer sloppod-placeholder", "ghp_abc123 and github_pat_X_y-z.", "xghp_ok"]});
         redact(&mut value);
         assert_eq!(
             value,
             json!({"a": ["Bearer [redacted]", "[redacted] and [redacted].", "xghp_ok"]})
+        );
+        // In keys too, where two that redact alike both stay.
+        let mut keyed = json!({"ghp_one": 1, "ghp_two": {"sloppod-placeholder": 2}, "plain": 3});
+        redact(&mut keyed);
+        assert_eq!(
+            keyed,
+            json!({"[redacted]": 1, "[redacted] (2)": {"[redacted]": 2}, "plain": 3})
         );
     }
 }

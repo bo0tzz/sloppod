@@ -780,7 +780,8 @@ async fn wake_session(
 
 #[derive(Deserialize)]
 struct BundleQuery {
-    message: String,
+    message: Option<String>,
+    before: Option<String>,
 }
 
 /// A debug bundle for one of the session's turns (#378), as a file to download.
@@ -793,12 +794,18 @@ async fn debug_bundle(
     let session = db::owned_session(&state.db, id, &user)
         .await?
         .ok_or_else(not_found)?;
-    let bundle = debug_bundle::load(&state, &session, &query.message)
+    let turn = match (query.message, query.before) {
+        (Some(message), None) => debug_bundle::Turn::Started(message),
+        (None, Some(before)) => debug_bundle::Turn::Before(before),
+        (None, None) => debug_bundle::Turn::Latest,
+        (Some(_), Some(_)) => return Err(bad_request("give `message` or `before`, not both")),
+    };
+    let bundle = debug_bundle::load(&state, &session, &turn)
         .await?
         .ok_or_else(not_found)?;
     let disposition = format!(
         "attachment; filename=\"{}\"",
-        debug_bundle::file_name(id, &query.message)
+        debug_bundle::file_name(id, bundle["turn"].as_str().unwrap_or_default())
     );
     Ok((
         [(axum::http::header::CONTENT_DISPOSITION, disposition)],
