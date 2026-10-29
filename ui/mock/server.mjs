@@ -316,20 +316,76 @@ const newGrant = (capability, params, description, expires_at) => ({
   ...(expires_at ? { expires_at } : {}),
 });
 
+/** The repository as a token reaches it: as it lists it, or, for a token that reaches more than it lists, any well-formed
+ * name (GitHub decides when it's used); undefined if it doesn't. */
+function tokenReaches(token, wanted) {
+  const listed = token.config.repositories.find((r) => r.toLowerCase() === String(wanted).toLowerCase());
+  const wellFormed = /^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/.test(String(wanted)) && !['.', '..'].includes(String(wanted).split('/')[1]);
+  return listed ?? (token.config.more_repositories && wellFormed ? wanted : undefined);
+}
+
+/** A repository grant that acts as one of the user's tokens (ADR 29): its params and description. */
+function actAsToken(grant, token) {
+  const login = token.config.login;
+  grant.params = { ...grant.params, credential: token.id, as: login };
+  grant.description = `${grant.params.repo}: read, and push the session branch \`${grant.params.branch}\` and branches named after it, as ${login} (the user's own GitHub token).`;
+}
+
+/** A new session's starting set given as grants, checked as the runtime does (`starting::build`): the grants to start with
+ * and the repository of the first, or the reason it's refused. Model access and docs always come, GitHub with a repository. */
+function buildStartingGrants(wanted, id) {
+  const branch = `sloppod/${id.slice(0, 8)}`;
+  const grants = [newGrant('model', {}, grantable.model), newGrant('docs', {}, grantable.docs)];
+  const has = (name) => grants.some((g) => g.capability === name);
+  let repo = null;
+  for (const want of wanted) {
+    const name = String(want.capability ?? '').trim();
+    if (want.credential && name !== 'repo') return { error: `only a repository grant names a credential, not ${name}` };
+    if (name === 'repo') {
+      const asked = String(want.params?.repo ?? '').trim();
+      if (!asked) return { error: 'a repository grant names its repository in params.repo' };
+      let found;
+      let token;
+      if (want.credential) {
+        token = credentials.find((c) => c.id === want.credential && c.kind === 'github-user');
+        if (!token) return { error: "that isn't one of your GitHub tokens" };
+        found = tokenReaches(token, asked);
+        if (!found) return { error: `the token ${token.name} doesn't reach ${asked}` };
+      } else {
+        found = availableRepos().find((r) => r.toLowerCase() === asked.toLowerCase());
+        if (!found) return { error: `${asked} isn't accessible to your GitHub App` };
+      }
+      if (grants.some((g) => g.capability === 'repo' && g.params.repo === found)) return { error: `${found} is in the starting set twice` };
+      const grant = newGrant('repo', { repo: found, access: 'rw', branch }, `${found}: read, and push the session branch \`${branch}\` and branches named after it.`);
+      if (token) actAsToken(grant, token);
+      grants.push(grant);
+      repo ??= found;
+    } else if (has(name)) {
+      // Asked for twice: once is enough.
+    } else if (startingCapabilities().includes(name)) {
+      grants.push(newGrant(name, {}, grantable[name]));
+    } else {
+      const definition = definitions.find((d) => d.name === name);
+      if (!definition) {
+        return { error: `a new session can start with ${startingCapabilities().join(', ')}, a repository, or one of your own capabilities, not ${name}` };
+      }
+      grants.push(newGrant(name, { definition: definition.id, description: definition.description }, definition.description));
+    }
+  }
+  if (repo && !has('github')) grants.splice(2, 0, newGrant('github', {}, grantable.github));
+  return { grants, repo, branch };
+}
+
 /** Has a session act on a repository with one of the user's GitHub tokens (ADR 29). */
 function addRepoAs(res, session, body) {
   const token = credentials.find((c) => c.id === body.credential && c.kind === 'github-user');
   if (!token) return json(res, 400, { error: "that isn't one of your GitHub tokens" });
-  const listed = token.config.repositories.find((r) => r.toLowerCase() === String(body.repo).toLowerCase());
-  // A token that reaches more than it lists can take any well-formed name; GitHub decides when it's used.
-  const wellFormed = /^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/.test(String(body.repo)) && !['.', '..'].includes(String(body.repo).split('/')[1]);
-  const repo = listed ?? (token.config.more_repositories && wellFormed ? body.repo : undefined);
+  const repo = tokenReaches(token, body.repo);
   if (!repo) return json(res, 400, { error: `the token ${token.name} doesn't reach ${body.repo}` });
   grantRepo(session, repo);
   const grant = session.data.grants.find((g) => g.capability === 'repo' && g.params.repo === repo);
   const login = token.config.login;
-  grant.params = { ...grant.params, credential: token.id, as: login };
-  grant.description = `${repo}: read, and push the session branch \`${grant.params.branch}\` and branches named after it, as ${login} (the user's own GitHub token).`;
+  actAsToken(grant, token);
   session.broadcast();
   void notifyAgent(
     session,
@@ -1068,11 +1124,11 @@ function deriveRepo(prompt) {
 
 /** Creates a session from its first message, which is recorded right away and queued for the agent; `parent` makes it a
  * sub-session. */
-function createSession({ prompt, repo, title, capabilities, parent }) {
-  const id = randomUUID();
+function createSession({ prompt, repo, title, capabilities, parent, starting }) {
+  const id = starting?.id ?? randomUUID();
   const created = now();
-  // Absent, the repository is derived from the prompt; null means none.
-  const sessionRepo = repo === undefined ? deriveRepo(prompt) : repo;
+  // Absent, the repository is derived from the prompt; null means none. A starting set given as grants has its own.
+  const sessionRepo = starting ? starting.repo : repo === undefined ? deriveRepo(prompt) : repo;
   const branch = sessionRepo ? `sloppod/${id.slice(0, 8)}` : null;
   // Like the runtime: the chosen capabilities, and GitHub too when there's a repository, which needs it.
   const chosen = (capability) => (capabilities ?? ['github', 'packages']).includes(capability) || (capability === 'github' && sessionRepo);
@@ -1082,10 +1138,14 @@ function createSession({ prompt, repo, title, capabilities, parent }) {
     repo: sessionRepo,
     branch,
     grants: [
-      newGrant('model', {}, grantable.model),
-      newGrant('docs', {}, grantable.docs),
-      ...['github', 'packages', 'codex'].filter(chosen).map((capability) => newGrant(capability, {}, grantable[capability])),
-      ...(sessionRepo
+      ...(starting
+        ? starting.grants
+        : [
+            newGrant('model', {}, grantable.model),
+            newGrant('docs', {}, grantable.docs),
+            ...['github', 'packages', 'codex'].filter(chosen).map((capability) => newGrant(capability, {}, grantable[capability])),
+          ]),
+      ...(sessionRepo && !starting
         ? [
             newGrant(
               'repo',
@@ -1480,9 +1540,20 @@ async function handleApi(req, res, url) {
       if (!credentials.some((c) => c.kind === 'claude')) {
         return json(res, 409, { error: 'no Claude account configured' });
       }
+      let starting;
+      if (body.grants !== undefined) {
+        if (body.repo !== undefined || body.capabilities !== undefined) {
+          return json(res, 400, { error: 'give the starting set as grants, or as repo and capabilities, not both' });
+        }
+        if (!Array.isArray(body.grants)) return json(res, 400, { error: 'grants is a list' });
+        const id = randomUUID();
+        starting = buildStartingGrants(body.grants, id);
+        if (starting.error) return json(res, 400, { error: starting.error });
+        starting.id = id;
+      }
       const unknown = (body.capabilities ?? []).find((c) => !startingCapabilities().includes(c));
       if (unknown) return json(res, 400, { error: `a new session can start with ${startingCapabilities().join(', ')}, not ${unknown}` });
-      const session = createSession(body);
+      const session = createSession({ ...body, starting });
       if (typeof body.model === 'string' && body.model) session.data.model = body.model;
       startAgent(session, startupDelay(body.prompt));
       if (/failing start/i.test(body.prompt)) failStart(session);
