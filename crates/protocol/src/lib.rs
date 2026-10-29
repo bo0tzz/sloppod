@@ -28,6 +28,21 @@ pub mod api {
         /// The model to run, instead of the user's default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub model: Option<String>,
+        /// The starting set as grants (ADR 2): built-ins, repositories (each with the token it acts with, if not the
+        /// GitHub App) and the user's own capabilities. Instead of `repo` and `capabilities`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub grants: Option<Vec<StartingGrant>>,
+    }
+
+    /// One grant of a starting set: a capability, its params (`{repo}` for a repository), and the credential it acts
+    /// with, by id, where it takes one (ADR 29).
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct StartingGrant {
+        pub capability: String,
+        #[serde(default, skip_serializing_if = "Value::is_null")]
+        pub params: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub credential: Option<String>,
     }
 
     /// Tells a field that's `null` (`Some(None)`) from one that's absent (`None`, with `#[serde(default)]`).

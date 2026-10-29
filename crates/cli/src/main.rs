@@ -144,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
                 agent,
                 capabilities: None,
                 model: None,
+                grants: None,
             };
             let session: Session = serde_json::from_value(
                 check(
