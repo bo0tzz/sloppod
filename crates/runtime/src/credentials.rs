@@ -482,6 +482,16 @@ impl Credentials {
         Ok(account)
     }
 
+    /// The id of the account last attached to a session's requests for a kind. Read when something about those
+    /// requests arrives (a quota report), before anything waits: a fallback meanwhile attaches another (#252).
+    pub fn attached(&self, session_id: &str, kind: &str) -> Option<Uuid> {
+        self.attached
+            .lock()
+            .unwrap()
+            .get(&(session_id.to_owned(), kind.to_owned()))
+            .copied()
+    }
+
     /// The account a session last used for a kind: the one last attached to its requests, if it's still there,
     /// otherwise the one it would use now.
     pub async fn used(
@@ -489,12 +499,17 @@ impl Credentials {
         session: &SessionContext,
         kind: &str,
     ) -> sqlx::Result<Option<CredentialRow>> {
-        let attached = self
-            .attached
-            .lock()
-            .unwrap()
-            .get(&(session.session_id.clone(), kind.to_owned()))
-            .copied();
+        let attached = self.attached(&session.session_id, kind);
+        self.used_as_of(session, kind, attached).await
+    }
+
+    /// [`Self::used`], with the account that was attached when it was read.
+    pub async fn used_as_of(
+        &self,
+        session: &SessionContext,
+        kind: &str,
+        attached: Option<Uuid>,
+    ) -> sqlx::Result<Option<CredentialRow>> {
         if let Some(id) = attached
             && let Some(row) = self.owned(&session.owner, kind, &id.to_string()).await?
         {
@@ -1236,6 +1251,38 @@ mod tests {
         );
     }
 
+    #[sqlx::test]
+    async fn a_report_is_kept_against_the_account_attached_when_it_came(db: PgPool) {
+        let credentials = credentials(db.clone()).await;
+        let work = add(&credentials, "dev", claude("Work")).await;
+        let personal = add(&credentials, "dev", claude("Personal")).await;
+        let session = SessionContext {
+            session_id: "s".into(),
+            owner: "dev".into(),
+            grants: vec![Grant::new(
+                "model",
+                json!({"credentials": [work.id.to_string(), personal.id.to_string()]}),
+            )],
+            role: SessionRole::Work,
+        };
+        credentials.attach(&session, CLAUDE).await.unwrap();
+        // Work's report arrives; before it's handled, Work's turn fails and the session falls back to Personal.
+        let arrived = credentials.attached("s", CLAUDE);
+        crate::quota::mark_limited(&db, work.id, Utc::now())
+            .await
+            .unwrap();
+        credentials.attach(&session, CLAUDE).await.unwrap();
+        let name = |row: Option<CredentialRow>| row.map(|r| r.name);
+        assert_eq!(
+            name(credentials.used(&session, CLAUDE).await.unwrap()).as_deref(),
+            Some("Personal")
+        );
+        let reported = credentials
+            .used_as_of(&session, CLAUDE, arrived)
+            .await
+            .unwrap();
+        assert_eq!(name(reported).as_deref(), Some("Work"));
+    }
     #[sqlx::test]
     async fn the_owner_gives_a_model_grant_only_their_own_accounts_of_its_kind(db: PgPool) {
         let credentials = credentials(db.clone()).await;

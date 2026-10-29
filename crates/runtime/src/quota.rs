@@ -216,6 +216,27 @@ struct State {
     observed_at: DateTime<Utc>,
 }
 
+/// When a limit ends: at its reset, or, when nobody said when that is, [`PROBE_AFTER`] after it was reported, when
+/// the credential is tried again.
+fn limit_ends(
+    limited: bool,
+    resets_at: Option<DateTime<Utc>>,
+    observed_at: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    match resets_at {
+        None if limited => Some(observed_at + PROBE_AFTER),
+        known => known,
+    }
+}
+
+impl State {
+    fn limited_at(&self, now: DateTime<Utc>) -> bool {
+        self.limited
+            && limit_ends(self.limited, self.resets_at, self.observed_at)
+                .is_none_or(|end| end > now)
+    }
+}
+
 /// A report over what's kept: it replaces only what no newer report has said, whatever order they arrive in.
 fn merge(mut state: State, observation: &Observation) -> State {
     let at = observation.observed_at;
@@ -291,12 +312,8 @@ impl QuotaRow {
     /// As it stands at `now`: a limit whose reset has passed is over, and a window that has reset since is unused.
     fn into_quota(self, now: DateTime<Utc>) -> Quota {
         let over = |at: Option<DateTime<Utc>>| at.is_some_and(|at| at <= now);
-        // A limit whose reset isn't known reads as resetting after a while, so the credential is tried again then,
-        // and a wait for it ends then too.
-        let resets_at = match self.resets_at {
-            None if self.limited => Some(self.observed_at + PROBE_AFTER),
-            known => known,
-        };
+        // A limit whose reset isn't known reads as resetting when it's tried again, and a wait for it ends then too.
+        let resets_at = limit_ends(self.limited, self.resets_at, self.observed_at);
         let (limited, resets_at) = if over(resets_at) {
             (false, None)
         } else {
@@ -371,19 +388,37 @@ pub async fn is_limited(db: &PgPool, credential: Uuid, now: DateTime<Utc>) -> sq
         .is_some_and(|quota| quota.limited))
 }
 
-/// A turn failed on a credential's usage limit (#252): it's kept as limited, until [`PROBE_AFTER`] from now when
-/// nothing says when the limit resets. A quota that already says it's limited is left as it is. Says whether it changed.
+/// A turn failed on a credential's usage limit (#252): unless its quota already says it's limited, it's kept as
+/// limited until [`PROBE_AFTER`] from now. That's the runtime's guess, not a report: it doesn't move when the quota
+/// was last reported, so a report that came before the failure but is stored after it still replaces it, with the
+/// reset it knows. Checked and written under the row's lock, like reports. Says whether it changed.
 pub async fn mark_limited(db: &PgPool, credential: Uuid, now: DateTime<Utc>) -> sqlx::Result<bool> {
-    if is_limited(db, credential, now).await? {
+    let mut tx = db.begin().await?;
+    sqlx::query(
+        "insert into credential_quotas (credential_id, limited, windows, observed_at) \
+         values ($1, false, '{}', to_timestamp(0)) on conflict (credential_id) do nothing",
+    )
+    .bind(credential)
+    .execute(&mut *tx)
+    .await?;
+    let current: State = sqlx::query_as(
+        "select limited, resets_at, windows, observed_at from credential_quotas where credential_id = $1 \
+         for update",
+    )
+    .bind(credential)
+    .fetch_one(&mut *tx)
+    .await?;
+    if current.limited_at(now) {
         return Ok(false);
     }
-    let observation = Observation {
-        observed_at: now,
-        limited: true,
-        resets_at: Some(now + PROBE_AFTER),
-        windows: BTreeMap::new(),
-    };
-    store(db, credential, &observation).await?;
+    sqlx::query(
+        "update credential_quotas set limited = true, resets_at = $2 where credential_id = $1",
+    )
+    .bind(credential)
+    .bind(now + PROBE_AFTER)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok(true)
 }
 
@@ -411,8 +446,15 @@ async fn record(state: &AppState, credential: Uuid, owner: &str, observation: Ob
 }
 
 /// A `usage_update` from a session's agent: Claude Code's carry the rate limits of the Claude subscription the
-/// session used, the one last attached to its requests (ADR 29, #252). `at` is when it came, taken before anything here waits.
-pub async fn seen(state: &AppState, session: Uuid, update: Value, at: DateTime<Utc>) {
+/// session used: `attached`, the one last attached to its requests when it came (ADR 29, #252), and `at`, when it
+/// came, are both taken before anything here waits.
+pub async fn seen(
+    state: &AppState,
+    session: Uuid,
+    update: Value,
+    at: DateTime<Utc>,
+    attached: Option<Uuid>,
+) {
     let Some(observation) = from_claude(&update["_meta"]["_claude/rateLimit"], at) else {
         return;
     };
@@ -424,7 +466,11 @@ pub async fn seen(state: &AppState, session: Uuid, update: Value, at: DateTime<U
             return;
         }
     };
-    match state.credentials.used(&session, CLAUDE).await {
+    match state
+        .credentials
+        .used_as_of(&session, CLAUDE, attached)
+        .await
+    {
         Ok(Some(credential)) => record(state, credential.id, &credential.owner, observation).await,
         Ok(None) => {}
         Err(e) => {

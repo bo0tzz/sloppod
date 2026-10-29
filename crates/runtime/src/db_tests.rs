@@ -936,6 +936,41 @@ async fn credential(db: &PgPool, owner: &str, kind: &str) -> Uuid {
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_failed_turn_s_limit_never_hides_a_reported_reset(db: PgPool) {
+    use crate::quota::{self, Observation};
+    let failed_at = Utc::now();
+    // Claude Code reported the limit, with a reset hours away, just before the turn failed on it.
+    let report = Observation {
+        observed_at: failed_at - Duration::seconds(1),
+        limited: true,
+        resets_at: Some(failed_at + Duration::hours(5)),
+        windows: Default::default(),
+    };
+    let reset = |quota: Option<sloppod_protocol::api::Quota>| {
+        let quota = quota.unwrap();
+        assert!(quota.limited);
+        quota
+            .resets_at
+            .unwrap()
+            .parse::<chrono::DateTime<Utc>>()
+            .unwrap()
+    };
+    // Stored before the failure is kept: the guess doesn't replace it.
+    let first = credential(&db, "dev", "claude").await;
+    quota::store(&db, first, &report).await.unwrap();
+    assert!(!quota::mark_limited(&db, first, failed_at).await.unwrap());
+    let kept = reset(quota::for_credential(&db, first, failed_at).await.unwrap());
+    assert!(kept > failed_at + Duration::hours(4), "{kept}");
+    // Stored after it, it replaces the guess.
+    let second = credential(&db, "other", "claude").await;
+    assert!(quota::mark_limited(&db, second, failed_at).await.unwrap());
+    let guessed = reset(quota::for_credential(&db, second, failed_at).await.unwrap());
+    assert!(guessed < failed_at + Duration::hours(1), "{guessed}");
+    quota::store(&db, second, &report).await.unwrap();
+    let kept = reset(quota::for_credential(&db, second, failed_at).await.unwrap());
+    assert!(kept > failed_at + Duration::hours(4), "{kept}");
+}
+#[sqlx::test(migrator = "db::MIGRATOR")]
 async fn a_quota_keeps_the_windows_a_report_leaves_out(db: PgPool) {
     use crate::quota::{self, Observation, Window};
     use sloppod_protocol::api::QuotaStatus;

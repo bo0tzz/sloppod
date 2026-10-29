@@ -275,8 +275,12 @@ async fn main() -> anyhow::Result<()> {
     }));
     let usage = state.clone();
     state.hub.set_usage_seen(Arc::new(move |id, update| {
+        // Which account the report is about, and when it came, are taken as it arrives.
         let (state, at) = (usage.clone(), chrono::Utc::now());
-        Box::pin(async move { quota::seen(&state, id, update, at).await })
+        let attached = state
+            .credentials
+            .attached(&id.to_string(), credentials::CLAUDE);
+        Box::pin(async move { quota::seen(&state, id, update, at, attached).await })
     }));
     let limited = state.clone();
     state.hub.set_limit_hit(Arc::new(move |id| {
