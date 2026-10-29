@@ -2,7 +2,7 @@
   import { Alert, Badge, Button, Field, IconButton, Input, ModalBody, Select, Text, Textarea } from '@immich/ui';
   import { mdiArrowDown, mdiArrowUp, mdiClose, mdiFileTreeOutline } from '@mdi/js';
   import { onMount } from 'svelte';
-  import { api, type WorkEvent, type WorkItem, type WorkLinkKind, type WorkState } from '#lib/api.ts';
+  import { api, type WorkEvent, type WorkItem, type WorkLink, type WorkLinkKind, type WorkState } from '#lib/api.ts';
   import { clockTime } from '#lib/format.ts';
   import { describeEvent, linkHref, linkKinds, linkLabel, siblings, stateColor } from '#lib/work.ts';
   import Dialog from './Dialog.svelte';
@@ -69,6 +69,8 @@
     if (await act(() => api.editWorkItem(itemId, { title, description }))) editing = false;
   }
 
+  // Where what a link points at stands; set here until the runtime follows it (ADR 30, stage 3).
+  const linkStatuses = ['open', 'finished', 'abandoned'].map((s) => ({ value: s, label: s }));
   const stateOptions = ['open', 'active', 'done', 'dropped'].map((s) => ({ value: s, label: s }));
   const parentOptions = $derived([
     { value: '', label: 'Top level' },
@@ -149,7 +151,15 @@
                 <span>{linkLabel(link)}</span>
               {/if}
               <Badge size="tiny" shape="round" color="secondary">{link.role}</Badge>
-              <Badge size="tiny" shape="round" color={link.status === 'finished' ? 'success' : 'info'}>{link.status}</Badge>
+              <div class="w-32">
+                <Select
+                  size="tiny"
+                  title="Status of {linkLabel(link)}"
+                  options={linkStatuses}
+                  value={link.status}
+                  onChange={(value) => void act(() => api.setWorkLinkStatus(link.id, value as WorkLink['status']))}
+                />
+              </div>
               <IconButton
                 icon={mdiClose}
                 aria-label="Remove link {linkLabel(link)}"

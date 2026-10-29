@@ -91,3 +91,23 @@ export function describeEvent(event: WorkEvent, titleOf: (id: unknown) => string
       return event.kind;
   }
 }
+
+/**
+ * What an item waits on now: the unfinished items that block it or an item it's part of (blockers are inherited), as
+ * the runtime's frontier counts them. Each says which item it blocks when that's an ancestor.
+ */
+export function waitingOn(item: WorkItem, items: WorkItem[]): { blocker: WorkItem; through: WorkItem | null }[] {
+  const byId = new Map(items.map((i) => [i.id, i]));
+  const waiting: { blocker: WorkItem; through: WorkItem | null }[] = [];
+  const seen = new Set<string>();
+  for (let at: WorkItem | undefined = item; at && !seen.has(at.id); at = at.parent_id ? byId.get(at.parent_id) : undefined) {
+    seen.add(at.id);
+    for (const id of at.blocked_by) {
+      const blocker = byId.get(id);
+      if (blocker && blocker.state !== 'done' && blocker.state !== 'dropped') {
+        waiting.push({ blocker, through: at.id === item.id ? null : at });
+      }
+    }
+  }
+  return waiting;
+}

@@ -2680,6 +2680,22 @@ test('a work graph shows what is ready first, then the rest by state, and its st
   await expect(ready.getByTestId('work-item')).toHaveText([/Build/, /Ship/]);
   await expect(workItemIn(page, 'work-done', 'Design')).toBeVisible();
 
+  // A finished blocker blocks nothing: Build's row no longer names Design.
+  await expect(workItemIn(page, 'work-tree', 'Build').getByTestId('blocked-by')).toHaveCount(0);
+  // What blocks an item blocks its parts too: Docs, part of Ship, waits on what blocks Ship.
+  await page.getByRole('textbox', { name: 'New item' }).fill('Docs');
+  await page.getByRole('combobox', { name: 'Part of' }).click();
+  await page.getByRole('option', { name: 'Ship' }).click();
+  await page.getByRole('button', { name: 'Add', exact: true }).click();
+  await expect(workItemIn(page, 'work-ready', 'Docs')).toBeVisible();
+  const ship = await openWorkItem(page, 'Ship');
+  await ship.getByRole('combobox', { name: 'Add a blocker' }).click();
+  await page.getByRole('option', { name: 'Build' }).click();
+  await ship.getByRole('button', { name: 'Block' }).click();
+  await page.keyboard.press('Escape');
+  await expect(workItemIn(page, 'work-ready', 'Docs')).toHaveCount(0);
+  await expect(workItemIn(page, 'work-open', 'Docs').getByTestId('blocked-by')).toHaveText('Blocked by Build (through Ship)');
+
   // Parts sit under what they're part of.
   await page.getByRole('textbox', { name: 'New item' }).fill('Tests');
   await page.getByRole('combobox', { name: 'Part of' }).click();
@@ -2712,6 +2728,15 @@ test("an item's detail links, changes and undoes from its history", async ({ pag
   await expect(page.getByRole('dialog').getByRole('paragraph').first()).toHaveText('Fix the build');
   // The rules' own change has no undo; it follows the link.
   await expect(detail.getByTestId('work-event').filter({ hasText: '(by the rules)' }).getByRole('button', { name: 'Undo' })).toHaveCount(0);
+
+  // Merged: the owner says so on the link, and the item is done by it.
+  await detail.getByTestId('work-links').getByRole('combobox').first().click();
+  await page.getByRole('option', { name: 'finished' }).click();
+  await expect(detail.getByRole('combobox', { name: 'State' })).toContainText('done');
+  // Reopened, it's active again.
+  await detail.getByTestId('work-links').getByRole('combobox').first().click();
+  await page.getByRole('option', { name: 'open', exact: true }).click();
+  await expect(detail.getByRole('combobox', { name: 'State' })).toContainText('active');
 
   // Done by hand isn't allowed while the pull request decides; dropping is.
   await detail.getByRole('combobox', { name: 'State' }).click();

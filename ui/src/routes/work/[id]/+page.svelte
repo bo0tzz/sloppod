@@ -32,7 +32,6 @@
   });
 
   const items = $derived(graph?.items ?? []);
-  const titleOf = (id: string) => items.find((i) => i.id === id)?.title ?? id.slice(0, 8);
   const readyIds = $derived(new Set(ready.map((i) => i.id)));
   const open = (item: WorkItem) => (opened = item.id);
 
@@ -102,7 +101,7 @@
         <section class="flex flex-col gap-1" data-testid="work-ready">
           <Heading tag="h2" size="tiny">Ready</Heading>
           {#each ready as item (item.id)}
-            <WorkItemRow {item} {titleOf} onOpen={open} />
+            <WorkItemRow {item} {items} onOpen={open} />
           {:else}
             <Text size="small" color="muted">Nothing is ready to start.</Text>
           {/each}
@@ -114,7 +113,7 @@
             <section class="flex flex-col gap-1" data-testid="work-{state}">
               <Heading tag="h2" size="tiny">{label}</Heading>
               {#each inState as item (item.id)}
-                <WorkItemRow {item} {titleOf} onOpen={open} />
+                <WorkItemRow {item} {items} onOpen={open} />
               {/each}
             </section>
           {/if}
@@ -140,7 +139,7 @@
                   drop(item);
                 }}
               >
-                <WorkItemRow {item} {titleOf} {depth} onOpen={open} />
+                <WorkItemRow {item} {items} {depth} onOpen={open} />
               </li>
             {/each}
           </ol>
