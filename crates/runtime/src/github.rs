@@ -304,7 +304,11 @@ impl GitHubApp {
         Self::for_user_with_api(API, token, login)
     }
 
-    fn for_user_with_api(api: &str, token: String, login: String) -> anyhow::Result<Self> {
+    pub(crate) fn for_user_with_api(
+        api: &str,
+        token: String,
+        login: String,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             api: api.to_owned(),
             app_id: String::new(),

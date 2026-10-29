@@ -157,10 +157,13 @@ impl ProposalKind for PullRequestUpdates {
         let app = super::github_for(&self.credentials, session, repo).await?;
         let mut current = Vec::new();
         for number in numbers {
-            // A pull request's title and body are its issue's.
-            let mut pull = app.issue(repo, number).await.map_err(err)?;
-            pull["number"] = json!(number);
-            current.push(pull);
+            // Looked up as a pull request, so a number that is only an issue is refused here, not just on approval.
+            let pull = app.pull(repo, number).await.map_err(err)?;
+            current.push(json!({
+                "number": number,
+                "title": pull["title"].as_str().unwrap_or_default(),
+                "body": pull["body"].as_str().unwrap_or_default(),
+            }));
         }
         Ok(json!({"current": current}))
     }
@@ -181,22 +184,26 @@ impl ProposalKind for PullRequestUpdates {
     }
 }
 
-/// Makes one update: the comment and labels as for any update, then marks a draft ready, then the pull request's own
-/// fields. Carrying out an approved proposal again (after a restart) repeats only what's harmless to repeat: a pull
-/// request that's no longer a draft isn't marked again.
+/// Makes one update. The pull request is looked up first, so a number that is only an issue is refused before anything
+/// is written (comments, labels and edits all go through the issues API, which would take it). Then the comment and
+/// labels as for any update, reopening, marking a draft ready (GitHub refuses that for a closed one), and the
+/// remaining fields. Carrying out an approved proposal again (after a restart) repeats only what's harmless to repeat:
+/// a pull request that's no longer a draft isn't marked again.
 async fn apply(
     app: &crate::github::GitHubApp,
     repo: &str,
     number: u64,
     update: &Value,
 ) -> anyhow::Result<()> {
+    let pull = app.pull(repo, number).await?;
     updates::comment_and_label(app, repo, number, update).await?;
-    if update.get("ready").is_some() {
-        let pull = app.pull(repo, number).await?;
-        if pull["draft"] == true {
-            app.mark_ready(repo, pull["node_id"].as_str().unwrap_or_default())
-                .await?;
-        }
+    if update.get("reopen").is_some() {
+        app.update_issue(repo, number, &json!({"state": "open"}))
+            .await?;
+    }
+    if update.get("ready").is_some() && pull["draft"] == true {
+        app.mark_ready(repo, pull["node_id"].as_str().unwrap_or_default())
+            .await?;
     }
     let mut patch = Map::new();
     for field in ["title", "body"] {
@@ -207,9 +214,6 @@ async fn apply(
     if update.get("close").is_some() {
         patch.insert("state".into(), json!("closed"));
     }
-    if update.get("reopen").is_some() {
-        patch.insert("state".into(), json!("open"));
-    }
     if !patch.is_empty() {
         app.update_issue(repo, number, &Value::Object(patch))
             .await?;
@@ -219,7 +223,154 @@ async fn apply(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use axum::extract::{Path, State};
+    use axum::http::StatusCode;
+    use axum::routing::{get, patch, post};
+    use axum::{Json, Router};
+
     use super::*;
+    use crate::github::GitHubApp;
+
+    /// A fake GitHub: pull requests by number (a number that isn't one is only an issue), and every write made to it.
+    #[derive(Default)]
+    struct Fake {
+        pulls: Mutex<HashMap<u64, Value>>,
+        writes: Mutex<Vec<String>>,
+    }
+
+    type Shared = State<Arc<Fake>>;
+
+    async fn pull(
+        State(fake): Shared,
+        Path((_, _, number)): Path<(String, String, u64)>,
+    ) -> std::result::Result<Json<Value>, StatusCode> {
+        let pulls = fake.pulls.lock().unwrap();
+        pulls
+            .get(&number)
+            .cloned()
+            .map(Json)
+            .ok_or(StatusCode::NOT_FOUND)
+    }
+
+    async fn no_comments() -> Json<Value> {
+        Json(json!([]))
+    }
+
+    async fn comment(
+        State(fake): Shared,
+        Path((_, _, number)): Path<(String, String, u64)>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        fake.writes.lock().unwrap().push(format!(
+            "comment #{number}: {}",
+            body["body"].as_str().unwrap_or_default()
+        ));
+        Json(json!({}))
+    }
+
+    async fn edit(
+        State(fake): Shared,
+        Path((_, _, number)): Path<(String, String, u64)>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        fake.writes
+            .lock()
+            .unwrap()
+            .push(format!("patch #{number}: {body}"));
+        if let (Some(pull), Some(state)) = (
+            fake.pulls.lock().unwrap().get_mut(&number),
+            body["state"].as_str(),
+        ) {
+            pull["state"] = json!(state);
+        }
+        Json(json!({}))
+    }
+
+    /// Marks the pull request ready, unless it's closed, which GitHub refuses.
+    async fn graphql(State(fake): Shared, Json(body): Json<Value>) -> Json<Value> {
+        let id = body["variables"]["id"].as_str().unwrap_or_default();
+        let mut pulls = fake.pulls.lock().unwrap();
+        let pull = pulls.values_mut().find(|p| p["node_id"] == id).unwrap();
+        if pull["state"] == "closed" {
+            return Json(json!({"errors": [{"message": "Pull request is closed"}]}));
+        }
+        pull["draft"] = json!(false);
+        fake.writes.lock().unwrap().push(format!("ready {id}"));
+        Json(json!({"data": {}}))
+    }
+
+    /// A client for a fake where #5 is a draft pull request and #6 a closed one, and #9 is only an issue.
+    async fn github() -> (Arc<Fake>, GitHubApp) {
+        let fake = Arc::new(Fake::default());
+        for (number, state) in [(5, "open"), (6, "closed")] {
+            fake.pulls.lock().unwrap().insert(
+                number,
+                json!({"number": number, "state": state, "draft": true, "node_id": format!("PR{number}"), "title": "Draft", "body": null}),
+            );
+        }
+        let router = Router::new()
+            .route("/repos/{owner}/{name}/pulls/{number}", get(pull))
+            .route("/repos/{owner}/{name}/issues/{number}", patch(edit))
+            .route(
+                "/repos/{owner}/{name}/issues/{number}/comments",
+                get(no_comments).post(comment),
+            )
+            .route("/graphql", post(graphql))
+            .with_state(fake.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let app = GitHubApp::for_user_with_api(&api, "token".into(), "octo".into()).unwrap();
+        (fake, app)
+    }
+
+    #[tokio::test]
+    async fn an_issue_number_is_refused_before_anything_is_written() {
+        let (fake, app) = github().await;
+        for update in [
+            json!({"number": 9, "comment": "Hello"}),
+            json!({"number": 9, "title": "New", "close": true}),
+            json!({"number": 9, "ready": true, "comment": "Hello"}),
+        ] {
+            assert!(apply(&app, "o/r", 9, &update).await.is_err(), "{update}");
+        }
+        assert_eq!(*fake.writes.lock().unwrap(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_closed_draft_is_reopened_before_it_is_marked_ready() {
+        let (fake, app) = github().await;
+        let update = json!({"number": 6, "reopen": true, "ready": true, "title": "Ready"});
+        apply(&app, "o/r", 6, &update).await.unwrap();
+        assert_eq!(
+            *fake.writes.lock().unwrap(),
+            [
+                r#"patch #6: {"state":"open"}"#,
+                "ready PR6",
+                r#"patch #6: {"title":"Ready"}"#
+            ]
+        );
+        // Closed and not reopened, it can't be marked ready.
+        let (_, app) = github().await;
+        assert!(
+            apply(&app, "o/r", 6, &json!({"number": 6, "ready": true}))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn carrying_an_update_out_again_repeats_nothing() {
+        let (fake, app) = github().await;
+        let update = json!({"number": 5, "ready": true});
+        apply(&app, "o/r", 5, &update).await.unwrap();
+        apply(&app, "o/r", 5, &update).await.unwrap();
+        // Marked ready once: the second time it isn't a draft any more.
+        assert_eq!(*fake.writes.lock().unwrap(), ["ready PR5"]);
+    }
 
     #[test]
     fn checks_update_lists() {
