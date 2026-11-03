@@ -99,6 +99,16 @@ impl ToolStreams {
             .subscribe()
     }
 
+    /// Whether the session's client was given a list other than `tools`: a change it missed while it had no stream
+    /// open, which it hears of when it opens one.
+    fn stale(&self, session: Uuid, tools: &[Value]) -> bool {
+        let sessions = self.0.lock().unwrap();
+        sessions
+            .get(&session)
+            .and_then(|listed| listed.tools)
+            .is_some_and(|given| given != digest(tools))
+    }
+
     /// Forgets a session that's gone.
     pub fn forget(&self, session: Uuid) {
         self.0.lock().unwrap().remove(&session);
@@ -126,12 +136,17 @@ impl ToolStreams {
 /// Sends `notifications/tools/list_changed` to the session's agent when its tools are no longer the ones it was
 /// given, e.g. after a grant change (#323). Its client then lists them again.
 pub async fn tools_changed(state: &AppState, session: Uuid) {
-    let tools = match session_kind(state, session).await {
-        Ok(row) => tools(state, &row),
-        Err(_) => Vec::new(),
-    };
+    let tools = current_tools(state, session).await;
     if state.tool_streams.changed(session, &tools) {
         tracing::info!(%session, "told the agent its tools changed");
+    }
+}
+
+/// The tools the session has now; none if it can't act.
+async fn current_tools(state: &AppState, session: Uuid) -> Vec<Value> {
+    match session_kind(state, session).await {
+        Ok(row) => tools(state, &row),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -145,20 +160,30 @@ pub async fn stream(
     let Some(session) = crate::identity::calling_session(&state, &headers, peer.ip()).await else {
         return (StatusCode::FORBIDDEN, "not a session pod").into_response();
     };
+    // Subscribed before it's checked, so a change in between is either sent on the stream or found stale here.
     let changed = state.tool_streams.subscribe(session);
-    let notices = futures::stream::unfold(changed, |mut changed| async move {
+    let missed = state
+        .tool_streams
+        .stale(session, &current_tools(&state, session).await);
+    let notice = || {
+        let notice = json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"});
+        Ok::<_, std::convert::Infallible>(
+            Event::default().event("message").data(notice.to_string()),
+        )
+    };
+    let notices = futures::stream::unfold(changed, move |mut changed| async move {
         // A lagged receiver missed only repeats of the same notice.
         if let Err(broadcast::error::RecvError::Closed) = changed.recv().await {
             return None;
         }
-        let notice = json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"});
-        let event = Event::default().event("message").data(notice.to_string());
-        Some((Ok::<_, std::convert::Infallible>(event), changed))
+        Some((notice(), changed))
     });
-    Sse::new(notices)
+    let missed = futures::stream::iter(missed.then(notice));
+    Sse::new(futures::StreamExt::chain(missed, notices))
         .keep_alive(KeepAlive::default())
         .into_response()
 }
+
 /// Which tools a session gets depends on its kind, so a session that can't be loaded gets none.
 async fn session_kind(state: &AppState, session: Uuid) -> Result<db::SessionRow, String> {
     match db::get_session(&state.db, session).await {
@@ -496,6 +521,26 @@ mod tests {
         );
         streams.forget(session);
         assert!(!streams.changed(session, &after));
+    }
+
+    #[test]
+    fn a_change_missed_while_no_stream_was_open_is_told_when_one_opens() {
+        let streams = ToolStreams::default();
+        let session = Uuid::new_v4();
+        let before = [json!({"name": "ask_user"})];
+        let after = [json!({"name": "ask_user"}), json!({"name": "list_work"})];
+        streams.listed(session, &before);
+        let stream = streams.subscribe(session);
+        drop(stream);
+        // The grant changes while the stream is closed: nobody hears.
+        assert!(!streams.changed(session, &after));
+        // Reopened with no further change, it's told of the one it missed, until it lists the tools again.
+        let _stream = streams.subscribe(session);
+        assert!(streams.stale(session, &after));
+        streams.listed(session, &after);
+        assert!(!streams.stale(session, &after));
+        // Never listed: nothing to be stale.
+        assert!(!streams.stale(Uuid::new_v4(), &after));
     }
 
     #[test]
