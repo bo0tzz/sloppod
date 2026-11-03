@@ -38,10 +38,13 @@
   const known = (id: string) => choices.some((c) => c.value === id) || models.some((entry) => entry.value === id);
   // A saved model the agent doesn't list shows as typed in, rather than silently as unset.
   const selected = $derived(typing || (value && !known(value)) ? OTHER : value || UNSET);
+  const withoutModels = $derived(
+    description ? `${description} The list of models appears after your first session.` : 'The list of models appears after your first session.',
+  );
 </script>
 
-{#if models.length > 0}
-  <Field {label} {description}>
+{#if models.length > 0 || choices.length > 0}
+  <Field {label} description={models.length > 0 ? description : withoutModels}>
     <Select
       {options}
       value={selected}
@@ -57,7 +60,7 @@
     </Field>
   {/if}
 {:else}
-  <Field {label} description={description ? `${description} The list of models appears after your first session.` : 'The list of models appears after your first session.'}>
+  <Field {label} description={withoutModels}>
     <Input bind:value placeholder={unset} autocomplete="off" data-testid={testid} />
   </Field>
 {/if}

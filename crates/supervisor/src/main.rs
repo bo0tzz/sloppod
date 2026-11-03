@@ -317,7 +317,7 @@ async fn run(
         AgentExited,
         Terminate,
     }
-    let mut ping = tokio::time::interval(Duration::from_secs(20));
+    let mut ping = tokio::time::interval(sloppod_protocol::link::COMMANDS_EVERY);
     // What the runtime was last told about the agent's commands; a new link starts out telling it.
     let mut commands_told = None;
     // Results of commands the runtime asked to run, sent back on this link.

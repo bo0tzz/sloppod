@@ -2931,6 +2931,26 @@ test('a selection runs from one message across tool calls to the next', async ({
   expect(selected).toMatch(/approve it\.?\s*$/);
 });
 
+test('sub-sessions can follow their parent before the agent has listed models', async ({ page }) => {
+  await page.request.post('/_mock/models?offered=0');
+  try {
+    const defaults = page.getByTestId('session-defaults');
+    await page.goto('/settings');
+    // The default model has nothing to choose from yet, so it's typed in.
+    await expect(defaults.getByRole('textbox', { name: 'Model' })).toBeVisible();
+    const field = defaults.getByRole('combobox', { name: 'Sub-sessions' });
+    await field.click();
+    await page.getByRole('option', { name: 'The same as their parent', exact: true }).click();
+    await defaults.getByRole('button', { name: 'Save' }).click();
+    await expect(defaults.getByRole('button', { name: 'Save' })).toBeDisabled();
+    const settings: { sub_session_model: string | null } = await (await page.request.get('/api/v1/settings')).json();
+    expect(settings.sub_session_model).toBe('parent');
+  } finally {
+    await page.request.put('/api/v1/settings', { data: { sub_session_model: null } });
+    await page.request.post('/_mock/models');
+  }
+});
+
 test('saves the instructions all sessions get', async ({ page }) => {
   const section = page.getByTestId('instructions-setting');
   const save = section.getByRole('button', { name: 'Save' });
