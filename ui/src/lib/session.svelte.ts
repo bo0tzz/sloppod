@@ -204,7 +204,6 @@ export class SessionView {
 
     // A reconnect: the runtime may have been redeployed meanwhile.
     if (this.loaded) account.refresh();
-    const rest = this.loaded ? this.refresh() : Promise.resolve();
     this.#replay = new Transcript();
     this.#replayUpdates = [];
     try {
@@ -222,7 +221,9 @@ export class SessionView {
       this.#replayUpdates = null;
     }
     this.loaded = true;
-    await rest;
+    // Fetched again only now that `session/load` has subscribed this socket: a proposal made since the last fetch
+    // then comes one way or the other, where fetching alongside the load could miss it (#423).
+    await this.refresh();
   }
 
   #onNotification(method: string, params: unknown) {

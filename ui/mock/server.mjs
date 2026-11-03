@@ -1428,6 +1428,17 @@ function handleCall(conn, message) {
         conn.error(id, -32602, `Unknown session ${params.sessionId}`);
         return;
       }
+      if (proposeOnLoad && !proposeOnLoad.used) {
+        // The proposal falls after the UI's REST fetch of proposals and before this connection subscribes (#423).
+        const hook = proposeOnLoad;
+        hook.used = true;
+        void Promise.race([hook.fetched, new Promise((resolve) => setTimeout(resolve, 5000))]).then(() => {
+          createProposal(session);
+          proposeOnLoad = null;
+          handleCall(conn, message);
+        });
+        return;
+      }
       // Like the runtime: only the latest of the log, with where to ask for older pages. An update's seq is its
       // position in the log, from 1.
       const start = Math.max(0, session.log.length - HISTORY_PAGE);
@@ -1904,7 +1915,9 @@ async function handleApi(req, res, url) {
       const list = [...proposals.values()]
         .filter((p) => (!sessionId || p.session_id === sessionId) && (!status || p.status === status))
         .map(publicProposal);
-      return json(res, 200, list);
+      json(res, 200, list);
+      if (sessionId) proposeOnLoad?.served();
+      return;
     }
     const proposal = proposals.get(parts[1]);
     if (!proposal) return json(res, 404, { error: 'proposal not found' });
@@ -2405,6 +2418,12 @@ const server = http.createServer(async (req, res) => {
       }
       return json(res, 200, {});
     }
+    if (url.pathname === '/_mock/propose-on-load' && req.method === 'POST') {
+      let served = () => {};
+      const fetched = new Promise((resolve) => (served = resolve));
+      proposeOnLoad = { fetched, served, used: false };
+      return json(res, 200, {});
+    }
     if (url.pathname === '/_mock/drop' && req.method === 'POST') {
       // With `?for=<ms>`, new connections are refused that long, so a UI stays disconnected for a while.
       refuseConnectionsUntil = Date.now() + Number(url.searchParams.get('for') ?? 0);
@@ -2420,6 +2439,12 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+/**
+ * Set by `/_mock/propose-on-load`: the next `session/load` waits until the UI's REST fetch of the session's proposals
+ * has been answered, then makes a proposal, and only then subscribes the connection, so the proposal reaches the UI
+ * only if it fetches again once subscribed (#423).
+ */
+let proposeOnLoad = null;
 /** Set by `/_mock/drop?for=<ms>`: until then, UIs can't connect. */
 let refuseConnectionsUntil = 0;
 /** Set by `/_mock/drop?slow=<ms>`: until then, reading a session waits, as a slow runtime's REST does. */
