@@ -1450,6 +1450,11 @@ function handleCall(conn, message) {
         conn.error(id, -32602, `Unknown session ${params.sessionId}`);
         return;
       }
+      // With `/_mock/fail-loads?for=<ms>`, loads fail that long, the connection itself being fine.
+      if (Date.now() < failLoadsUntil) {
+        conn.error(id, -32603, 'the runtime could not read the session');
+        return;
+      }
       // With `/_mock/drop?slowload=<ms>`, loads are answered that long after they come.
       if (Date.now() < slowLoadsUntil) {
         setTimeout(() => handleCall(conn, message), slowLoadsUntil - Date.now());
@@ -2461,6 +2466,10 @@ const server = http.createServer(async (req, res) => {
       proposeOnLoad = { fetched, served, used: false };
       return json(res, 200, {});
     }
+    if (url.pathname === '/_mock/fail-loads' && req.method === 'POST') {
+      failLoadsUntil = Date.now() + Number(url.searchParams.get('for') ?? 0);
+      return json(res, 200, {});
+    }
     if (url.pathname === '/_mock/slow-loads' && req.method === 'POST') {
       slowLoadsUntil = Date.now() + Number(url.searchParams.get('for') ?? 0);
       return json(res, 200, {});
@@ -2492,6 +2501,7 @@ let refuseConnectionsUntil = 0;
 /** Set by `/_mock/drop?slow=<ms>`: until then, reading a session waits, as a slow runtime's REST does. */
 let slowSessionsUntil = 0;
 let slowLoadsUntil = 0;
+let failLoadsUntil = 0;
 
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {

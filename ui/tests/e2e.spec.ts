@@ -2778,6 +2778,48 @@ test('a session left and entered again while its load is on its way is loaded on
   await expect(permissionCard(page)).toBeVisible();
 });
 
+test("a session whose load keeps failing doesn't disturb the list or the meters, or the socket", async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  const sockets: PageSocket[] = [];
+  page.on('websocket', (socket) => sockets.push(socket));
+  await setWorkQuota(page, 20);
+  try {
+    const waiting = 'Propose a PR for sloppod, the list follows it';
+    const waitingId = await createSession(page, waiting);
+    await finishTurn(page);
+    const other = 'Say something, its load will fail';
+    await createSession(page, other);
+    await finishTurn(page);
+    const nav = page.getByRole('navigation', { name: 'Sessions' });
+    const row = nav.getByTestId('session-row').filter({ hasText: waiting });
+    await expect(row.getByTestId('phase')).toHaveText('Waiting on you');
+    const meter = page.getByTestId('sidebar').getByTestId('quota-window');
+    await expect(meter).toContainText('20%');
+
+    // Each created session reloaded the page, so this is the socket it has now.
+    const socketsBefore = sockets.length;
+    // The runtime can't read a session for a while: opening it fails over and over, with backoff.
+    await page.request.post('/_mock/fail-loads?for=4000');
+    await nav.getByTestId('session-row').filter({ hasText: waiting }).click();
+    await expect(page.getByText('the runtime could not read the session')).toBeVisible();
+
+    // Meanwhile the list and the meters follow what the runtime pushes, on the same socket.
+    await setWorkQuota(page, 70);
+    await expect(meter).toContainText('70%');
+    const proposals: { id: string; status: string }[] = await (await page.request.get(`/api/v1/proposals?session=${waitingId}`)).json();
+    await page.request.post(`/api/v1/proposals/${proposals.find((p) => p.status === 'pending')!.id}/reject`, { data: {} });
+    await expect(row.getByTestId('phase')).not.toHaveText('Waiting on you');
+
+    // And the session loads on its own once the runtime can read it. Nothing reconnected on the way.
+    await expect(page.getByText('the runtime could not read the session')).toBeHidden({ timeout: 20_000 });
+    await expect(page.getByRole('textbox', { name: 'Prompt' })).toBeEnabled();
+    expect(sockets).toHaveLength(socketsBefore);
+    expect(sockets[socketsBefore - 1].isClosed()).toBe(false);
+  } finally {
+    await setWorkQuota(page, null);
+  }
+});
+
 test("a connection's quotas fetched after a newer connection's never replace them", async ({ page }) => {
   // The first connection's fetch is held back until the connection has dropped and come back with its own.
   let first: (() => void) | undefined;

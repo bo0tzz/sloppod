@@ -33,6 +33,8 @@ class AppConnection {
   #conn: AcpConnection | undefined;
   /** Consumers whose `onReady` ran on the connection as it is now. */
   #ready = new Set<Consumer>();
+  /** Consumers whose `onReady` failed, each waiting for its next try, with how many failed so far and why. */
+  #failed = new Map<Consumer, { attempts: number; error: string; timer?: ReturnType<typeof setTimeout> }>();
   /** Counts the connection's comings-up; one that's been replaced stops what it was doing. */
   #generation = 0;
   #initialized = false;
@@ -57,6 +59,7 @@ class AppConnection {
     return () => {
       this.#consumers.delete(consumer);
       this.#ready.delete(consumer);
+      this.#forget(consumer);
       if (this.#consumers.size === 0) this.#close();
     };
   }
@@ -80,13 +83,38 @@ class AppConnection {
 
   /** A consumer that registered on a connection that's up: it's up for it once its own state is fetched. */
   #late(consumer: Consumer) {
-    const generation = this.#generation;
     consumer.onStateChange?.('connecting');
-    void this.#ready_(consumer, generation).then(() => {
-      if (generation === this.#generation && this.state === 'open' && this.#ready.has(consumer)) {
-        consumer.onStateChange?.('open');
-      }
-    });
+    void this.#attempt(consumer, this.#generation);
+  }
+
+  /** Runs a consumer's `onReady` and, once it's through, tells it the connection is up. */
+  async #attempt(consumer: Consumer, generation: number) {
+    if (!(await this.#ready_(consumer, generation))) return;
+    if (generation === this.#generation && this.state === 'open' && this.#ready.has(consumer)) {
+      consumer.onStateChange?.('open');
+    }
+  }
+
+  /** Takes a consumer out of the failed ones, and stops its waiting to try again. */
+  #forget(consumer: Consumer) {
+    clearTimeout(this.#failed.get(consumer)?.timer);
+    this.#failed.delete(consumer);
+  }
+
+  /**
+   * A consumer's own fetch failed: it tries again after a backoff, like the session's REST side does. The connection
+   * and the other consumers are left as they are; only a failure of the connection itself reconnects.
+   */
+  #retryLater(consumer: Consumer, generation: number, error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    const attempts = (this.#failed.get(consumer)?.attempts ?? 0) + 1;
+    clearTimeout(this.#failed.get(consumer)?.timer);
+    const timer = setTimeout(() => {
+      if (generation !== this.#generation || this.state !== 'open' || !this.#consumers.has(consumer)) return;
+      void this.#attempt(consumer, generation);
+    }, Math.min(30_000, 1000 * 2 ** (attempts - 1)));
+    this.#failed.set(consumer, { attempts, error: message, timer });
+    consumer.onStateChange?.('connecting', message);
   }
 
   #open() {
@@ -107,10 +135,14 @@ class AppConnection {
         if (state !== 'open') {
           this.#initialized = false;
           this.#ready.clear();
+          for (const consumer of [...this.#failed.keys()]) this.#forget(consumer);
         }
         for (const consumer of [...this.#consumers]) {
+          const failure = this.#failed.get(consumer);
+          // One whose fetch failed is still waiting to try again; the connection being up isn't news to it.
+          if (state === 'open' && failure) consumer.onStateChange?.('connecting', failure.error);
           // One that registered after the loop in `#onReady` was done with its snapshot hasn't been readied.
-          if (state === 'open' && !this.#ready.has(consumer)) this.#late(consumer);
+          else if (state === 'open' && !this.#ready.has(consumer)) this.#late(consumer);
           else consumer.onStateChange?.(state, error);
         }
       },
@@ -127,6 +159,7 @@ class AppConnection {
     this.#initialized = false;
     this.#connectedBefore = false;
     this.#ready.clear();
+    for (const consumer of [...this.#failed.keys()]) this.#forget(consumer);
     this.state = 'closed';
     document.removeEventListener('visibilitychange', this.#wake);
     window.removeEventListener('online', this.#wake);
@@ -145,27 +178,33 @@ class AppConnection {
     if (this.#connectedBefore) account.refresh();
     this.#connectedBefore = true;
     this.#initialized = true;
-    // One after the other, as a session's load must not overtake the list's fetch; one failing drops the socket, which
-    // comes back and tries them all again. Those that register meanwhile are taken in turn: it goes on until none is left.
+    // One after the other. A consumer whose fetch fails doesn't stop the rest, or the connection: it tries again on
+    // its own. Those that register meanwhile are taken in turn: it goes on until none is left.
     for (;;) {
       if (generation !== this.#generation) return;
-      const next = [...this.#consumers].find((consumer) => !this.#ready.has(consumer));
+      const next = [...this.#consumers].find((consumer) => !this.#ready.has(consumer) && !this.#failed.has(consumer));
       if (!next) return;
-      await this.#ready_(next, generation, true);
+      await this.#ready_(next, generation);
     }
   }
 
-  /** Runs a consumer's `onReady` once on this connection. A failure drops the socket, as `onReady` throwing does. */
-  async #ready_(consumer: Consumer, generation: number, throws = false) {
+  /**
+   * Runs a consumer's `onReady` once on this connection; false if it didn't get that far: it left, or its fetch
+   * failed and is tried again later.
+   */
+  async #ready_(consumer: Consumer, generation: number): Promise<boolean> {
     // One that left while it waited its turn isn't started.
-    if (this.#ready.has(consumer) || !this.#consumers.has(consumer)) return;
+    if (this.#ready.has(consumer) || !this.#consumers.has(consumer)) return false;
     this.#ready.add(consumer);
     try {
       await consumer.onReady(this);
+      this.#forget(consumer);
+      return true;
     } catch (error) {
       this.#ready.delete(consumer);
-      if (throws) throw error;
-      if (generation === this.#generation) this.#conn?.drop(error instanceof Error ? error.message : String(error));
+      // The connection moving on is its own failure, and takes everything up again.
+      if (generation === this.#generation && this.#consumers.has(consumer)) this.#retryLater(consumer, generation, error);
+      return false;
     }
   }
 }
