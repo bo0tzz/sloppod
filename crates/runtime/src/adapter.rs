@@ -83,7 +83,8 @@ fn session_prompt(context: &AgentContext, subagents: bool) -> String {
         }
         prompt.push_str(
             "- Independent work that can run in parallel goes to a sub-session (`spawn_session`): it has its own \
-             pod, branch and transcript, and reports back with `report_done`.\n",
+             pod, branch and transcript, and reports back with `report_done`. It parks by itself a few minutes after \
+             its report is carried out; `park_session` parks it sooner, and a message wakes it.\n",
         );
         prompt.push_str(
             "- To have another model review a branch before you propose it, call `request_code_review`; a \
@@ -259,7 +260,8 @@ fn auto_mode_environment(context: &AgentContext) -> Vec<String> {
          external system, and calling them is routine. The `propose_*` tools submit proposals that a person \
          reviews before sloppod carries them out; `ask_user` queues a question for the user; `spawn_session` starts \
          a sub-session in a sandboxed pod of its own, with at most this session's grants; `message_session`, \
-         `report_done`, `request_code_review`, `request_repository` and `list_grants` coordinate within sloppod."
+         `park_session`, `report_done`, `request_code_review`, `request_repository` and `list_grants` coordinate \
+         within sloppod."
             .to_owned(),
         "**Messages from sloppod**: user turns that start with `sloppod:`, or with a `[sloppod: …]` time line, are \
          written by the runtime: what became of proposals, notices, nudges, messages relayed from other sessions. \

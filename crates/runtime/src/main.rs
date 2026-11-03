@@ -351,6 +351,7 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 every.tick().await;
                 inference::park_idle(&state).await;
+                subsessions::park_finished(&state).await;
             }
         });
     }

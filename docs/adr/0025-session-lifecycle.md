@@ -51,3 +51,5 @@ Open questions:
 - Whether a pinned session should also be exempt from auto-parking. Parking keeps everything, so this proposes not.
 - Whether the thresholds belong per user (Settings) rather than per cluster.
 - Whether archiving should first ask the agent to push work in progress (a notice: "this session will be archived; push anything worth keeping"), at the cost of a turn.
+
+2026-11-03: idle parking isn't built yet for work sessions. Sub-sessions park by themselves sooner, 5 minutes after they've finished (their report carried out, nothing of theirs in review) and gone quiet, as ADR 27's note of this date says ([#284](https://github.com/bo0tzz/sloppod/issues/284)), since they hold their tree's limited slots.
