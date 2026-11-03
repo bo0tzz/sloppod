@@ -16,6 +16,8 @@ use crate::credentials::{CHATGPT, CLAUDE};
 pub const PLACEHOLDER: &str = "sloppod-placeholder";
 const OAUTH_PLACEHOLDER: &str = "sk-ant-oat01-sloppod-placeholder";
 const MEMINI_PLUGIN: &str = "/opt/sloppod/plugins/memini";
+/// Claude Code's hook for shell commands: the supervisor, which is on every session image, reading the call (#339).
+const GUARD: &str = "sloppod-supervisor guard";
 /// Claude Code tools that don't fit a sloppod session: scheduling starts turns the runtime doesn't see and dies with
 /// the pod, plan mode would leave auto mode on exit, worktrees put work on branches the session can't push, and
 /// AskUserQuestion stops the turn until answered, where sloppod's `ask_user` doesn't.
@@ -356,6 +358,11 @@ impl AgentAdapter for ClaudeCode {
                 // are the agent's call; without this, auto mode blocks them as destructive.
                 "permissions": {"allow": ["Bash(git push:*)"]},
                 "autoMode": {"environment": auto_mode_environment(context)},
+                // Refuses a few shell commands that go wrong unnoticed, saying what to do instead (#339).
+                "hooks": {"PreToolUse": [{
+                    "matcher": "Bash|Monitor",
+                    "hooks": [{"type": "command", "command": GUARD}],
+                }]},
             }))
             .unwrap_or_default(),
             overwrite: true,
@@ -578,6 +585,20 @@ mod tests {
         assert!(
             read_only_work.contains("propose_pull_request") && read_only_work.contains("ask_user")
         );
+    }
+
+    #[test]
+    fn shell_commands_go_through_the_guard() {
+        let launch = ClaudeCode.launch(&context());
+        let settings = launch
+            .files
+            .iter()
+            .find(|f| f.path == "/workspace/.claude/settings.json")
+            .unwrap();
+        let settings: Value = serde_json::from_str(&settings.content).unwrap();
+        let hook = &settings["hooks"]["PreToolUse"][0];
+        assert_eq!(hook["matcher"], "Bash|Monitor");
+        assert_eq!(hook["hooks"][0]["command"], "sloppod-supervisor guard");
     }
 
     #[test]
