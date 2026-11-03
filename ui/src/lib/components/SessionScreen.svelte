@@ -95,6 +95,10 @@
   let decidedProposalId = $state<string | null>(null);
   const decidedProposal = $derived(view.proposals.find((proposal) => proposal.id === decidedProposalId));
 
+  const oldestPending = $derived(
+    [...pendingProposals].sort((a, b) => a.created_at.localeCompare(b.created_at))[0],
+  );
+
   /** After a decision, the modal moves on to the oldest proposal still waiting for the user, or closes. */
   function openNextProposal(decided: Proposal) {
     const next = pendingProposals
@@ -338,9 +342,12 @@
               </span>
             {/if}
           </span>
-          <Button size="small" shape="round" onclick={() => (proposalList = 'open')}>
-            {pendingProposals.length > 0 ? 'Review' : 'View'}
-          </Button>
+          {#if oldestPending}
+            <Button size="small" shape="round" variant="ghost" onclick={() => (proposalList = 'open')}>List</Button>
+            <Button size="small" shape="round" onclick={() => openProposalModal(oldestPending.id)}>Review</Button>
+          {:else}
+            <Button size="small" shape="round" onclick={() => (proposalList = 'open')}>View</Button>
+          {/if}
         </div>
       {/if}
 {/snippet}

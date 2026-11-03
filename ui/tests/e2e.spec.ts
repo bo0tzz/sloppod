@@ -1839,8 +1839,11 @@ test('deciding a proposal moves on to the next one waiting', async ({ page }) =>
   await box.press('Enter');
   await expect(page.getByTestId('proposals-bar')).toContainText('2 proposals to review');
 
-  await page.getByTestId('proposals-bar').getByRole('button').first().click();
-  await page.getByRole('dialog').locator('[data-kind="github.pr.create"]').getByRole('button', { name: 'Review' }).click();
+  // The bar's Review opens the oldest one straight away; the list is a tap away for picking another.
+  await page.getByTestId('proposals-bar').getByRole('button', { name: 'List' }).click();
+  await expect(page.getByRole('dialog').getByTestId('proposal-card')).toHaveCount(2);
+  await page.keyboard.press('Escape');
+  await page.getByTestId('proposals-bar').getByRole('button', { name: 'Review' }).click();
   const detail = page.getByTestId('proposal-detail');
   await expect(detail.getByTestId('proposal-title')).toHaveText('Reconnect the ACP socket with exponential backoff');
   await page.getByRole('button', { name: 'Approve', exact: true }).click();
