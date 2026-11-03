@@ -190,6 +190,7 @@ pub async fn apply_egress(state: &AppState, id: Uuid) -> anyhow::Result<bool> {
 /// told. A session that isn't acting gets its egress at its next placement.
 pub async fn grants_changed(state: &AppState, id: Uuid, what: &str) {
     reapply_egress(state, id);
+    crate::mcp::tools_changed(state, id).await;
     state.hub.broadcast_session(id).await;
     state
         .hub
@@ -465,6 +466,7 @@ pub async fn wake(state: &AppState, session: &db::SessionRow) -> anyhow::Result<
 pub async fn remove_session(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
     let id = session.id;
     state.hub.stop(id).await?;
+    state.tool_streams.forget(id);
     state.placement.delete(&id.to_string()).await?;
     state.hub.remove_egress(id, &*state.enforcer).await?;
     if crate::capabilities::holds(&session.context(), &crate::capabilities::Part::Memory)

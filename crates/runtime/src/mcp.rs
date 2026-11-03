@@ -1,14 +1,18 @@
 //! The runtime's MCP endpoint: tools for proposals, reached from session pods and identified by pod IP.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Mutex as StdMutex;
 
 use axum::Json;
 use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 use sloppod_contracts::SessionRole;
 use sloppod_protocol::api::{ProposalStatus, SessionKind};
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::{AppState, db, proposals, reviews, subsessions, work};
@@ -29,13 +33,17 @@ pub async fn handler(
     let result = match method {
         "initialize" => Ok(json!({
             "protocolVersion": message["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
-            "capabilities": {"tools": {}},
+            "capabilities": {"tools": {"listChanged": true}},
             "serverInfo": {"name": "sloppod", "version": state.config.build.as_deref().unwrap_or(env!("CARGO_PKG_VERSION"))},
             "instructions": "sloppod's tools for this session: proposals of outward actions (a person reviews them before sloppod carries them out), questions to the user, what the session is granted, and, for work sessions, sub-sessions. Each tool says what it does.",
         })),
         "ping" => Ok(json!({})),
         "tools/list" => match session_kind(&state, session).await {
-            Ok(row) => Ok(json!({"tools": tools(&state, &row)})),
+            Ok(row) => {
+                let tools = tools(&state, &row);
+                state.tool_streams.listed(session, &tools);
+                Ok(json!({"tools": tools}))
+            }
             Err(e) => Err(json!({"code": -32603, "message": e})),
         },
         "tools/call" => Ok(call(&state, session, &message["params"]).await),
@@ -46,6 +54,134 @@ pub async fn handler(
         Err(error) => json!({"jsonrpc": "2.0", "id": id, "error": error}),
     };
     Json(body).into_response()
+}
+
+/// What each session's agent was last told its tools are, and the streams it listens on for a change to them (#323).
+/// An agent's MCP client fetches the tool list when it connects; a grant that changes the list mid-session would
+/// otherwise reach it only at its next start.
+#[derive(Default)]
+pub struct ToolStreams(StdMutex<HashMap<Uuid, Listed>>);
+
+struct Listed {
+    /// A digest of the tool list the session was last given, if it asked.
+    tools: Option<u64>,
+    changed: broadcast::Sender<()>,
+}
+
+impl Listed {
+    fn new() -> Self {
+        Self {
+            tools: None,
+            changed: broadcast::channel(4).0,
+        }
+    }
+}
+
+fn digest(tools: &[Value]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    Value::Array(tools.to_vec()).to_string().hash(&mut hasher);
+    hasher.finish()
+}
+
+impl ToolStreams {
+    fn listed(&self, session: Uuid, tools: &[Value]) {
+        let mut sessions = self.0.lock().unwrap();
+        sessions.entry(session).or_insert_with(Listed::new).tools = Some(digest(tools));
+    }
+
+    fn subscribe(&self, session: Uuid) -> broadcast::Receiver<()> {
+        let mut sessions = self.0.lock().unwrap();
+        sessions
+            .entry(session)
+            .or_insert_with(Listed::new)
+            .changed
+            .subscribe()
+    }
+
+    /// Whether the session's client was given a list other than `tools`: a change it missed while it had no stream
+    /// open, which it hears of when it opens one.
+    fn stale(&self, session: Uuid, tools: &[Value]) -> bool {
+        let sessions = self.0.lock().unwrap();
+        sessions
+            .get(&session)
+            .and_then(|listed| listed.tools)
+            .is_some_and(|given| given != digest(tools))
+    }
+
+    /// Forgets a session that's gone.
+    pub fn forget(&self, session: Uuid) {
+        self.0.lock().unwrap().remove(&session);
+    }
+
+    /// Tells the session's agent its tools changed, if they differ from what it was last given. Says whether it did.
+    fn changed(&self, session: Uuid, tools: &[Value]) -> bool {
+        let mut sessions = self.0.lock().unwrap();
+        let Some(listed) = sessions.get_mut(&session) else {
+            return false;
+        };
+        let now = Some(digest(tools));
+        if listed.tools.is_none() || listed.tools == now {
+            return false;
+        }
+        // An agent with no stream open doesn't hear of it, and still has the list it was given.
+        let sent = listed.changed.send(()).is_ok();
+        if sent {
+            listed.tools = now;
+        }
+        sent
+    }
+}
+
+/// Sends `notifications/tools/list_changed` to the session's agent when its tools are no longer the ones it was
+/// given, e.g. after a grant change (#323). Its client then lists them again.
+pub async fn tools_changed(state: &AppState, session: Uuid) {
+    let tools = current_tools(state, session).await;
+    if state.tool_streams.changed(session, &tools) {
+        tracing::info!(%session, "told the agent its tools changed");
+    }
+}
+
+/// The tools the session has now; none if it can't act.
+async fn current_tools(state: &AppState, session: Uuid) -> Vec<Value> {
+    match session_kind(state, session).await {
+        Ok(row) => tools(state, &row),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// `GET /mcp`: the stream the server sends the agent's MCP client notifications on (MCP's streamable HTTP). The only
+/// one sent is `notifications/tools/list_changed`.
+pub async fn stream(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let Some(session) = crate::identity::calling_session(&state, &headers, peer.ip()).await else {
+        return (StatusCode::FORBIDDEN, "not a session pod").into_response();
+    };
+    // Subscribed before it's checked, so a change in between is either sent on the stream or found stale here.
+    let changed = state.tool_streams.subscribe(session);
+    let missed = state
+        .tool_streams
+        .stale(session, &current_tools(&state, session).await);
+    let notice = || {
+        let notice = json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"});
+        Ok::<_, std::convert::Infallible>(
+            Event::default().event("message").data(notice.to_string()),
+        )
+    };
+    let notices = futures::stream::unfold(changed, move |mut changed| async move {
+        // A lagged receiver missed only repeats of the same notice.
+        if let Err(broadcast::error::RecvError::Closed) = changed.recv().await {
+            return None;
+        }
+        Some((notice(), changed))
+    });
+    let missed = futures::stream::iter(missed.then(notice));
+    Sse::new(futures::StreamExt::chain(missed, notices))
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// Which tools a session gets depends on its kind, so a session that can't be loaded gets none.
@@ -363,6 +499,50 @@ fn grant_list(grants: &[sloppod_protocol::api::Grant], role: &SessionRole) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_hears_when_its_tools_change_from_what_it_was_given() {
+        let streams = ToolStreams::default();
+        let session = Uuid::new_v4();
+        let before = [json!({"name": "ask_user"})];
+        let after = [json!({"name": "ask_user"}), json!({"name": "list_work"})];
+        // Not listed yet: it gets the current list when it asks.
+        assert!(!streams.changed(session, &after));
+        streams.listed(session, &before);
+        // No stream open: nobody to tell, and it still has what it was given.
+        assert!(!streams.changed(session, &after));
+        let mut changed = streams.subscribe(session);
+        assert!(!streams.changed(session, &before));
+        assert!(streams.changed(session, &after));
+        assert!(changed.try_recv().is_ok());
+        assert!(!streams.changed(session, &after), "told once");
+        assert!(
+            streams.changed(session, &before),
+            "and again when they change back"
+        );
+        streams.forget(session);
+        assert!(!streams.changed(session, &after));
+    }
+
+    #[test]
+    fn a_change_missed_while_no_stream_was_open_is_told_when_one_opens() {
+        let streams = ToolStreams::default();
+        let session = Uuid::new_v4();
+        let before = [json!({"name": "ask_user"})];
+        let after = [json!({"name": "ask_user"}), json!({"name": "list_work"})];
+        streams.listed(session, &before);
+        let stream = streams.subscribe(session);
+        drop(stream);
+        // The grant changes while the stream is closed: nobody hears.
+        assert!(!streams.changed(session, &after));
+        // Reopened with no further change, it's told of the one it missed, until it lists the tools again.
+        let _stream = streams.subscribe(session);
+        assert!(streams.stale(session, &after));
+        streams.listed(session, &after);
+        assert!(!streams.stale(session, &after));
+        // Never listed: nothing to be stale.
+        assert!(!streams.stale(Uuid::new_v4(), &after));
+    }
 
     #[test]
     fn the_grant_list_points_to_request_repository_only_where_it_exists() {

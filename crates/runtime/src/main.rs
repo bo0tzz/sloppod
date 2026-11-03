@@ -96,6 +96,8 @@ pub struct Inner {
     pub rechecks: Arc<rebases::Rechecks>,
     /// What's left of each inference credential's usage limits (#140).
     pub quotas: quota::Quotas,
+    /// What each session's agent was last told its tools are, to tell it when they change (#323).
+    pub tool_streams: mcp::ToolStreams,
 }
 
 #[derive(Clone)]
@@ -259,6 +261,7 @@ async fn main() -> anyhow::Result<()> {
         inference: inference::Inference::default(),
         suggestions: starting::Suggestions::default(),
         image_nudges: lifecycle::ImageNudges::default(),
+        tool_streams: mcp::ToolStreams::default(),
         rechecks,
         quotas: quota::Quotas::new()?,
     }));
@@ -374,7 +377,7 @@ async fn main() -> anyhow::Result<()> {
             &format!("{}/{{name}}", sloppod_protocol::link::TRANSCRIPT_PATH),
             get(link::transcript),
         )
-        .route("/mcp", post(mcp::handler))
+        .route("/mcp", post(mcp::handler).get(mcp::stream))
         .route(memory::PREFIX, any(memory::proxy))
         .route(&format!("{}/{{*path}}", memory::PREFIX), any(memory::proxy))
         .route(
