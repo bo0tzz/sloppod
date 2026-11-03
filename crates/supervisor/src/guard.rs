@@ -57,6 +57,8 @@ fn split(command: &str) -> Vec<Simple> {
     let mut current = Simple::default();
     let mut word: Option<String> = None;
     let mut chars = command.chars().peekable();
+    // Here-documents whose bodies start after the next newline: their delimiters, and whether tabs are stripped.
+    let mut heredocs: Vec<(String, bool)> = Vec::new();
     let end_word = |word: &mut Option<String>, current: &mut Simple| {
         if let Some(word) = word.take() {
             current.words.push(word);
@@ -88,6 +90,24 @@ fn split(command: &str) -> Vec<Simple> {
                     word.get_or_insert_default().push(c);
                 }
             }
+            '<' if chars.peek() == Some(&'<') => {
+                end_word(&mut word, &mut current);
+                chars.next();
+                // `<<<` is a here-string: its word is an argument, not a body.
+                if chars.next_if_eq(&'<').is_some() {
+                    continue;
+                }
+                let tabs = chars.next_if_eq(&'-').is_some();
+                while chars.next_if(|c| *c == ' ' || *c == '\t').is_some() {}
+                let mut delimiter = String::new();
+                while let Some(c) = chars.next_if(|c| !c.is_whitespace() && !";|&()<>".contains(*c))
+                {
+                    if !matches!(c, '\'' | '"' | '\\') {
+                        delimiter.push(c);
+                    }
+                }
+                heredocs.push((delimiter, tabs));
+            }
             c if c.is_whitespace() && c != '\n' => end_word(&mut word, &mut current),
             ';' | '\n' | '|' | '&' | '(' | ')' => {
                 end_word(&mut word, &mut current);
@@ -112,6 +132,22 @@ fn split(command: &str) -> Vec<Simple> {
                     commands.push(std::mem::take(&mut current));
                 }
                 current.background = false;
+                // A here-document's body is data, not commands.
+                if c == '\n' {
+                    for (delimiter, tabs) in heredocs.drain(..) {
+                        loop {
+                            let line: String = chars.by_ref().take_while(|c| *c != '\n').collect();
+                            let line = if tabs {
+                                line.trim_start_matches('\t')
+                            } else {
+                                &line
+                            };
+                            if line == delimiter || chars.peek().is_none() {
+                                break;
+                            }
+                        }
+                    }
+                }
             }
             c => word.get_or_insert_default().push(c),
         }
@@ -186,23 +222,40 @@ fn blanket_staging(words: &[String]) -> Option<String> {
             blanket.then(|| format!("`git add` of everything: {STAGE_BY_NAME}"))
         }
         "commit" => {
+            let refused = || Some(format!("`git commit -a`: {STAGE_BY_NAME}"));
             let mut args = args.iter();
             while let Some(a) = args.next() {
-                if a == "--" {
-                    break;
-                }
-                if has_flag(a, 'a', "--all") {
-                    return Some(format!("`git commit -a`: {STAGE_BY_NAME}"));
-                }
-                // The value of an option that takes one isn't a flag.
-                let takes_value =
-                    matches!(a.as_str(), "--message" | "--file" | "--author" | "--date")
-                        || (a.starts_with('-')
-                            && !a.starts_with("--")
-                            && a.len() > 1
-                            && a.ends_with(['m', 'F', 'C', 'c']));
-                if takes_value {
-                    args.next();
+                match a.as_str() {
+                    "--" => break,
+                    "--all" => return refused(),
+                    // A long option's value is the next word, unless it's attached with `=`.
+                    "--message" | "--file" | "--author" | "--date" | "--template"
+                    | "--reuse-message" | "--reedit-message" | "--fixup" | "--squash"
+                    | "--cleanup" => {
+                        args.next();
+                    }
+                    _ => {
+                        let Some(cluster) = a.strip_prefix('-').filter(|c| !c.starts_with('-'))
+                        else {
+                            continue;
+                        };
+                        // Read in order: an option that takes a value takes the rest of the word (`-m"msg"`), or
+                        // the next word when nothing's left.
+                        for (i, flag) in cluster.char_indices() {
+                            if flag == 'a' {
+                                return refused();
+                            }
+                            if "mFCct".contains(flag) {
+                                if i + 1 == cluster.len() {
+                                    args.next();
+                                }
+                                break;
+                            }
+                            if flag == 'S' {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             None
@@ -325,6 +378,8 @@ mod tests {
             "git commit -a -m 'wip'",
             "git commit -am wip",
             "git commit --all",
+            "git commit -vam wip",
+            "cat <<EOF > a\nhi\nEOF\ngit add -A",
         ] {
             assert!(
                 bash(command).is_some_and(|r| r.contains("Stage the paths")),
@@ -336,6 +391,13 @@ mod tests {
             "git add -p src/a.rs",
             "git commit -m 'stage with git add -A'",
             "git commit -m -a",
+            "git commit -m\"update docs\"",
+            "git commit -mupdate",
+            "git commit -F./a.txt",
+            "git commit -S -m wip",
+            "cat <<'EOF' > notes.md\ngit add -A\npkill -f x\nEOF\ngit status",
+            "cat <<-EOF\n\tgit add -A\n\tEOF",
+            "grep -c x <<< \"git add -A\"",
             "git commit -F msg.txt",
             "echo git add -A",
             "git status",
