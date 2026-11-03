@@ -101,6 +101,40 @@ pub(crate) fn head_branch<'a>(session_branch: &'a str, named: Option<&'a str>) -
     }
 }
 
+/// What a branch is compared with, or merged into, when a proposal names `base` (#373). A session branch the work
+/// started from, the proposing session's own or the one it branched off, may be behind the repository's default
+/// branch with nothing of its own, e.g. a parent's that wasn't brought up to date before it spawned a sub-session.
+/// Compared with that, commits already on the default branch would show as the change's, so the default branch
+/// stands in: compared from its merge base with the head, it shows the change alone. Any other base stays.
+async fn current_base(
+    app: &GitHubApp,
+    session: &SessionContext,
+    repo: &str,
+    base: String,
+) -> Result<String> {
+    let started_from = session.grants.iter().any(|g| {
+        g.capability == sloppod_contracts::capability::REPO
+            && g.param("repo")
+                .is_some_and(|r| sloppod_contracts::same_repo(r, repo))
+            && (g.param("branch") == Some(&base) || g.param("from") == Some(&base))
+    });
+    if !started_from {
+        return Ok(base);
+    }
+    let default = app.default_branch(repo).await.map_err(err)?;
+    if base == default {
+        return Ok(base);
+    }
+    match app
+        .compare_if_found(repo, &default, &base)
+        .await
+        .map_err(err)?
+    {
+        Some(behind) if behind.ahead_by == 0 => Ok(default),
+        _ => Ok(base),
+    }
+}
+
 /// What a reviewer of a branch sees: the diff and commits from the base to the commit that was proposed, not
 /// wherever the branch is now. Nothing for a payload without one.
 async fn branch_detail(app: &GitHubApp, payload: &Value) -> Result<Value> {
@@ -1119,5 +1153,61 @@ mod tests {
         assert_eq!(recorded, Ok(result));
         assert_eq!(writes.load(Ordering::SeqCst), 4);
         assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    /// A fake GitHub whose default branch is `main`, where `behind` lists the branches that are behind `main` with
+    /// nothing of their own.
+    async fn github_with(behind: &'static [&'static str]) -> GitHubApp {
+        use axum::extract::Path;
+        use axum::routing::get;
+        use axum::{Json, Router};
+        let router = Router::new()
+            .route(
+                "/repos/{owner}/{name}",
+                get(|| async { Json(json!({"default_branch": "main"})) }),
+            )
+            .route(
+                "/repos/{owner}/{name}/compare/{*range}",
+                get(
+                    move |Path((_, _, range)): Path<(String, String, String)>| async move {
+                        let (_, head) = range.split_once("...").unwrap();
+                        let ahead = u64::from(!behind.contains(&head));
+                        Json(json!({"ahead_by": ahead, "commits": []}))
+                    },
+                ),
+            )
+            .route(
+                "/repos/{owner}/{name}/commits/{*reference}",
+                get(|| async { Json(json!({"sha": "f00"})) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        GitHubApp::for_user_with_api(&api, "token".into(), "octo".into()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_session_branch_behind_the_default_branch_gives_way_to_it() {
+        let app = github_with(&["sloppod/parent", "release"]).await;
+        let mut child = session(&["o/r"]);
+        child.grants[0].params["branch"] = json!("sloppod/parent-01234567");
+        child.grants[0].params["from"] = json!("sloppod/parent");
+        let base = |base: &str| current_base(&app, &child, "o/r", base.to_owned());
+        // The parent's branch the child started from, behind main: compared from main instead.
+        assert_eq!(base("sloppod/parent").await.unwrap(), "main");
+        // One with work of its own stays, as does a branch that isn't the session's, behind main or not.
+        assert_eq!(
+            base("sloppod/parent-01234567").await.unwrap(),
+            "sloppod/parent-01234567"
+        );
+        assert_eq!(base("release").await.unwrap(), "release");
+        assert_eq!(base("main").await.unwrap(), "main");
+        // The same branch in another repository isn't the session's.
+        assert_eq!(
+            current_base(&app, &child, "o/other", "sloppod/parent".into())
+                .await
+                .unwrap(),
+            "sloppod/parent"
+        );
     }
 }

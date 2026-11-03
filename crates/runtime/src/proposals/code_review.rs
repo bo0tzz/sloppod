@@ -117,6 +117,7 @@ impl ProposalKind for CodeReview {
             Some(base) => base.trim().to_owned(),
             None => app.default_branch(repo).await.map_err(err)?,
         };
+        let base = super::current_base(&app, session, repo, base).await?;
         let comparison = app
             .compare_if_found(repo, &base, head)
             .await
