@@ -613,14 +613,43 @@ test('an open proposal follows a decision made elsewhere', async ({ page }) => {
 test('retries loading a session that failed to load', async ({ page }) => {
   const sessions: { id: string; title: string }[] = await (await page.request.get('/api/v1/sessions')).json();
   const session = sessions.find((candidate) => candidate.title === 'Park and wake')!;
-  let failures = 1;
+  // Every load fails until the test lets them through: the session loads more than once (#423), and the error has to
+  // stay up for as long as the test looks at it.
+  let failing = true;
   await page.route(`**/api/v1/sessions/${session.id}`, (route) =>
-    failures-- > 0 ? route.fulfill({ status: 500, json: { error: 'database unavailable' } }) : route.fallback(),
+    failing ? route.fulfill({ status: 500, json: { error: 'database unavailable' } }) : route.fallback(),
   );
   await page.goto(`/sessions/${session.id}`);
   await expect(page.getByTestId('load-error')).toContainText('database unavailable');
+  failing = false;
   await expect(page.getByTestId('load-error')).toBeHidden();
   await expect(page.getByRole('heading', { level: 1 })).toHaveText('Park and wake');
+});
+
+test('a load that fails after a newer one succeeded shows no error', async ({ page }) => {
+  const sessions: { id: string; title: string }[] = await (await page.request.get('/api/v1/sessions')).json();
+  const session = sessions.find((candidate) => candidate.title === 'Park and wake')!;
+  // The first load hangs until the session has loaded by other means (the refresh after `session/load`), then fails.
+  let calls = 0;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  let failed!: () => void;
+  const answered = new Promise<void>((resolve) => (failed = resolve));
+  await page.route(`**/api/v1/sessions/${session.id}`, async (route) => {
+    if (calls++ > 0) return route.fallback();
+    await held;
+    await route.fulfill({ status: 500, json: { error: 'database unavailable' } });
+    failed();
+  });
+  await page.goto(`/sessions/${session.id}`);
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText('Park and wake');
+  await expect.poll(() => calls).toBeGreaterThan(1);
+  release();
+  await answered;
+  // Long enough for the failure to have been handled; unhandled, its error would show for about a second.
+  await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 300)));
+  // Not retried: the error does go away by itself, after its retry.
+  expect(await page.getByTestId('load-error').count()).toBe(0);
 });
 
 test('rejects a proposal with a reason', async ({ page }) => {
