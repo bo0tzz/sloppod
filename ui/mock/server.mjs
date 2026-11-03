@@ -37,7 +37,7 @@ const MODELS = [
   { value: 'haiku', name: 'Haiku' },
 ];
 /** The user's defaults for new sessions. `models` fills in once a session has offered them. */
-const settings = { model: null, models: [], review: 'off', timezone: null };
+const settings = { model: null, models: [], review: 'off', timezone: null, instructions: null };
 const CANCELLED = Symbol('cancelled');
 
 /** @type {Map<string, MockSession>} */
@@ -1524,6 +1524,12 @@ async function handleApi(req, res, url) {
       if ('model' in body) {
         if (body.model !== null && typeof body.model !== 'string') return json(res, 400, { error: 'model must be a string or null' });
         settings.model = body.model || null;
+      }
+      if ('instructions' in body) {
+        if (body.instructions !== null && typeof body.instructions !== 'string') {
+          return json(res, 400, { error: 'instructions must be a string or null' });
+        }
+        settings.instructions = body.instructions?.trim() || null;
       }
       if ('review' in body) {
         if (!['off', 'required'].includes(body.review)) return json(res, 400, { error: 'review must be one of off, required' });

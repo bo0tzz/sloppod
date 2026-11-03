@@ -2909,3 +2909,20 @@ test('a selection runs from one message across tool calls to the next', async ({
   expect(selected).toContain('npm test -- reconnect');
   expect(selected).toMatch(/approve it\.?\s*$/);
 });
+
+test('saves the instructions all sessions get', async ({ page }) => {
+  const section = page.getByTestId('instructions-setting');
+  const save = section.getByRole('button', { name: 'Save' });
+  await page.goto('/settings');
+  await expect(save).toBeDisabled();
+  await section.getByRole('textbox', { name: 'Instructions' }).fill('  - Only comment code for intent a reader could not infer.\n');
+  await save.click();
+  await expect(save).toBeDisabled();
+  await page.reload();
+  await expect(section.getByRole('textbox', { name: 'Instructions' })).toHaveValue(
+    '- Only comment code for intent a reader could not infer.',
+  );
+  const settings: { instructions: string | null } = await (await page.request.get('/api/v1/settings')).json();
+  expect(settings.instructions).toBe('- Only comment code for intent a reader could not infer.');
+  await page.request.put('/api/v1/settings', { data: { instructions: null } });
+});

@@ -140,7 +140,10 @@ async fn settings(state: &AppState, user: &str) -> ApiResult<serde_json::Value> 
         .unwrap_or_default();
     let review = db::user_review(&state.db, user).await?;
     let timezone = db::user_timezone(&state.db, user).await?;
-    Ok(json!({"model": model, "models": models, "review": review, "timezone": timezone}))
+    let instructions = db::user_instructions(&state.db, user).await?;
+    Ok(
+        json!({"model": model, "models": models, "review": review, "timezone": timezone, "instructions": instructions}),
+    )
 }
 
 /// Deserializes a field that's present, so `Option<Option<T>>` tells an absent field from a null one.
@@ -164,6 +167,9 @@ async fn get_settings(
     Ok(Json(settings(&state, &user).await?))
 }
 
+/// How long a user's own instructions may be: they go into every session's context.
+const MAX_INSTRUCTIONS: usize = 32 * 1024;
+
 /// Fields left out stay as they are.
 #[derive(Deserialize)]
 struct SettingsUpdate {
@@ -171,6 +177,8 @@ struct SettingsUpdate {
     model: Option<Option<String>>,
     review: Option<String>,
     timezone: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    instructions: Option<Option<String>>,
 }
 
 async fn put_settings(
@@ -189,6 +197,16 @@ async fn put_settings(
                 .map_err(|_| bad_request(format!("{name} isn't a timezone, e.g. Europe/Amsterdam")))
         })
         .transpose()?;
+    let instructions = match &update.instructions {
+        Some(Some(text)) if text.len() > MAX_INSTRUCTIONS => {
+            return Err(bad_request(format!(
+                "instructions are at most {} KiB",
+                MAX_INSTRUCTIONS / 1024
+            )));
+        }
+        Some(text) => Some(text.as_deref().map(str::trim).filter(|t| !t.is_empty())),
+        None => None,
+    };
     if let Some(model) = &update.model {
         let model = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
         db::set_user_model(&state.db, &user, model).await?;
@@ -198,6 +216,9 @@ async fn put_settings(
     }
     if let Some(timezone) = timezone {
         db::set_user_timezone(&state.db, &user, timezone.name()).await?;
+    }
+    if let Some(instructions) = instructions {
+        db::set_user_instructions(&state.db, &user, instructions).await?;
     }
     Ok(Json(settings(&state, &user).await?))
 }

@@ -1421,6 +1421,32 @@ pub async fn set_user_model(db: &PgPool, owner: &str, model: Option<&str>) -> sq
     .map(|_| ())
 }
 
+/// The owner's own instructions for their sessions (#342).
+pub async fn user_instructions(db: &PgPool, owner: &str) -> sqlx::Result<Option<String>> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("select instructions from user_settings where owner = $1")
+            .bind(owner)
+            .fetch_optional(db)
+            .await?;
+    Ok(row.and_then(|(instructions,)| instructions))
+}
+
+pub async fn set_user_instructions(
+    db: &PgPool,
+    owner: &str,
+    instructions: Option<&str>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "insert into user_settings (owner, instructions) values ($1, $2) \
+         on conflict (owner) do update set instructions = excluded.instructions, updated_at = now()",
+    )
+    .bind(owner)
+    .bind(instructions)
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
 /// The agent's state from the owner's most recently active session, for the models it offered.
 pub async fn latest_agent_state(db: &PgPool, owner: &str) -> sqlx::Result<Option<Value>> {
     let row: Option<(Option<Value>,)> = sqlx::query_as(

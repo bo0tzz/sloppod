@@ -68,7 +68,8 @@ spec:
     session:
       model: claude-opus-5-5
       memory: 8Gi
-    # Optional: your user-level CLAUDE.md, rendered into every session.
+    # Optional: instructions for every user's sessions, rendered ahead of each user's own (Settings).
+    # For one user, Settings → Your instructions is the place.
     # instructions: |
     #   ...
 ```

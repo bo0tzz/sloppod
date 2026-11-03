@@ -2079,3 +2079,23 @@ async fn finds_proposals_waiting_on_a_decision_or_their_author(db: PgPool) {
         .collect();
     assert_eq!(found, &ids[..2]);
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_user_keeps_their_own_instructions(db: PgPool) {
+    assert_eq!(db::user_instructions(&db, "dev").await.unwrap(), None);
+    db::set_user_model(&db, "dev", Some("opus")).await.unwrap();
+    db::set_user_instructions(&db, "dev", Some("Clone into $TMPDIR."))
+        .await
+        .unwrap();
+    assert_eq!(
+        db::user_instructions(&db, "dev").await.unwrap().as_deref(),
+        Some("Clone into $TMPDIR.")
+    );
+    assert_eq!(
+        db::user_model(&db, "dev").await.unwrap().as_deref(),
+        Some("opus")
+    );
+    assert_eq!(db::user_instructions(&db, "ada").await.unwrap(), None);
+    db::set_user_instructions(&db, "dev", None).await.unwrap();
+    assert_eq!(db::user_instructions(&db, "dev").await.unwrap(), None);
+}
