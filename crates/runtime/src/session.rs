@@ -2405,6 +2405,34 @@ impl Hub {
         F: FnOnce() -> Fut,
         Fut: Future<Output = anyhow::Result<()>>,
     {
+        self.park_if(id, false, suspend).await.map(|_| ())
+    }
+
+    /// Parks a session like [`Hub::park`], but only if it's idle with nothing going on: no turn, nothing queued, no
+    /// open request, and its supervisor says none of the agent's commands are running. Checked under its transition
+    /// lock; says whether it parked it.
+    pub async fn park_quiet<F, Fut>(
+        self: &Arc<Self>,
+        id: Uuid,
+        suspend: F,
+    ) -> Result<bool, ParkError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<()>>,
+    {
+        self.park_if(id, true, suspend).await
+    }
+
+    async fn park_if<F, Fut>(
+        self: &Arc<Self>,
+        id: Uuid,
+        quiet: bool,
+        suspend: F,
+    ) -> Result<bool, ParkError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<()>>,
+    {
         let live = self.live(id);
         let _transition = live.transition.lock().await;
         match self
@@ -2414,14 +2442,25 @@ impl Hub {
             .map_err(anyhow::Error::from)?
         {
             Some(row) if row.phase() == Phase::Stopped => return Err(ParkError::Stopped),
-            Some(row) if row.phase() == Phase::Parked => return Ok(()),
+            Some(row) if row.phase() == Phase::Parked => return Ok(!quiet),
+            Some(row) if quiet && row.phase() != Phase::Idle => return Ok(false),
             Some(_) => {}
             None => return Err(ParkError::Stopped),
         }
         let (agent, agent_session_id) = {
             let mut state = live.state.lock().await;
             if state.turn_running {
-                return Err(ParkError::InTurn);
+                return if quiet {
+                    Ok(false)
+                } else {
+                    Err(ParkError::InTurn)
+                };
+            }
+            let busy = !state.queue.is_empty()
+                || !state.permissions.is_empty()
+                || state.commands.is_none_or(|running| running > 0);
+            if quiet && busy {
+                return Ok(false);
             }
             live.end_work(&mut state);
             (state.agent.take(), state.agent_session_id.take())
@@ -2441,7 +2480,7 @@ impl Hub {
         if let Some(agent) = agent {
             agent.close();
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Replaces a quiet session's pod (#28), and says whether it did. Under the session's transition lock, and only
