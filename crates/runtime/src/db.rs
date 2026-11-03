@@ -1502,6 +1502,18 @@ pub async fn proposals_in_review(db: &PgPool, session: Uuid) -> sqlx::Result<Vec
     .await
 }
 
+/// Proposals out of review and waiting on a decision or on their author, of sessions that aren't deleted: what may
+/// have to follow what moved under it (#141).
+pub async fn undecided_proposals(db: &PgPool) -> sqlx::Result<Vec<ProposalRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "select {PROPOSAL_COLUMNS} from proposals p where status in ('pending', 'changes_requested') \
+         and exists (select 1 from sessions s where s.id = p.session_id and s.deleted_at is null) \
+         order by created_at"
+    )))
+    .fetch_all(db)
+    .await
+}
+
 /// The proposal a review session reviews.
 pub async fn reviewed_proposal(db: &PgPool, session: Uuid) -> sqlx::Result<Option<ProposalRow>> {
     sqlx::query_as(AssertSqlSafe(format!(

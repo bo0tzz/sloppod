@@ -571,6 +571,19 @@ pub struct ReviewSubject {
     pub describes_change: bool,
 }
 
+/// How an undecided proposal moved with what it was prepared against, without its author: say, a pull request whose
+/// base branch merged and was deleted, now on the branch that one merged into (#141).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Followed {
+    /// The payload prepared again (`prepare`) on what moved.
+    pub payload: Value,
+    /// What happened, for its author and reviewer.
+    pub note: String,
+    /// Whether the change in `payload`, at the commits it pins, is still the one that was reviewed, so a review it
+    /// passed holds.
+    pub same_change: bool,
+}
+
 /// An outward action the agent can propose and a human approves (ADR 3).
 #[async_trait]
 pub trait ProposalKind: Send + Sync {
@@ -610,6 +623,15 @@ pub trait ProposalKind: Send + Sync {
     /// always reviewed, and once the review is over there's nothing to carry out. Only for kinds that aren't outward.
     fn is_review(&self) -> bool {
         false
+    }
+    /// Follows what an undecided proposal was prepared against when that changed by itself; `None` while nothing
+    /// moved. The runtime asks before every later review round, and now and then while a proposal waits.
+    async fn follow(
+        &self,
+        _session: &SessionContext,
+        _payload: &Value,
+    ) -> Result<Option<Followed>> {
+        Ok(None)
     }
     /// Applies the reviewer's edits, sent along with the approval, to the payload.
     fn edit(&self, payload: &Value, edits: &Value) -> Result<Value> {

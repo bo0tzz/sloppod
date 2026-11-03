@@ -449,16 +449,19 @@ export function newerSession(current: Session | null | undefined, incoming: Sess
   return incoming;
 }
 
-/** How far along a proposal is; it only ever moves forward, apart from going back and forth between review rounds. */
+/**
+ * How far along a proposal is; it only ever moves forward, apart from going back and forth between review rounds, and
+ * from waiting for a decision back to review when its change moved by itself (#141).
+ */
 const proposalStage: Record<ProposalStatus, number> = {
   in_review: 0,
   changes_requested: 0,
-  pending: 1,
-  approved: 2,
-  rejected: 3,
-  executed: 3,
-  failed: 3,
-  withdrawn: 3,
+  pending: 0,
+  approved: 1,
+  rejected: 2,
+  executed: 2,
+  failed: 2,
+  withdrawn: 2,
 };
 
 /** Keeps whichever copy of a proposal is further along, so a stale copy (e.g. a slow refetch) can't undo a decision. */

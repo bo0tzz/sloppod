@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use sloppod_contracts::{
-    Error, ProposalKind, RepoGrant, Result, SessionContext, ToolSpec, operation,
+    Error, Followed, ProposalKind, RepoGrant, Result, SessionContext, ToolSpec, operation,
 };
 use sloppod_protocol::api::{Proposal, ProposalStatus, ReviewPolicy};
 use tracing::Instrument;
@@ -209,14 +209,134 @@ pub(crate) async fn prepared(
     arguments: Value,
 ) -> Result<Value> {
     let span = crate::github::acting_span(&session.session_id, None);
-    let mut payload = kind.prepare(session, arguments).instrument(span).await?;
+    let payload = kind.prepare(session, arguments).instrument(span).await?;
+    Ok(acting_as(kind, session, payload))
+}
+
+/// A prepared payload with `as`, who it acts as.
+fn acting_as(kind: &dyn ProposalKind, session: &SessionContext, mut payload: Value) -> Value {
     if let Some(login) = kind
         .target(&payload)
         .and_then(|repo| session.repo_acting_as(&repo).map(str::to_owned))
     {
         payload["as"] = json!(login);
     }
-    Ok(payload)
+    payload
+}
+
+/// A proposal's payload prepared again after following what moved under it (`ProposalKind::follow`), with what
+/// happened; `None` while nothing moved.
+pub(crate) async fn followed(
+    kind: &dyn ProposalKind,
+    session: &SessionContext,
+    payload: &Value,
+) -> Result<Option<(Value, Followed)>> {
+    let span = crate::github::acting_span(&session.session_id, None);
+    let Some(followed) = kind.follow(session, payload).instrument(span).await? else {
+        return Ok(None);
+    };
+    let payload = acting_as(kind, session, followed.payload.clone());
+    Ok(Some((payload, followed)))
+}
+
+/// How often undecided proposals are checked for what moved under them.
+const FOLLOW_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Keeps undecided proposals on what they were prepared against as that moves by itself (#141), e.g. a pull request
+/// on a branch that merged: approving it as it was would fail.
+pub async fn follow_undecided(state: AppState) {
+    let mut every = tokio::time::interval(FOLLOW_EVERY);
+    loop {
+        every.tick().await;
+        let proposals = match db::undecided_proposals(&state.db).await {
+            Ok(proposals) => proposals,
+            Err(e) => {
+                tracing::warn!(error = %e, "listing undecided proposals");
+                continue;
+            }
+        };
+        for proposal in proposals {
+            if let Err(e) = follow(&state, &proposal).await {
+                tracing::debug!(proposal = %proposal.id, error = %e, "following what moved under a proposal");
+            }
+        }
+    }
+}
+
+/// Follows what moved under one undecided proposal. One that passed review goes through another round if its change
+/// isn't the one reviewed any more; one with changes requested waits for its author's `request_review` as before.
+pub(crate) async fn follow(state: &AppState, proposal: &db::ProposalRow) -> anyhow::Result<()> {
+    let Some(kind) = state.proposals.get(&proposal.kind).cloned() else {
+        return Ok(());
+    };
+    let Some(session) = db::get_session(&state.db, proposal.session_id).await? else {
+        return Ok(());
+    };
+    let Some((payload, followed)) = followed(kind.as_ref(), &session.context(), &proposal.payload)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.0))?
+    else {
+        return Ok(());
+    };
+    let subject = kind.review_subject(&payload);
+    let reviewed = !db::reviews(&state.db, proposal.id).await?.is_empty();
+    let again = subject.is_some()
+        && reviewed_again(proposal.status, followed.same_change, reviewed)
+        && reviews::available(state, &session.owner).await?;
+    let to = if again {
+        ProposalStatus::InReview
+    } else {
+        proposal.status
+    };
+    let Some(row) =
+        db::move_proposal(&state.db, proposal.id, proposal.status, to, Some(&payload)).await?
+    else {
+        // Decided or sent to another round meanwhile.
+        return Ok(());
+    };
+    state.hub.broadcast_proposal(&row.to_api());
+    let next = if again {
+        " Its change isn't the one that was reviewed any more, so it's being reviewed again; you'll be told how that goes."
+    } else if proposal.status == ProposalStatus::ChangesRequested {
+        " Your next `request_review` reviews it as it is now."
+    } else {
+        " It's still waiting for the user."
+    };
+    state
+        .hub
+        .notify(
+            proposal.session_id,
+            format!(
+                "sloppod: your proposal {} ({}) moved: {}.{next}",
+                proposal.id,
+                kind.summary(&payload),
+                followed.note
+            ),
+        )
+        .await;
+    if let Some(subject) = subject.filter(|_| again)
+        && let Err(e) = reviews::review_again(state, &row, &subject, &followed.note).await
+    {
+        tracing::warn!(proposal = %row.id, error = %e, "starting a review after the proposal moved");
+        if let Some(row) = db::move_proposal(
+            &state.db,
+            row.id,
+            ProposalStatus::InReview,
+            ProposalStatus::Pending,
+            None,
+        )
+        .await?
+        {
+            state.hub.broadcast_proposal(&row.to_api());
+        }
+    }
+    Ok(())
+}
+
+/// Whether a proposal that moved by itself goes through review again: one that was reviewed and waits for the user, if
+/// its change isn't the one reviewed any more. One with changes requested goes when its author asks.
+fn reviewed_again(status: ProposalStatus, same_change: bool, reviewed: bool) -> bool {
+    status == ProposalStatus::Pending && reviewed && !same_change
 }
 
 /// An outward proposal on a repository whose grant doesn't cover proposing is refused: a sub-session's inherited grant
@@ -369,7 +489,7 @@ pub async fn propose(
             .await
             .map_err(|e| e.to_string());
     };
-    if let Err(e) = reviews::start(state, &row, &subject, None, carried.as_ref()).await {
+    if let Err(e) = reviews::start(state, &row, &subject, None, carried.as_ref(), None).await {
         tracing::warn!(proposal = %row.id, error = %e, "starting a review");
         let row = db::move_proposal(
             &state.db,
@@ -1080,6 +1200,18 @@ mod tests {
             line.contains("session=s-1") && line.contains("credential=\"c1\""),
             "{line}"
         );
+    }
+
+    #[test]
+    fn a_reviewed_proposal_whose_change_moved_is_reviewed_again() {
+        use ProposalStatus::*;
+        // The same change, as a merge commit or a clean squash leaves it, keeps its review; any other is looked at again.
+        assert!(reviewed_again(Pending, false, true));
+        assert!(!reviewed_again(Pending, true, true));
+        // Not reviewed before, the user sees it as it is now.
+        assert!(!reviewed_again(Pending, false, false));
+        // The author's next request_review takes it.
+        assert!(!reviewed_again(ChangesRequested, false, true));
     }
 
     #[test]

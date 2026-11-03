@@ -121,6 +121,7 @@ pub async fn start(
     subject: &ReviewSubject,
     replies: Option<&str>,
     carried: Option<&CarriedOver>,
+    moved: Option<&str>,
 ) -> anyhow::Result<()> {
     // A kept reviewer is only taken if nothing else has it; otherwise the review starts afresh.
     let carried = match carried {
@@ -132,18 +133,12 @@ pub async fn start(
     let previous = db::reviews(&state.db, proposal.id).await?.pop();
     let round = db::start_review_round(&state.db, proposal.id, &subject.head_sha, replies).await?;
     let prompt = match &previous {
-        Some(previous) => next_round_prompt(
-            subject,
-            round,
-            &previous.head_sha,
-            previous
-                .findings
-                .as_array()
-                .map(Vec::as_slice)
-                .unwrap_or_default(),
-            replies,
-        ),
-        None => match carried {
+        Some(previous) if proposal.review_session_id.is_some() => {
+            next_round_prompt(subject, round, previous, replies, moved)
+        }
+        // A reviewer that's gone (#141: the proposal passed, then moved) is replaced by one that reviews it whole.
+        Some(previous) => replacement_prompt(subject, previous, moved),
+        _ => match carried {
             Some(carried) => carried_over_prompt(subject, carried),
             None => first_round_prompt(subject),
         },
@@ -544,14 +539,69 @@ fn first_round_prompt(subject: &ReviewSubject) -> String {
     )
 }
 
+/// For a new reviewer of a proposal whose earlier reviewer is gone (#141): the whole change, as in a first round, and
+/// the last round's findings, which its verdict has to account for like any later round's.
+fn replacement_prompt(
+    subject: &ReviewSubject,
+    previous: &db::ReviewRow,
+    moved: Option<&str>,
+) -> String {
+    let mut prompt = first_round_prompt(subject);
+    if let Some(moved) = moved {
+        prompt.push_str(&format!(
+            "\n\nIt was reviewed before, and has changed since without its author: {moved}."
+        ));
+    }
+    let open = previous
+        .findings
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if !open.is_empty() {
+        prompt.push_str(&format!(
+            "\n\nThe last reviewer, who's gone, left these findings. Report again each that still holds, whatever its \
+             severity, naming its id in `prior`, and list in `resolved` the ids of those that no longer hold.\n\n{}",
+            findings_text(open)
+        ));
+    }
+    prompt
+}
+
 fn next_round_prompt(
     subject: &ReviewSubject,
     round: i32,
-    previous_sha: &str,
-    open: &[Value],
+    previous: &db::ReviewRow,
     replies: Option<&str>,
+    moved: Option<&str>,
 ) -> String {
-    let ReviewSubject { head, head_sha, .. } = subject;
+    let ReviewSubject {
+        base,
+        head,
+        head_sha,
+        ..
+    } = subject;
+    let previous_sha = &previous.head_sha;
+    let open = previous
+        .findings
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    // Only findings send a proposal back to its author: a round after any other verdict is one it moved into by itself.
+    let what = match (previous.verdict.as_deref(), moved) {
+        (Some("changes"), None) => "the author worked on your findings, and ".to_owned(),
+        (Some("changes"), Some(moved)) => {
+            format!("the author worked on your findings, and meanwhile {moved}; ")
+        }
+        (_, moved) => format!(
+            "the proposal changed without its author: {}; ",
+            moved.unwrap_or("its branch moved")
+        ),
+    };
+    let whole = if moved.is_some() {
+        format!(" Since it moved, `git diff origin/{base}...{head_sha}` is the change as a whole.")
+    } else {
+        String::new()
+    };
     let decided = if subject.describes_change {
         format!(
             " The title and description are part of the change: a human decides from them, so one that no longer \
@@ -567,9 +617,9 @@ fn next_round_prompt(
         None => String::new(),
     };
     format!(
-        "sloppod: round {round} of {MAX_ROUNDS}: the author worked on your findings, and `{head}` is now at {head_sha}. \
+        "sloppod: round {round} of {MAX_ROUNDS}: {what}`{head}` is now at {head_sha}. \
          Your checkout has been moved there, and `git diff {previous_sha}..{head_sha}` shows what changed since your \
-         last review (if `git rev-parse HEAD` says otherwise, `git fetch origin {head} && git checkout --detach {head_sha}`).\n\n\
+         last review (if `git rev-parse HEAD` says otherwise, `git fetch origin {head} && git checkout --detach {head_sha}`).{whole}\n\n\
          Check each finding below against the code at {head_sha}. Report again each that still holds, whatever its \
          severity, naming its id in `prior`, and list in `resolved` the ids of those that no longer hold: fixed, or \
          answered convincingly by a reply. The last review set the bar, so raise as new only p0 or p1 findings on lines \
@@ -880,9 +930,20 @@ pub async fn request(state: &AppState, session: Uuid, arguments: &Value) -> Resu
     let edited = kind
         .edit(&proposal.payload, &arguments["update"])
         .map_err(|e| format!("`update`: {}", e.0))?;
-    let payload = crate::proposals::prepared(kind.as_ref(), &author.context(), edited)
+    // A base that merged meanwhile is followed first (#141), and the reviewer told.
+    let context = author.context();
+    let (payload, moved) = match crate::proposals::followed(kind.as_ref(), &context, &edited)
         .await
-        .map_err(|e| e.0)?;
+        .map_err(|e| e.0)?
+    {
+        Some((payload, followed)) => (payload, Some(followed.note)),
+        None => (
+            crate::proposals::prepared(kind.as_ref(), &context, edited)
+                .await
+                .map_err(|e| e.0)?,
+            None,
+        ),
+    };
     let subject = kind
         .review_subject(&payload)
         .ok_or("this proposal can't be reviewed")?;
@@ -907,10 +968,27 @@ pub async fn request(state: &AppState, session: Uuid, arguments: &Value) -> Resu
     .map_err(|e| e.to_string())?
     .ok_or("the proposal changed meanwhile")?;
     state.hub.broadcast_proposal(&row.to_api());
-    start(state, &row, &subject, replies, None)
+    start(state, &row, &subject, replies, None, moved.as_deref())
         .await
         .map_err(|e| e.to_string())?;
     Ok("The next review round has started; you'll be told how it goes.".into())
+}
+
+/// Starts another round for a proposal that was reviewed and then changed without its author (#141): with its reviewer
+/// if that's still there to take, otherwise with a new one.
+pub async fn review_again(
+    state: &AppState,
+    proposal: &db::ProposalRow,
+    subject: &ReviewSubject,
+    moved: &str,
+) -> anyhow::Result<()> {
+    let mut proposal = proposal.clone();
+    if let Some(reviewer) = proposal.review_session_id
+        && !db::claim_reviewer(&state.db, proposal.id, reviewer).await?
+    {
+        proposal.review_session_id = None;
+    }
+    start(state, &proposal, subject, None, None, Some(moved)).await
 }
 
 async fn turn_ended(state: &AppState, session: Uuid) {
@@ -1125,6 +1203,74 @@ mod tests {
         assert!(context.repo_covers("futo/kupra", operation::READ));
     }
 
+    /// A finished round at `sha` with `verdict`, and no findings.
+    fn round(sha: &str, verdict: &str) -> db::ReviewRow {
+        db::ReviewRow {
+            round: 1,
+            head_sha: sha.into(),
+            replies: None,
+            verdict: Some(verdict.into()),
+            summary: None,
+            findings: json!([]),
+            resolved: json!([]),
+            created_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            paused_seconds: 0,
+            paused_since: None,
+        }
+    }
+
+    #[test]
+    fn a_new_reviewer_gets_the_findings_it_has_to_account_for() {
+        let subject = ReviewSubject {
+            repo: "o/r".into(),
+            base: "main".into(),
+            head: "sloppod/abcd1234-two".into(),
+            head_sha: "f00".into(),
+            title: "Two".into(),
+            body: String::new(),
+            describes_change: true,
+        };
+        let mut passed = round("e00", "pass");
+        passed.findings = json!([finding(json!({"id": "1.1", "severity": "p2"}))]);
+        let prompt = replacement_prompt(&subject, &passed, Some("`a` merged into `main` (#7)"));
+        // The whole change, as a first round reviews it, and the open finding by its id.
+        assert!(prompt.starts_with("Review this change on o/r"));
+        assert!(prompt.contains("changed since without its author: `a` merged into `main` (#7)."));
+        assert!(prompt.contains("naming its id in `prior`"));
+        assert!(prompt.contains("[1.1] p2"));
+        // Nothing to account for, nothing asked.
+        assert!(!replacement_prompt(&subject, &round("e00", "pass"), None).contains("`prior`"));
+    }
+
+    #[test]
+    fn a_round_after_the_base_moved_says_so() {
+        let subject = ReviewSubject {
+            repo: "o/r".into(),
+            base: "main".into(),
+            head: "sloppod/abcd1234-two".into(),
+            head_sha: "f00".into(),
+            title: "Two".into(),
+            body: String::new(),
+            describes_change: true,
+        };
+        let moved = "`sloppod/abcd1234-one` merged into `main` (#7) and is gone, so it now merges into `main`";
+        let passed = next_round_prompt(&subject, 2, &round("e00", "pass"), None, Some(moved));
+        assert!(passed.contains(&format!(
+            "the proposal changed without its author: {moved}; `sloppod/abcd1234-two` is now at f00"
+        )));
+        assert!(passed.contains("`git diff origin/main...f00` is the change as a whole"));
+        let asked = next_round_prompt(&subject, 2, &round("e00", "changes"), None, Some(moved));
+        assert!(asked.contains(&format!(
+            "the author worked on your findings, and meanwhile {moved};"
+        )));
+        let plain = next_round_prompt(&subject, 2, &round("e00", "changes"), None, None);
+        assert!(plain.contains(
+            "the author worked on your findings, and `sloppod/abcd1234-two` is now at f00"
+        ));
+        assert!(!plain.contains("as a whole"));
+    }
+
     fn finding(extra: Value) -> Value {
         let mut f = json!({"severity": "p1", "category": "correctness", "title": "Off by one", "explanation": "The last item is skipped."});
         for (k, v) in extra.as_object().unwrap() {
@@ -1171,7 +1317,7 @@ mod tests {
         let proposed = first_round_prompt(&subject);
         assert!(proposed.contains("Title: Fix the build"));
         assert!(proposed.contains("a human decides from them"));
-        let next = next_round_prompt(&subject, 2, "e00", &[], None);
+        let next = next_round_prompt(&subject, 2, &round("e00", "changes"), None, None);
         assert!(next.contains("no longer describes the change at f00 is a p1"));
 
         subject.describes_change = false;
@@ -1180,7 +1326,10 @@ mod tests {
         assert!(!asked.contains("a human decides"));
         assert!(asked.contains("Nobody decides on this branch"));
         assert!(asked.contains("Nothing in particular."));
-        assert!(!next_round_prompt(&subject, 2, "e00", &[], None).contains("is a p1"));
+        assert!(
+            !next_round_prompt(&subject, 2, &round("e00", "changes"), None, None)
+                .contains("is a p1")
+        );
     }
 
     #[test]
