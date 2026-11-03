@@ -335,23 +335,6 @@ const ROLL_AFTER_IDLE_UNKNOWN: chrono::Duration = chrono::Duration::hours(2);
 /// How long a session's pod may run an older image before its agent is asked to find a quiet moment (#230).
 const NUDGE_AFTER: chrono::Duration = chrono::Duration::hours(24);
 
-/// Sessions whose agent was asked to quiet down for an image, so it's asked once per image.
-#[derive(Default)]
-pub struct ImageNudges(std::sync::Mutex<std::collections::HashSet<(Uuid, String)>>);
-
-impl ImageNudges {
-    fn sent(&self, session: Uuid, image: &str) -> bool {
-        self.0
-            .lock()
-            .unwrap()
-            .contains(&(session, image.to_owned()))
-    }
-
-    fn record(&self, session: Uuid, image: &str) {
-        self.0.lock().unwrap().insert((session, image.to_owned()));
-    }
-}
-
 /// Whether a session that can't be given a new pod yet should be asked to find a quiet moment: its pod has run an
 /// older image for long enough. The notice only goes while no turn is running, so it interrupts none.
 fn due_for_nudge(
@@ -371,7 +354,10 @@ const NUDGE: &str = "sloppod: a newer session image is out, and this session's p
                      you're told what was.";
 
 /// Whether a session's pod is due to be replaced for the current session image: it runs another, and the session
-/// has been idle long enough that the replacement interrupts nothing. `busy` is [`Hub::busy`](crate::session::Hub::busy).
+/// is quiet enough that the replacement interrupts nothing. `busy` is [`Hub::busy`](crate::session::Hub::busy).
+/// A session whose agent was asked to make room for this image is replaced as soon as it's quiet (#416):
+/// a busy one gets a notice every few minutes, so it's never quiet for long. Others have to have been quiet for a
+/// while, as their agent might be about to pick work up again.
 fn due_for_image(
     session: &db::SessionRow,
     running: Option<&str>,
@@ -379,8 +365,10 @@ fn due_for_image(
     busy: Option<bool>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
+    let nudged = session.image_nudged.as_deref() == Some(current);
     let quiet_for = match busy {
         Some(true) => return false,
+        Some(false) if nudged => chrono::Duration::zero(),
         Some(false) => ROLL_AFTER_IDLE,
         None => ROLL_AFTER_IDLE_UNKNOWN,
     };
@@ -413,13 +401,14 @@ pub async fn roll_images(state: &AppState) {
                 running.as_deref(),
                 current,
                 now,
-            ) && !state.image_nudges.sent(session.id, current)
+            ) && session.image_nudged.as_deref() != Some(current.as_str())
                 && state
                     .hub
                     .notify_when_idle(session.id, None, NUDGE.to_owned())
                     .await
+                && let Err(e) = db::set_image_nudged(&state.db, session.id, current).await
             {
-                state.image_nudges.record(session.id, current);
+                tracing::warn!(session = %session.id, error = %e, "recording that a session was asked to make room for an image");
             }
             continue;
         }
@@ -530,16 +519,6 @@ mod tests {
             now
         ));
         assert!(!due_for_nudge(day_ago, None, "session:new", now));
-
-        let nudges = ImageNudges::default();
-        let session = Uuid::now_v7();
-        assert!(!nudges.sent(session, "session:new"));
-        nudges.record(session, "session:new");
-        assert!(nudges.sent(session, "session:new"));
-        assert!(
-            !nudges.sent(session, "session:newer"),
-            "again for the next image"
-        );
     }
 
     use chrono::{Duration, Utc};
@@ -583,6 +562,30 @@ mod tests {
         // Without word on its commands, only after a long quiet.
         assert!(!due(&idle, Some("session:old"), None));
         assert!(due(&session(Phase::Idle, 150), Some("session:old"), None));
+    }
+
+    #[test]
+    fn a_session_asked_to_make_room_gets_a_new_pod_as_soon_as_it_is_quiet() {
+        let now = Utc::now();
+        let session = |nudged: Option<&str>, quiet_minutes: i64| {
+            let mut row = db::SessionRow::for_test(Uuid::now_v7(), "dev");
+            row.phase = Phase::Idle.as_str().to_owned();
+            row.active_at = now - Duration::minutes(quiet_minutes);
+            row.image_nudged = nudged.map(str::to_owned);
+            row
+        };
+        let due = |row: &db::SessionRow, busy: Option<bool>| {
+            due_for_image(row, Some("session:old"), "session:new", busy, now)
+        };
+        // Asked for this image: quiet now is enough.
+        assert!(due(&session(Some("session:new"), 0), Some(false)));
+        // Not while anything is going on, nor when its commands aren't known.
+        assert!(!due(&session(Some("session:new"), 0), Some(true)));
+        assert!(!due(&session(Some("session:new"), 0), None));
+        // Never asked, or asked for an older image: it has to have been quiet a while.
+        assert!(!due(&session(None, 0), Some(false)));
+        assert!(!due(&session(Some("session:older"), 0), Some(false)));
+        assert!(due(&session(Some("session:older"), 20), Some(false)));
     }
 
     /// A request policy that only names its hosts.

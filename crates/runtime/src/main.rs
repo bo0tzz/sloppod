@@ -90,8 +90,6 @@ pub struct Inner {
     /// The runtime's own small model calls (ADR 26).
     pub inference: inference::Inference,
     pub suggestions: starting::Suggestions,
-    /// Sessions asked to quiet down for a new session image (#230).
-    pub image_nudges: lifecycle::ImageNudges,
     /// Pushes to heads of pull requests set to merge themselves, waiting to be rechecked (#106).
     pub rechecks: Arc<rebases::Rechecks>,
     /// What's left of each inference credential's usage limits (#140).
@@ -260,7 +258,6 @@ async fn main() -> anyhow::Result<()> {
         instructions,
         inference: inference::Inference::default(),
         suggestions: starting::Suggestions::default(),
-        image_nudges: lifecycle::ImageNudges::default(),
         tool_streams: mcp::ToolStreams::default(),
         rechecks,
         quotas: quota::Quotas::new()?,
@@ -327,7 +324,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let state = state.clone();
         tokio::spawn(async move {
-            let mut every = tokio::time::interval(std::time::Duration::from_secs(300));
+            let mut every = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 every.tick().await;
                 lifecycle::roll_images(&state).await;

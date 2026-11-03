@@ -50,6 +50,8 @@ pub struct SessionRow {
     pub parent_id: Option<Uuid>,
     /// When the session, which hit its usage limit, carries on by itself (#251).
     pub limited_until: Option<DateTime<Utc>>,
+    /// The session image its agent was last asked to make room for (#416).
+    pub image_nudged: Option<String>,
 }
 
 impl SessionRow {
@@ -77,6 +79,7 @@ impl SessionRow {
             agent_error: None,
             parent_id: None,
             limited_until: None,
+            image_nudged: None,
         }
     }
 
@@ -173,7 +176,7 @@ impl SessionRow {
     }
 }
 
-const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, repo, created_at, updated_at, active_at, deleted_at, agent_status, agent_error, parent_id, limited_until, \
+const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, repo, created_at, updated_at, active_at, deleted_at, agent_status, agent_error, parent_id, limited_until, image_nudged, \
      coalesce((select jsonb_agg(jsonb_build_object('id', g.id, 'capability', g.capability, 'params', g.params, \
      'created_at', g.created_at, 'expires_at', g.expires_at) order by g.created_at) \
      from session_grants g where g.session_id = sessions.id and (g.expires_at is null or g.expires_at > now())), \
@@ -535,6 +538,16 @@ pub async fn save_queue(db: &PgPool, id: Uuid, queue: &[Value]) -> sqlx::Result<
     .execute(db)
     .await
     .map(|_| ())
+}
+
+/// Records that the session's agent was asked to make room for `image` (#416).
+pub async fn set_image_nudged(db: &PgPool, id: Uuid, image: &str) -> sqlx::Result<()> {
+    sqlx::query("update sessions set image_nudged = $2 where id = $1")
+        .bind(id)
+        .bind(image)
+        .execute(db)
+        .await
+        .map(|_| ())
 }
 
 /// Sets when the session, waiting for its usage limit, carries on; none when it isn't waiting.
