@@ -9,6 +9,7 @@
 <script lang="ts">
   import { Button, Checkbox, Field, IconButton, Input, LoadingSpinner, Select, Text } from '@immich/ui';
   import { mdiClose, mdiPlus } from '@mdi/js';
+  import { capabilityDescriptions } from '#lib/presentation.ts';
 
   let {
     title,
@@ -143,16 +144,21 @@
   {#if offered.length > 0 || own.length > 0}
     <div class="flex flex-col gap-1">
       <Text size="small" class="font-medium">Access</Text>
-      <div class="flex flex-wrap gap-x-4 gap-y-1">
+      <div class="flex flex-col gap-2">
         {#each offered as capability (capability)}
-          <label class="flex items-center gap-2 text-sm" data-testid="capability-{capability}">
+          <label class="flex items-center gap-2 text-sm" data-testid="capability-{capability}" title={capabilityDescriptions[capability]}>
             <Checkbox
               size="tiny"
               checked={capabilities.includes(capability)}
               aria-label={capability}
               onCheckedChange={(on) => onCapability(capability, on)}
             />
-            {capability}
+            <span class="flex flex-col">
+              {capability}
+              {#if capabilityDescriptions[capability]}
+                <span class="text-muted text-xs" data-testid="capability-description">{capabilityDescriptions[capability]}</span>
+              {/if}
+            </span>
           </label>
         {/each}
         {#each own as definition (definition.name)}
@@ -163,7 +169,12 @@
               aria-label={definition.name}
               onCheckedChange={(on) => onOwn(definition.name, on)}
             />
-            {definition.name}
+            <span class="flex flex-col">
+              {definition.name}
+              {#if definition.description}
+                <span class="text-muted text-xs" data-testid="capability-description">{definition.description}</span>
+              {/if}
+            </span>
           </label>
         {/each}
       </div>

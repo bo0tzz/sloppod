@@ -8,11 +8,24 @@
     commands = null,
     commandLines = [],
     waiting,
+    unknown = false,
     size = 'tiny',
-  }: { phase: Phase; commands?: number | null; commandLines?: string[]; waiting?: Waiting; size?: 'tiny' | 'small' } = $props();
+  }: {
+    phase: Phase;
+    commands?: number | null;
+    commandLines?: string[];
+    waiting?: Waiting;
+    /** The connection is down: the state was last heard as `phase`, and may have changed since. */
+    unknown?: boolean;
+    size?: 'tiny' | 'small';
+  } = $props();
 
-  const info = $derived(phaseShown(phase, commands, commandLines, waiting));
-  const live = $derived(phase === 'working' || phase === 'starting');
+  const info = $derived(
+    unknown
+      ? { label: 'Unknown', color: 'secondary' as const, description: "The connection is down: what it's doing shows again once it's back" }
+      : phaseShown(phase, commands, commandLines, waiting),
+  );
+  const live = $derived(!unknown && (phase === 'working' || phase === 'starting'));
 </script>
 
 <Badge

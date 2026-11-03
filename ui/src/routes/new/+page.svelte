@@ -228,7 +228,7 @@
             {tokens}
             {repos}
             {pending}
-            {source}
+            source={text.trim() === '' ? null : source}
             onTitle={(value) => {
               touched.title = true;
               title = value;

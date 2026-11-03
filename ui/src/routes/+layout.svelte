@@ -61,7 +61,7 @@
             </div>
           </div>
           <div class="min-h-0 grow overflow-y-auto">
-            <SessionList compact sessions={sessions.sorted} activeId={page.params.id} />
+            <SessionList compact sessions={sessions.sorted} activeId={page.params.id} unknown={sessions.lost} />
           </div>
           <QuotaMeters />
           <div class="border-light-200 flex h-12 shrink-0 items-center gap-2 border-t ps-4 pe-2">

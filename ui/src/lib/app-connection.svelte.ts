@@ -64,6 +64,11 @@ class AppConnection {
     };
   }
 
+  /** Skips the remaining backoff of a connection that's down, e.g. for a "Retry now". */
+  reconnectNow() {
+    this.#conn?.reconnectNow();
+  }
+
   request<T = unknown>(method: string, params: unknown): Promise<T> {
     if (!this.#conn) return Promise.reject(new Error('Not connected'));
     return this.#conn.request<T>(method, params);

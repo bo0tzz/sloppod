@@ -171,6 +171,11 @@ export class SessionView {
     this.#unregister = app.register(this.#consumer);
   }
 
+  /** Tries to reconnect at once, instead of waiting out the backoff. */
+  retryNow() {
+    app.reconnectNow();
+  }
+
   stop() {
     this.#stopped = true;
     clearTimeout(this.#loadRetry);

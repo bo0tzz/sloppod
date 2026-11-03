@@ -10,11 +10,14 @@ import { api, newerSession, sortSessions, type Session } from './api.ts';
 class SessionStore {
   list = $state<Session[]>([]);
   loaded = $state(false);
+  /** The connection was up and has gone: what the list says may be out of date until it's back. */
+  lost = $state(false);
   error = $state<string | null>(null);
   sorted = $derived(sortSessions(this.list));
 
   #subscribers = 0;
   #unregister: (() => void) | undefined;
+  #everOpen = false;
   #failures = 0;
   #retry: ReturnType<typeof setTimeout> | undefined;
   /** How many sessions were removed so far, and which, with the count when each was. */
@@ -97,6 +100,14 @@ class SessionStore {
         onNotification: (method, params) => {
           if (method === '_sloppod/session') this.#pushed((params as { session: Session }).session);
         },
+        onStateChange: (state) => {
+          if (state === 'open') {
+            this.#everOpen = true;
+            this.lost = false;
+          } else if (this.#everOpen) {
+            this.lost = true;
+          }
+        },
       });
     }
     return () => {
@@ -104,6 +115,8 @@ class SessionStore {
       if (this.#subscribers === 0) {
         this.#unregister?.();
         this.#unregister = undefined;
+        this.#everOpen = false;
+        this.lost = false;
         clearTimeout(this.#retry);
       }
     };
