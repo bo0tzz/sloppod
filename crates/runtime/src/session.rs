@@ -398,6 +398,9 @@ pub struct Hub {
     /// The time the tests say it is, instead of the clock's.
     now: StdMutex<Option<DateTime<Utc>>>,
     limit_hit: StdMutex<Option<LimitHit>>,
+    /// Sessions whose `waiting`, phase or the like changed, for the owner's UIs: each connection reads the session
+    /// and pushes it (#368). Only the id travels, so it can be sent from anywhere, sync or not.
+    touched: broadcast::Sender<Uuid>,
     /// Hold a turn just before it starts, and just before it's sent, until released; for tests of a link going
     /// meanwhile.
     #[cfg(test)]
@@ -455,6 +458,7 @@ impl Hub {
             sessions: StdMutex::default(),
             agent_capabilities: StdMutex::default(),
             limit_hit: StdMutex::default(),
+            touched: broadcast::channel(256).0,
             now: StdMutex::default(),
             #[cfg(test)]
             start_gate: Gate::default(),
@@ -556,6 +560,11 @@ impl Hub {
             .clone()
     }
 
+    /// The sessions that changed, as they do, whoever owns them.
+    pub fn changed_sessions(&self) -> broadcast::Receiver<Uuid> {
+        self.touched.subscribe()
+    }
+
     pub fn subscribe(&self, id: Uuid) -> broadcast::Receiver<UiEvent> {
         self.live(id).events.subscribe()
     }
@@ -583,6 +592,7 @@ impl Hub {
     /// Saves the session's phase and tells its UIs, or says why it couldn't.
     pub async fn save_phase(&self, id: Uuid, phase: Phase) -> sqlx::Result<()> {
         if let Some(row) = self.store.set_phase(id, phase).await? {
+            let _ = self.touched.send(id);
             self.broadcast(
                 id,
                 UiEvent::Notification {
@@ -598,6 +608,7 @@ impl Hub {
     }
 
     pub async fn broadcast_session(&self, id: Uuid) {
+        let _ = self.touched.send(id);
         if let Ok(Some(row)) = self.store.get_session(id).await {
             self.broadcast(
                 id,
@@ -617,6 +628,8 @@ impl Hub {
             Some(kinds) => kinds.summarized(proposal.clone()),
             None => proposal.clone(),
         };
+        // A proposal made, decided, withdrawn or carried out changes what the session waits on.
+        let _ = self.touched.send(proposal.session_id);
         self.broadcast(
             proposal.session_id,
             UiEvent::Notification {
@@ -2375,16 +2388,19 @@ impl Hub {
 
     async fn limit_saved(&self, id: Uuid, saved: sqlx::Result<Option<crate::db::SessionRow>>) {
         match saved {
-            Ok(Some(row)) => self.broadcast(
-                id,
-                UiEvent::Notification {
-                    seq: None,
-                    message: notification(
-                        "_sloppod/session",
-                        json!({"session": self.session_api(&row).await}),
-                    ),
-                },
-            ),
+            Ok(Some(row)) => {
+                let _ = self.touched.send(id);
+                self.broadcast(
+                    id,
+                    UiEvent::Notification {
+                        seq: None,
+                        message: notification(
+                            "_sloppod/session",
+                            json!({"session": self.session_api(&row).await}),
+                        ),
+                    },
+                )
+            }
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!(session = %id, error = %e, "keeping the session's usage limit")

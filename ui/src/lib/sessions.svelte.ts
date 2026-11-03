@@ -1,7 +1,12 @@
+import { AcpConnection, acpUrl } from './acp/connection.ts';
 import { account } from './account.svelte.ts';
 import { api, newerSession, sortSessions, type Session } from './api.ts';
 
-/** The session list, shared by the list page and the sidebar. The runtime has no list-wide push, so it polls. */
+/**
+ * The session list, shared by the list page and the sidebar. The runtime pushes each change of a session over a
+ * connection of the store's own (`_sloppod/session`), so what waits on the user shows at once. The list is also
+ * fetched on a timer, for sessions that come and go (#426 is to replace it).
+ */
 class SessionStore {
   list = $state<Session[]>([]);
   loaded = $state(false);
@@ -10,6 +15,7 @@ class SessionStore {
 
   #subscribers = 0;
   #timer: ReturnType<typeof setInterval> | undefined;
+  #conn: AcpConnection | undefined;
   /** How many sessions were removed so far, and which, with the count when each was. */
   #removals = 0;
   #removed = new Map<string, number>();
@@ -59,11 +65,20 @@ class SessionStore {
     this.list = this.list.filter((session) => session.id !== id);
   }
 
-  /** Polls while at least one component is subscribed. Returns the unsubscribe function. */
+  /** Keeps the list current while at least one component is subscribed. Returns the unsubscribe function. */
   subscribe(intervalMs = 5000) {
     this.#subscribers++;
     if (this.#subscribers === 1) {
       void this.refresh();
+      // Changes are pushed from the moment the connection is up, so fetching after that misses nothing.
+      this.#conn = new AcpConnection(acpUrl(), {
+        onReady: () => this.refresh(),
+        onNotification: (method, params) => {
+          if (method === '_sloppod/session') this.upsert((params as { session: Session }).session);
+        },
+        onRequest: (id) => this.#conn?.respondError(id, -32601, 'not handled here'),
+      });
+      this.#conn.connect();
       this.#timer = setInterval(() => {
         if (document.visibilityState === 'visible') void this.refresh();
       }, intervalMs);
@@ -73,6 +88,8 @@ class SessionStore {
       this.#subscribers--;
       if (this.#subscribers === 0) {
         clearInterval(this.#timer);
+        this.#conn?.close();
+        this.#conn = undefined;
         document.removeEventListener('visibilitychange', this.#onVisible);
       }
     };

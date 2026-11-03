@@ -100,7 +100,8 @@ class MockSession {
 
   broadcast() {
     this.data.updated_at = now();
-    for (const conn of this.subscribers) conn.notify('_sloppod/session', { session: this.data });
+    // As the runtime pushes each change to the owner's connections, whichever session they show.
+    for (const conn of connections) conn.notify('_sloppod/session', { session: this.data });
   }
 
   configOptions() {
@@ -1246,6 +1247,8 @@ function publicProposal(proposal) {
 function broadcastProposal(proposal) {
   const session = sessions.get(proposal.session_id);
   for (const conn of session?.subscribers ?? []) conn.notify('_sloppod/proposal', { proposal: publicProposal(proposal) });
+  // A proposal made or decided changes what the session waits on.
+  session?.broadcast();
 }
 
 const availableRepos = () => (credentials.some((c) => c.kind === 'github-app') ? REPOS : []);

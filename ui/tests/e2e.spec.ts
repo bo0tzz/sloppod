@@ -3206,6 +3206,25 @@ test('an idle session with a proposal or a question waiting shows it is waiting 
   await expect(asked.getByTestId('phase')).toHaveAttribute('title', /1 question/);
 });
 
+test('the session list follows what waits on you as it is pushed, without fetching', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  const prompt = 'Propose a PR for sloppod, left for the list to follow';
+  const id = await createSession(page, prompt);
+  await finishTurn(page);
+  const row = page.getByRole('navigation', { name: 'Sessions' }).getByTestId('session-row').filter({ hasText: prompt });
+  await expect(row.getByTestId('phase')).toHaveText('Waiting on you');
+
+  // Another session shown, and the list no longer fetched: a proposal of the first one decided elsewhere has to
+  // reach the list by push.
+  await createSession(page, 'Say something while the list is watching');
+  await finishTurn(page);
+  await page.route('**/api/v1/sessions', (route) => route.abort());
+  const proposals: { id: string; status: string }[] = await (await page.request.get(`/api/v1/proposals?session=${id}`)).json();
+  const pending = proposals.find((proposal) => proposal.status === 'pending')!;
+  await page.request.post(`/api/v1/proposals/${pending.id}/reject`, { data: {} });
+  await expect(row.getByTestId('phase')).not.toHaveText('Waiting on you');
+});
+
 test('arrow keys move between the rows of the session list', async ({ page }) => {
   await page.setViewportSize({ width: 1400, height: 900 });
   await createSession(page, 'First session about arrows');

@@ -3310,3 +3310,44 @@ async fn parking_a_quiet_session_leaves_a_busy_one_alone() {
     assert_eq!(h.phase().await, "parked");
     assert!(!h.hub.park_quiet(h.id, busy).await.unwrap());
 }
+
+#[tokio::test]
+async fn a_change_to_what_the_session_waits_on_is_told_to_its_owners_uis() {
+    use sloppod_protocol::api::{Proposal, ProposalStatus};
+    let h = Harness::ready().await;
+    let mut changed = h.hub.changed_sessions();
+    let mut proposal = Proposal {
+        id: Uuid::new_v4(),
+        session_id: h.id,
+        kind: "github.issue.create".into(),
+        status: ProposalStatus::Pending,
+        payload: json!({}),
+        result: None,
+        error: None,
+        reason: None,
+        created_at: START.into(),
+        decided_at: None,
+        decided_by: None,
+        review_session_id: None,
+        summary: None,
+    };
+    // Made, then decided: each moves the proposals the session waits on.
+    h.hub.broadcast_proposal(&proposal);
+    assert_eq!(changed.try_recv().unwrap(), h.id);
+    proposal.status = ProposalStatus::Rejected;
+    h.hub.broadcast_proposal(&proposal);
+    assert_eq!(changed.try_recv().unwrap(), h.id);
+
+    // A question asked and answered.
+    let questions = json!([{"question": "Which backoff?", "options": [{"label": "Exponential"}, {"label": "Fixed"}]}]);
+    h.hub.ask(h.id, questions).await.unwrap();
+    assert_eq!(changed.try_recv().unwrap(), h.id);
+    let replay = h.hub.replay(h.id).await.unwrap();
+    let (pid, _, _) = replay.permissions.first().cloned().expect("the question");
+    while changed.try_recv().is_ok() {}
+    let answer = json!({"action": "accept", "content": {"question_0": "Exponential"}});
+    h.hub
+        .answer_permission(h.id, pid, Ok(answer), "a test")
+        .await;
+    assert_eq!(changed.try_recv().unwrap(), h.id);
+}
