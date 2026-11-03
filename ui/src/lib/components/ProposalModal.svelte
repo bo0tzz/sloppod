@@ -34,7 +34,7 @@
   import { diffStats, diffTexts, parseUnifiedDiff } from '#lib/diff.ts';
   import { readStored, writeStored } from '#lib/storage.ts';
   import { absoluteTime } from '#lib/format.ts';
-  import { actingAs, proposalKinds, proposalStatus, proposalSummary } from '#lib/presentation.ts';
+  import { actingAs, planChanges, planChangeText, proposalKinds, proposalStatus, proposalSummary } from '#lib/presentation.ts';
   import DiffView from './DiffView.svelte';
   import Markdown from './Markdown.svelte';
   import PullRequestChanges from './PullRequestChanges.svelte';
@@ -96,6 +96,17 @@
   const currentIssue = (number: number) => detail?.current?.find((issue) => issue.number === number);
   const summary = $derived(proposalSummary(detail ?? proposal));
   const stack = $derived(detail?.kind === 'github.stack.create' ? (detail.payload as StackPayload) : null);
+  const plan = $derived(detail?.kind === 'sloppod.work.plan' ? planChanges(detail) : null);
+  // The titles of the items a plan's moves point at, from the graph as it is now.
+  let planTitles = $state(new Map<string, string>());
+  $effect(() => {
+    const graph = detail?.kind === 'sloppod.work.plan' ? detail.payload.graph : undefined;
+    if (typeof graph !== 'string') return;
+    api
+      .getWorkGraph(graph)
+      .then((fetched) => (planTitles = new Map(fetched.items.map((item) => [item.id, item.title]))))
+      .catch(() => {});
+  });
   const pending = $derived(detail?.status === 'pending');
 
   // The proposal changes while the modal is open: it's decided in another tab, passes review, or a review round
@@ -244,7 +255,7 @@
 </script>
 
 <Dialog
-  title={proposalKinds[kind]?.title ?? `Proposal: ${kind}`}
+  title={proposalKinds[kind]?.title ?? 'Proposal'}
   icon={summary.icon}
   size={pr || stack ? 'giant' : issues ? 'large' : 'medium'}
   onClose={requestClose}
@@ -424,9 +435,24 @@
               pull requests from it. Merging stays with you.
             </Text>
           </div>
+        {:else if plan}
+          <div class="flex flex-col gap-3">
+            <Heading tag="h2" size="tiny" data-testid="proposal-title">{summary.title}</Heading>
+            <div class="flex flex-col gap-1">
+              <Text size="small" fontWeight="semi-bold">The agent's reason</Text>
+              <p class="bg-light-100 rounded-xl p-3 text-sm whitespace-pre-wrap" data-testid="proposal-reason">
+                {(detail.payload.reason as string) || 'No reason given.'}
+              </p>
+            </div>
+            <ul class="flex flex-col gap-1 text-sm">
+              {#each plan as change, index (index)}
+                <li data-testid="plan-change">{planChangeText(change, planTitles)}</li>
+              {/each}
+            </ul>
+          </div>
         {:else}
           <div class="flex flex-col gap-2">
-            <Heading tag="h2" size="tiny" data-testid="proposal-title">{detail.kind}</Heading>
+            <Heading tag="h2" size="tiny" data-testid="proposal-title">{summary.title}</Heading>
             <Text color="muted" size="small">This UI doesn't know this kind of proposal yet. Its payload:</Text>
             <pre class="bg-light-100 max-h-[50dvh] overflow-auto rounded-lg p-3 font-mono text-xs" data-testid="proposal-payload">{JSON.stringify(detail.payload, null, 2)}</pre>
           </div>

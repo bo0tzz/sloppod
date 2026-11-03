@@ -1091,7 +1091,7 @@ async fn list_proposals(
     let proposals: Vec<_> = db::list_proposals(&state.db, &user, filter.session, status)
         .await?
         .iter()
-        .map(|p| p.to_api())
+        .map(|p| state.proposals.summarized(p.to_api()))
         .collect();
     Ok(Json(proposals))
 }
@@ -1134,7 +1134,7 @@ async fn approve(
         edits: body.map(|Json(edits)| edits).unwrap_or_default(),
     };
     match proposals::decide(&state, id, verdict, &user, &user).await {
-        Ok(Some(proposal)) => Ok(Json(proposal)),
+        Ok(Some(proposal)) => Ok(Json(state.proposals.summarized(proposal))),
         Ok(None) => Err(not_found()),
         Err(e) => Err(decide_error(e)),
     }
@@ -1158,7 +1158,7 @@ async fn reject(
     )
     .await
     {
-        Ok(Some(proposal)) => Ok(Json(proposal)),
+        Ok(Some(proposal)) => Ok(Json(state.proposals.summarized(proposal))),
         Ok(None) => Err(not_found()),
         Err(e) => Err(decide_error(e)),
     }

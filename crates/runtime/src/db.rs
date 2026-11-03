@@ -923,6 +923,7 @@ impl ProposalRow {
             decided_at: self.decided_at.map(|d| d.to_rfc3339()),
             decided_by: self.decided_by.clone(),
             review_session_id: self.review_session_id,
+            summary: None,
         }
     }
 }

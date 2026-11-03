@@ -170,7 +170,7 @@ export type ProposalEdits = {
 export type Proposal = {
   id: string;
   session_id: string;
-  /** `github.pr.create`, `github.issue.create` and `sloppod.repo.grant` so far; others render generically. */
+  /** The kinds this UI renders are in `proposalSummary`; others show their `summary`. */
   kind: string;
   status: ProposalStatus;
   payload: Record<string, unknown>;
@@ -192,6 +192,19 @@ export type Proposal = {
   decided_by?: string;
   /** The session reviewing it, or that did. */
   review_session_id?: string;
+  /** What it does, in a line: the runtime's summary of its kind, for kinds this UI doesn't render. */
+  summary?: string;
+};
+
+/** A change a `sloppod.work.plan` proposal makes to a work graph (ADR 30). */
+export type WorkPlanChange = {
+  item: string;
+  title: string;
+  action: 'move' | 'drop' | 'reopen';
+  /** For a move: the new parent, `null` for the top level, left out to stay. */
+  parent_id?: string | null;
+  /** For a move: the sibling it goes after, `null` for first, left out for last. */
+  after?: string | null;
 };
 
 /** A pre-approved proposal pattern: matching proposals are approved as they're made. */
