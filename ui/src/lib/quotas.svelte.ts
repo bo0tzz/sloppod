@@ -13,6 +13,8 @@ class QuotaStore {
   #conn: AcpConnection | undefined;
   /** Changes that came while the list was being fetched, applied again over what it returns, which may predate them. */
   #duringFetch: [string, Quota | null][] | undefined;
+  /** Counts the connection's comings-up, so only the latest one's fetch is kept. */
+  #generation = 0;
   // A socket that died while the tab was hidden or offline comes back without waiting out its backoff.
   #wake = () => {
     if (document.visibilityState === 'visible') this.#conn?.reconnectNow();
@@ -38,13 +40,17 @@ class QuotaStore {
         // Changes are pushed from the moment the connection is up, so fetching after that misses nothing. A fetch that
         // fails drops the connection, which tries again.
         onReady: async () => {
-          this.#duringFetch = [];
+          // A fetch of an earlier connection, still on its way, is older than this one's and is dropped when it lands.
+          const generation = ++this.#generation;
+          const during: [string, Quota | null][] = [];
+          this.#duringFetch = during;
           try {
             const list = await api.listQuotas();
+            if (generation !== this.#generation) return;
             this.list = list;
-            for (const [credentialId, quota] of this.#duringFetch) this.apply(credentialId, quota);
+            for (const [credentialId, quota] of during) this.apply(credentialId, quota);
           } finally {
-            this.#duringFetch = undefined;
+            if (this.#duringFetch === during) this.#duringFetch = undefined;
           }
         },
         onNotification: (method, params) => {

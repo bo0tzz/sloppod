@@ -125,38 +125,43 @@ pub fn announce_resets(state: &AppState) {
     tokio::spawn(async move {
         loop {
             let now = Utc::now();
-            let quotas = match all(&state.db, now).await {
+            let planned = match all(&state.db, now).await {
                 Ok(quotas) => quotas,
                 Err(e) => {
                     tracing::warn!(error = %e, "listing quotas for their resets");
                     Vec::new()
                 }
             };
-            let next = quotas.iter().filter_map(|(_, q)| next_reset(q)).min();
+            let next = planned.iter().filter_map(|(_, q)| next_reset(q)).min();
             // Without a reset to wait for, a change still wakes it; once an hour it looks again regardless.
             let wait = next
                 .map(|at| (at - now).to_std().unwrap_or_default())
                 .unwrap_or(std::time::Duration::from_secs(3600))
                 + std::time::Duration::from_secs(1);
-            tokio::select! {
-                _ = tokio::time::sleep(wait) => {
-                    let now = Utc::now();
-                    for (owner, quota) in &quotas {
-                        if next_reset(quota).is_some_and(|at| at <= now)
-                            && let Ok(fresh) = for_credential(&state.db, quota.credential_id, now).await
-                        {
-                            state.quotas.send(owner, quota.credential_id, fresh);
-                        }
-                    }
+            let closed = tokio::select! {
+                _ = tokio::time::sleep(wait) => false,
+                change = changes.recv() => matches!(change, Err(broadcast::error::RecvError::Closed)),
+            };
+            // However it woke: what's planned next is listed as it stands then, which no longer shows a reset that
+            // has passed, so a reset that passed meanwhile is announced now or never.
+            let now = Utc::now();
+            for (owner, quota) in due(&planned, now) {
+                if let Ok(fresh) = for_credential(&state.db, quota.credential_id, now).await {
+                    state.quotas.send(owner, quota.credential_id, fresh);
                 }
-                change = changes.recv() => {
-                    if matches!(change, Err(broadcast::error::RecvError::Closed)) {
-                        return;
-                    }
-                }
+            }
+            if closed {
+                return;
             }
         }
     });
+}
+
+/// The planned quotas a reset of which has passed by `now`.
+fn due(planned: &[(String, Quota)], now: DateTime<Utc>) -> impl Iterator<Item = &(String, Quota)> {
+    planned
+        .iter()
+        .filter(move |(_, quota)| next_reset(quota).is_some_and(|at| at <= now))
 }
 
 /// The earliest reset a quota still has to come: its limit's end, or a window's.
@@ -709,6 +714,21 @@ mod tests {
         })
         .await;
         assert!(lagged.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_reset_that_passed_before_a_change_woke_it_is_still_announced() {
+        // Account A's window resets at noon; a report for account B wakes the task half a second later, inside the
+        // second it would have slept past the reset.
+        let a = ("dev".to_owned(), quota("a", 0.9));
+        let mut b = ("dev".to_owned(), quota("b", 0.1));
+        b.1.credential_id = Uuid::from_u128(2);
+        b.1.windows[0].resets_at = Some("2026-11-03T15:00:00Z".into());
+        let planned = [a, b];
+        let woken = at("2026-11-03T12:00:00.500Z");
+        let due: Vec<_> = due(&planned, woken).map(|(_, q)| q.name.as_str()).collect();
+        assert_eq!(due, ["a"]);
+        assert_eq!(super::due(&planned, at("2026-11-03T11:59:59Z")).count(), 0);
     }
 
     #[test]

@@ -2490,24 +2490,27 @@ test('the sidebar shows every usage window of each account, by its name', async 
   }
 });
 
+/** Has the mock report one Claude account's 5-hour window at `percent`, or no quotas at all. */
+const setWorkQuota = (page: Page, percent: number | null) =>
+  page.request.post('/_mock/quotas', {
+    data:
+      percent === null
+        ? []
+        : [
+            {
+              credential_id: 'claude-work',
+              kind: 'claude',
+              name: 'work',
+              limited: false,
+              resets_at: null,
+              windows: [{ window: 'five_hour', utilization: percent / 100, resets_at: null, status: 'allowed' }],
+              observed_at: new Date().toISOString(),
+            },
+          ],
+  });
+
 test('the usage meters follow quota changes as they happen, without a reload', async ({ page }) => {
-  const set = (percent: number | null) =>
-    page.request.post('/_mock/quotas', {
-      data:
-        percent === null
-          ? []
-          : [
-              {
-                credential_id: 'claude-work',
-                kind: 'claude',
-                name: 'work',
-                limited: false,
-                resets_at: null,
-                windows: [{ window: 'five_hour', utilization: percent / 100, resets_at: null, status: 'allowed' }],
-                observed_at: new Date().toISOString(),
-              },
-            ],
-    });
+  const set = (percent: number | null) => setWorkQuota(page, percent);
   await set(20);
   try {
     await page.goto('/settings');
@@ -2545,6 +2548,43 @@ test('the usage meters follow quota changes as they happen, without a reload', a
     await expect(page.getByTestId('sidebar').getByTestId('quota')).toHaveCount(0);
   } finally {
     await set(null);
+  }
+});
+
+test("a connection's quotas fetched after a newer connection's never replace them", async ({ page }) => {
+  // The first connection's fetch is held back until the connection has dropped and come back with its own.
+  let first: (() => void) | undefined;
+  const firstLanded = new Promise<void>((resolve) => (first = resolve));
+  let read: (() => void) | undefined;
+  const firstRead = new Promise<void>((resolve) => (read = resolve));
+  let held = false;
+  await page.route('**/api/v1/quotas', async (route) => {
+    if (held) return route.continue();
+    held = true;
+    const response = await route.fetch();
+    read?.();
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    await route.fulfill({ response });
+    first?.();
+  });
+  await setWorkQuota(page, 20);
+  try {
+    await page.goto('/settings');
+    const meter = page.getByTestId('sidebar').getByTestId('quota-window');
+    // The held fetch has read 20%; then it's 30%, pushed.
+    await firstRead;
+    await setWorkQuota(page, 30);
+    await expect(meter).toContainText('30%');
+    const refetched = page.waitForResponse('**/api/v1/quotas');
+    await page.request.post('/_mock/drop');
+    await refetched;
+    await expect(meter).toContainText('30%');
+    // The first fetch, with 20%, lands now; it's older than what's shown, and changes nothing.
+    await firstLanded;
+    await page.waitForTimeout(300);
+    await expect(meter).toContainText('30%', { timeout: 1000 });
+  } finally {
+    await setWorkQuota(page, null);
   }
 });
 
