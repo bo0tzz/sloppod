@@ -259,7 +259,7 @@ impl Conn {
             "cwd": "/",
             "title": s.title,
             "updatedAt": s.updated_at.to_rfc3339(),
-            "_meta": {"sloppod": s.to_api()},
+            "_meta": {"sloppod": self.state.hub.session_api(s)},
         })).collect::<Vec<_>>()}))
     }
 

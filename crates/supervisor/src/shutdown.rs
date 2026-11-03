@@ -112,9 +112,38 @@ fn output_tail(root: &Path, pid: u32) -> Option<String> {
     (!tail.trim().is_empty()).then_some(tail)
 }
 
-/// How many commands are running under the agent.
-pub fn count(agent: u32, helpers: &Helpers) -> usize {
-    commands(&read_procs(Path::new("/proc")), agent, helpers).len()
+/// The command lines of the commands running under the agent, each cut short for showing (#413).
+pub fn command_lines(agent: u32, helpers: &Helpers) -> Vec<String> {
+    command_lines_in(Path::new("/proc"), agent, helpers)
+}
+
+/// How long a command line is shown.
+const SHOWN_CHARS: usize = 300;
+
+fn command_lines_in(root: &Path, agent: u32, helpers: &Helpers) -> Vec<String> {
+    commands(&read_procs(root), agent, helpers)
+        .into_iter()
+        .map(|pid| {
+            let line = command_line(root, pid).unwrap_or_else(|| format!("process {pid}"));
+            match line.char_indices().nth(SHOWN_CHARS) {
+                Some((cut, _)) => format!("{}…", &line[..cut]),
+                None => line,
+            }
+        })
+        .collect()
+}
+
+/// A process's command line, its arguments joined with spaces.
+fn command_line(root: &Path, pid: u32) -> Option<String> {
+    let cmdline = std::fs::read(root.join(pid.to_string()).join("cmdline")).ok()?;
+    Some(
+        cmdline
+            .split(|b| *b == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 /// The commands still running under the agent, read from `/proc`.
@@ -127,13 +156,7 @@ fn running_in(root: &Path, agent: u32, helpers: &Helpers) -> Vec<RunningProcess>
     commands(&procs, agent, helpers)
         .into_iter()
         .filter_map(|pid| {
-            let cmdline = std::fs::read(root.join(pid.to_string()).join("cmdline")).ok()?;
-            let command = cmdline
-                .split(|b| *b == 0)
-                .filter(|part| !part.is_empty())
-                .map(|part| String::from_utf8_lossy(part).into_owned())
-                .collect::<Vec<_>>()
-                .join(" ");
+            let command = command_line(root, pid)?;
             Some(RunningProcess {
                 command,
                 output_tail: output_tail(root, pid),
@@ -244,6 +267,16 @@ mod tests {
         assert_eq!(running[0].command, "/bin/bash -c cargo test 2>&1");
         let tail = running[0].output_tail.as_deref().unwrap();
         assert!(tail.starts_with("line 11\n") && tail.ends_with("line 30"));
+        // What the runtime shows of each, cut short.
+        assert_eq!(
+            command_lines_in(&root, 10, &Helpers::new()),
+            ["/bin/bash -c cargo test 2>&1"]
+        );
+        let long = format!("/bin/sh\0-c\0{}", "x".repeat(400));
+        std::fs::write(root.join("20/cmdline"), long).unwrap();
+        let lines = command_lines_in(&root, 10, &Helpers::new());
+        assert_eq!(lines[0].chars().count(), SHOWN_CHARS + 1);
+        assert!(lines[0].ends_with("x…"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

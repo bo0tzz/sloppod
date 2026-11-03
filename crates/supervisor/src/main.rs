@@ -402,16 +402,18 @@ async fn run(
                 if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
                     break Event::LinkEnded;
                 }
-                let running = match (a.child.id(), &a.helpers) {
-                    (Some(pid), Some(helpers)) => shutdown::count(pid, helpers),
+                let lines = match (a.child.id(), &a.helpers) {
+                    (Some(pid), Some(helpers)) => shutdown::command_lines(pid, helpers),
                     // Not up yet, so nothing it runs is a command.
-                    _ => 0,
+                    _ => Vec::new(),
                 };
-                if commands_told != Some(running) {
-                    if send(&mut sink, &FromSupervisor::Commands { running }).await.is_err() {
+                if commands_told.as_ref() != Some(&lines) {
+                    let running = lines.len();
+                    let told = FromSupervisor::Commands { running, lines: lines.clone() };
+                    if send(&mut sink, &told).await.is_err() {
                         break Event::LinkEnded;
                     }
-                    commands_told = Some(running);
+                    commands_told = Some(lines);
                 }
             }
             _ = &mut deadline => {

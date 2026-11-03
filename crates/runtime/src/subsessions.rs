@@ -220,6 +220,18 @@ pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<
     ))
 }
 
+/// What a child is doing, in words: an idle one with commands running waits on them, unlike one that's done (#413).
+fn doing(phase: Phase, commands: Option<usize>) -> String {
+    match (phase, commands) {
+        (Phase::Idle, Some(1)) => "waiting on 1 command it started".into(),
+        (Phase::Idle, Some(n)) if n > 1 => format!("waiting on {n} commands it started"),
+        (Phase::Idle, Some(_)) => "idle, with nothing running".into(),
+        (Phase::Idle, None) => "idle".into(),
+        (Phase::Working, _) => "working on a turn".into(),
+        (phase, _) => phase.as_str().into(),
+    }
+}
+
 /// `list_sessions`: the session's children, and how each is doing.
 pub async fn list(state: &AppState, parent: Uuid) -> Result<String, String> {
     let children = db::children(&state.db, parent)
@@ -228,8 +240,12 @@ pub async fn list(state: &AppState, parent: Uuid) -> Result<String, String> {
     let children: Vec<Value> = children
         .iter()
         .map(|child| {
-            let api = child.to_api();
-            json!({"id": child.id, "title": child.title, "phase": child.phase, "model": child.model, "repo": api.repo, "branch": api.branch})
+            let api = state.hub.session_api(child);
+            json!({
+                "id": child.id, "title": child.title, "phase": child.phase, "model": child.model, "repo": api.repo,
+                "branch": api.branch, "doing": doing(api.phase, api.commands), "commands": api.commands,
+                "command_lines": api.command_lines,
+            })
         })
         .collect();
     Ok(Value::Array(children).to_string())
@@ -423,7 +439,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "list_sessions",
-            "description": "Your sub-sessions: each one's id, title, phase, model, repository and branch.",
+            "description": "Your sub-sessions: each one's id, title, phase, model, repository and branch, and what it's doing (`doing`): an idle one with commands running (`commands`, their `command_lines`) is waiting on them, not done.",
             "inputSchema": {"type": "object", "properties": {}},
         }),
     ]

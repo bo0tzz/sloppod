@@ -356,7 +356,7 @@
     <ChatHeader {title} subtitle={session ? (session.repo ?? 'No repository') : undefined} mono={Boolean(session?.repo)}>
       {#snippet actions()}
         {#if session}
-          <PhaseBadge phase={session.phase} />
+          <PhaseBadge phase={session.phase} commands={session.commands} commandLines={session.command_lines} />
         {/if}
         <IconButton
           icon={mdiSourcePull}

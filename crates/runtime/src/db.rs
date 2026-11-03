@@ -152,6 +152,8 @@ impl SessionRow {
             agent_error: self.agent_error.clone(),
             parent_id: self.parent_id,
             limited_until: self.limited_until.map(|d| d.to_rfc3339()),
+            commands: None,
+            command_lines: Vec::new(),
         }
     }
 
