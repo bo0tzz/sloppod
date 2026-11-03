@@ -2490,6 +2490,64 @@ test('the sidebar shows every usage window of each account, by its name', async 
   }
 });
 
+test('the usage meters follow quota changes as they happen, without a reload', async ({ page }) => {
+  const set = (percent: number | null) =>
+    page.request.post('/_mock/quotas', {
+      data:
+        percent === null
+          ? []
+          : [
+              {
+                credential_id: 'claude-work',
+                kind: 'claude',
+                name: 'work',
+                limited: false,
+                resets_at: null,
+                windows: [{ window: 'five_hour', utilization: percent / 100, resets_at: null, status: 'allowed' }],
+                observed_at: new Date().toISOString(),
+              },
+            ],
+    });
+  await set(20);
+  try {
+    await page.goto('/settings');
+    const meter = page.getByTestId('sidebar').getByTestId('quota-window');
+    await expect(meter).toContainText('20%');
+    await set(30);
+    await expect(meter).toContainText('30%');
+
+    // Across switching to a session and on to another.
+    await createSession(page, 'Meters while switching sessions');
+    await set(40);
+    await expect(meter).toContainText('40%');
+    await createSession(page, 'Another session for the meters');
+    await set(50);
+    await expect(meter).toContainText('50%');
+
+    // After the tab was hidden and shown again.
+    const visibility = (state: 'hidden' | 'visible') =>
+      page.evaluate((state) => {
+        Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => state });
+        document.dispatchEvent(new Event('visibilitychange'));
+      }, state);
+    await visibility('hidden');
+    await set(60);
+    await visibility('visible');
+    await expect(meter).toContainText('60%');
+
+    // A change while the connection is down shows once it's back.
+    await page.request.post('/_mock/drop?for=1500');
+    await set(70);
+    await expect(meter).toContainText('70%');
+
+    // An account that's gone takes its meter with it.
+    await set(null);
+    await expect(page.getByTestId('sidebar').getByTestId('quota')).toHaveCount(0);
+  } finally {
+    await set(null);
+  }
+});
+
 test('only the transcript scrolls, not the page around it', async ({ page }) => {
   await page.setViewportSize({ width: 1000, height: 500 });
   await createSession(page, 'Give me a long answer in sloppod');

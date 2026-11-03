@@ -972,7 +972,14 @@ async fn create_credential(
     Json(new): Json<NewCredential>,
 ) -> ApiResult<impl IntoResponse> {
     match state.credentials.create(&user, new).await? {
-        Ok(row) => Ok((StatusCode::CREATED, Json(row.to_api()))),
+        Ok(row) => {
+            // A ChatGPT login's limits are read now, rather than at the next round, so its meter shows at once.
+            if row.kind == crate::credentials::CHATGPT {
+                let (state, login) = (state.clone(), row.clone());
+                tokio::spawn(async move { quota::read_chatgpt_login(&state, &login).await });
+            }
+            Ok((StatusCode::CREATED, Json(row.to_api())))
+        }
         Err(invalid) => Err(bad_request(invalid.0)),
     }
 }
@@ -1080,6 +1087,8 @@ async fn delete_credential(
     Path(id): Path<Uuid>,
 ) -> ApiResult<impl IntoResponse> {
     if state.credentials.delete(&user, id).await? {
+        // Its quota goes with it, from the meters too.
+        state.quotas.send(&user, id, None);
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(not_found())
