@@ -98,6 +98,14 @@ export class AcpConnection {
     this.connect();
   }
 
+  /** Drops the socket and reconnects, e.g. because something that had to run once it was up failed. */
+  drop(error?: string) {
+    const ws = this.#ws;
+    if (this.#closed || !ws) return;
+    this.#setState('connecting', error);
+    ws.close();
+  }
+
   close() {
     this.#closed = true;
     clearTimeout(this.#timer);

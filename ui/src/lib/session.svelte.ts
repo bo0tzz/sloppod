@@ -1,14 +1,7 @@
-import {
-  AcpConnection,
-  acpUrl,
-  ConnectionClosedError,
-  type ConnectionState,
-  type RequestId,
-} from './acp/connection.ts';
+import { ConnectionClosedError, type ConnectionState, type RequestId } from './acp/connection.ts';
 import { Transcript } from './acp/transcript.svelte.ts';
 import type {
   ContentBlock,
-  InitializeResponse,
   LoadSessionResponse,
   ElicitationRequest,
   ElicitationResponse,
@@ -18,7 +11,7 @@ import type {
   SessionUpdate,
   StopReason,
 } from './acp/types.ts';
-import { account } from './account.svelte.ts';
+import { app, type Consumer } from './app-connection.svelte.ts';
 import { api, ApiError, newerProposal, newerSession, type Proposal, type Session } from './api.ts';
 import { loadUnconfirmed, saveAnswer, saveUnconfirmed, type Outgoing } from './drafts.ts';
 import { sessions } from './sessions.svelte.ts';
@@ -64,6 +57,20 @@ const promptBlocks = ({ text, images = [] }: Outgoing): ContentBlock[] => [
   ...images.map((image) => ({ type: 'image' as const, ...image })),
 ];
 
+/**
+ * The sessions being closed on the app's connection, by id: what a view coming back to one waits for, or its load could
+ * be undone by the close of the one before.
+ */
+const closing = new Map<string, Promise<unknown>>();
+
+/** Puts `done` into the barrier for `id`, after whatever it already holds, and takes it out once it's the last. */
+function reserve(id: string, done: Promise<unknown>) {
+  const barrier = Promise.all([closing.get(id), done]).finally(() => {
+    if (closing.get(id) === barrier) closing.delete(id);
+  });
+  closing.set(id, barrier);
+}
+
 /** One open session: its ACP connection, transcript, and the REST state that goes with it. */
 export class SessionView {
   readonly id: string;
@@ -85,13 +92,21 @@ export class SessionView {
   #refreshed = 0;
   #loadRetry: ReturnType<typeof setTimeout> | undefined;
   #stopped = false;
+  /** A `session/load` is on its way over the shared connection. */
+  #loading = false;
+  /** Lifts the barrier a stop put up for a load that was still on its way. */
+  #lifted: (() => void) | undefined;
 
   configOptions = $state<SessionConfigOption[]>([]);
   /** The agent's model picker, if it offers one. */
   model = $derived(this.configOptions.find((option) => option.id === 'model' && option.type === 'select'));
-  steeringSupported = $state(false);
+  get steeringSupported() {
+    return app.steeringSupported;
+  }
   /** Whether the agent takes images in a prompt. */
-  imagesSupported = $state(false);
+  get imagesSupported() {
+    return app.imagesSupported;
+  }
 
   permissions = $state<PendingPermission[]>([]);
   /** Open questions from the agent (form elicitations), answered like permission requests. */
@@ -107,7 +122,9 @@ export class SessionView {
     this.promptsInFlight > 0 || this.session?.phase === 'working' || this.session?.phase === 'waiting',
   );
 
-  #conn: AcpConnection;
+  /** What this session registers on the app's connection while it's shown. */
+  #consumer: Consumer;
+  #unregister: (() => void) | undefined;
   /** Receives the history replay of a (re)load, and replaces `transcript` once the load completes. */
   #replay: Transcript | null = null;
   /** The updates `transcript` is built from, oldest first, so older history can go in front of them. */
@@ -127,8 +144,9 @@ export class SessionView {
     this.id = id;
     // Sent before a reload and never confirmed: settled like any other once the session loads.
     this.#unconfirmed = loadUnconfirmed(id);
-    this.#conn = new AcpConnection(acpUrl(), {
-      onReady: (connection) => this.#onReady(connection),
+    this.#consumer = {
+      sessionId: id,
+      onReady: () => this.#onReady(),
       onNotification: (method, params) => this.#onNotification(method, params),
       onRequest: (rpcId, method, params) => this.#onRequest(rpcId, method, params),
       onStateChange: (state, error) => {
@@ -144,28 +162,38 @@ export class SessionView {
           this.questions = this.questions.map((question) => ({ ...question, stale: true }));
         }
       },
-    });
+    };
   }
 
   start() {
     this.#stopped = false;
     void this.refresh();
-    this.#conn.connect();
-    document.addEventListener('visibilitychange', this.#onVisible);
-    window.addEventListener('online', this.#onVisible);
+    this.#unregister = app.register(this.#consumer);
   }
 
   stop() {
     this.#stopped = true;
     clearTimeout(this.#loadRetry);
-    document.removeEventListener('visibilitychange', this.#onVisible);
-    window.removeEventListener('online', this.#onVisible);
-    this.#conn.close();
+    this.#unregister?.();
+    this.#unregister = undefined;
+    // The runtime stops sending this session's events and requests on the shared connection; what it left open waits.
+    // A load still on its way ends with the close instead, or it would install what the close removed. Meanwhile
+    // the barrier is up, so a view that comes back to the session waits for both.
+    if (this.#loading) {
+      reserve(this.id, new Promise<void>((resolve) => (this.#lifted = resolve)));
+    } else if (this.loaded) {
+      void this.#close();
+    }
   }
 
-  #onVisible = () => {
-    if (document.visibilityState === 'visible') this.#conn.reconnectNow();
-  };
+  /** Tells the runtime this view is done with the session, and holds the barrier until it has. */
+  #close(): Promise<void> {
+    const closed = app
+      .request('session/close', { sessionId: this.id })
+      .then(() => {}, () => {});
+    reserve(this.id, closed);
+    return closed;
+  }
 
   /**
    * Refetches the REST side: the session itself and its proposals. A failure is retried with backoff, since nothing
@@ -203,30 +231,32 @@ export class SessionView {
     }
   }
 
-  async #onReady(connection: AcpConnection) {
-    const init = await connection.request<InitializeResponse>('initialize', {
-      protocolVersion: 1,
-      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
-      clientInfo: { name: 'sloppod-ui', version: '0.0.0' },
-    });
-    this.steeringSupported = init?._meta?.steering?.supported === true;
-    this.imagesSupported = init?.agentCapabilities?.promptCapabilities?.image === true;
-
-    // A reconnect: the runtime may have been redeployed meanwhile.
-    if (this.loaded) account.refresh();
+  async #onReady() {
+    // Back on a session just left: its close has to be through, or it could land after this load and end it.
+    await closing.get(this.id);
+    if (this.#stopped) return;
     this.#replay = new Transcript();
     this.#replayUpdates = [];
+    this.#loading = true;
     try {
-      const response = await connection.request<LoadSessionResponse>('session/load', {
+      const response = await app.request<LoadSessionResponse>('session/load', {
         sessionId: this.id,
         cwd: '/',
         mcpServers: [],
       });
+      // The view was left while the runtime read the session: it has subscribed this socket by now, and stops.
+      if (this.#stopped) {
+        await this.#close();
+        return;
+      }
       this.transcript = this.#replay;
       this.#updates = this.#replayUpdates;
       this.historyBefore = (response?._meta?.sloppod as { historyBefore?: number | null } | undefined)?.historyBefore ?? null;
       this.configOptions = response?.configOptions ?? [];
     } finally {
+      this.#loading = false;
+      this.#lifted?.();
+      this.#lifted = undefined;
       this.#replay = null;
       this.#replayUpdates = null;
     }
@@ -287,7 +317,7 @@ export class SessionView {
       const request = params as ElicitationRequest;
       if (request.sessionId === this.id) {
         if (request.mode !== 'form') {
-          this.#conn.respondError(rpcId, -32602, `Unsupported elicitation mode: ${request.mode}`);
+          app.respondError(rpcId, -32602, `Unsupported elicitation mode: ${request.mode}`);
           return;
         }
         const pending = { ...request, rpcId, ...questionKey(request) };
@@ -298,7 +328,7 @@ export class SessionView {
         return;
       }
     }
-    this.#conn.respondError(rpcId, -32601, `Method not found: ${method}`);
+    app.respondError(rpcId, -32601, `Method not found: ${method}`);
   }
 
   #applyUpdate(update: SessionUpdate) {
@@ -322,7 +352,7 @@ export class SessionView {
     if (before === null || this.loadingHistory || this.#replay) return;
     this.loadingHistory = true;
     try {
-      const page = await this.#conn.request<{ updates: SessionUpdate[]; before: number | null }>('_sloppod/history', {
+      const page = await app.request<{ updates: SessionUpdate[]; before: number | null }>('_sloppod/history', {
         sessionId: this.id,
         before,
       });
@@ -364,7 +394,7 @@ export class SessionView {
     // Kept until the runtime answers, so a page reload before then can still tell whether it arrived.
     this.#keepSending(message);
     try {
-      const result = await this.#conn.request<{ stopReason: StopReason }>('session/prompt', {
+      const result = await app.request<{ stopReason: StopReason }>('session/prompt', {
         sessionId: this.id,
         prompt: promptBlocks(message),
         _meta: { sloppod: { messageId: id } },
@@ -428,12 +458,12 @@ export class SessionView {
 
   /** Moves a queued message into the running turn. */
   steerQueued(id: string) {
-    return this.#conn.request('_sloppod/steer_queued', { sessionId: this.id, id });
+    return app.request('_sloppod/steer_queued', { sessionId: this.id, id });
   }
 
   /** Takes a queued message out of the queue without running it; resolves with what it held. */
   async removeQueued(id: string): Promise<ContentBlock[]> {
-    const { prompt } = await this.#conn.request<{ prompt: ContentBlock[] }>('_sloppod/remove_queued', {
+    const { prompt } = await app.request<{ prompt: ContentBlock[] }>('_sloppod/remove_queued', {
       sessionId: this.id,
       id,
     });
@@ -446,7 +476,7 @@ export class SessionView {
    * questions asked with `ask_user` aren't the turn's, so they stay open.
    */
   cancel() {
-    this.#conn.notify('session/cancel', { sessionId: this.id });
+    app.notify('session/cancel', { sessionId: this.id });
   }
 
   async setConfigOption(configId: string, value: string) {
@@ -456,7 +486,7 @@ export class SessionView {
       option.id === configId && option.type === 'select' ? { ...option, currentValue: value } : option,
     );
     try {
-      const response = await this.#conn.request<{ configOptions?: SessionConfigOption[] }>('session/set_config_option', {
+      const response = await app.request<{ configOptions?: SessionConfigOption[] }>('session/set_config_option', {
         sessionId: this.id,
         configId,
         value,
@@ -483,12 +513,12 @@ export class SessionView {
 
   answerQuestion(question: PendingQuestion, response: ElicitationResponse) {
     if (question.stale) return;
-    this.#conn.respond(question.rpcId, response);
+    app.respond(question.rpcId, response);
     this.questions = this.questions.filter((pending) => pending.rpcId !== question.rpcId);
   }
 
   answerPermission(request: PendingPermission, optionId: string) {
-    this.#conn.respond(request.rpcId, { outcome: { outcome: 'selected', optionId } });
+    app.respond(request.rpcId, { outcome: { outcome: 'selected', optionId } });
     this.permissions = this.permissions.filter((pending) => pending.rpcId !== request.rpcId);
   }
 }

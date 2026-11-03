@@ -1,5 +1,5 @@
 import { readFile } from 'node:fs/promises';
-import { expect, test, type Page, type WebSocketRoute } from '@playwright/test';
+import { expect, test, type Page, type WebSocket as PageSocket, type WebSocketRoute } from '@playwright/test';
 import type { Proposal } from '../src/lib/api.ts';
 
 const FINAL = /Done\. The tests pass/;
@@ -1974,7 +1974,7 @@ test('a list fetched before a delete, arriving late, leaves the session deleted'
     await released;
     await route.fulfill({ json: stale });
   });
-  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await page.request.post('/_mock/drop');
   await expect.poll(() => holding).toBe(true);
 
   await page.getByRole('button', { name: 'Session actions' }).click();
@@ -1982,14 +1982,14 @@ test('a list fetched before a delete, arriving late, leaves the session deleted'
   await page.getByRole('button', { name: 'Delete', exact: true }).click();
   await expect(page).toHaveURL(/\/$/);
   const newer = page.waitForResponse((response) => response.url().endsWith('/api/v1/sessions') && response.status() === 200);
-  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await page.request.post('/_mock/drop');
   await newer;
   await expect(rows).toHaveCount(0);
 
   const late = page.waitForResponse((response) => response.url().endsWith('/api/v1/sessions'));
   release!();
   await late;
-  // Checked once, not retried: the next poll would hide a session the late list put back.
+  // Checked once, not retried: a later fetch would hide a session the late list put back.
   await page.waitForTimeout(300);
   expect(await rows.count()).toBe(0);
 });
@@ -2607,6 +2607,280 @@ test('the usage meters follow quota changes as they happen, without a reload', a
     await expect(page.getByTestId('sidebar').getByTestId('quota')).toHaveCount(0);
   } finally {
     await set(null);
+  }
+});
+
+test('the page keeps one socket for the list, the meters and the open session, across a reconnect', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  const sockets: PageSocket[] = [];
+  page.on('websocket', (socket) => sockets.push(socket));
+  await setWorkQuota(page, 20);
+  try {
+    const prompt = 'Propose a PR for sloppod, over one socket';
+    const id = await createSession(page, prompt);
+    await finishTurn(page);
+    const sidebar = page.getByTestId('sidebar');
+    const row = page.getByRole('navigation', { name: 'Sessions' }).getByTestId('session-row').filter({ hasText: prompt });
+    await expect(row.getByTestId('phase')).toHaveText('Waiting on you');
+    const meter = sidebar.getByTestId('quota-window');
+    await expect(meter).toContainText('20%');
+
+    // Moving about the app, a session after another and the settings, opens no other socket.
+    await page.getByRole('link', { name: 'New session' }).click();
+    const box = page.getByRole('textbox', { name: 'Prompt' });
+    await box.fill('Say something over the one socket');
+    await box.press('Enter');
+    await expect(page).toHaveURL(/\/sessions\/[0-9a-f-]+$/);
+    await finishTurn(page);
+    await page.getByRole('link', { name: 'Settings' }).first().click();
+    await expect(page).toHaveURL(/\/settings$/);
+    await row.click();
+    await expect(page).toHaveURL(new RegExp(id));
+    expect(sockets).toHaveLength(1);
+    expect(sockets[0].isClosed()).toBe(false);
+
+    // Down for a while: what changes meanwhile is read once it's back, with no timer to read it.
+    await page.request.post('/_mock/drop?for=1500');
+    const proposals: { id: string; status: string }[] = await (await page.request.get(`/api/v1/proposals?session=${id}`)).json();
+    await page.request.post(`/api/v1/proposals/${proposals.find((p) => p.status === 'pending')!.id}/reject`, { data: {} });
+    await setWorkQuota(page, 70);
+    await expect(meter).toContainText('70%');
+    await expect(row.getByTestId('phase')).toHaveText('Idle');
+    // Refused attempts show as sockets too: only one is open.
+    const open = () => sockets.filter((socket) => !socket.isClosed());
+    expect(open()).toHaveLength(1);
+
+    // And what changes after is pushed on the new socket: the meter, and the session shown.
+    await setWorkQuota(page, 80);
+    await expect(meter).toContainText('80%');
+    const again = page.getByRole('textbox', { name: 'Prompt' });
+    await again.fill('Propose a PR for sloppod, once more over the new socket');
+    await again.press('Enter');
+    await finishTurn(page);
+    expect(open()).toHaveLength(1);
+  } finally {
+    await setWorkQuota(page, null);
+  }
+});
+
+test('a session opened while a reconnect is still fetching the rest loads once those are through', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  const first = 'Say something, the first of two on one socket';
+  const second = 'Say something, the second of two on one socket';
+  await createSession(page, first);
+  await finishTurn(page);
+  await createSession(page, second);
+  await finishTurn(page);
+  const nav = page.getByRole('navigation', { name: 'Sessions' });
+
+  // The reconnect's fetch of the quotas is held, so the connection is still coming up when the other session opens.
+  let hold = false;
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => (release = resolve));
+  let fetching!: () => void;
+  const started = new Promise<void>((resolve) => (fetching = resolve));
+  await page.route('**/api/v1/quotas', async (route) => {
+    if (hold) {
+      fetching();
+      await released;
+    }
+    await route.fallback();
+  });
+  hold = true;
+  await page.request.post('/_mock/drop');
+  await started;
+  await nav.getByTestId('session-row').filter({ hasText: first }).click();
+  await expect(page).toHaveURL(/\/sessions\/[0-9a-f-]+$/);
+  release();
+  await expect(agentMessages(page).filter({ hasText: FINAL })).toBeVisible();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+  await expect(page.getByTestId('reconnecting')).toBeHidden();
+});
+
+test('a session left while its load is on its way is closed once the load is through', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  const first = 'Say something, left while it reloads';
+  const second = 'Say something, opened while it reloads';
+  const firstId = await createSession(page, first);
+  await finishTurn(page);
+  await createSession(page, second);
+  await finishTurn(page);
+  const nav = page.getByRole('navigation', { name: 'Sessions' });
+  await nav.getByTestId('session-row').filter({ hasText: first }).click();
+  await expect(page).toHaveURL(new RegExp(firstId));
+  await expect(agentMessages(page).filter({ hasText: FINAL })).toBeVisible();
+
+  // What the page sends and gets on the sockets from here on.
+  const frames: { dir: 'sent' | 'received'; message: { id?: number; method?: string; params?: { sessionId?: string } } }[] = [];
+  page.on('websocket', (socket) => {
+    socket.on('framesent', ({ payload }) => frames.push({ dir: 'sent', message: JSON.parse(String(payload)) }));
+    socket.on('framereceived', ({ payload }) => frames.push({ dir: 'received', message: JSON.parse(String(payload)) }));
+  });
+  // The socket comes back at once, but the runtime takes 3 s to answer the load; the page moves on meanwhile.
+  await page.request.post('/_mock/drop?slowload=3000');
+  await expect
+    .poll(() => frames.some((frame) => frame.dir === 'sent' && frame.message.method === 'session/load' && frame.message.params?.sessionId === firstId))
+    .toBe(true);
+  await nav.getByTestId('session-row').filter({ hasText: second }).click();
+  await expect(page).not.toHaveURL(new RegExp(firstId));
+
+  // The close goes after the load has been answered, not before, when the runtime wouldn't have the subscription yet.
+  await expect.poll(() => frames.some((frame) => frame.dir === 'sent' && frame.message.method === 'session/close')).toBe(true);
+  const load = frames.find((frame) => frame.dir === 'sent' && frame.message.method === 'session/load' && frame.message.params?.sessionId === firstId)!;
+  const answered = frames.findIndex((frame) => frame.dir === 'received' && frame.message.id === load.message.id && frame.message.method === undefined);
+  const closed = frames.findIndex((frame) => frame.dir === 'sent' && frame.message.method === 'session/close' && frame.message.params?.sessionId === firstId);
+  expect(answered).toBeGreaterThan(-1);
+  expect(closed).toBeGreaterThan(answered);
+});
+
+test('a session left and entered again while its load is on its way is loaded once the first is closed', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  // Every load and close the page sends, from the first socket on.
+  const sent: { method: string; sessionId: string }[] = [];
+  page.on('websocket', (socket) =>
+    socket.on('framesent', ({ payload }) => {
+      const message = JSON.parse(String(payload));
+      if (message.method === 'session/load' || message.method === 'session/close') {
+        sent.push({ method: message.method, sessionId: message.params?.sessionId });
+      }
+    }),
+  );
+  const first = 'Say something, left and come back to';
+  const second = 'Say something, the other one meanwhile';
+  const firstId = await createSession(page, first);
+  await finishTurn(page);
+  await createSession(page, second);
+  await finishTurn(page);
+  const nav = page.getByRole('navigation', { name: 'Sessions' });
+  const row = (prompt: string) => nav.getByTestId('session-row').filter({ hasText: prompt });
+
+  const methods = () => sent.filter((frame) => frame.sessionId === firstId).map((frame) => frame.method);
+  // Entering the first session so far: one load, and a close when it was left for the second.
+  const before = methods().length;
+  // On a connection that's up, the runtime takes 3 s to answer a load: the first session is opened, left and opened
+  // again before it has.
+  await page.request.post('/_mock/slow-loads?for=3000');
+  await row(first).click();
+  await expect.poll(() => methods().slice(before)).toEqual(['session/load']);
+  await row(second).click();
+  await expect(page).not.toHaveURL(new RegExp(firstId));
+  await row(first).click();
+  await expect(page).toHaveURL(new RegExp(firstId));
+
+  // The second load waits for the first to be answered and closed, or the close would end the one that is shown.
+  await expect(agentMessages(page).filter({ hasText: FINAL })).toBeVisible();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+  expect(methods().slice(before)).toEqual(['session/load', 'session/close', 'session/load']);
+  // And the session is live on the socket: a message runs a turn.
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('And once more, back again');
+  await box.press('Enter');
+  await expect(permissionCard(page)).toBeVisible();
+});
+
+test("a session whose load keeps failing doesn't disturb the list or the meters, or the socket", async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  const sockets: PageSocket[] = [];
+  page.on('websocket', (socket) => sockets.push(socket));
+  await setWorkQuota(page, 20);
+  try {
+    const waiting = 'Propose a PR for sloppod, the list follows it';
+    const waitingId = await createSession(page, waiting);
+    await finishTurn(page);
+    const other = 'Say something, its load will fail';
+    await createSession(page, other);
+    await finishTurn(page);
+    const nav = page.getByRole('navigation', { name: 'Sessions' });
+    const row = nav.getByTestId('session-row').filter({ hasText: waiting });
+    await expect(row.getByTestId('phase')).toHaveText('Waiting on you');
+    const meter = page.getByTestId('sidebar').getByTestId('quota-window');
+    await expect(meter).toContainText('20%');
+
+    // Each created session reloaded the page, so this is the socket it has now.
+    const socketsBefore = sockets.length;
+    // The runtime can't read a session for a while: opening it fails over and over, with backoff.
+    await page.request.post('/_mock/fail-loads?for=4000');
+    await nav.getByTestId('session-row').filter({ hasText: waiting }).click();
+    await expect(page.getByText('the runtime could not read the session')).toBeVisible();
+
+    // Meanwhile the list and the meters follow what the runtime pushes, on the same socket.
+    await setWorkQuota(page, 70);
+    await expect(meter).toContainText('70%');
+    const proposals: { id: string; status: string }[] = await (await page.request.get(`/api/v1/proposals?session=${waitingId}`)).json();
+    await page.request.post(`/api/v1/proposals/${proposals.find((p) => p.status === 'pending')!.id}/reject`, { data: {} });
+    await expect(row.getByTestId('phase')).not.toHaveText('Waiting on you');
+
+    // And the session loads on its own once the runtime can read it. Nothing reconnected on the way.
+    await expect(page.getByText('the runtime could not read the session')).toBeHidden({ timeout: 20_000 });
+    await expect(page.getByRole('textbox', { name: 'Prompt' })).toBeEnabled();
+    expect(sockets).toHaveLength(socketsBefore);
+    expect(sockets[socketsBefore - 1].isClosed()).toBe(false);
+  } finally {
+    await setWorkQuota(page, null);
+  }
+});
+
+test("a consumer that failed early tries again though a later one is still loading", async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  const sockets: PageSocket[] = [];
+  page.on('websocket', (socket) => sockets.push(socket));
+  await setWorkQuota(page, 20);
+  try {
+    await createSession(page, 'Say something, the meters fail first');
+    await finishTurn(page);
+    const meter = page.getByTestId('sidebar').getByTestId('quota-window');
+    await expect(meter).toContainText('20%');
+
+    // After the reconnect the quotas fail once; the session's load, which comes after, takes longer than the retry's
+    // first delay, so the connection is still coming up when it's due.
+    let calls = 0;
+    await page.route('**/api/v1/quotas', (route) =>
+      ++calls === 1 ? route.fulfill({ status: 500, json: { error: 'the quotas are unavailable' } }) : route.fallback(),
+    );
+    const socketsBefore = sockets.length;
+    await page.request.post('/_mock/drop?slowload=3000');
+    await expect.poll(() => calls).toBe(1);
+    // The retry comes once the session's load is through and the connection is up, not before and not never.
+    await expect.poll(() => calls, { timeout: 20_000 }).toBe(2);
+    await setWorkQuota(page, 70);
+    await expect(meter).toContainText('70%');
+    // One reconnect, and nothing else.
+    expect(sockets).toHaveLength(socketsBefore + 1);
+  } finally {
+    await setWorkQuota(page, null);
+  }
+});
+
+test("a fetch left pending across a reconnect doesn't cancel the retry of the new connection's", async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  await setWorkQuota(page, 20);
+  try {
+    // The page's first quotas fetch is held; the one after the reconnect fails; the held one is let go afterwards.
+    let calls = 0;
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => (release = resolve));
+    await page.route('**/api/v1/quotas', async (route) => {
+      const call = ++calls;
+      if (call === 1) {
+        const response = await route.fetch();
+        await released;
+        await route.fulfill({ response });
+      } else if (call === 2) {
+        await route.fulfill({ status: 500, json: { error: 'the quotas are unavailable' } });
+      } else {
+        await route.fallback();
+      }
+    });
+    await page.goto('/settings');
+    await expect.poll(() => calls).toBe(1);
+    await page.request.post('/_mock/drop');
+    await expect.poll(() => calls).toBe(2);
+    release();
+    // The held fetch is old news; the retry of the failed one still comes, and fills the meters.
+    await expect(page.getByTestId('sidebar').getByTestId('quota-window')).toContainText('20%', { timeout: 20_000 });
+    expect(calls).toBeGreaterThanOrEqual(3);
+  } finally {
+    await setWorkQuota(page, null);
   }
 });
 
@@ -3284,7 +3558,7 @@ test('a list fetched before a push does not undo it', async ({ page }) => {
     await route.fulfill({ json: list });
     answered();
   });
-  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await page.request.post('/_mock/drop');
   await expect.poll(() => started).toBe(true);
 
   const proposals: { id: string; status: string }[] = await (await page.request.get(`/api/v1/proposals?session=${id}`)).json();
