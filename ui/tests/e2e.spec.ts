@@ -2189,6 +2189,9 @@ test('a grant made before the user had an account of its kind is given one later
 
 test('grants, narrows, times and revokes the grants of a running session', async ({ page }) => {
   await createSession(page, 'Fix the build in bo0tzz/sloppod');
+  // The agent's first turn ends before anything is granted: a notice reaches a turn that's still running only when it
+  // takes it, which a turn waiting on a permission request doesn't, so whether the last one showed depended on timing.
+  await finishTurn(page);
   await page.getByRole('button', { name: 'Session actions' }).click();
   await page.getByRole('menuitem', { name: 'Grants' }).click();
   const grants = page.getByTestId('grants');
