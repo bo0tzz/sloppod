@@ -1246,7 +1246,6 @@ function publicProposal(proposal) {
 function broadcastProposal(proposal) {
   const session = sessions.get(proposal.session_id);
   for (const conn of session?.subscribers ?? []) conn.notify('_sloppod/proposal', { proposal: publicProposal(proposal) });
-  session?.broadcast();
 }
 
 const availableRepos = () => (credentials.some((c) => c.kind === 'github-app') ? REPOS : []);

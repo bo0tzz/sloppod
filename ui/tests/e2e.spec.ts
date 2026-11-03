@@ -3176,6 +3176,7 @@ test('an idle session with a proposal or a question waiting shows it is waiting 
   await finishTurn(page);
   const sidebar = page.getByRole('navigation', { name: 'Sessions' });
   const row = sidebar.getByTestId('session-row').filter({ hasText: 'Propose a PR for sloppod, the one to wait on' });
+  await expect(phase(page)).toHaveText('Waiting on you');
   await expect(row.getByTestId('phase')).toHaveText('Waiting on you');
   await expect(row.getByTestId('phase')).toHaveAttribute('data-phase', 'idle');
   await expect(row.getByTestId('phase')).toHaveAttribute('title', /1 proposal/);
@@ -3191,6 +3192,8 @@ test('an idle session with a proposal or a question waiting shows it is waiting 
   await page.getByTestId('proposal-card').getByRole('button', { name: 'Review' }).click();
   await page.getByRole('button', { name: 'Reject…' }).click();
   await page.getByRole('button', { name: 'Reject', exact: true }).click();
+  // The header follows the proposals the view already has: the runtime doesn't push the session when one is decided.
+  await expect(phase(page)).toHaveText('Idle');
   await expect(row.getByTestId('phase')).toHaveText('Idle');
 
   // An ask_user question, which outlives the turn.

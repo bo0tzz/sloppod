@@ -64,6 +64,11 @@
   const pendingProposals = $derived(view.proposals.filter((proposal) => proposal.status === 'pending'));
   // Approved proposals are carried out in the background; their cards stay until that's done. Failures go to the
   // agent, not here.
+  // The runtime pushes the session when questions or permission requests change, but not when a proposal is decided,
+  // so the proposals this view already follows give the count (#368).
+  const waitingOnYou = $derived(
+    session?.waiting && view.proposalsLoaded ? { ...session.waiting, proposals: pendingProposals.length } : session?.waiting,
+  );
   const openProposals = $derived(
     view.proposals.filter((proposal) => proposal.status === 'pending' || proposal.status === 'approved'),
   );
@@ -356,7 +361,7 @@
     <ChatHeader {title} subtitle={session ? (session.repo ?? 'No repository') : undefined} mono={Boolean(session?.repo)}>
       {#snippet actions()}
         {#if session}
-          <PhaseBadge phase={session.phase} commands={session.commands} commandLines={session.command_lines} waiting={session.waiting} />
+          <PhaseBadge phase={session.phase} commands={session.commands} commandLines={session.command_lines} waiting={waitingOnYou} />
         {/if}
         <IconButton
           icon={mdiSourcePull}
