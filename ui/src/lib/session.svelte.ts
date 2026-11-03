@@ -77,6 +77,8 @@ export class SessionView {
   connectionError = $state<string | null>(null);
   /** Why the session's REST side (the session and its proposals) didn't load; it's retried meanwhile. */
   loadError = $state<string | null>(null);
+  /** True once `proposals` is what the runtime listed, so counts taken from it can be trusted. */
+  proposalsLoaded = $state(false);
   #loadFailures = 0;
   /** Refreshes started, and the latest one that succeeded: a failure of an older one than that isn't an error to show. */
   #refreshes = 0;
@@ -180,6 +182,7 @@ export class SessionView {
       ]);
       this.setSession(session);
       for (const proposal of proposals) this.upsertProposal(proposal);
+      this.proposalsLoaded = true;
       this.loadError = null;
       this.#loadFailures = 0;
       this.#refreshed = Math.max(this.#refreshed, refresh);

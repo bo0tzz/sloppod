@@ -214,6 +214,20 @@ pub mod api {
         /// Those commands' command lines, when the supervisor sends them.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub command_lines: Vec<String>,
+        /// What waits on the user in the session, so a list of sessions can say which need them (#368).
+        #[serde(default)]
+        pub waiting: Waiting,
+    }
+
+    /// What a session has open for the user to answer.
+    #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct Waiting {
+        /// Proposals awaiting a decision.
+        pub proposals: usize,
+        /// Questions from the agent, `ask_user`'s included.
+        pub questions: usize,
+        /// The agent's permission requests.
+        pub permissions: usize,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

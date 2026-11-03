@@ -157,6 +157,7 @@ impl SessionRow {
             limited_until: self.limited_until.map(|d| d.to_rfc3339()),
             commands: None,
             command_lines: Vec::new(),
+            waiting: Default::default(),
         }
     }
 
@@ -1560,6 +1561,17 @@ pub async fn set_repo_commit(
     .execute(db)
     .await?;
     Ok(())
+}
+
+/// How many of the session's proposals wait on the user's decision.
+pub async fn pending_proposals(db: &PgPool, session: Uuid) -> sqlx::Result<usize> {
+    let count: i64 = sqlx::query_scalar(
+        "select count(*) from proposals where session_id = $1 and status = 'pending'",
+    )
+    .bind(session)
+    .fetch_one(db)
+    .await?;
+    Ok(count as usize)
 }
 
 /// A session's proposals that are still with their reviewer: in review, or waiting on the author's fixes.

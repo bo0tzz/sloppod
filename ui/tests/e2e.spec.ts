@@ -3201,3 +3201,125 @@ test('an idle session with commands running shows it is waiting on them', async 
   await expect(header).toHaveText('Idle');
   await expect(row.getByTestId('phase')).toHaveText('Idle');
 });
+
+test('an idle session with a proposal or a question waiting shows it is waiting on you', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  await createSession(page, 'Propose a PR for sloppod, the one to wait on');
+  await finishTurn(page);
+  const sidebar = page.getByRole('navigation', { name: 'Sessions' });
+  const row = sidebar.getByTestId('session-row').filter({ hasText: 'Propose a PR for sloppod, the one to wait on' });
+  await expect(phase(page)).toHaveText('Waiting on you');
+  await expect(row.getByTestId('phase')).toHaveText('Waiting on you');
+  await expect(row.getByTestId('phase')).toHaveAttribute('data-phase', 'idle');
+  await expect(row.getByTestId('phase')).toHaveAttribute('title', /1 proposal/);
+
+  // The home page says so too.
+  await page.goto('/');
+  await expect(page.getByTestId('session-row').filter({ hasText: 'Propose a PR for sloppod, the one to wait on' }).getByTestId('phase').first()).toHaveText(
+    'Waiting on you',
+  );
+
+  // Decided, it's idle.
+  await page.getByTestId('session-row').filter({ hasText: 'Propose a PR for sloppod, the one to wait on' }).first().click();
+  await page.getByTestId('proposal-card').getByRole('button', { name: 'Review' }).click();
+  await page.getByRole('button', { name: 'Reject…' }).click();
+  await page.getByRole('button', { name: 'Reject', exact: true }).click();
+  // The header follows the proposals the view already has: the runtime doesn't push the session when one is decided.
+  await expect(phase(page)).toHaveText('Idle');
+  await expect(row.getByTestId('phase')).toHaveText('Idle');
+
+  // An ask_user question, which outlives the turn.
+  await createSession(page, 'Use ask_user about the retry budget');
+  await expect(phase(page)).toHaveAttribute('data-phase', 'working');
+  await page.getByRole('button', { name: 'Stop' }).click();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+  const asked = sidebar.getByTestId('session-row').filter({ hasText: 'Use ask_user about the retry budget' });
+  await expect(asked.getByTestId('phase')).toHaveText('Waiting on you');
+  await expect(asked.getByTestId('phase')).toHaveAttribute('title', /1 question/);
+});
+
+test('the session list follows what waits on you as it is pushed, without fetching', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  const prompt = 'Propose a PR for sloppod, left for the list to follow';
+  const id = await createSession(page, prompt);
+  await finishTurn(page);
+  const row = page.getByRole('navigation', { name: 'Sessions' }).getByTestId('session-row').filter({ hasText: prompt });
+  await expect(row.getByTestId('phase')).toHaveText('Waiting on you');
+
+  // Another session shown, and the list no longer fetched: a proposal of the first one decided elsewhere has to
+  // reach the list by push.
+  await createSession(page, 'Say something while the list is watching');
+  await finishTurn(page);
+  await page.route('**/api/v1/sessions', (route) => route.abort());
+  const proposals: { id: string; status: string }[] = await (await page.request.get(`/api/v1/proposals?session=${id}`)).json();
+  const pending = proposals.find((proposal) => proposal.status === 'pending')!;
+  await page.request.post(`/api/v1/proposals/${pending.id}/reject`, { data: {} });
+  await expect(row.getByTestId('phase')).not.toHaveText('Waiting on you');
+});
+
+test('a list fetched before a push does not undo it', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  const prompt = 'Propose a PR for sloppod, left for a stale list to undo';
+  const id = await createSession(page, prompt);
+  await finishTurn(page);
+  const row = page.getByRole('navigation', { name: 'Sessions' }).getByTestId('session-row').filter({ hasText: prompt });
+  await expect(row.getByTestId('phase')).toHaveText('Waiting on you');
+  await createSession(page, 'Say something while a list is on its way');
+  await finishTurn(page);
+
+  // A list fetch on its way, held until the proposal has been decided and the push has come: its copy of the session
+  // is the one from before, with the same updated_at, as what a session waits on doesn't move it.
+  let hold!: () => void;
+  const held = new Promise<void>((resolve) => (hold = resolve));
+  let answered!: () => void;
+  const done = new Promise<void>((resolve) => (answered = resolve));
+  let started = false;
+  await page.route('**/api/v1/sessions', async (route) => {
+    // Later fetches (the timer's) fail, so none is applied ahead of this one, which an older list never would be.
+    if (started) return route.abort();
+    started = true;
+    await held;
+    const list: { id: string; waiting: { proposals: number } }[] = await (await page.request.get('/api/v1/sessions')).json();
+    for (const session of list) if (session.id === id) session.waiting = { ...session.waiting, proposals: 1 };
+    await route.fulfill({ json: list });
+    answered();
+  });
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await expect.poll(() => started).toBe(true);
+
+  const proposals: { id: string; status: string }[] = await (await page.request.get(`/api/v1/proposals?session=${id}`)).json();
+  const pending = proposals.find((proposal) => proposal.status === 'pending')!;
+  await page.request.post(`/api/v1/proposals/${pending.id}/reject`, { data: {} });
+  // Idle again once the agent has taken the decision, so the badge is the only thing a stale copy could bring back.
+  await expect(row.getByTestId('phase')).toHaveText('Idle');
+  hold();
+  await done;
+  // Long enough for the list to have been applied; not retried, as a badge that came back would only go with a fetch.
+  await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 300)));
+  expect(await row.getByTestId('phase').textContent()).not.toContain('Waiting on you');
+});
+
+test('arrow keys move between the rows of the session list', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  await createSession(page, 'First session about arrows');
+  await finishTurn(page);
+  await createSession(page, 'Second session about arrows');
+  await finishTurn(page);
+  await createSession(page, 'Third session about arrows');
+  await finishTurn(page);
+  const rows = page.getByRole('navigation', { name: 'Sessions' }).getByTestId('session-row').filter({ hasText: 'session about arrows' });
+  await expect(rows).toHaveCount(3);
+
+  await rows.first().focus();
+  await page.keyboard.press('ArrowDown');
+  await expect(rows.nth(1)).toBeFocused();
+  await page.keyboard.press('ArrowDown');
+  await expect(rows.nth(2)).toBeFocused();
+  await page.keyboard.press('ArrowUp');
+  await expect(rows.nth(1)).toBeFocused();
+  await page.keyboard.press('ArrowUp');
+  await expect(rows.first()).toBeFocused();
+  // The newest session is the first of the list: nothing above it.
+  await page.keyboard.press('ArrowUp');
+  await expect(rows.first()).toBeFocused();
+});

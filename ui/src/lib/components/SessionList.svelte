@@ -28,6 +28,19 @@
   const running = $derived(roots.filter(isRunning));
   const parked = $derived(roots.filter((session) => !isRunning(session)));
 
+  let container = $state<HTMLElement>();
+
+  /** Arrow keys move between the rows, in the order they're shown, sub-sessions included. */
+  function onkeydown(event: KeyboardEvent) {
+    const step = { ArrowDown: 1, ArrowUp: -1 }[event.key];
+    if (!step || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+    const rows = [...(container?.querySelectorAll<HTMLElement>('[data-testid="session-row"]') ?? [])];
+    const index = rows.indexOf(event.target as HTMLElement);
+    if (index === -1) return;
+    event.preventDefault();
+    rows[Math.min(Math.max(index + step, 0), rows.length - 1)].focus();
+  }
+
   let now = $state(Date.now());
   $effect(() => {
     const timer = setInterval(() => (now = Date.now()), 30_000);
@@ -57,7 +70,7 @@
             <Icon icon={mdiTimerSandComplete} size="1.1em" aria-label="Waiting for the usage limit" />
           </span>
         {/if}
-        <PhaseBadge phase={session.phase} commands={session.commands} commandLines={session.command_lines} />
+        <PhaseBadge phase={session.phase} commands={session.commands} commandLines={session.command_lines} waiting={session.waiting} />
       </div>
       <div class="text-muted flex min-w-0 items-center gap-1.5 text-xs">
         {#if session.repo}
@@ -84,6 +97,9 @@
   </li>
 {/snippet}
 
+<!-- The rows are links, focusable as they are; the handler only adds the arrow keys. -->
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div bind:this={container} {onkeydown} class="contents">
 <ul class="flex flex-col {compact ? 'gap-0.5 p-2' : 'gap-2'}" data-testid="session-list">
   {#each running as session (session.id)}
     {@render row(session)}
@@ -103,3 +119,4 @@
     </ul>
   </section>
 {/if}
+</div>

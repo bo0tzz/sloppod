@@ -59,6 +59,18 @@ const sha = () => randomBytes(20).toString('hex');
 class MockSession {
   constructor(data) {
     this.data = data;
+    // What waits on the user, as the runtime counts it on the session (#368); read when the session is sent.
+    Object.defineProperty(data, 'waiting', {
+      enumerable: true,
+      get: () => {
+        const pending = [...this.pending.values()];
+        return {
+          proposals: [...proposals.values()].filter((p) => p.session_id === data.id && p.status === 'pending').length,
+          questions: pending.filter((p) => p.method === 'elicitation/create').length,
+          permissions: pending.filter((p) => p.method !== 'elicitation/create').length,
+        };
+      },
+    });
     /** Every `session/update` params object, replayed by `session/load`. */
     this.log = [];
     /** @type {Set<Connection>} */
@@ -88,7 +100,13 @@ class MockSession {
 
   broadcast() {
     this.data.updated_at = now();
-    for (const conn of this.subscribers) conn.notify('_sloppod/session', { session: this.data });
+    this.push();
+  }
+
+  /** Sends the session as it is: what it waits on changing doesn't move `updated_at` in the runtime. */
+  push() {
+    // As the runtime pushes each change to the owner's connections, whichever session they show.
+    for (const conn of connections) conn.notify('_sloppod/session', { session: this.data });
   }
 
   configOptions() {
@@ -444,6 +462,7 @@ function requestFromUser(session, { method, params, toolCallId, cancelled, block
     const pending = { method, params, toolCallId, cancelled, blocking, resolve, requests: new Map() };
     session.pending.set(pending, pending);
     if (blocking) session.setPhase('waiting');
+    else session.push();
     for (const conn of session.subscribers) sendPending(session, pending, conn);
   });
 }
@@ -476,6 +495,7 @@ function resolvePending(session, pending, result) {
   pending.requests.clear();
   const blocked = [...session.pending.values()].some((other) => other.blocking);
   if (session.data.phase === 'waiting' && !blocked) session.setPhase('working');
+  else session.push();
   pending.resolve(result);
 }
 
@@ -1232,6 +1252,8 @@ function publicProposal(proposal) {
 function broadcastProposal(proposal) {
   const session = sessions.get(proposal.session_id);
   for (const conn of session?.subscribers ?? []) conn.notify('_sloppod/proposal', { proposal: publicProposal(proposal) });
+  // A proposal made or decided changes what the session waits on.
+  session?.push();
 }
 
 const availableRepos = () => (credentials.some((c) => c.kind === 'github-app') ? REPOS : []);

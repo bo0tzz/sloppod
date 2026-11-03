@@ -254,13 +254,17 @@ impl Conn {
         let sessions = db::list_sessions(&self.state.db, &self.user)
             .await
             .map_err(internal)?;
-        Ok(json!({"sessions": sessions.iter().map(|s| json!({
-            "sessionId": s.id,
-            "cwd": "/",
-            "title": s.title,
-            "updatedAt": s.updated_at.to_rfc3339(),
-            "_meta": {"sloppod": self.state.hub.session_api(s)},
-        })).collect::<Vec<_>>()}))
+        let mut listed = Vec::new();
+        for s in &sessions {
+            listed.push(json!({
+                "sessionId": s.id,
+                "cwd": "/",
+                "title": s.title,
+                "updatedAt": s.updated_at.to_rfc3339(),
+                "_meta": {"sloppod": self.state.hub.session_api(s).await},
+            }));
+        }
+        Ok(json!({"sessions": listed}))
     }
 
     async fn handle_response(&self, message: &Value) {
@@ -294,6 +298,34 @@ fn older_than(page: &[(i64, Value)]) -> Option<i64> {
 
 fn internal(e: impl std::fmt::Display) -> RpcError {
     RpcError::new(-32603, e.to_string())
+}
+
+/// Sends the connection each change of one of its owner's sessions, as a `_sloppod/session` notification: the session
+/// as the API shows it, `waiting` included. A connection that falls behind is told to reconnect, so it fetches the
+/// list again rather than miss one.
+async fn forward_sessions(conn: &Conn, mut changes: broadcast::Receiver<Uuid>) {
+    loop {
+        let id = match changes.recv().await {
+            Ok(id) => id,
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                return conn.drop_connection.notify_one();
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
+        };
+        let row = match db::get_session(&conn.state.db, id).await {
+            Ok(Some(row)) if row.owner == conn.user => row,
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::warn!(session = %id, error = %e, "reading a changed session to push it");
+                continue;
+            }
+        };
+        let session = conn.state.hub.session_api(&row).await;
+        conn.send(
+            json!({"jsonrpc": "2.0", "method": "_sloppod/session", "params": {"session": session}}),
+        )
+        .await;
+    }
 }
 
 async fn run(state: AppState, user: String, agent: String, socket: WebSocket) {
@@ -333,6 +365,12 @@ async fn run(state: AppState, user: String, agent: String, socket: WebSocket) {
             })
             .await
         })
+    };
+    // The owner's sessions as they change, whichever one the connection shows, or none: the session list follows them.
+    let sessions = {
+        let conn = conn.clone();
+        let changes = conn.state.hub.changed_sessions();
+        tokio::spawn(async move { forward_sessions(&conn, changes).await })
     };
     loop {
         let message = tokio::select! {
@@ -382,6 +420,7 @@ async fn run(state: AppState, user: String, agent: String, socket: WebSocket) {
         task.abort();
     }
     quotas.abort();
+    sessions.abort();
     writer.abort();
     tracing::info!(connection = %conn.id, "UI disconnected");
 }

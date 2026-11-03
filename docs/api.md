@@ -139,6 +139,7 @@ type Session = {
   limited_until?: string; // the session hit the account's usage limit and carries on by itself then (see "When a turn fails on the account's usage limit" below)
   commands: number | null; // how many of the agent's commands are running, foreground or background, as its supervisor last said (`null` until it says, e.g. no pod); an `idle` session with some running is waiting on them, not done (#413). Kept live, not stored: a dropped link makes it `null` again
   command_lines?: string[]; // those commands' command lines, each cut to 300 characters, when the supervisor sends them
+  waiting: { proposals: number; questions: number; permissions: number }; // what waits on the user: proposals awaiting a decision, open questions (`ask_user`'s too) and the agent's permission requests, so a list of sessions can say which need them (#368). Counted when the session is sent (proposals from the database, the rest kept live) and pushed as `_sloppod/session` whenever it changes
 };
 
 // What the session may do (ADR 2). Capabilities so far: "model", "github" (read: public data, plus the "repo"
@@ -483,7 +484,7 @@ Runtime → UI:
 | `_sloppod/queue` `{sessionId, messages: {id, prompt}[]}` | The messages waiting behind the running turn, sent whenever that changes and when a UI loads the session. |
 | `_sloppod/permission_resolved` `{sessionId, toolCallId, requestId}` | Sent to every UI, including the one that answered, once a permission request or question is answered or cancelled. `requestId` is the JSON-RPC id the request had on this connection. |
 | `_sloppod/quota` `{credentialId, quota: Quota \| null}` | One of the owner's quotas changed (see Quotas): `quota` as it stands now, or `null` once the credential is gone. Sent on every connection of the owner, with or without a session loaded. A connection that falls behind is dropped, so its UI reconnects and fetches them all. |
-| `_sloppod/session` `{session: Session}` | The session's phase, title, repository or grants changed, or the agent's running commands (`commands`, `command_lines`). |
+| `_sloppod/session` `{session: Session}` | The session's phase, title, repository or grants changed, the agent's running commands (`commands`, `command_lines`), or what waits on the user (`waiting`: a proposal made, decided, withdrawn or carried out, a question asked or answered, a permission request opened or resolved). Sent on every connection of the owner for any of the owner's sessions, with or without it loaded, so a session list follows them without fetching; a connection that falls behind is dropped, so its UI reconnects and fetches the list. A connection that has the session loaded may get it twice. |
 | `_sloppod/proposal` `{proposal: Proposal}` | A proposal for a loaded session was created or changed. |
 
 ### Questions
