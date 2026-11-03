@@ -1600,6 +1600,7 @@ async fn a_proposal_carries_over_the_review_its_sub_session_s_report_passed(db: 
         title: "Fix".into(),
         body: String::new(),
         describes_change: true,
+        whole: false,
     };
     let parent_row = db::get_session(&db, parent).await.unwrap().unwrap();
     let reports = |kind: &str| kind == "sloppod.session.report";
@@ -1729,6 +1730,7 @@ async fn a_review_carried_over_again_after_its_proposal_ended_is_claimed_or_refu
         title: "Fix".into(),
         body: String::new(),
         describes_change: true,
+        whole: false,
     };
     let parent_row = db::get_session(&db, parent).await.unwrap().unwrap();
     let reports = |kind: &str| kind == "sloppod.session.report";

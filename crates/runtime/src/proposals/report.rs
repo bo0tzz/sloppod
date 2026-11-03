@@ -132,6 +132,7 @@ impl ProposalKind for Report {
             title: field("title")?,
             body: field("summary").unwrap_or_default(),
             describes_change: true,
+            whole: false,
         })
     }
 

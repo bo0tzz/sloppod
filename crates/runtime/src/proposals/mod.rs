@@ -25,7 +25,7 @@ use crate::github::{GitHubApp, StackWatch};
 use crate::{AppState, db, lifecycle, reviews};
 
 pub use act_as::ActAsOwner;
-pub use code_review::{CODE_REVIEW, CodeReview};
+pub use code_review::{CODE_REVIEW, CodeReview, started as code_review_started};
 pub use issue_updates::IssueUpdates;
 pub use issues::Issues;
 use pull_request::stack_layers;

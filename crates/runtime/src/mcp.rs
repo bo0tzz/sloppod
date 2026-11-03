@@ -446,12 +446,7 @@ async fn propose(
         .map_err(|e| format!("Proposal refused: {e}"))?;
     // A code review asks no human: it ends with its findings, and nothing is carried out.
     if proposal.kind == proposals::CODE_REVIEW {
-        return Ok(format!(
-            "Code review {} started; another model is reviewing the branch. Its findings come back to you. No human \
-             is asked and nothing is carried out: push fixes and call request_review for the next round, or \
-             withdraw_proposal once you've heard enough.",
-            proposal.id
-        ));
+        return Ok(proposals::code_review_started(&proposal));
     }
     Ok(match proposal.status {
         ProposalStatus::InReview => format!(
