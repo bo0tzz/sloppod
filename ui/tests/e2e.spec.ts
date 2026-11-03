@@ -731,6 +731,8 @@ test('reconnects after the socket drops without duplicating history', async ({ p
 
 test('a dropped connection leaves the state unknown, with a way to retry at once', async ({ page }) => {
   await page.setViewportSize({ width: 1400, height: 900 });
+  const sockets: PageSocket[] = [];
+  page.on('websocket', (socket) => sockets.push(socket));
   const prompt = 'Say something, the connection will drop';
   await createSession(page, prompt);
   await finishTurn(page);
@@ -739,16 +741,22 @@ test('a dropped connection leaves the state unknown, with a way to retry at once
   await expect(row.getByTestId('phase')).toHaveText('Idle');
 
   // Down for a while: neither the header nor the sidebar says Idle meanwhile.
-  await page.request.post('/_mock/drop?for=3000');
+  const attemptsBefore = sockets.length;
+  await page.request.post('/_mock/drop?for=8000');
   const banner = page.getByTestId('reconnecting');
   await expect(banner).toContainText('Connection lost, reconnecting');
   await expect(phase(page)).toHaveText('Unknown');
   await expect(row.getByTestId('phase')).toHaveText('Unknown');
   await expect(banner.getByRole('button', { name: 'Retry now' })).toBeVisible();
 
-  // Retrying tries at once instead of waiting out the backoff; once the runtime takes it, the states are back.
+  // The automatic attempts back off (0.5, 1, 2 s…): once three have been refused the next is more than two seconds
+  // off. Retrying starts one at once, instead of waiting that out.
+  await expect.poll(() => sockets.length).toBeGreaterThanOrEqual(attemptsBefore + 3);
+  const attempts = sockets.length;
   await banner.getByRole('button', { name: 'Retry now' }).click();
-  await expect(banner).toBeHidden({ timeout: 15_000 });
+  await expect.poll(() => sockets.length, { timeout: 1000 }).toBeGreaterThan(attempts);
+  // Once the runtime takes a connection, the states are back.
+  await expect(banner).toBeHidden({ timeout: 20_000 });
   await expect(phase(page)).toHaveText('Idle');
   await expect(row.getByTestId('phase')).toHaveText('Idle');
 });
@@ -3604,8 +3612,9 @@ test('a list fetched before a push does not undo it', async ({ page }) => {
   const proposals: { id: string; status: string }[] = await (await page.request.get(`/api/v1/proposals?session=${id}`)).json();
   const pending = proposals.find((proposal) => proposal.status === 'pending')!;
   await page.request.post(`/api/v1/proposals/${pending.id}/reject`, { data: {} });
-  // Idle again once the agent has taken the decision, so the badge is the only thing a stale copy could bring back.
-  await expect(row.getByTestId('phase')).toHaveText('Idle');
+  // Idle again once the agent has taken the decision, so the badge is the only thing a stale copy could bring back. The
+  // label says Unknown meanwhile: the list's fetch, held, keeps the connection coming up. The phase itself is read.
+  await expect(row.getByTestId('phase')).toHaveAttribute('data-phase', 'idle');
   hold();
   await done;
   // Long enough for the list to have been applied; not retried, as a badge that came back would only go with a fetch.
