@@ -64,6 +64,18 @@ class AppConnection {
     };
   }
 
+  /**
+   * For a "Retry now": a connection that's down reconnects at once, and a consumer waiting out the backoff of a failed
+   * fetch (on a connection that's up) tries again at once.
+   */
+  reconnectNow(consumer?: Consumer) {
+    this.#conn?.reconnectNow();
+    const failure = consumer && this.#failed.get(consumer);
+    if (!consumer || !failure || this.state !== 'open') return;
+    clearTimeout(failure.timer);
+    void this.#attempt(consumer, this.#generation);
+  }
+
   request<T = unknown>(method: string, params: unknown): Promise<T> {
     if (!this.#conn) return Promise.reject(new Error('Not connected'));
     return this.#conn.request<T>(method, params);

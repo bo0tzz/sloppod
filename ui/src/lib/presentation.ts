@@ -221,6 +221,14 @@ export function hasInput(rawInput: unknown): boolean {
   return typeof rawInput !== 'object' || Object.keys(rawInput).length > 0;
 }
 
+/** What each built-in capability lets a session do, in the words the session's own grants list uses. */
+export const capabilityDescriptions: Record<string, string> = {
+  github:
+    "GitHub's API and git: reads of public repositories and the ones granted, pushes to the session's own branches. Other writes go through proposals.",
+  packages: 'Package registries and tool downloads (crates.io, npm, PyPI, Go, GitHub releases, mise and others).',
+  codex: "Codex's API on chatgpt.com, with your ChatGPT login.",
+};
+
 export type CredentialKindSpec = {
   kind: CredentialKind;
   title: string;

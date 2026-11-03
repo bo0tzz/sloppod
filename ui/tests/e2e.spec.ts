@@ -729,6 +729,75 @@ test('reconnects after the socket drops without duplicating history', async ({ p
   await expect(permissionCard(page)).toBeVisible();
 });
 
+test('a dropped connection leaves the state unknown, with a way to retry at once', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  const sockets: PageSocket[] = [];
+  page.on('websocket', (socket) => sockets.push(socket));
+  const prompt = 'Say something, the connection will drop';
+  await createSession(page, prompt);
+  await finishTurn(page);
+  const row = page.getByRole('navigation', { name: 'Sessions' }).getByTestId('session-row').filter({ hasText: prompt });
+  await expect(phase(page)).toHaveText('Idle');
+  await expect(row.getByTestId('phase')).toHaveText('Idle');
+
+  // Down for a while: neither the header nor the sidebar says Idle meanwhile.
+  const attemptsBefore = sockets.length;
+  await page.request.post('/_mock/drop?for=8000');
+  const banner = page.getByTestId('reconnecting');
+  await expect(banner).toContainText('Connection lost, reconnecting');
+  await expect(phase(page)).toHaveText('Unknown');
+  await expect(row.getByTestId('phase')).toHaveText('Unknown');
+  await expect(banner.getByRole('button', { name: 'Retry now' })).toBeVisible();
+
+  // The automatic attempts back off (0.5, 1, 2 s…): once three have been refused the next is more than two seconds
+  // off. Retrying starts one at once, instead of waiting that out.
+  await expect.poll(() => sockets.length).toBeGreaterThanOrEqual(attemptsBefore + 3);
+  const attempts = sockets.length;
+  await banner.getByRole('button', { name: 'Retry now' }).click();
+  await expect.poll(() => sockets.length, { timeout: 1000 }).toBeGreaterThan(attempts);
+  // Once the runtime takes a connection, the states are back.
+  await expect(banner).toBeHidden({ timeout: 20_000 });
+  await expect(phase(page)).toHaveText('Idle');
+  await expect(row.getByTestId('phase')).toHaveText('Idle');
+});
+
+test('Retry now also tries a session whose load failed on a connection that is up', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  const prompt = 'Say something, its load will fail once reconnected';
+  await createSession(page, prompt);
+  await finishTurn(page);
+
+  const loads: number[] = [];
+  page.on('websocket', (socket) =>
+    socket.on('framesent', ({ payload }) => {
+      if (JSON.parse(String(payload)).method === 'session/load') loads.push(Date.now());
+    }),
+  );
+  // The reconnect comes back up, but the runtime can't read the session: the load fails, and retries back off (1 s, 2 s…).
+  await page.request.post('/_mock/fail-loads?for=60000');
+  await page.request.post('/_mock/drop');
+  const banner = page.getByTestId('reconnecting');
+  await expect(banner).toBeVisible();
+  await expect.poll(() => loads.length).toBeGreaterThanOrEqual(2);
+
+  // The runtime can read it again, and the next automatic try is about two seconds off: Retry now doesn't wait for it.
+  await page.request.post('/_mock/fail-loads?for=0');
+  const before = loads.length;
+  await banner.getByRole('button', { name: 'Retry now' }).click();
+  await expect.poll(() => loads.length, { timeout: 800 }).toBeGreaterThan(before);
+  await expect(banner).toBeHidden({ timeout: 3000 });
+  await expect(phase(page)).toHaveText('Idle');
+});
+
+test('a stopped session says that a message does not start it again', async ({ page }) => {
+  const sessions: { id: string; title: string }[] = await (await page.request.get('/api/v1/sessions')).json();
+  const stopped = sessions.find((candidate) => candidate.title === 'Summarise the namespace resolution rules')!;
+  await page.goto(`/sessions/${stopped.id}`);
+  await expect(phase(page)).toHaveAttribute('data-phase', 'stopped');
+  await expect(page.getByTestId('composer-hint')).toContainText('does not start it again');
+  await expect(page.getByTestId('composer-hint')).toContainText('Start a new session');
+});
+
 test('the sidebar shows a redeployed runtime once the connection is back', async ({ page }) => {
   await createSession(page, 'Reconnect me in sloppod');
   await finishTurn(page);
@@ -1099,6 +1168,10 @@ test('the new-session page suggests a starting set, and sends the one the user e
   }
   // Docs come with every session, so there's nothing to choose.
   await expect(card.getByTestId('capability-docs')).toHaveCount(0);
+  // Each says what it gives, and nothing claims to be matched from a message that isn't there yet.
+  await expect(card.getByTestId('capability-github').getByTestId('capability-description')).toContainText('GitHub');
+  await expect(card.getByTestId('capability-packages').getByTestId('capability-description')).toContainText('Package registries');
+  await expect(card.getByTestId('starting-source')).toHaveText('');
 
   const box = page.getByRole('textbox', { name: 'Prompt' });
   await box.fill('Fix the build in bo0tzz/sloppod');
@@ -2205,6 +2278,9 @@ test('grants, narrows, times and revokes the grants of a running session', async
   const codex = grants.getByTestId('grant-codex');
   await expect(codex).toContainText("Codex's API");
   await expect(codex).toContainText('Runs out');
+  // One that doesn't run out says so, rather than saying nothing.
+  await expect(grants.getByTestId('grant-packages')).toContainText("Doesn't run out");
+  await expect(codex).not.toContainText("Doesn't run out");
 
   const repo = grants.getByTestId('grant-repo');
   await repo.getByRole('button', { name: 'Make read only' }).click();
@@ -3567,8 +3643,9 @@ test('a list fetched before a push does not undo it', async ({ page }) => {
   const proposals: { id: string; status: string }[] = await (await page.request.get(`/api/v1/proposals?session=${id}`)).json();
   const pending = proposals.find((proposal) => proposal.status === 'pending')!;
   await page.request.post(`/api/v1/proposals/${pending.id}/reject`, { data: {} });
-  // Idle again once the agent has taken the decision, so the badge is the only thing a stale copy could bring back.
-  await expect(row.getByTestId('phase')).toHaveText('Idle');
+  // Idle again once the agent has taken the decision, so the badge is the only thing a stale copy could bring back. The
+  // label says Unknown meanwhile: the list's fetch, held, keeps the connection coming up. The phase itself is read.
+  await expect(row.getByTestId('phase')).toHaveAttribute('data-phase', 'idle');
   hold();
   await done;
   // Long enough for the list to have been applied; not retried, as a badge that came back would only go with a fetch.

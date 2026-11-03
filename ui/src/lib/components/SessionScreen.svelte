@@ -368,7 +368,7 @@
     <ChatHeader {title} subtitle={session ? (session.repo ?? 'No repository') : undefined} mono={Boolean(session?.repo)}>
       {#snippet actions()}
         {#if session}
-          <PhaseBadge phase={session.phase} commands={session.commands} commandLines={session.command_lines} waiting={waitingOnYou} />
+          <PhaseBadge phase={session.phase} commands={session.commands} commandLines={session.command_lines} waiting={waitingOnYou} unknown={showReconnecting} />
         {/if}
         <IconButton
           icon={mdiSourcePull}
@@ -433,6 +433,7 @@
       >
         <LoadingSpinner size="tiny" />
         Connection lost, reconnecting…
+        <button type="button" class="font-medium underline" onclick={() => view.retryNow()}>Retry now</button>
       </div>
     {/if}
 
