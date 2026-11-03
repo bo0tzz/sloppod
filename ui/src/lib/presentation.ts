@@ -11,6 +11,7 @@ import {
   mdiDeleteOutline,
   mdiFileDocumentOutline,
   mdiFileMoveOutline,
+  mdiFileTreeOutline,
   mdiLightbulbOutline,
   mdiMagnify,
   mdiPencilOutline,
@@ -21,7 +22,7 @@ import {
 } from '@mdi/js';
 import type { Color } from '@immich/ui';
 import type { ConfigSelectGroup, ConfigSelectOption, PlanEntry, ToolCallStatus, ToolKind } from './acp/types.ts';
-import type { CredentialKind, Grant, Phase, Proposal, ProposalStatus } from './api.ts';
+import type { CredentialKind, Grant, Phase, Proposal, ProposalStatus, WorkPlanChange } from './api.ts';
 import { timeAgo } from './format.ts';
 
 export const phases: Record<Phase, { label: string; color: Color; description: string }> = {
@@ -85,6 +86,7 @@ export const proposalKinds: Record<string, { title: string; plural: string; exec
   'sloppod.repo.act_as_owner': { title: 'Acting as you', plural: 'Acting as you', executed: 'Granted' },
   'sloppod.session.report': { title: 'Report to the parent session', plural: 'Reports', executed: 'Delivered' },
   'sloppod.code_review': { title: 'Code review', plural: 'Code reviews', executed: 'Reviewed' },
+  'sloppod.work.plan': { title: 'Work plan', plural: 'Work plans', executed: 'Changed' },
 };
 
 export function proposalStatus(proposal: Proposal): { label: string; color: Color } {
@@ -162,8 +164,16 @@ export function proposalSummary(proposal: Proposal): { label: string; title: str
         detail: payloadText(payload.reason) || undefined,
         icon: mdiSourceRepository,
       };
+    case 'sloppod.work.plan':
+      return {
+        label: 'Work plan',
+        title: `Plan for ${payloadText(payload.graph_name)}: ${planCounts(planChanges(proposal))}`,
+        detail: payloadText(payload.reason) || undefined,
+        icon: mdiFileTreeOutline,
+      };
     default:
-      return { label: 'Proposal', title: proposal.kind, icon: mdiHelpCircleOutline };
+      // A kind this UI doesn't know yet reads by the runtime's own summary of it.
+      return { label: 'Proposal', title: proposal.summary || proposal.kind, icon: mdiHelpCircleOutline };
   }
 }
 
@@ -329,4 +339,31 @@ export function tokenExpiry(expiresAt: string | null, now = Date.now()): { text:
   const left = Date.parse(expiresAt) - now;
   if (left <= 0) return { text: `Expired ${timeAgo(expiresAt, now)}`, level: 'expired' };
   return { text: `Expires ${timeAgo(expiresAt, now)}`, level: left < 7 * 24 * 3600_000 ? 'soon' : 'ok' };
+}
+
+/** The changes a `sloppod.work.plan` proposal makes. */
+export function planChanges(proposal: Proposal): WorkPlanChange[] {
+  return Array.isArray(proposal.payload.changes) ? (proposal.payload.changes as WorkPlanChange[]) : [];
+}
+
+/** What a plan does, counted: "move 1 item, drop 2". */
+export function planCounts(changes: WorkPlanChange[]): string {
+  const counted = (['move', 'drop', 'reopen'] as const)
+    .map((action) => [action, changes.filter((c) => c.action === action).length] as const)
+    .filter(([, count]) => count > 0);
+  return counted.map(([action, count], i) => `${action} ${count}${i === 0 ? ` item${count === 1 ? '' : 's'}` : ''}`).join(', ');
+}
+
+/** One change of a plan in words. `titles` names the items a move points at, by id. */
+export function planChangeText(change: WorkPlanChange, titles: Map<string, string>): string {
+  const quoted = `“${change.title}”`;
+  if (change.action === 'drop') return `Drop ${quoted}`;
+  if (change.action === 'reopen') return `Reopen ${quoted}`;
+  const named = (id: string) => `“${titles.get(id) ?? 'an item'}”`;
+  const parent = change.parent_id === undefined ? undefined : change.parent_id === null ? 'the top level' : named(change.parent_id);
+  let where: string;
+  if (change.after === null) where = parent ? `to the top of ${parent}` : 'to the top';
+  else if (change.after !== undefined) where = `after ${named(change.after)}${parent ? ` in ${parent}` : ''}`;
+  else where = parent ? `to the end of ${parent}` : 'to the end';
+  return `Move ${quoted} ${where}`;
 }

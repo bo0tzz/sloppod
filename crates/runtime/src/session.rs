@@ -360,6 +360,8 @@ pub type LimitHit =
 pub struct Hub {
     store: Arc<dyn SessionStore>,
     waker: StdMutex<Option<Waker>>,
+    /// The proposal kinds, for the summary each proposal goes out with.
+    proposal_kinds: StdMutex<Option<crate::proposals::ProposalKinds>>,
     turn_ended: StdMutex<Option<TurnEnded>>,
     usage_seen: StdMutex<Option<UsageSeen>>,
     sessions: StdMutex<HashMap<Uuid, Arc<Live>>>,
@@ -418,6 +420,7 @@ impl Hub {
         Self {
             store,
             waker: StdMutex::default(),
+            proposal_kinds: StdMutex::default(),
             turn_ended: StdMutex::default(),
             usage_seen: StdMutex::default(),
             sessions: StdMutex::default(),
@@ -462,6 +465,10 @@ impl Hub {
                 .collect(),
             None => blocks,
         }
+    }
+
+    pub fn set_proposal_kinds(&self, kinds: crate::proposals::ProposalKinds) {
+        *self.proposal_kinds.lock().expect("hub lock") = Some(kinds);
     }
 
     pub fn set_waker(&self, waker: Waker) {
@@ -569,6 +576,10 @@ impl Hub {
     }
 
     pub fn broadcast_proposal(&self, proposal: &Proposal) {
+        let proposal = match &*self.proposal_kinds.lock().expect("hub lock") {
+            Some(kinds) => kinds.summarized(proposal.clone()),
+            None => proposal.clone(),
+        };
         self.broadcast(
             proposal.session_id,
             UiEvent::Notification {

@@ -14,7 +14,7 @@ import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { formatPatch, structuredPatch } from 'diff';
 import { WebSocketServer } from 'ws';
-import { handleWork, workGraphs } from './work.mjs';
+import { handleWork, itemsOf, workGraphs } from './work.mjs';
 
 const { values: args } = parseArgs({
   options: {
@@ -691,6 +691,55 @@ async function agentScript(session, turn, prompt) {
       content: [{ type: 'content', content: { type: 'text', text: `Proposal ${proposal.id} created and waiting for human review.` } }],
     });
     await say("I've proposed three issues for the backlog. They're filed once you approve them.");
+    return;
+  }
+
+  if (/plan the work/i.test(prompt)) {
+    await step(2);
+    const graph = workGraphs[0];
+    const [parent, moving, dropping] = itemsOf(graph.id).slice(-3);
+    if (!dropping) {
+      await say('The work graph needs three items before I can plan anything.');
+      return;
+    }
+    const proposal = {
+      id: randomUUID(),
+      session_id: session.data.id,
+      kind: 'sloppod.work.plan',
+      status: 'pending',
+      payload: {
+        graph: graph.id,
+        graph_name: graph.name,
+        changes: [
+          { item: moving.id, title: moving.title, action: 'move', parent_id: parent.id, after: null },
+          { item: dropping.id, title: dropping.title, action: 'drop' },
+        ],
+        reason: 'The parser comes first now, and the old exporter is superseded.',
+      },
+      summary: `2 changes to the work graph ${graph.name}`,
+      created_at: now(),
+    };
+    proposals.set(proposal.id, proposal);
+    broadcastProposal(proposal);
+    await say("I've proposed a change to the plan.");
+    return;
+  }
+
+  // A kind this UI doesn't render: it reads by the summary the runtime gives every proposal.
+  if (/propose something new/i.test(prompt)) {
+    await step(2);
+    const proposal = {
+      id: randomUUID(),
+      session_id: session.data.id,
+      kind: 'sloppod.example.future',
+      status: 'pending',
+      payload: { thing: 'a widget' },
+      summary: 'a widget for the future',
+      created_at: now(),
+    };
+    proposals.set(proposal.id, proposal);
+    broadcastProposal(proposal);
+    await say("I've proposed something this UI hasn't seen before.");
     return;
   }
 
