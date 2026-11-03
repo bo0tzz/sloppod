@@ -438,3 +438,6 @@ export async function handleWork(req, res, parts, { json, readBody, user }) {
     return inverse;
   }
 }
+
+/** A graph's items, oldest first, for the mock agent's plan proposals. */
+export const itemsOf = (graph) => graphItems(graph).map(view);

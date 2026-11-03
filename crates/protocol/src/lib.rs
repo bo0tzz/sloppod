@@ -314,6 +314,9 @@ pub mod api {
         /// The session reviewing it, or that did (ADR 24).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub review_session_id: Option<Uuid>,
+        /// What it does, in a line: its kind's own summary, for a UI that doesn't know the kind.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub summary: Option<String>,
     }
 
     /// One round of a proposal's review by another model (ADR 24).

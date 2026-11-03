@@ -2969,3 +2969,37 @@ test('what is typed while the instructions save is kept', async ({ page }) => {
   await page.unroute('**/api/v1/settings');
   await page.request.put('/api/v1/settings', { data: { instructions: null } });
 });
+
+test('a work-plan proposal reads as what it changes', async ({ page }) => {
+  const graph = '0192f000-0000-7000-8000-000000000001';
+  const add = async (title: string) => {
+    const created = await page.request.post(`/api/v1/work/graphs/${graph}/items`, { data: { title } });
+    expect(created.status()).toBe(201);
+  };
+  for (const title of ['Parser work', 'Write the parser', 'Old exporter']) await add(title);
+  await createSession(page, 'Plan the work');
+
+  const card = page.getByTestId('proposal-card');
+  await expect(card.getByTestId('proposal-card-title')).toHaveText('Plan for sloppod: move 1 item, drop 1');
+  await expect(card).toContainText('Work plan');
+  await expect(card).toContainText('The parser comes first now');
+  await card.getByRole('button', { name: 'Review' }).click();
+
+  const dialog = page.getByRole('dialog');
+  await expect(dialog.getByTestId('proposal-title')).toHaveText('Plan for sloppod: move 1 item, drop 1');
+  await expect(dialog.getByTestId('proposal-reason')).toHaveText('The parser comes first now, and the old exporter is superseded.');
+  await expect(dialog.getByTestId('plan-change')).toHaveText(['Move “Write the parser” to the top of “Parser work”', 'Drop “Old exporter”']);
+  await expect(dialog.getByTestId('proposal-payload')).toHaveCount(0);
+});
+
+test('a proposal of a kind the UI does not know reads by its summary', async ({ page }) => {
+  await createSession(page, 'Propose something new');
+
+  const card = page.getByTestId('proposal-card');
+  await expect(card.getByTestId('proposal-card-title')).toHaveText('a widget for the future');
+  await card.getByRole('button', { name: 'Review' }).click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog.getByTestId('proposal-title')).toHaveText('a widget for the future');
+  await expect(dialog.getByTestId('proposal-payload')).toContainText('a widget');
+  await expect(dialog).not.toContainText('sloppod.example.future');
+});
