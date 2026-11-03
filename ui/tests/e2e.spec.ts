@@ -3169,3 +3169,61 @@ test('an idle session with commands running shows it is waiting on them', async 
   await expect(header).toHaveText('Idle');
   await expect(row.getByTestId('phase')).toHaveText('Idle');
 });
+
+test('an idle session with a proposal or a question waiting shows it is waiting on you', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  await createSession(page, 'Propose a PR for sloppod, the one to wait on');
+  await finishTurn(page);
+  const sidebar = page.getByRole('navigation', { name: 'Sessions' });
+  const row = sidebar.getByTestId('session-row').filter({ hasText: 'Propose a PR for sloppod, the one to wait on' });
+  await expect(row.getByTestId('phase')).toHaveText('Waiting on you');
+  await expect(row.getByTestId('phase')).toHaveAttribute('data-phase', 'idle');
+  await expect(row.getByTestId('phase')).toHaveAttribute('title', /1 proposal/);
+
+  // The home page says so too.
+  await page.goto('/');
+  await expect(page.getByTestId('session-row').filter({ hasText: 'Propose a PR for sloppod, the one to wait on' }).getByTestId('phase').first()).toHaveText(
+    'Waiting on you',
+  );
+
+  // Decided, it's idle.
+  await page.getByTestId('session-row').filter({ hasText: 'Propose a PR for sloppod, the one to wait on' }).first().click();
+  await page.getByTestId('proposal-card').getByRole('button', { name: 'Review' }).click();
+  await page.getByRole('button', { name: 'Reject…' }).click();
+  await page.getByRole('button', { name: 'Reject', exact: true }).click();
+  await expect(row.getByTestId('phase')).toHaveText('Idle');
+
+  // An ask_user question, which outlives the turn.
+  await createSession(page, 'Use ask_user about the retry budget');
+  await expect(phase(page)).toHaveAttribute('data-phase', 'working');
+  await page.getByRole('button', { name: 'Stop' }).click();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+  const asked = sidebar.getByTestId('session-row').filter({ hasText: 'Use ask_user about the retry budget' });
+  await expect(asked.getByTestId('phase')).toHaveText('Waiting on you');
+  await expect(asked.getByTestId('phase')).toHaveAttribute('title', /1 question/);
+});
+
+test('arrow keys move between the rows of the session list', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  await createSession(page, 'First session about arrows');
+  await finishTurn(page);
+  await createSession(page, 'Second session about arrows');
+  await finishTurn(page);
+  await createSession(page, 'Third session about arrows');
+  await finishTurn(page);
+  const rows = page.getByRole('navigation', { name: 'Sessions' }).getByTestId('session-row').filter({ hasText: 'session about arrows' });
+  await expect(rows).toHaveCount(3);
+
+  await rows.first().focus();
+  await page.keyboard.press('ArrowDown');
+  await expect(rows.nth(1)).toBeFocused();
+  await page.keyboard.press('ArrowDown');
+  await expect(rows.nth(2)).toBeFocused();
+  await page.keyboard.press('ArrowUp');
+  await expect(rows.nth(1)).toBeFocused();
+  await page.keyboard.press('ArrowUp');
+  await expect(rows.first()).toBeFocused();
+  // The newest session is the first of the list: nothing above it.
+  await page.keyboard.press('ArrowUp');
+  await expect(rows.first()).toBeFocused();
+});

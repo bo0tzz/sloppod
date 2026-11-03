@@ -59,6 +59,18 @@ const sha = () => randomBytes(20).toString('hex');
 class MockSession {
   constructor(data) {
     this.data = data;
+    // What waits on the user, as the runtime counts it on the session (#368); read when the session is sent.
+    Object.defineProperty(data, 'waiting', {
+      enumerable: true,
+      get: () => {
+        const pending = [...this.pending.values()];
+        return {
+          proposals: [...proposals.values()].filter((p) => p.session_id === data.id && p.status === 'pending').length,
+          questions: pending.filter((p) => p.method === 'elicitation/create').length,
+          permissions: pending.filter((p) => p.method !== 'elicitation/create').length,
+        };
+      },
+    });
     /** Every `session/update` params object, replayed by `session/load`. */
     this.log = [];
     /** @type {Set<Connection>} */
@@ -444,6 +456,7 @@ function requestFromUser(session, { method, params, toolCallId, cancelled, block
     const pending = { method, params, toolCallId, cancelled, blocking, resolve, requests: new Map() };
     session.pending.set(pending, pending);
     if (blocking) session.setPhase('waiting');
+    else session.broadcast();
     for (const conn of session.subscribers) sendPending(session, pending, conn);
   });
 }
@@ -476,6 +489,7 @@ function resolvePending(session, pending, result) {
   pending.requests.clear();
   const blocked = [...session.pending.values()].some((other) => other.blocking);
   if (session.data.phase === 'waiting' && !blocked) session.setPhase('working');
+  else session.broadcast();
   pending.resolve(result);
 }
 
@@ -1232,6 +1246,7 @@ function publicProposal(proposal) {
 function broadcastProposal(proposal) {
   const session = sessions.get(proposal.session_id);
   for (const conn of session?.subscribers ?? []) conn.notify('_sloppod/proposal', { proposal: publicProposal(proposal) });
+  session?.broadcast();
 }
 
 const availableRepos = () => (credentials.some((c) => c.kind === 'github-app') ? REPOS : []);

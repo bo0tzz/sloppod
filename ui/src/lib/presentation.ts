@@ -22,7 +22,7 @@ import {
 } from '@mdi/js';
 import type { Color } from '@immich/ui';
 import type { ConfigSelectGroup, ConfigSelectOption, PlanEntry, ToolCallStatus, ToolKind } from './acp/types.ts';
-import type { CredentialKind, Grant, Phase, Proposal, ProposalStatus, WorkPlanChange } from './api.ts';
+import type { CredentialKind, Grant, Phase, Proposal, ProposalStatus, Waiting, WorkPlanChange } from './api.ts';
 import { timeAgo } from './format.ts';
 
 export const phases: Record<Phase, { label: string; color: Color; description: string }> = {
@@ -35,17 +35,30 @@ export const phases: Record<Phase, { label: string; color: Color; description: s
   stopped: { label: 'Stopped', color: 'secondary', description: 'The session has stopped' },
 };
 
+const plural = (count: number, one: string, many: string) => `${count} ${count === 1 ? one : many}`;
+
 /**
- * How a session's phase shows. An idle session whose agent still has commands running (a test run, a build) is
+ * How a session's phase shows. A session that's idle but has a proposal or a question open for the user is waiting on
+ * them, not doing nothing (#368). An idle session whose agent still has commands running (a test run, a build) is
  * waiting on them, not doing nothing (#413); hovering lists their command lines when the runtime has them.
  */
 export function phaseShown(
   phase: Phase,
   commands: number | null | undefined,
   commandLines: string[] | undefined,
+  waiting?: Waiting,
 ): { label: string; color: Color; description: string } {
   const info = phases[phase] ?? { label: phase, color: 'secondary' as Color, description: '' };
-  if (phase !== 'idle' || !commands) return info;
+  if (phase !== 'idle') return info;
+  const open = [
+    waiting?.proposals ? plural(waiting.proposals, 'proposal', 'proposals') : '',
+    waiting?.questions ? plural(waiting.questions, 'question', 'questions') : '',
+    waiting?.permissions ? plural(waiting.permissions, 'permission request', 'permission requests') : '',
+  ].filter(Boolean);
+  if (open.length > 0) {
+    return { label: 'Waiting on you', color: 'warning', description: `Waiting for you: ${open.join(', ')}` };
+  }
+  if (!commands) return info;
   const lines = commandLines?.length ? `:\n${commandLines.join('\n')}` : '';
   return {
     label: `Waiting on ${commands} ${commands === 1 ? 'command' : 'commands'}`,

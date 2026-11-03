@@ -31,6 +31,18 @@ export type Session = {
   commands?: number | null;
   /** Those commands' command lines, when the runtime has them. */
   command_lines?: string[];
+  /** What waits on the user in the session (#368). */
+  waiting?: Waiting;
+};
+
+/** What a session has open for the user to answer. */
+export type Waiting = {
+  /** Proposals awaiting a decision. */
+  proposals: number;
+  /** Questions from the agent. */
+  questions: number;
+  /** The agent's permission requests. */
+  permissions: number;
 };
 
 export type NewSession = {

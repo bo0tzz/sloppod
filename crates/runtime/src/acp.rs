@@ -254,13 +254,17 @@ impl Conn {
         let sessions = db::list_sessions(&self.state.db, &self.user)
             .await
             .map_err(internal)?;
-        Ok(json!({"sessions": sessions.iter().map(|s| json!({
-            "sessionId": s.id,
-            "cwd": "/",
-            "title": s.title,
-            "updatedAt": s.updated_at.to_rfc3339(),
-            "_meta": {"sloppod": self.state.hub.session_api(s)},
-        })).collect::<Vec<_>>()}))
+        let mut listed = Vec::new();
+        for s in &sessions {
+            listed.push(json!({
+                "sessionId": s.id,
+                "cwd": "/",
+                "title": s.title,
+                "updatedAt": s.updated_at.to_rfc3339(),
+                "_meta": {"sloppod": self.state.hub.session_api(s).await},
+            }));
+        }
+        Ok(json!({"sessions": listed}))
     }
 
     async fn handle_response(&self, message: &Value) {

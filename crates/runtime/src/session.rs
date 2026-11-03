@@ -291,6 +291,16 @@ impl LiveState {
 }
 
 impl Live {
+    /// Records how many questions and permission requests `state` has open, for [`Hub::session_api`].
+    fn sync_asks(&self, state: &LiveState) {
+        let questions = state
+            .permissions
+            .values()
+            .filter(|p| p.method == "elicitation/create")
+            .count();
+        *self.asks.lock().expect("hub lock") = (questions, state.permissions.len() - questions);
+    }
+
     /// How many of the agent's commands are running, if its supervisor says.
     fn running_commands(&self) -> Option<usize> {
         self.commands
@@ -323,6 +333,9 @@ pub struct Live {
     /// The agent's running commands, as its supervisor last said; `None` until it says, and from supervisors that
     /// don't. Apart from `state`, so the session can be read while that's held (#413).
     commands: StdMutex<Option<RunningCommands>>,
+    /// How many questions and permission requests are open, as `state.permissions` last said; kept apart for the
+    /// same reason as `commands` (#368).
+    asks: StdMutex<(usize, usize)>,
 }
 
 /// How many of the agent's commands are running, and their command lines when its supervisor sends them.
@@ -537,6 +550,7 @@ impl Hub {
                     boundary: Notify::new(),
                     heard_at: StdMutex::default(),
                     commands: StdMutex::default(),
+                    asks: StdMutex::default(),
                 })
             })
             .clone()
@@ -575,7 +589,7 @@ impl Hub {
                     seq: None,
                     message: notification(
                         "_sloppod/session",
-                        json!({"session": self.session_api(&row)}),
+                        json!({"session": self.session_api(&row).await}),
                     ),
                 },
             );
@@ -591,7 +605,7 @@ impl Hub {
                     seq: None,
                     message: notification(
                         "_sloppod/session",
-                        json!({"session": self.session_api(&row)}),
+                        json!({"session": self.session_api(&row).await}),
                     ),
                 },
             );
@@ -664,7 +678,9 @@ impl Hub {
             *live.commands.lock().expect("hub lock") = None;
             live.end_work(&mut state);
             // The new link reports the requests the agent still has open, and they're asked again under it.
-            take_agent_permissions(&mut state)
+            let resolved = take_agent_permissions(&mut state);
+            live.sync_asks(&state);
+            resolved
         };
         self.resolve_permissions(id, resolved);
     }
@@ -710,19 +726,26 @@ impl Hub {
 
     /// The session as the API and its UIs see it: its row, with what's only known live, the agent's running
     /// commands (#413).
-    pub fn session_api(&self, row: &crate::db::SessionRow) -> sloppod_protocol::api::Session {
+    pub async fn session_api(&self, row: &crate::db::SessionRow) -> sloppod_protocol::api::Session {
         let mut session = row.to_api();
+        session.waiting.proposals = self.store.pending_proposals(row.id).await.unwrap_or_else(|e| {
+            tracing::warn!(session = %row.id, error = %e, "counting the session's pending proposals");
+            0
+        });
         let live = self
             .sessions
             .lock()
             .expect("hub lock")
             .get(&row.id)
             .cloned();
-        if let Some(commands) =
-            live.and_then(|live| live.commands.lock().expect("hub lock").clone())
-        {
-            session.commands = Some(commands.running);
-            session.command_lines = commands.lines;
+        if let Some(live) = live {
+            let (questions, permissions) = *live.asks.lock().expect("hub lock");
+            session.waiting.questions = questions;
+            session.waiting.permissions = permissions;
+            if let Some(commands) = live.commands.lock().expect("hub lock").clone() {
+                session.commands = Some(commands.running);
+                session.command_lines = commands.lines;
+            }
         }
         session
     }
@@ -1321,7 +1344,9 @@ impl Hub {
             *live.commands.lock().expect("hub lock") = None;
             live.end_work(&mut state);
             self.set_phase(id, Phase::Disconnected).await;
-            take_agent_permissions(&mut state)
+            let resolved = take_agent_permissions(&mut state);
+            live.sync_asks(&state);
+            resolved
         };
         self.resolve_permissions(id, resolved);
     }
@@ -1428,6 +1453,7 @@ impl Hub {
                     },
                 },
             );
+            live.sync_asks(&state);
             self.set_phase(id, Phase::Waiting).await;
             pid
         };
@@ -1439,6 +1465,7 @@ impl Hub {
                 params,
             },
         );
+        self.broadcast_session(id).await;
     }
 
     /// The first answer to a permission request wins; later ones are ignored. `by` says who answered, for the log.
@@ -1453,6 +1480,7 @@ impl Hub {
             let live = self.live(id);
             let mut state = live.state.lock().await;
             let permission = state.permissions.remove(&pid);
+            live.sync_asks(&state);
             let blocked = |p: &Permission| matches!(p.asker, Asker::Agent { .. });
             let agent_asked = permission.as_ref().is_some_and(blocked);
             if agent_asked {
@@ -1472,6 +1500,7 @@ impl Hub {
             tracing::debug!(session = %id, permission = pid, by, "ignoring an answer to a settled permission request");
             return;
         };
+        self.broadcast_session(id).await;
         let tool_call_id = tool_call_id(&permission.params);
         tracing::info!(
             session = %id,
@@ -2256,8 +2285,10 @@ impl Hub {
                     asker: Asker::Tool { key, questions },
                 },
             );
+            live.sync_asks(&state);
             pid
         };
+        self.broadcast_session(id).await;
         self.broadcast(
             id,
             UiEvent::PermissionRequest {
@@ -2333,14 +2364,16 @@ impl Hub {
     /// Keeps when a session waiting for its usage limit carries on, and tells the UIs; under the state lock.
     /// Ends the session's wait for its usage limit at `at`, and a review round's it works on, in one write.
     async fn end_limit(&self, id: Uuid, at: DateTime<Utc>) {
-        self.limit_saved(id, self.store.end_limit(id, at).await);
+        self.limit_saved(id, self.store.end_limit(id, at).await)
+            .await;
     }
 
     async fn save_limit(&self, id: Uuid, until: Option<DateTime<Utc>>) {
-        self.limit_saved(id, self.store.set_limited_until(id, until).await);
+        self.limit_saved(id, self.store.set_limited_until(id, until).await)
+            .await;
     }
 
-    fn limit_saved(&self, id: Uuid, saved: sqlx::Result<Option<crate::db::SessionRow>>) {
+    async fn limit_saved(&self, id: Uuid, saved: sqlx::Result<Option<crate::db::SessionRow>>) {
         match saved {
             Ok(Some(row)) => self.broadcast(
                 id,
@@ -2348,7 +2381,7 @@ impl Hub {
                     seq: None,
                     message: notification(
                         "_sloppod/session",
-                        json!({"session": self.session_api(&row)}),
+                        json!({"session": self.session_api(&row).await}),
                     ),
                 },
             ),

@@ -1,16 +1,17 @@
 <script lang="ts">
   import { Badge } from '@immich/ui';
-  import type { Phase } from '#lib/api.ts';
+  import type { Phase, Waiting } from '#lib/api.ts';
   import { phaseShown } from '#lib/presentation.ts';
 
   let {
     phase,
     commands = null,
     commandLines = [],
+    waiting,
     size = 'tiny',
-  }: { phase: Phase; commands?: number | null; commandLines?: string[]; size?: 'tiny' | 'small' } = $props();
+  }: { phase: Phase; commands?: number | null; commandLines?: string[]; waiting?: Waiting; size?: 'tiny' | 'small' } = $props();
 
-  const info = $derived(phaseShown(phase, commands, commandLines));
+  const info = $derived(phaseShown(phase, commands, commandLines, waiting));
   const live = $derived(phase === 'working' || phase === 'starting');
 </script>
 

@@ -237,18 +237,16 @@ pub async fn list(state: &AppState, parent: Uuid) -> Result<String, String> {
     let children = db::children(&state.db, parent)
         .await
         .map_err(|e| e.to_string())?;
-    let children: Vec<Value> = children
-        .iter()
-        .map(|child| {
-            let api = state.hub.session_api(child);
-            json!({
+    let mut listed = Vec::new();
+    for child in &children {
+        let api = state.hub.session_api(child).await;
+        listed.push(json!({
                 "id": child.id, "title": child.title, "phase": child.phase, "model": child.model, "repo": api.repo,
                 "branch": api.branch, "doing": doing(api.phase, api.commands), "commands": api.commands,
                 "command_lines": api.command_lines,
-            })
-        })
-        .collect();
-    Ok(Value::Array(children).to_string())
+            }));
+    }
+    Ok(Value::Array(listed).to_string())
 }
 
 /// `message_session`: a message from `from` to its parent or one of its children, delivered as a notice. A parked

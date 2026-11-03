@@ -939,13 +939,13 @@ async fn running_commands_are_known_from_the_current_agent_only() {
 async fn the_session_shows_its_running_commands_and_its_uis_hear_when_they_change() {
     let h = Harness::ready().await;
     let row = h.store.get_session(h.id).await.unwrap().unwrap();
-    let shown = h.hub.session_api(&row);
+    let shown = h.hub.session_api(&row).await;
     assert_eq!((shown.commands, shown.command_lines.len()), (None, 0));
 
     let mut events = h.hub.subscribe(h.id);
     let lines = vec!["cargo test".to_owned(), "npm run build".to_owned()];
     h.hub.set_commands(h.id, &h.agent, 2, lines.clone()).await;
-    let shown = h.hub.session_api(&row);
+    let shown = h.hub.session_api(&row).await;
     assert_eq!(
         (shown.commands, shown.command_lines),
         (Some(2), lines.clone())
@@ -965,7 +965,7 @@ async fn the_session_shows_its_running_commands_and_its_uis_hear_when_they_chang
     h.hub
         .attach_agent(h.id, Arc::new(AgentConn::new(mpsc::unbounded_channel().0)))
         .await;
-    assert_eq!(h.hub.session_api(&row).commands, None);
+    assert_eq!(h.hub.session_api(&row).await.commands, None);
 }
 
 #[tokio::test]
@@ -1784,12 +1784,17 @@ async fn a_question_from_ask_user_waits_for_its_answer_without_the_agent() {
     let replay = h.hub.replay(h.id).await.unwrap();
     let (pid, method, _) = replay.permissions.first().cloned().expect("the question");
     assert_eq!(method, "elicitation/create");
+    // The session says it's waiting on the user, though it's idle (#368).
+    let row = h.store.get_session(h.id).await.unwrap().unwrap();
+    let waiting = h.hub.session_api(&row).await.waiting;
+    assert_eq!((waiting.questions, waiting.permissions), (1, 0));
 
     // Answered, it reaches the agent as a notice.
     let answer = json!({"action": "accept", "content": {"question_0": "Fixed"}});
     h.hub
         .answer_permission(h.id, pid, Ok(answer), "a test")
         .await;
+    assert_eq!(h.hub.session_api(&row).await.waiting.questions, 0);
     // Past the cancel the agent was sent.
     let request = loop {
         let message = h.next().await;

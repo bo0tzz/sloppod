@@ -12,6 +12,10 @@ use crate::db::{self, SessionRow};
 #[async_trait]
 pub trait SessionStore: Send + Sync {
     async fn get_session(&self, id: Uuid) -> sqlx::Result<Option<SessionRow>>;
+    /// How many of the session's proposals wait on the user's decision.
+    async fn pending_proposals(&self, _id: Uuid) -> sqlx::Result<usize> {
+        Ok(0)
+    }
     async fn set_phase(&self, id: Uuid, phase: Phase) -> sqlx::Result<Option<SessionRow>>;
     async fn set_auto_title(&self, id: Uuid, title: &str) -> sqlx::Result<bool>;
     async fn set_session_model(&self, id: Uuid, model: &str) -> sqlx::Result<()>;
@@ -66,6 +70,10 @@ pub struct PgStore(pub PgPool);
 impl SessionStore for PgStore {
     async fn get_session(&self, id: Uuid) -> sqlx::Result<Option<SessionRow>> {
         db::get_session(&self.0, id).await
+    }
+
+    async fn pending_proposals(&self, id: Uuid) -> sqlx::Result<usize> {
+        db::pending_proposals(&self.0, id).await
     }
 
     async fn owner_zone(&self, owner: &str) -> sqlx::Result<chrono_tz::Tz> {
