@@ -912,6 +912,96 @@ impl GitHubApp {
             .context("commit without sha")
     }
 
+    /// Whether `branch` is on GitHub: a merged pull request's head is gone once GitHub deletes it.
+    pub async fn branch_exists(&self, repo: &str, branch: &str) -> anyhow::Result<bool> {
+        let response = self
+            .repo_get(
+                repo,
+                &format!("/branches/{}", branch_in_path(branch)),
+                "application/vnd.github+json",
+            )
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        response.error_for_status()?;
+        Ok(true)
+    }
+
+    /// The pull request from `branch` that merged last, if one did, as GitHub's REST API has it.
+    pub async fn merged_pull_from(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> anyhow::Result<Option<Value>> {
+        let pulls: Vec<Value> = self
+            .repo_json(
+                repo,
+                &format!(
+                    "/pulls{}",
+                    query(&[
+                        ("state", "closed"),
+                        ("head", &head_ref(repo, branch)),
+                        ("sort", "updated"),
+                        ("direction", "desc"),
+                    ])
+                ),
+            )
+            .await?;
+        Ok(pulls.into_iter().find(|p| p["merged_at"].is_string()))
+    }
+
+    /// Whether the commit `sha` is in `reference`'s history.
+    pub async fn contains(&self, repo: &str, reference: &str, sha: &str) -> anyhow::Result<bool> {
+        let info: Value = self
+            .repo_json(
+                repo,
+                &format!("/compare/{sha}...{}", branch_in_path(reference)),
+            )
+            .await?;
+        Ok(matches!(
+            info["status"].as_str(),
+            Some("ahead" | "identical")
+        ))
+    }
+
+    /// Merges `from` into the branch `into` with a merge commit, as `git merge` would: the commit `into` is at
+    /// afterwards, or `None` when they conflict.
+    pub async fn merge_into(
+        &self,
+        repo: &str,
+        into: &str,
+        from: &str,
+        message: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let token = self.token_for(repo).await?;
+        self.audit("POST", &format!("/repos/{repo}/merges"));
+        let response = self
+            .http
+            .post(self.url(&format!("/repos/{repo}/merges")))
+            .bearer_auth(token)
+            .header("accept", "application/vnd.github+json")
+            .json(&json!({"base": into, "head": from, "commit_message": message}))
+            .send()
+            .await?;
+        match response.status() {
+            reqwest::StatusCode::CONFLICT => Ok(None),
+            // Nothing to merge: `into` has it all already.
+            reqwest::StatusCode::NO_CONTENT => Ok(Some(self.branch_sha(repo, into).await?)),
+            status if status.is_success() => {
+                let body: Value = response.json().await?;
+                Ok(body["sha"].as_str().map(str::to_owned))
+            }
+            status => {
+                let body: Value = response.json().await.unwrap_or(Value::Null);
+                bail!(
+                    "GitHub refused it ({status}): {}",
+                    body["message"].as_str().unwrap_or("no message")
+                )
+            }
+        }
+    }
+
     /// Turns auto-merge off on open pull requests from `branch`, returning their numbers.
     pub async fn disable_auto_merge(&self, repo: &str, branch: &str) -> anyhow::Result<Vec<u64>> {
         let headed: Vec<Value> = self

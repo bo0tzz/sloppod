@@ -2040,3 +2040,40 @@ async fn a_session_s_turns_start_at_messages_not_steered_in(db: PgPool) {
     let last = db::events_between(&db, id, turns[1].0, None).await.unwrap();
     assert_eq!(last.len(), 2);
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn finds_proposals_waiting_on_a_decision_or_their_author(db: PgPool) {
+    let s = session(&db, "dev").await;
+    let mut ids = Vec::new();
+    for status in [
+        ProposalStatus::Pending,
+        ProposalStatus::ChangesRequested,
+        ProposalStatus::InReview,
+        ProposalStatus::Approved,
+    ] {
+        ids.push(
+            db::insert_proposal(&db, s, "github.pr.create", status, &json!({}))
+                .await
+                .unwrap()
+                .id,
+        );
+    }
+    let gone = session(&db, "dev").await;
+    db::insert_proposal(
+        &db,
+        gone,
+        "github.pr.create",
+        ProposalStatus::Pending,
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    db::mark_deleted(&db, gone).await.unwrap();
+    let found: Vec<Uuid> = db::undecided_proposals(&db)
+        .await
+        .unwrap()
+        .iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(found, &ids[..2]);
+}

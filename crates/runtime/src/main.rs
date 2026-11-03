@@ -333,6 +333,7 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::spawn(rebases::run(state.clone(), pushes_to_recheck));
     tokio::spawn(pulls::run(state.clone()));
+    tokio::spawn(proposals::follow_undecided(state.clone()));
     tokio::spawn(work::follow::run(state.clone()));
     {
         let state = state.clone();

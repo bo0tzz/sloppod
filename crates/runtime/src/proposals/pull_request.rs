@@ -5,7 +5,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use sloppod_contracts::{
-    Error, Manifest, ProposalKind, RepoGrant, Result, ReviewSubject, SessionContext, ToolSpec,
+    Error, Followed, Manifest, ProposalKind, RepoGrant, Result, ReviewSubject, SessionContext,
+    ToolSpec,
 };
 
 use super::{branch_detail, err, head_branch, target_repo};
@@ -123,6 +124,28 @@ impl ProposalKind for PullRequest {
     async fn detail(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
         let repo = payload["repo"].as_str().unwrap_or_default();
         branch_detail(&*self.app(session, repo).await?, payload).await
+    }
+
+    async fn follow(&self, session: &SessionContext, payload: &Value) -> Result<Option<Followed>> {
+        let repo = payload["repo"].as_str().unwrap_or_default();
+        let (Some(base), Some(head), Some(head_sha)) = (
+            payload["base"].as_str(),
+            payload["head"].as_str(),
+            payload["head_sha"].as_str(),
+        ) else {
+            return Ok(None);
+        };
+        let app = self.app(session, repo).await?;
+        let Some(followed) = follow_base(&app, repo, base, head, head_sha).await? else {
+            return Ok(None);
+        };
+        let mut arguments = payload.clone();
+        arguments["base"] = json!(followed.base);
+        Ok(Some(Followed {
+            arguments,
+            note: followed.note,
+            same_change: followed.same_change,
+        }))
     }
 
     fn edit(&self, payload: &Value, edits: &Value) -> Result<Value> {
@@ -422,6 +445,39 @@ impl ProposalKind for Stack {
         Ok(json!({"layers": layers}))
     }
 
+    /// Only the bottom pull request's base can merge before the stack is opened; the layers above stay on theirs.
+    async fn follow(&self, session: &SessionContext, payload: &Value) -> Result<Option<Followed>> {
+        let repo = payload["repo"].as_str().unwrap_or_default();
+        let layers = stack_layers(payload);
+        let (Some(base), Some(bottom)) = (payload["base"].as_str(), layers.first()) else {
+            return Ok(None);
+        };
+        let app = self.app(session, repo).await?;
+        let Some(followed) = follow_base(
+            &app,
+            repo,
+            base,
+            bottom["head"].as_str().unwrap_or_default(),
+            bottom["head_sha"].as_str().unwrap_or_default(),
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let mut same_change = followed.same_change;
+        for layer in &layers[1..] {
+            let head = layer["head"].as_str().unwrap_or_default();
+            same_change &= app.branch_sha(repo, head).await.map_err(err)? == layer["head_sha"];
+        }
+        let mut arguments = payload.clone();
+        arguments["base"] = json!(followed.base);
+        Ok(Some(Followed {
+            arguments,
+            note: followed.note,
+            same_change,
+        }))
+    }
+
     fn edit(&self, payload: &Value, edits: &Value) -> Result<Value> {
         edit_stack(payload, edits)
     }
@@ -535,6 +591,124 @@ impl ProposalKind for Stack {
     }
 }
 
+/// A base branch that merged and is gone, followed to where it went.
+#[derive(Debug, PartialEq)]
+struct MovedBase {
+    /// The branch it merged into: still there, unless that merged too, as a stack merging from the bottom up does.
+    base: String,
+    /// The old base's last commit, as it merged.
+    merged_sha: String,
+    /// The pull requests it took, the old base's first.
+    pulls: Vec<u64>,
+}
+
+/// How many merged branches deep a base is followed.
+const FOLLOW_DEPTH: usize = 8;
+
+/// Where `base` went: `None` while it's there, or when it's gone without being merged, which leaves nothing to follow.
+async fn moved_base(app: &GitHubApp, repo: &str, base: &str) -> Result<Option<MovedBase>> {
+    if app.branch_exists(repo, base).await.map_err(err)? {
+        return Ok(None);
+    }
+    let mut branch = base.to_owned();
+    let mut merged_sha = None;
+    let mut pulls = Vec::new();
+    for _ in 0..FOLLOW_DEPTH {
+        let Some(pull) = app.merged_pull_from(repo, &branch).await.map_err(err)? else {
+            return Ok(None);
+        };
+        let (Some(into), Some(sha), Some(number)) = (
+            pull["base"]["ref"].as_str(),
+            pull["head"]["sha"].as_str(),
+            pull["number"].as_u64(),
+        ) else {
+            return Ok(None);
+        };
+        merged_sha.get_or_insert_with(|| sha.to_owned());
+        pulls.push(number);
+        branch = into.to_owned();
+        if app.branch_exists(repo, &branch).await.map_err(err)? {
+            return Ok(merged_sha.map(|merged_sha| MovedBase {
+                base: branch,
+                merged_sha,
+                pulls,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// A pull request from `head`, proposed at `head_sha` onto `base`, moved off a base that merged and is gone onto
+/// where it went, as GitHub retargets an open one (#141).
+struct FollowedBase {
+    base: String,
+    note: String,
+    /// Whether its diff is still the one proposed, by `rebases::fingerprint`.
+    same_change: bool,
+}
+
+/// Follows a merged base. With a merge commit, what merged with it is in the new base's history and drops out of the
+/// comparison by itself; squashed or rebased, it isn't, so the new base is merged into `head` to leave it out, as
+/// `git merge` would. A conflict leaves that to the author.
+async fn follow_base(
+    app: &GitHubApp,
+    repo: &str,
+    base: &str,
+    head: &str,
+    head_sha: &str,
+) -> Result<Option<FollowedBase>> {
+    let Some(moved) = moved_base(app, repo, base).await? else {
+        return Ok(None);
+    };
+    let new = moved.base.as_str();
+    let pulls = moved
+        .pulls
+        .iter()
+        .map(|n| format!("#{n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut note = format!(
+        "`{base}` merged into `{new}` ({pulls}) and is gone, so it now merges into `{new}`"
+    );
+    let mut tip = app.branch_sha(repo, head).await.map_err(err)?;
+    if !app
+        .contains(repo, new, &moved.merged_sha)
+        .await
+        .map_err(err)?
+    {
+        let message = format!(
+            "Merge {new} into {head}\n\n{base} was squashed or rebased into {new}; this leaves out its commits."
+        );
+        match app.merge_into(repo, head, new, &message).await.map_err(err)? {
+            Some(merged) => {
+                note.push_str(&format!(
+                    ". It was squashed or rebased, so sloppod merged `{new}` into `{head}` (now at {merged:.7}) to \
+                     leave out what merged with it; pull before you push to `{head}` again"
+                ));
+                tip = merged;
+            }
+            None => note.push_str(&format!(
+                ". It was squashed or rebased, and `{new}` conflicts with `{head}`, so the change still carries what \
+                 merged with `{base}`: merge `{new}` into `{head}` yourself"
+            )),
+        }
+    }
+    let proposed = app
+        .diff_to(repo, &moved.merged_sha, head_sha)
+        .await
+        .map_err(err)?;
+    let now = app.diff_to(repo, new, &tip).await.map_err(err)?;
+    let same_change = {
+        let proposed = crate::rebases::fingerprint(&proposed);
+        proposed.is_some() && proposed == crate::rebases::fingerprint(&now)
+    };
+    Ok(Some(FollowedBase {
+        base: new.to_owned(),
+        note,
+        same_change,
+    }))
+}
+
 fn edit_pull_request(payload: &Value, edits: &Value) -> Result<Value> {
     let mut payload = payload.clone();
     for field in ["title", "body"] {
@@ -624,5 +798,274 @@ mod tests {
             true
         );
         assert!(edit_stack(&payload, &json!({"auto_merge": "yes"})).is_err());
+    }
+
+    /// A fake GitHub where `sloppod/a-one` merged into `main` as #7, at `a1`, and is gone, and `sloppod/a-two`, at
+    /// `b1`, builds on it: proposed with `sloppod/a-one` as its base.
+    mod merged_base {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        use axum::extract::{Path, Query, State};
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::{IntoResponse, Response};
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+
+        use super::*;
+
+        const ONE: &str = "diff --git a/one b/one\n+one\n";
+        const TWO: &str = "diff --git a/two b/two\n+two\n";
+
+        #[derive(Default)]
+        struct Fake {
+            branches: Mutex<HashMap<String, String>>,
+            merged: Vec<Value>,
+            /// Commits in `main`'s history.
+            in_main: Vec<&'static str>,
+            /// Diffs by `base...sha`.
+            diffs: HashMap<String, String>,
+            conflicts: bool,
+            writes: Mutex<Vec<String>>,
+        }
+
+        type Shared = State<Arc<Fake>>;
+
+        async fn branch(
+            State(fake): Shared,
+            Path((_, _, name)): Path<(String, String, String)>,
+        ) -> Response {
+            match fake.branches.lock().unwrap().get(&name) {
+                Some(sha) => Json(json!({"name": name, "commit": {"sha": sha}})).into_response(),
+                None => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+
+        async fn commit(
+            State(fake): Shared,
+            Path((_, _, name)): Path<(String, String, String)>,
+        ) -> Json<Value> {
+            let sha = fake
+                .branches
+                .lock()
+                .unwrap()
+                .get(&name)
+                .cloned()
+                .unwrap_or(name);
+            Json(json!({"sha": sha}))
+        }
+
+        async fn pulls(
+            State(fake): Shared,
+            Query(query): Query<HashMap<String, String>>,
+        ) -> Json<Value> {
+            let head = query["head"].split_once(':').unwrap().1.to_owned();
+            assert_eq!(query["state"], "closed");
+            Json(json!(
+                fake.merged
+                    .iter()
+                    .filter(|p| p["head"]["ref"] == head.as_str())
+                    .collect::<Vec<_>>()
+            ))
+        }
+
+        async fn compare(
+            State(fake): Shared,
+            Path((_, _, range)): Path<(String, String, String)>,
+            headers: HeaderMap,
+        ) -> Response {
+            if headers["accept"] == "application/vnd.github.diff" {
+                let tip = |name: &str| {
+                    fake.branches
+                        .lock()
+                        .unwrap()
+                        .get(name)
+                        .cloned()
+                        .unwrap_or(name.into())
+                };
+                let (base, sha) = range.split_once("...").unwrap();
+                // Named by branch or by commit alike.
+                let key = format!("{base}...{}", tip(sha));
+                return fake
+                    .diffs
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_response();
+            }
+            let (sha, reference) = range.split_once("...").unwrap();
+            assert_eq!(reference, "main");
+            let status = if fake.in_main.contains(&sha) {
+                "ahead"
+            } else {
+                "diverged"
+            };
+            Json(json!({"status": status})).into_response()
+        }
+
+        async fn merge(State(fake): Shared, Json(body): Json<Value>) -> Response {
+            let (into, from) = (
+                body["base"].as_str().unwrap(),
+                body["head"].as_str().unwrap(),
+            );
+            fake.writes
+                .lock()
+                .unwrap()
+                .push(format!("merge {from} into {into}"));
+            if fake.conflicts {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({"message": "Merge conflict"})),
+                )
+                    .into_response();
+            }
+            fake.branches
+                .lock()
+                .unwrap()
+                .insert(into.to_owned(), "m1".into());
+            (StatusCode::CREATED, Json(json!({"sha": "m1"}))).into_response()
+        }
+
+        fn fake(squashed: bool) -> Fake {
+            let mut fake = Fake {
+                merged: vec![json!({
+                    "number": 7, "merged_at": "2026-11-03T08:00:00Z",
+                    "head": {"ref": "sloppod/a-one", "sha": "a1"}, "base": {"ref": "main"},
+                })],
+                in_main: if squashed { vec![] } else { vec!["a1"] },
+                ..Fake::default()
+            };
+            fake.branches.lock().unwrap().extend([
+                ("main".to_owned(), "c1".to_owned()),
+                ("sloppod/a-two".to_owned(), "b1".to_owned()),
+            ]);
+            // The change as proposed, and as it compares with `main` afterwards: a squash leaves `sloppod/a-one`'s
+            // change in it until `main` is merged in.
+            fake.diffs.insert("a1...b1".into(), TWO.into());
+            let after = if squashed {
+                format!("{ONE}{TWO}")
+            } else {
+                TWO.into()
+            };
+            fake.diffs.insert("main...b1".into(), after);
+            fake.diffs.insert("main...m1".into(), TWO.into());
+            fake
+        }
+
+        async fn github(fake: Fake) -> (Arc<Fake>, GitHubApp) {
+            let fake = Arc::new(fake);
+            let router = Router::new()
+                .route("/repos/{owner}/{name}/branches/{*branch}", get(branch))
+                .route("/repos/{owner}/{name}/commits/{*reference}", get(commit))
+                .route("/repos/{owner}/{name}/pulls", get(pulls))
+                .route("/repos/{owner}/{name}/compare/{*range}", get(compare))
+                .route("/repos/{owner}/{name}/merges", post(merge))
+                .with_state(fake.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, router).await });
+            (
+                fake,
+                GitHubApp::for_user_with_api(&api, "token".into(), "octo".into()).unwrap(),
+            )
+        }
+
+        async fn follow(app: &GitHubApp) -> Option<FollowedBase> {
+            follow_base(app, "o/r", "sloppod/a-one", "sloppod/a-two", "b1")
+                .await
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn a_merge_commit_leaves_the_branch_as_it_is() {
+            let (fake, app) = github(fake(false)).await;
+            let followed = follow(&app).await.unwrap();
+            assert_eq!(followed.base, "main");
+            assert!(followed.same_change);
+            assert!(
+                followed
+                    .note
+                    .contains("`sloppod/a-one` merged into `main` (#7)"),
+                "{}",
+                followed.note
+            );
+            assert!(fake.writes.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_squash_is_left_out_by_merging_the_new_base_in() {
+            let (fake, app) = github(fake(true)).await;
+            let followed = follow(&app).await.unwrap();
+            assert_eq!(followed.base, "main");
+            // What's left is the change that was proposed.
+            assert!(followed.same_change);
+            assert!(
+                followed
+                    .note
+                    .contains("merged `main` into `sloppod/a-two` (now at m1)"),
+                "{}",
+                followed.note
+            );
+            assert_eq!(
+                *fake.writes.lock().unwrap(),
+                ["merge main into sloppod/a-two"]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_conflict_moves_it_and_leaves_the_merge_to_the_author() {
+            let (_, app) = github(Fake {
+                conflicts: true,
+                ..fake(true)
+            })
+            .await;
+            let followed = follow(&app).await.unwrap();
+            assert_eq!(followed.base, "main");
+            // It carries `sloppod/a-one`'s change too now, which wasn't reviewed with it.
+            assert!(!followed.same_change);
+            assert!(
+                followed
+                    .note
+                    .contains("merge `main` into `sloppod/a-two` yourself"),
+                "{}",
+                followed.note
+            );
+        }
+
+        #[tokio::test]
+        async fn a_stack_that_merged_from_the_bottom_up_is_followed_to_the_end() {
+            let mut below = fake(false);
+            // `sloppod/a-one` merged into `sloppod/a-zero`, which then merged into `main`; both are gone.
+            below.merged = vec![
+                json!({"number": 7, "merged_at": "2026-11-03T08:00:00Z",
+                       "head": {"ref": "sloppod/a-one", "sha": "a1"}, "base": {"ref": "sloppod/a-zero"}}),
+                json!({"number": 6, "merged_at": "2026-11-03T08:01:00Z",
+                       "head": {"ref": "sloppod/a-zero", "sha": "a1"}, "base": {"ref": "main"}}),
+            ];
+            let (_, app) = github(below).await;
+            let followed = follow(&app).await.unwrap();
+            assert_eq!(followed.base, "main");
+            assert!(followed.note.contains("(#7, #6)"), "{}", followed.note);
+        }
+
+        #[tokio::test]
+        async fn a_base_that_is_there_or_went_unmerged_is_left_alone() {
+            let there = fake(false);
+            there
+                .branches
+                .lock()
+                .unwrap()
+                .insert("sloppod/a-one".into(), "a1".into());
+            let (seen, app) = github(there).await;
+            assert!(follow(&app).await.is_none());
+            assert!(seen.writes.lock().unwrap().is_empty());
+
+            let (_, app) = github(Fake {
+                merged: vec![],
+                ..fake(false)
+            })
+            .await;
+            assert!(follow(&app).await.is_none());
+        }
     }
 }
