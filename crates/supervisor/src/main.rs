@@ -1,6 +1,7 @@
 //! The session pod's entrypoint (ADR 17): connects outward to the runtime, prepares the pod and bridges the
 //! agent's ACP stdio over the link.
 
+mod guard;
 mod proxy;
 mod shutdown;
 
@@ -130,6 +131,10 @@ fn track(sent: &mut HashMap<String, Value>, owed: &mut HashMap<String, Value>, m
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Claude Code's hook for shell commands (#339), before anything a supervisor needs: it runs as the agent.
+    if std::env::args().nth(1).as_deref() == Some("guard") {
+        std::process::exit(guard::run());
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
