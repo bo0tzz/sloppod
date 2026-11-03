@@ -8,6 +8,8 @@ const executablePath = process.env.CHROMIUM_PATH ?? (existsSync('/usr/bin/chromi
 export default defineConfig({
   testDir: 'tests',
   workers: 1,
+  // In CI a test that fails and then passes is reported as flaky, not failed; the report still lists it for fixing.
+  retries: process.env.CI ? 1 : 0,
   fullyParallel: true,
   timeout: 45_000,
   expect: { timeout: 15_000 },
