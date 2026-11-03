@@ -175,14 +175,19 @@ pub(crate) async fn prepared(
     arguments: Value,
 ) -> Result<Value> {
     let span = crate::github::acting_span(&session.session_id, None);
-    let mut payload = kind.prepare(session, arguments).instrument(span).await?;
+    let payload = kind.prepare(session, arguments).instrument(span).await?;
+    Ok(acting_as(kind, session, payload))
+}
+
+/// A prepared payload with `as`, who it acts as.
+fn acting_as(kind: &dyn ProposalKind, session: &SessionContext, mut payload: Value) -> Value {
     if let Some(login) = kind
         .target(&payload)
         .and_then(|repo| session.repo_acting_as(&repo).map(str::to_owned))
     {
         payload["as"] = json!(login);
     }
-    Ok(payload)
+    payload
 }
 
 /// A proposal's payload prepared again after following what moved under it (`ProposalKind::follow`), with what
@@ -196,7 +201,7 @@ pub(crate) async fn followed(
     let Some(followed) = kind.follow(session, payload).instrument(span).await? else {
         return Ok(None);
     };
-    let payload = prepared(kind, session, followed.arguments.clone()).await?;
+    let payload = acting_as(kind, session, followed.payload.clone());
     Ok(Some((payload, followed)))
 }
 

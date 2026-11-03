@@ -575,11 +575,12 @@ pub struct ReviewSubject {
 /// base branch merged and was deleted, now on the branch that one merged into (#141).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Followed {
-    /// The arguments to prepare it from again.
-    pub arguments: Value,
+    /// The payload prepared again (`prepare`) on what moved.
+    pub payload: Value,
     /// What happened, for its author and reviewer.
     pub note: String,
-    /// Whether the change itself is still the one that was reviewed, so a review it passed holds.
+    /// Whether the change in `payload`, at the commits it pins, is still the one that was reviewed, so a review it
+    /// passed holds.
     pub same_change: bool,
 }
 

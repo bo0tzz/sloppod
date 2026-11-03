@@ -141,10 +141,13 @@ impl ProposalKind for PullRequest {
         };
         let mut arguments = payload.clone();
         arguments["base"] = json!(followed.base);
+        let payload = self.prepare(session, arguments).await?;
+        // A push since the comparison is a change nobody has looked at.
+        let same_change = followed.same_change && payload["head_sha"] == followed.head_sha.as_str();
         Ok(Some(Followed {
-            arguments,
+            payload,
             note: followed.note,
-            same_change: followed.same_change,
+            same_change,
         }))
     }
 
@@ -464,15 +467,12 @@ impl ProposalKind for Stack {
         else {
             return Ok(None);
         };
-        let mut same_change = followed.same_change;
-        for layer in &layers[1..] {
-            let head = layer["head"].as_str().unwrap_or_default();
-            same_change &= app.branch_sha(repo, head).await.map_err(err)? == layer["head_sha"];
-        }
         let mut arguments = payload.clone();
         arguments["base"] = json!(followed.base);
+        let prepared = self.prepare(session, arguments).await?;
+        let same_change = followed.same_change && pins_held(payload, &prepared, &followed.head_sha);
         Ok(Some(Followed {
-            arguments,
+            payload: prepared,
             note: followed.note,
             same_change,
         }))
@@ -591,6 +591,22 @@ impl ProposalKind for Stack {
     }
 }
 
+/// Whether a stack prepared again after its base moved pins what was compared: its bottom at `bottom`, the commit its
+/// change was fingerprinted at, and every layer above where it was proposed. A push to any is unreviewed.
+fn pins_held(proposed: &Value, prepared: &Value, bottom: &str) -> bool {
+    let pins = |payload| {
+        stack_layers(payload)
+            .iter()
+            .map(|l| l["head_sha"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let mut expected = pins(proposed);
+    if let Some(first) = expected.first_mut() {
+        *first = bottom.to_owned();
+    }
+    pins(prepared) == expected
+}
+
 /// A base branch that merged and is gone, followed to where it went.
 #[derive(Debug, PartialEq)]
 struct MovedBase {
@@ -643,8 +659,10 @@ async fn moved_base(app: &GitHubApp, repo: &str, base: &str) -> Result<Option<Mo
 struct FollowedBase {
     base: String,
     note: String,
-    /// Whether its diff is still the one proposed, by `rebases::fingerprint`.
+    /// Whether its diff at `head_sha` is still the one proposed, by `rebases::fingerprint`.
     same_change: bool,
+    /// The commit of `head` that was compared: what preparing it again has to pin for `same_change` to hold.
+    head_sha: String,
 }
 
 /// Follows a merged base. With a merge commit, what merged with it is in the new base's history and drops out of the
@@ -706,6 +724,7 @@ async fn follow_base(
         base: new.to_owned(),
         note,
         same_change,
+        head_sha: tip,
     }))
 }
 
@@ -774,6 +793,18 @@ mod tests {
                 .body
                 .contains("## 2. Two (`s-2` into `s-1`)\n\nSecond.")
         );
+    }
+
+    #[test]
+    fn a_followed_stack_keeps_its_review_only_at_the_commits_compared() {
+        let proposed = json!({"pull_requests": [{"head_sha": "b1"}, {"head_sha": "c1"}]});
+        // The bottom merged its new base in, at m1, and nothing else moved.
+        let prepared = json!({"pull_requests": [{"head_sha": "m1"}, {"head_sha": "c1"}]});
+        assert!(pins_held(&proposed, &prepared, "m1"));
+        // A push to the bottom after it was compared, or to a layer above.
+        assert!(!pins_held(&proposed, &prepared, "b1"));
+        let pushed = json!({"pull_requests": [{"head_sha": "m1"}, {"head_sha": "c2"}]});
+        assert!(!pins_held(&proposed, &pushed, "m1"));
     }
 
     #[test]
@@ -982,6 +1013,7 @@ mod tests {
             let followed = follow(&app).await.unwrap();
             assert_eq!(followed.base, "main");
             assert!(followed.same_change);
+            assert_eq!(followed.head_sha, "b1");
             assert!(
                 followed
                     .note
@@ -999,6 +1031,7 @@ mod tests {
             assert_eq!(followed.base, "main");
             // What's left is the change that was proposed.
             assert!(followed.same_change);
+            assert_eq!(followed.head_sha, "m1");
             assert!(
                 followed
                     .note

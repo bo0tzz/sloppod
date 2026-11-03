@@ -133,10 +133,11 @@ pub async fn start(
     let previous = db::reviews(&state.db, proposal.id).await?.pop();
     let round = db::start_review_round(&state.db, proposal.id, &subject.head_sha, replies).await?;
     let prompt = match &previous {
-        // A reviewer that's gone (#141: the proposal passed, then moved) is replaced by one that starts afresh.
         Some(previous) if proposal.review_session_id.is_some() => {
             next_round_prompt(subject, round, previous, replies, moved)
         }
+        // A reviewer that's gone (#141: the proposal passed, then moved) is replaced by one that reviews it whole.
+        Some(previous) => replacement_prompt(subject, previous, moved),
         _ => match carried {
             Some(carried) => carried_over_prompt(subject, carried),
             None => first_round_prompt(subject),
@@ -536,6 +537,34 @@ fn first_round_prompt(subject: &ReviewSubject) -> String {
          `submit_review`.{decided}",
         described(subject)
     )
+}
+
+/// For a new reviewer of a proposal whose earlier reviewer is gone (#141): the whole change, as in a first round, and
+/// the last round's findings, which its verdict has to account for like any later round's.
+fn replacement_prompt(
+    subject: &ReviewSubject,
+    previous: &db::ReviewRow,
+    moved: Option<&str>,
+) -> String {
+    let mut prompt = first_round_prompt(subject);
+    if let Some(moved) = moved {
+        prompt.push_str(&format!(
+            "\n\nIt was reviewed before, and has changed since without its author: {moved}."
+        ));
+    }
+    let open = previous
+        .findings
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if !open.is_empty() {
+        prompt.push_str(&format!(
+            "\n\nThe last reviewer, who's gone, left these findings. Report again each that still holds, whatever its \
+             severity, naming its id in `prior`, and list in `resolved` the ids of those that no longer hold.\n\n{}",
+            findings_text(open)
+        ));
+    }
+    prompt
 }
 
 fn next_round_prompt(
@@ -1189,6 +1218,29 @@ mod tests {
             paused_seconds: 0,
             paused_since: None,
         }
+    }
+
+    #[test]
+    fn a_new_reviewer_gets_the_findings_it_has_to_account_for() {
+        let subject = ReviewSubject {
+            repo: "o/r".into(),
+            base: "main".into(),
+            head: "sloppod/abcd1234-two".into(),
+            head_sha: "f00".into(),
+            title: "Two".into(),
+            body: String::new(),
+            describes_change: true,
+        };
+        let mut passed = round("e00", "pass");
+        passed.findings = json!([finding(json!({"id": "1.1", "severity": "p2"}))]);
+        let prompt = replacement_prompt(&subject, &passed, Some("`a` merged into `main` (#7)"));
+        // The whole change, as a first round reviews it, and the open finding by its id.
+        assert!(prompt.starts_with("Review this change on o/r"));
+        assert!(prompt.contains("changed since without its author: `a` merged into `main` (#7)."));
+        assert!(prompt.contains("naming its id in `prior`"));
+        assert!(prompt.contains("[1.1] p2"));
+        // Nothing to account for, nothing asked.
+        assert!(!replacement_prompt(&subject, &round("e00", "pass"), None).contains("`prior`"));
     }
 
     #[test]
