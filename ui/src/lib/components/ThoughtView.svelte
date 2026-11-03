@@ -11,7 +11,7 @@
 </script>
 
 <details class="group text-muted" data-testid="thought">
-  <summary class="flex cursor-pointer list-none items-center gap-1.5 text-sm select-none [&::-webkit-details-marker]:hidden">
+  <summary class="flex cursor-pointer list-none items-center gap-1.5 text-sm [&::-webkit-details-marker]:hidden">
     <Icon icon={mdiChevronRight} class="shrink-0 transition-transform group-open:rotate-90" aria-hidden />
     <Icon icon={mdiLightbulbOutline} class="shrink-0 {active ? 'animate-pulse' : ''}" aria-hidden />
     <span class="shrink-0 font-medium">{active ? 'Thinking…' : 'Thought'}</span>

@@ -80,6 +80,7 @@ impl ProposalKind for PullRequest {
             title: field("title")?,
             body: field("body").unwrap_or_default(),
             describes_change: true,
+            whole: false,
         })
     }
 
@@ -281,6 +282,7 @@ fn stack_review_subject(payload: &Value) -> Option<ReviewSubject> {
         title: format!("a stack of {} pull requests", layers.len()),
         body,
         describes_change: true,
+        whole: false,
     })
 }
 

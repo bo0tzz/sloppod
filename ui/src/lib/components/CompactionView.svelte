@@ -19,7 +19,7 @@
 
 <details class="group" data-testid="compaction" data-status={compaction.status}>
   <summary
-    class="text-muted flex list-none items-center gap-3 text-xs select-none [&::-webkit-details-marker]:hidden {expandable
+    class="text-muted flex list-none items-center gap-3 text-xs [&::-webkit-details-marker]:hidden {expandable
       ? 'cursor-pointer'
       : 'pointer-events-none'}"
   >

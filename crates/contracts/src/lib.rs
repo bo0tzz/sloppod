@@ -574,6 +574,8 @@ pub struct ReviewSubject {
     /// Whether someone decides from the title and body, so they have to describe the change and are reviewed with
     /// it. A code review's only say what the author wants looked at.
     pub describes_change: bool,
+    /// The code at `head_sha` as it is, not a change: `base` is empty (#344).
+    pub whole: bool,
 }
 
 /// How an undecided proposal moved with what it was prepared against, without its author: say, a pull request whose
