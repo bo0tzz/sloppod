@@ -269,7 +269,9 @@ async fn main() -> anyhow::Result<()> {
         let state = waker.clone();
         Box::pin(async move {
             match db::get_session(&state.db, id).await? {
-                Some(session) => lifecycle::wake(&state, &session).await,
+                Some(session) => {
+                    lifecycle::wake(&state, &session, "a message is queued for it").await
+                }
                 None => Ok(()),
             }
         })
@@ -328,6 +330,8 @@ async fn main() -> anyhow::Result<()> {
             let mut every = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 every.tick().await;
+                // First, so a review session that ought to be parked isn't given a new pod instead.
+                reviews::settle_reviewers(&state).await;
                 lifecycle::roll_images(&state).await;
             }
         });

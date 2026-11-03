@@ -135,7 +135,7 @@ fn reply(output: &str) -> anyhow::Result<Value> {
 async fn utility_session(state: &AppState, owner: &str) -> anyhow::Result<Uuid> {
     if let Some(session) = db::utility_session(&state.db, owner).await? {
         if session.phase() == Phase::Parked {
-            lifecycle::wake(state, &session).await?;
+            lifecycle::wake(state, &session, "its owner needs a judgement").await?;
         }
         return Ok(session.id);
     }

@@ -1523,6 +1523,44 @@ pub async fn move_proposal(
     .await
 }
 
+/// Review sessions that are up with nothing to review, quiet since before `quiet_since`: idle, not deleted, and with
+/// no proposal in review. One kept for a carried-over review, or between rounds while its author works on findings,
+/// is parked then (`reviews::settle_reviewers`) whatever happened to the park that was meant to follow its verdict.
+pub async fn reviewers_to_park(db: &PgPool, quiet_since: DateTime<Utc>) -> sqlx::Result<Vec<Uuid>> {
+    sqlx::query_scalar(
+        "select s.id from sessions s where s.kind = 'review' and s.deleted_at is null and s.phase = 'idle' \
+         and s.active_at < $1 \
+         and not exists (select 1 from proposals p where p.review_session_id = s.id and p.status = 'in_review') \
+         order by s.active_at",
+    )
+    .bind(quiet_since)
+    .fetch_all(db)
+    .await
+}
+
+/// Review sessions retired (`retire_reviewer`) before `since` whose pod and volume haven't been removed yet, e.g.
+/// because the removal meant to follow was lost to a restart.
+pub async fn retired_reviewers(db: &PgPool, since: DateTime<Utc>) -> sqlx::Result<Vec<SessionRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "select {SESSION_COLUMNS} from sessions where kind = 'review' and deleted_at < $1 \
+         and purge_started_at is not null and purged_at is null \
+         order by deleted_at"
+    )))
+    .bind(since)
+    .fetch_all(db)
+    .await
+}
+
+/// Whether a review session is reviewing a proposal now, as opposed to waiting on its author's fixes.
+pub async fn reviewing(db: &PgPool, session: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "select exists (select 1 from proposals where review_session_id = $1 and status = 'in_review')",
+    )
+    .bind(session)
+    .fetch_one(db)
+    .await
+}
+
 /// Review sessions none of whose proposals is still being reviewed, or was decided after `since`.
 pub async fn idle_review_sessions(db: &PgPool, since: DateTime<Utc>) -> sqlx::Result<Vec<Uuid>> {
     sqlx::query_scalar(

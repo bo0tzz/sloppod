@@ -439,11 +439,13 @@ pub async fn roll_images(state: &AppState) {
 }
 
 /// Brings a parked session back: its pod starts again and the agent resumes its conversation. Other sessions are
-/// left as they are, and a deleted one stays parked until it's restored.
-pub async fn wake(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
+/// left as they are, and a deleted one stays parked until it's restored. `why` is logged, so a wake can be traced to
+/// what asked for it.
+pub async fn wake(state: &AppState, session: &db::SessionRow, why: &str) -> anyhow::Result<()> {
     state
         .hub
         .wake(session.id, || async {
+            tracing::info!(session = %session.id, why, "waking a parked session");
             // Under the session's transition lock, which deleting parks it under too.
             let current = db::get_session(&state.db, session.id)
                 .await?

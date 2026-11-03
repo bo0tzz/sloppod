@@ -863,7 +863,7 @@ async fn wake_session(
             "the session is deleted; restore it first".into(),
         ));
     }
-    lifecycle::wake(&state, &session).await?;
+    lifecycle::wake(&state, &session, "the user woke it").await?;
     let session = db::get_session(&state.db, id)
         .await?
         .ok_or_else(not_found)?;
