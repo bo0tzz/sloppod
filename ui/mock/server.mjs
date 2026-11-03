@@ -264,11 +264,12 @@ function echoUser(
  * into a running turn, or answered with a short turn of its own when the agent is idle.
  */
 async function notifyAgent(session, text, ack, echo = true) {
-  if (echo) echoUser(session, text, { notice: true });
   if (session.turn) {
-    session.turn.steers.push({ text, ack });
+    // Shown when the turn takes it (`takeSteer`), not now: in the middle of a reply, it would split it (#420).
+    session.turn.steers.push({ text, ack, notice: echo });
     return;
   }
+  if (echo) echoUser(session, text, { notice: true });
   // Like the runtime, which queues a notice until the agent can take it rather than dropping it.
   if (session.data.phase !== 'idle') {
     if (sessions.has(session.data.id) && !['stopped', 'parked'].includes(session.data.phase)) {
@@ -284,7 +285,7 @@ async function notifyAgent(session, text, ack, echo = true) {
     // This one, and any that arrive while it's answered.
     while (turn.steers.length > 0) {
       const messageId = randomUUID();
-      for (const piece of chunks(steerReply(turn.steers.shift()))) {
+      for (const piece of chunks(takeSteer(session, turn))) {
         session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: piece }, messageId });
         await sleep(DELAY);
       }
@@ -493,7 +494,7 @@ async function runTurn(session, text, { echo = true, messageId, images = [] } = 
     // Like a real agent, pick up messages that arrived after the last step instead of dropping them.
     while (turn.steers.length > 0) {
       const messageId = randomUUID();
-      for (const piece of chunks(steerReply(turn.steers.shift()))) {
+      for (const piece of chunks(takeSteer(session, turn))) {
         session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: piece }, messageId });
         await sleep(session.fast ? 0 : DELAY);
       }
@@ -520,6 +521,16 @@ async function runTurn(session, text, { echo = true, messageId, images = [] } = 
 }
 
 /** What the agent says to a message steered into its turn: a notice's own reply, or an acknowledgement. */
+/**
+ * The agent's reply to the next message steered into `turn`. A notice is shown as the turn takes it, at a boundary,
+ * as the runtime holds notices until one (#264), so it never lands in the middle of a reply.
+ */
+function takeSteer(session, turn) {
+  const steer = turn.steers.shift();
+  if (steer.notice) echoUser(session, steer.text, { notice: true });
+  return steerReply(steer);
+}
+
 const steerReply = ({ text, ack }) =>
   ack ?? `Got your message mid-turn: “${text}”. I'll take that into account for the rest of this turn.`;
 
@@ -548,7 +559,7 @@ async function agentScript(session, turn, prompt) {
   const step = async (n = 1) => {
     await sleep(delay * n);
     checkCancel();
-    while (turn.steers.length > 0) await say(steerReply(turn.steers.shift()));
+    while (turn.steers.length > 0) await say(takeSteer(session, turn));
   };
   const tool = (fields) => session.emit({ sessionUpdate: 'tool_call', ...fields });
   const update = (toolCallId, fields) => session.emit({ sessionUpdate: 'tool_call_update', toolCallId, ...fields });
