@@ -48,15 +48,9 @@ class AppConnection {
       this.#open();
     } else {
       if (this.#initialized && this.state === 'open') {
-        // Up already: it's up for this consumer once its own state is fetched.
-        const generation = this.#generation;
-        consumer.onStateChange?.('connecting');
-        void this.#ready_(consumer, generation).then(() => {
-          if (generation === this.#generation && this.state === 'open' && this.#ready.has(consumer)) {
-            consumer.onStateChange?.('open');
-          }
-        });
+        this.#late(consumer);
       } else {
+        // Coming up: the loop in `#onReady` takes it if it's still going, and the connection's 'open' does if not.
         consumer.onStateChange?.(this.state, this.error ?? undefined);
       }
     }
@@ -84,6 +78,17 @@ class AppConnection {
     this.#conn?.respondError(id, code, message);
   }
 
+  /** A consumer that registered on a connection that's up: it's up for it once its own state is fetched. */
+  #late(consumer: Consumer) {
+    const generation = this.#generation;
+    consumer.onStateChange?.('connecting');
+    void this.#ready_(consumer, generation).then(() => {
+      if (generation === this.#generation && this.state === 'open' && this.#ready.has(consumer)) {
+        consumer.onStateChange?.('open');
+      }
+    });
+  }
+
   #open() {
     this.#conn = new AcpConnection(acpUrl(), {
       onReady: (connection) => this.#onReady(connection),
@@ -103,7 +108,11 @@ class AppConnection {
           this.#initialized = false;
           this.#ready.clear();
         }
-        for (const consumer of [...this.#consumers]) consumer.onStateChange?.(state, error);
+        for (const consumer of [...this.#consumers]) {
+          // One that registered after the loop in `#onReady` was done with its snapshot hasn't been readied.
+          if (state === 'open' && !this.#ready.has(consumer)) this.#late(consumer);
+          else consumer.onStateChange?.(state, error);
+        }
       },
     });
     this.#conn.connect();
@@ -137,16 +146,19 @@ class AppConnection {
     this.#connectedBefore = true;
     this.#initialized = true;
     // One after the other, as a session's load must not overtake the list's fetch; one failing drops the socket, which
-    // comes back and tries them all again.
-    for (const consumer of [...this.#consumers]) {
+    // comes back and tries them all again. Those that register meanwhile are taken in turn: it goes on until none is left.
+    for (;;) {
       if (generation !== this.#generation) return;
-      await this.#ready_(consumer, generation, true);
+      const next = [...this.#consumers].find((consumer) => !this.#ready.has(consumer));
+      if (!next) return;
+      await this.#ready_(next, generation, true);
     }
   }
 
   /** Runs a consumer's `onReady` once on this connection. A failure drops the socket, as `onReady` throwing does. */
   async #ready_(consumer: Consumer, generation: number, throws = false) {
-    if (this.#ready.has(consumer)) return;
+    // One that left while it waited its turn isn't started.
+    if (this.#ready.has(consumer) || !this.#consumers.has(consumer)) return;
     this.#ready.add(consumer);
     try {
       await consumer.onReady(this);

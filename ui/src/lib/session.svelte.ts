@@ -81,6 +81,8 @@ export class SessionView {
   #refreshed = 0;
   #loadRetry: ReturnType<typeof setTimeout> | undefined;
   #stopped = false;
+  /** A `session/load` is on its way over the shared connection. */
+  #loading = false;
 
   configOptions = $state<SessionConfigOption[]>([]);
   /** The agent's model picker, if it offers one. */
@@ -162,13 +164,16 @@ export class SessionView {
     this.#unregister?.();
     this.#unregister = undefined;
     // The runtime stops sending this session's events and requests on the shared connection; what it left open waits.
-    if (this.loaded) {
-      const closed = app
-        .request('session/close', { sessionId: this.id })
-        .catch(() => {})
-        .finally(() => closing.delete(this.id));
-      closing.set(this.id, closed);
-    }
+    // A load still on its way ends with the close instead, or it would install what the close removed.
+    if (this.loaded && !this.#loading) this.#close();
+  }
+
+  #close() {
+    const closed = app
+      .request('session/close', { sessionId: this.id })
+      .catch(() => {})
+      .finally(() => closing.delete(this.id));
+    closing.set(this.id, closed);
   }
 
   /**
@@ -210,19 +215,27 @@ export class SessionView {
   async #onReady() {
     // Back on a session just left: its close has to be through, or it could land after this load and end it.
     await closing.get(this.id);
+    if (this.#stopped) return;
     this.#replay = new Transcript();
     this.#replayUpdates = [];
+    this.#loading = true;
     try {
       const response = await app.request<LoadSessionResponse>('session/load', {
         sessionId: this.id,
         cwd: '/',
         mcpServers: [],
       });
+      // The view was left while the runtime read the session: it has subscribed this socket by now, and stops.
+      if (this.#stopped) {
+        this.#close();
+        return;
+      }
       this.transcript = this.#replay;
       this.#updates = this.#replayUpdates;
       this.historyBefore = (response?._meta?.sloppod as { historyBefore?: number | null } | undefined)?.historyBefore ?? null;
       this.configOptions = response?.configOptions ?? [];
     } finally {
+      this.#loading = false;
       this.#replay = null;
       this.#replayUpdates = null;
     }

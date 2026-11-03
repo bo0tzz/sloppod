@@ -1450,6 +1450,11 @@ function handleCall(conn, message) {
         conn.error(id, -32602, `Unknown session ${params.sessionId}`);
         return;
       }
+      // With `/_mock/drop?slowload=<ms>`, loads are answered that long after they come.
+      if (Date.now() < slowLoadsUntil) {
+        setTimeout(() => handleCall(conn, message), slowLoadsUntil - Date.now());
+        return;
+      }
       if (proposeOnLoad && !proposeOnLoad.used) {
         // The proposal falls after the UI's REST fetch of proposals and before this connection subscribes (#423).
         const hook = proposeOnLoad;
@@ -2460,6 +2465,7 @@ const server = http.createServer(async (req, res) => {
       // With `?for=<ms>`, new connections are refused that long, so a UI stays disconnected for a while.
       refuseConnectionsUntil = Date.now() + Number(url.searchParams.get('for') ?? 0);
       slowSessionsUntil = Date.now() + Number(url.searchParams.get('slow') ?? 0);
+      slowLoadsUntil = Date.now() + Number(url.searchParams.get('slowload') ?? 0);
       for (const conn of connections) conn.ws.terminate();
       return json(res, 200, { dropped: connections.size });
     }
@@ -2481,6 +2487,7 @@ let proposeOnLoad = null;
 let refuseConnectionsUntil = 0;
 /** Set by `/_mock/drop?slow=<ms>`: until then, reading a session waits, as a slow runtime's REST does. */
 let slowSessionsUntil = 0;
+let slowLoadsUntil = 0;
 
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {

@@ -2663,6 +2663,76 @@ test('the page keeps one socket for the list, the meters and the open session, a
   }
 });
 
+test('a session opened while a reconnect is still fetching the rest loads once those are through', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  const first = 'Say something, the first of two on one socket';
+  const second = 'Say something, the second of two on one socket';
+  await createSession(page, first);
+  await finishTurn(page);
+  await createSession(page, second);
+  await finishTurn(page);
+  const nav = page.getByRole('navigation', { name: 'Sessions' });
+
+  // The reconnect's fetch of the quotas is held, so the connection is still coming up when the other session opens.
+  let hold = false;
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => (release = resolve));
+  let fetching!: () => void;
+  const started = new Promise<void>((resolve) => (fetching = resolve));
+  await page.route('**/api/v1/quotas', async (route) => {
+    if (hold) {
+      fetching();
+      await released;
+    }
+    await route.fallback();
+  });
+  hold = true;
+  await page.request.post('/_mock/drop');
+  await started;
+  await nav.getByTestId('session-row').filter({ hasText: first }).click();
+  await expect(page).toHaveURL(/\/sessions\/[0-9a-f-]+$/);
+  release();
+  await expect(agentMessages(page).filter({ hasText: FINAL })).toBeVisible();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+  await expect(page.getByTestId('reconnecting')).toBeHidden();
+});
+
+test('a session left while its load is on its way is closed once the load is through', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  const first = 'Say something, left while it reloads';
+  const second = 'Say something, opened while it reloads';
+  const firstId = await createSession(page, first);
+  await finishTurn(page);
+  await createSession(page, second);
+  await finishTurn(page);
+  const nav = page.getByRole('navigation', { name: 'Sessions' });
+  await nav.getByTestId('session-row').filter({ hasText: first }).click();
+  await expect(page).toHaveURL(new RegExp(firstId));
+  await expect(agentMessages(page).filter({ hasText: FINAL })).toBeVisible();
+
+  // What the page sends and gets on the sockets from here on.
+  const frames: { dir: 'sent' | 'received'; message: { id?: number; method?: string; params?: { sessionId?: string } } }[] = [];
+  page.on('websocket', (socket) => {
+    socket.on('framesent', ({ payload }) => frames.push({ dir: 'sent', message: JSON.parse(String(payload)) }));
+    socket.on('framereceived', ({ payload }) => frames.push({ dir: 'received', message: JSON.parse(String(payload)) }));
+  });
+  // The socket comes back at once, but the runtime takes 3 s to answer the load; the page moves on meanwhile.
+  await page.request.post('/_mock/drop?slowload=3000');
+  await expect
+    .poll(() => frames.some((frame) => frame.dir === 'sent' && frame.message.method === 'session/load' && frame.message.params?.sessionId === firstId))
+    .toBe(true);
+  await nav.getByTestId('session-row').filter({ hasText: second }).click();
+  await expect(page).not.toHaveURL(new RegExp(firstId));
+
+  // The close goes after the load has been answered, not before, when the runtime wouldn't have the subscription yet.
+  await expect.poll(() => frames.some((frame) => frame.dir === 'sent' && frame.message.method === 'session/close')).toBe(true);
+  const load = frames.find((frame) => frame.dir === 'sent' && frame.message.method === 'session/load' && frame.message.params?.sessionId === firstId)!;
+  const answered = frames.findIndex((frame) => frame.dir === 'received' && frame.message.id === load.message.id && frame.message.method === undefined);
+  const closed = frames.findIndex((frame) => frame.dir === 'sent' && frame.message.method === 'session/close' && frame.message.params?.sessionId === firstId);
+  expect(answered).toBeGreaterThan(-1);
+  expect(closed).toBeGreaterThan(answered);
+});
+
 test("a connection's quotas fetched after a newer connection's never replace them", async ({ page }) => {
   // The first connection's fetch is held back until the connection has dropped and come back with its own.
   let first: (() => void) | undefined;
