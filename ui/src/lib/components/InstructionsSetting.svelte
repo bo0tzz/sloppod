@@ -23,8 +23,10 @@
     event.preventDefault();
     saving = true;
     try {
-      saved = (await api.updateSettings({ instructions: instructions.trim() || null })).instructions ?? '';
-      instructions = saved;
+      const submitted = instructions;
+      saved = (await api.updateSettings({ instructions: submitted.trim() || null })).instructions ?? '';
+      // What was typed while it saved stays, to be saved next.
+      if (instructions === submitted) instructions = saved;
       toastManager.success('Saved your instructions');
     } catch (e) {
       toastManager.danger({ title: "Couldn't save", description: e instanceof Error ? e.message : String(e) });

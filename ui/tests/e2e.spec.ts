@@ -2947,3 +2947,25 @@ test('saves the instructions all sessions get', async ({ page }) => {
   expect(settings.instructions).toBe('- Only comment code for intent a reader could not infer.');
   await page.request.put('/api/v1/settings', { data: { instructions: null } });
 });
+
+test('what is typed while the instructions save is kept', async ({ page }) => {
+  const section = page.getByTestId('instructions-setting');
+  const field = section.getByRole('textbox', { name: 'Instructions' });
+  const save = section.getByRole('button', { name: 'Save' });
+  await page.goto('/settings');
+  let release = () => {};
+  const held = new Promise<void>((resolve) => (release = resolve));
+  await page.route('**/api/v1/settings', async (route) => {
+    if (route.request().method() === 'PUT') await held;
+    await route.continue();
+  });
+  await field.fill('First line.');
+  await save.click();
+  await field.fill('First line.\nSecond line.');
+  release();
+  await expect(page.getByText('Saved your instructions')).toBeVisible();
+  await expect(field).toHaveValue('First line.\nSecond line.');
+  await expect(save).toBeEnabled();
+  await page.unroute('**/api/v1/settings');
+  await page.request.put('/api/v1/settings', { data: { instructions: null } });
+});
