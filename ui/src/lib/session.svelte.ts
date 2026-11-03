@@ -78,6 +78,9 @@ export class SessionView {
   /** Why the session's REST side (the session and its proposals) didn't load; it's retried meanwhile. */
   loadError = $state<string | null>(null);
   #loadFailures = 0;
+  /** Refreshes started, and the latest one that succeeded: a failure of an older one than that isn't an error to show. */
+  #refreshes = 0;
+  #refreshed = 0;
   #loadRetry: ReturnType<typeof setTimeout> | undefined;
   #stopped = false;
 
@@ -169,6 +172,7 @@ export class SessionView {
   async refresh() {
     if (this.#stopped) return;
     clearTimeout(this.#loadRetry);
+    const refresh = ++this.#refreshes;
     try {
       const [session, proposals] = await Promise.all([
         api.getSession(this.id),
@@ -178,13 +182,16 @@ export class SessionView {
       for (const proposal of proposals) this.upsertProposal(proposal);
       this.loadError = null;
       this.#loadFailures = 0;
+      this.#refreshed = Math.max(this.#refreshed, refresh);
     } catch (error) {
       if (error instanceof ApiError && error.status === 404) {
         this.notFound = true;
         this.stop();
         return;
       }
-      if (this.#stopped) return;
+      // Overlapping refreshes (the one after `session/load`, a reconnect) can come back in any order; a late failure
+      // of one that a newer refresh has already made up for would show an error over what has loaded.
+      if (this.#stopped || refresh < this.#refreshed) return;
       this.loadError = error instanceof Error ? error.message : String(error);
       // Overlapping refreshes (a reconnect during a retry) can both fail; only one retry stays scheduled.
       clearTimeout(this.#loadRetry);
