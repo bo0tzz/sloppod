@@ -307,6 +307,10 @@ impl AgentAdapter for ClaudeCode {
         capability::MODEL.into()
     }
 
+    fn sub_session_model(&self) -> Option<String> {
+        Some("sonnet".into())
+    }
+
     fn launch(&self, context: &AgentContext) -> AgentLaunch {
         let session_id = &context.session.session_id;
         let config_dir = format!("{}/.claude", context.workdir);

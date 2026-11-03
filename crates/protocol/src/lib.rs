@@ -183,6 +183,9 @@ pub mod api {
         pub grants: Vec<Grant>,
         pub phase: Phase,
         pub agent: String,
+        /// The model the agent runs on, if one was chosen rather than the agent's default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub model: Option<String>,
         pub kind: SessionKind,
         pub review: ReviewPolicy,
         pub created_at: String,
