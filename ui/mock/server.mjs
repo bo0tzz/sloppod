@@ -264,11 +264,12 @@ function echoUser(
  * into a running turn, or answered with a short turn of its own when the agent is idle.
  */
 async function notifyAgent(session, text, ack, echo = true) {
-  if (echo) echoUser(session, text, { notice: true });
   if (session.turn) {
-    session.turn.steers.push({ text, ack });
+    // Shown when the turn takes it (`takeSteer`), not now: in the middle of a reply, it would split it (#420).
+    session.turn.steers.push({ text, ack, notice: echo });
     return;
   }
+  if (echo) echoUser(session, text, { notice: true });
   // Like the runtime, which queues a notice until the agent can take it rather than dropping it.
   if (session.data.phase !== 'idle') {
     if (sessions.has(session.data.id) && !['stopped', 'parked'].includes(session.data.phase)) {
@@ -284,7 +285,7 @@ async function notifyAgent(session, text, ack, echo = true) {
     // This one, and any that arrive while it's answered.
     while (turn.steers.length > 0) {
       const messageId = randomUUID();
-      for (const piece of chunks(steerReply(turn.steers.shift()))) {
+      for (const piece of chunks(takeSteer(session, turn))) {
         session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: piece }, messageId });
         await sleep(DELAY);
       }
@@ -292,6 +293,7 @@ async function notifyAgent(session, text, ack, echo = true) {
   } finally {
     session.turn = null;
     if (sessions.has(session.data.id) && session.data.phase !== 'stopped') session.setPhase('idle');
+    keepNotices(session, turn);
   }
 }
 
@@ -493,7 +495,7 @@ async function runTurn(session, text, { echo = true, messageId, images = [] } = 
     // Like a real agent, pick up messages that arrived after the last step instead of dropping them.
     while (turn.steers.length > 0) {
       const messageId = randomUUID();
-      for (const piece of chunks(steerReply(turn.steers.shift()))) {
+      for (const piece of chunks(takeSteer(session, turn))) {
         session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: piece }, messageId });
         await sleep(session.fast ? 0 : DELAY);
       }
@@ -516,6 +518,27 @@ async function runTurn(session, text, { echo = true, messageId, images = [] } = 
       session.setPhase('idle');
       startWaiting(session);
     }
+    keepNotices(session, turn);
+  }
+}
+
+/**
+ * The agent's reply to the next message steered into `turn`. A notice is shown as the turn takes it, at a boundary,
+ * as the runtime holds notices until one (#264), so it never lands in the middle of a reply.
+ */
+function takeSteer(session, turn) {
+  const steer = turn.steers.shift();
+  if (steer.notice) echoUser(session, steer.text, { notice: true });
+  return steerReply(steer);
+}
+
+/**
+ * Notices steered into a turn that ended before taking them, e.g. stopped mid-reply: the runtime keeps a notice until
+ * the agent has it, so they're delivered again, as a turn of their own.
+ */
+function keepNotices(session, turn) {
+  for (const steer of turn.steers.splice(0)) {
+    if (steer.notice !== undefined) void notifyAgent(session, steer.text, steer.ack, steer.notice);
   }
 }
 
@@ -548,7 +571,7 @@ async function agentScript(session, turn, prompt) {
   const step = async (n = 1) => {
     await sleep(delay * n);
     checkCancel();
-    while (turn.steers.length > 0) await say(steerReply(turn.steers.shift()));
+    while (turn.steers.length > 0) await say(takeSteer(session, turn));
   };
   const tool = (fields) => session.emit({ sessionUpdate: 'tool_call', ...fields });
   const update = (toolCallId, fields) => session.emit({ sessionUpdate: 'tool_call_update', toolCallId, ...fields });
@@ -562,6 +585,29 @@ async function agentScript(session, turn, prompt) {
         { content: 'Push and propose a pull request', priority: 'low', status: statuses[3] },
       ],
     });
+
+  // A question, then a long reply: an answer given meanwhile waits for the reply to end (#420).
+  if (/ask me, then keep talking/i.test(prompt)) {
+    await step(1);
+    const [question] = QUESTIONS;
+    const askId = randomUUID();
+    tool({ toolCallId: askId, title: 'mcp__sloppod__ask_user', kind: 'other', status: 'pending', rawInput: { questions: [question] } });
+    void requestFromUser(session, {
+      method: 'elicitation/create',
+      params: { ...questionsToElicitation([question], session.data.id), _meta: { sloppod: { questionId: randomUUID() } } },
+      cancelled: { action: 'cancel' },
+      blocking: false,
+    }).then((response) => {
+      const answers = response.action === 'accept' ? summariseAnswers([question], response.content ?? {}) : [];
+      if (answers.length) {
+        void notifyAgent(session, `sloppod: the user answered your question:\n- ${question.question}: ${answers.join(' ')}`, `Thanks, going with that. ${answers.join(' ')}`);
+      }
+    });
+    update(askId, { status: 'completed' });
+    // Long enough to answer and stop in the middle of it: about 20 seconds, with no boundary in between.
+    await say(Array.from({ length: 2400 }, (_, i) => `word${i}`).join(' '));
+    return;
+  }
 
   if (/ask_user/i.test(prompt)) {
     await step(1);
