@@ -291,6 +291,7 @@ type Proposal = {
   decided_at?: string;
   decided_by?: string;                         // the user, "standing-approval:<id>", or "sloppod" for a kind that isn't outward
   review_session_id?: string;                  // the session reviewing it, or that did
+  summary?: string;                            // what it does, in a line: its kind's own summary, as notices give it; a UI shows it for kinds it doesn't render
 };
 
 type Review = {

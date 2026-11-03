@@ -52,6 +52,14 @@ impl ProposalKinds {
         self.by_kind.values().find(|k| k.tool().name == tool)
     }
 
+    /// `proposal` with its kind's summary, as UIs get it.
+    pub fn summarized(&self, mut proposal: Proposal) -> Proposal {
+        proposal.summary = self
+            .get(&proposal.kind)
+            .map(|k| k.summary(&proposal.payload));
+        proposal
+    }
+
     pub fn tools(&self) -> Vec<ToolSpec> {
         let mut tools: Vec<ToolSpec> = self.by_kind.values().map(|k| k.tool()).collect();
         tools.sort_by(|a, b| a.name.cmp(&b.name));
@@ -980,7 +988,7 @@ pub async fn detail(state: &AppState, id: Uuid, owner: &str) -> anyhow::Result<O
     let Some(row) = owned_proposal(state, id, owner).await? else {
         return Ok(None);
     };
-    let mut proposal = serde_json::to_value(row.to_api())?;
+    let mut proposal = serde_json::to_value(state.proposals.summarized(row.to_api()))?;
     let kind = state
         .proposals
         .get(&row.kind)
@@ -1122,7 +1130,7 @@ mod tests {
             "test.on_repo".into()
         }
         fn summary(&self, _: &Value) -> String {
-            String::new()
+            "something on a repository".into()
         }
         fn tool(&self) -> ToolSpec {
             ToolSpec {
@@ -1212,6 +1220,36 @@ mod tests {
         assert!(!reviewed_again(Pending, false, false));
         // The author's next request_review takes it.
         assert!(!reviewed_again(ChangesRequested, false, true));
+    }
+
+    #[test]
+    fn a_proposal_goes_out_with_its_kind_s_summary() {
+        let mut kinds = ProposalKinds::default();
+        kinds.register(Arc::new(OnRepo));
+        let proposal = |kind: &str| Proposal {
+            id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            kind: kind.into(),
+            status: ProposalStatus::Pending,
+            payload: json!({}),
+            result: None,
+            error: None,
+            reason: None,
+            created_at: String::new(),
+            decided_at: None,
+            decided_by: None,
+            review_session_id: None,
+            summary: None,
+        };
+        assert_eq!(
+            kinds
+                .summarized(proposal("test.on_repo"))
+                .summary
+                .as_deref(),
+            Some("something on a repository")
+        );
+        // A kind no longer registered has none, and the UI falls back to the kind's name.
+        assert_eq!(kinds.summarized(proposal("test.gone")).summary, None);
     }
 
     #[test]
