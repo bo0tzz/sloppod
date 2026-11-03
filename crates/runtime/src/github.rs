@@ -8,7 +8,7 @@ use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::OnceCell;
 
@@ -274,6 +274,14 @@ pub struct Comparison {
     pub ahead_by: u64,
     /// The commit `head` resolved to.
     pub head_sha: String,
+}
+
+/// The size of a commit's tree, as [`GitHubApp::tree_size`] counts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreeSize {
+    pub files: u64,
+    pub bytes: u64,
+    pub truncated: bool,
 }
 
 impl GitHubApp {
@@ -1000,6 +1008,27 @@ impl GitHubApp {
                 )
             }
         }
+    }
+
+    /// How many files the tree at commit `sha` has and their size in bytes, and whether GitHub's listing was cut
+    /// short (it stops at 100,000 entries or 7 MB), in which case there are more.
+    pub async fn tree_size(&self, repo: &str, sha: &str) -> anyhow::Result<TreeSize> {
+        let tree: Value = self
+            .repo_json(repo, &format!("/git/trees/{sha}?recursive=1"))
+            .await?;
+        let blobs = tree["tree"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry["type"] == "blob");
+        let (files, bytes) = blobs.fold((0, 0), |(files, bytes), entry| {
+            (files + 1, bytes + entry["size"].as_u64().unwrap_or(0))
+        });
+        Ok(TreeSize {
+            files,
+            bytes,
+            truncated: tree["truncated"].as_bool() == Some(true),
+        })
     }
 
     /// Turns auto-merge off on open pull requests from `branch`, returning their numbers.
