@@ -140,9 +140,10 @@ async fn settings(state: &AppState, user: &str) -> ApiResult<serde_json::Value> 
         .unwrap_or_default();
     let review = db::user_review(&state.db, user).await?;
     let timezone = db::user_timezone(&state.db, user).await?;
+    let sub_session_model = db::user_sub_session_model(&state.db, user).await?;
     let instructions = db::user_instructions(&state.db, user).await?;
     Ok(
-        json!({"model": model, "models": models, "review": review, "timezone": timezone, "instructions": instructions}),
+        json!({"model": model, "sub_session_model": sub_session_model, "models": models, "review": review, "timezone": timezone, "instructions": instructions}),
     )
 }
 
@@ -175,6 +176,8 @@ const MAX_INSTRUCTIONS: usize = 32 * 1024;
 struct SettingsUpdate {
     #[serde(default, deserialize_with = "present")]
     model: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present")]
+    sub_session_model: Option<Option<String>>,
     review: Option<String>,
     timezone: Option<String>,
     #[serde(default, deserialize_with = "present")]
@@ -210,6 +213,10 @@ async fn put_settings(
     if let Some(model) = &update.model {
         let model = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
         db::set_user_model(&state.db, &user, model).await?;
+    }
+    if let Some(model) = &update.sub_session_model {
+        let model = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+        db::set_user_sub_session_model(&state.db, &user, model).await?;
     }
     if let Some(review) = review {
         db::set_user_review(&state.db, &user, review).await?;

@@ -141,6 +141,7 @@ impl SessionRow {
                 .collect(),
             phase: Phase::parse(&self.phase),
             agent: self.agent.clone(),
+            model: self.model.clone(),
             kind: self.kind,
             review: self.review,
             created_at: self.created_at.to_rfc3339(),
@@ -1442,6 +1443,33 @@ pub async fn set_user_instructions(
     )
     .bind(owner)
     .bind(instructions)
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
+/// The model the owner's sub-sessions default to (#283), as
+/// [`subsessions::child_model`](crate::subsessions::child_model) reads it.
+pub async fn user_sub_session_model(db: &PgPool, owner: &str) -> sqlx::Result<Option<String>> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("select sub_session_model from user_settings where owner = $1")
+            .bind(owner)
+            .fetch_optional(db)
+            .await?;
+    Ok(row.and_then(|(model,)| model))
+}
+
+pub async fn set_user_sub_session_model(
+    db: &PgPool,
+    owner: &str,
+    model: Option<&str>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "insert into user_settings (owner, sub_session_model) values ($1, $2) \
+         on conflict (owner) do update set sub_session_model = excluded.sub_session_model, updated_at = now()",
+    )
+    .bind(owner)
+    .bind(model)
     .execute(db)
     .await
     .map(|_| ())

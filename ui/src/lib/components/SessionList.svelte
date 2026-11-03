@@ -68,6 +68,10 @@
         <time class="shrink-0" datetime={session.active_at} title={absoluteTime(session.active_at)}>
           {timeAgo(session.active_at, now)}
         </time>
+        {#if session.parent_id && session.model}
+          <span aria-hidden="true">·</span>
+          <span class="truncate" title="Runs on {session.model}" data-testid="session-model">{session.model}</span>
+        {/if}
       </div>
     </a>
     {#if children.get(session.id)?.length}

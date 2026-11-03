@@ -8,6 +8,8 @@ export type Session = {
   grants: Grant[];
   phase: Phase;
   agent: string;
+  /** The model the agent runs on, if one was chosen rather than the agent's default. */
+  model?: string;
   /** 'work', or 'review' for a session that reviews a proposal. */
   kind: string;
   review: ReviewPolicy;
@@ -321,6 +323,9 @@ export type QuotaWindow = {
 /** Defaults for new sessions. `models` is what the agent offered most recently; empty before the first session. */
 export type Settings = {
   model: string | null;
+  /** What sub-sessions run on unless their parent names a model: a model, `parent` for their parent's, or `null` for a
+   * cheaper model than the agent's default where it has one (Sonnet for Claude Code). */
+  sub_session_model: string | null;
   models: { value: string; name: string }[];
   review: ReviewPolicy;
   /** The user's timezone, e.g. `Europe/Amsterdam`, for the times agents are told and their pods' clocks. */
@@ -419,6 +424,7 @@ export const api = {
   getSettings: () => call<Settings>('GET', '/settings'),
   updateSettings: (body: {
     model?: string | null;
+    sub_session_model?: string | null;
     review?: ReviewPolicy;
     timezone?: string;
     instructions?: string | null;
