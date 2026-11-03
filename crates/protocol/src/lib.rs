@@ -386,6 +386,10 @@ pub mod link {
     /// ServiceAccount token to each request, so the runtime knows the session from the pod's own identity.
     pub const LOCAL_PROXY: &str = "127.0.0.1:7811";
 
+    /// How often the supervisor pings the runtime and, when it changed, reports how many of the agent's commands
+    /// are running (`Commands`). A count is at most this old.
+    pub const COMMANDS_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+
     /// Whether `name` can be a transcript file: a plain `.jsonl` file name, nothing that reaches outside the
     /// transcript directory. Checked when the runtime stores a file and again when a supervisor restores it.
     pub fn is_transcript_file_name(name: &str) -> bool {

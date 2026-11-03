@@ -2123,3 +2123,13 @@ async fn a_user_keeps_their_own_instructions(db: PgPool) {
     db::set_user_instructions(&db, "dev", None).await.unwrap();
     assert_eq!(db::user_instructions(&db, "dev").await.unwrap(), None);
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_session_remembers_the_image_it_was_asked_to_make_room_for(db: PgPool) {
+    let id = session(&db, "dev").await;
+    let s = db::get_session(&db, id).await.unwrap().unwrap();
+    assert_eq!(s.image_nudged, None);
+    db::set_image_nudged(&db, id, "session:new").await.unwrap();
+    let s = db::get_session(&db, id).await.unwrap().unwrap();
+    assert_eq!(s.image_nudged.as_deref(), Some("session:new"));
+}
