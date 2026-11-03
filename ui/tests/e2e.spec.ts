@@ -432,6 +432,17 @@ test('Esc stops a running turn, unless it closes a dialog first', async ({ page 
   await expect(page.getByRole('button', { name: 'Stop' })).toBeHidden();
 });
 
+test('a proposal made while the session view is loading shows without a reload', async ({ page }) => {
+  await createSession(page, 'Give me a long answer');
+  await expect(agentMessages(page).filter({ hasText: 'The end.' })).toBeVisible();
+  await expect(page.getByTestId('proposal-card')).toBeHidden();
+
+  // The proposal is made after the reloaded page's REST fetch and before its socket subscribes (#423).
+  await page.request.post('/_mock/propose-on-load');
+  await page.reload();
+  await expect(page.getByTestId('proposal-card')).toBeVisible();
+});
+
 test('approves a proposal with an edited title', async ({ page }) => {
   const id = await createSession(page, 'Propose a PR for sloppod');
   await finishTurn(page);
