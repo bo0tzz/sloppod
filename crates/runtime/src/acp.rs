@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::link::RpcError;
 use crate::session::{UiEvent, session_update};
 use crate::users::User;
-use crate::{AppState, db};
+use crate::{AppState, db, quota};
 
 pub async fn handler(
     State(state): State<AppState>,
@@ -322,6 +322,18 @@ async fn run(state: AppState, user: String, agent: String, socket: WebSocket) {
         loaded: Mutex::default(),
         drop_connection: tokio::sync::Notify::new(),
     });
+    // The owner's quota changes, whatever session the connection shows, or none: the usage meters follow them.
+    let quotas = {
+        let conn = conn.clone();
+        let changes = conn.state.quotas.subscribe();
+        tokio::spawn(async move {
+            let out = conn.out.clone();
+            quota::forward(&conn.user, changes, out, || {
+                conn.drop_connection.notify_one()
+            })
+            .await
+        })
+    };
     loop {
         let message = tokio::select! {
             message = stream.next() => message,
@@ -369,6 +381,7 @@ async fn run(state: AppState, user: String, agent: String, socket: WebSocket) {
     for (_, task) in conn.loaded.lock().await.drain() {
         task.abort();
     }
+    quotas.abort();
     writer.abort();
     tracing::info!(connection = %conn.id, "UI disconnected");
 }

@@ -289,6 +289,7 @@ async fn main() -> anyhow::Result<()> {
         Box::pin(async move { limits::hit(&state, id).await })
     }));
     limits::follow_quotas(&state);
+    quota::announce_resets(&state);
     let checker = state.clone();
     state.hub.set_turn_ended(Arc::new(move |id| {
         let state = checker.clone();

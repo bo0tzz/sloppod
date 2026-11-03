@@ -222,14 +222,11 @@ pub fn follow_quotas(state: &AppState) {
                 if context.owner != change.owner {
                     continue;
                 }
-                let uses =
-                    state
-                        .credentials
-                        .accounts(&context, &kind)
-                        .await
-                        .is_ok_and(|accounts| {
-                            accounts.iter().any(|a| a.id == change.quota.credential_id)
-                        });
+                let uses = state
+                    .credentials
+                    .accounts(&context, &kind)
+                    .await
+                    .is_ok_and(|accounts| accounts.iter().any(|a| a.id == change.credential_id));
                 if !uses {
                     continue;
                 }

@@ -2506,6 +2506,104 @@ test('the sidebar shows every usage window of each account, by its name', async 
   }
 });
 
+/** Has the mock report one Claude account's 5-hour window at `percent`, or no quotas at all. */
+const setWorkQuota = (page: Page, percent: number | null) =>
+  page.request.post('/_mock/quotas', {
+    data:
+      percent === null
+        ? []
+        : [
+            {
+              credential_id: 'claude-work',
+              kind: 'claude',
+              name: 'work',
+              limited: false,
+              resets_at: null,
+              windows: [{ window: 'five_hour', utilization: percent / 100, resets_at: null, status: 'allowed' }],
+              observed_at: new Date().toISOString(),
+            },
+          ],
+  });
+
+test('the usage meters follow quota changes as they happen, without a reload', async ({ page }) => {
+  const set = (percent: number | null) => setWorkQuota(page, percent);
+  await set(20);
+  try {
+    await page.goto('/settings');
+    const meter = page.getByTestId('sidebar').getByTestId('quota-window');
+    await expect(meter).toContainText('20%');
+    await set(30);
+    await expect(meter).toContainText('30%');
+
+    // Across switching to a session and on to another.
+    await createSession(page, 'Meters while switching sessions');
+    await set(40);
+    await expect(meter).toContainText('40%');
+    await createSession(page, 'Another session for the meters');
+    await set(50);
+    await expect(meter).toContainText('50%');
+
+    // After the tab was hidden and shown again.
+    const visibility = (state: 'hidden' | 'visible') =>
+      page.evaluate((state) => {
+        Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => state });
+        document.dispatchEvent(new Event('visibilitychange'));
+      }, state);
+    await visibility('hidden');
+    await set(60);
+    await visibility('visible');
+    await expect(meter).toContainText('60%');
+
+    // A change while the connection is down shows once it's back.
+    await page.request.post('/_mock/drop?for=1500');
+    await set(70);
+    await expect(meter).toContainText('70%');
+
+    // An account that's gone takes its meter with it.
+    await set(null);
+    await expect(page.getByTestId('sidebar').getByTestId('quota')).toHaveCount(0);
+  } finally {
+    await set(null);
+  }
+});
+
+test("a connection's quotas fetched after a newer connection's never replace them", async ({ page }) => {
+  // The first connection's fetch is held back until the connection has dropped and come back with its own.
+  let first: (() => void) | undefined;
+  const firstLanded = new Promise<void>((resolve) => (first = resolve));
+  let read: (() => void) | undefined;
+  const firstRead = new Promise<void>((resolve) => (read = resolve));
+  let held = false;
+  await page.route('**/api/v1/quotas', async (route) => {
+    if (held) return route.continue();
+    held = true;
+    const response = await route.fetch();
+    read?.();
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    await route.fulfill({ response });
+    first?.();
+  });
+  await setWorkQuota(page, 20);
+  try {
+    await page.goto('/settings');
+    const meter = page.getByTestId('sidebar').getByTestId('quota-window');
+    // The held fetch has read 20%; then it's 30%, pushed.
+    await firstRead;
+    await setWorkQuota(page, 30);
+    await expect(meter).toContainText('30%');
+    const refetched = page.waitForResponse('**/api/v1/quotas');
+    await page.request.post('/_mock/drop');
+    await refetched;
+    await expect(meter).toContainText('30%');
+    // The first fetch, with 20%, lands now; it's older than what's shown, and changes nothing.
+    await firstLanded;
+    await page.waitForTimeout(300);
+    await expect(meter).toContainText('30%', { timeout: 1000 });
+  } finally {
+    await setWorkQuota(page, null);
+  }
+});
+
 test('only the transcript scrolls, not the page around it', async ({ page }) => {
   await page.setViewportSize({ width: 1000, height: 500 });
   await createSession(page, 'Give me a long answer in sloppod');

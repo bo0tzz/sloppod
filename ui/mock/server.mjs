@@ -2320,7 +2320,15 @@ const server = http.createServer(async (req, res) => {
   try {
     if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
     if (url.pathname === '/_mock/quotas' && req.method === 'POST') {
+      const before = quotas;
       quotas = await readBody(req);
+      // As the runtime pushes each change to the owner's connections; one that's down gets them on reconnecting.
+      const changed = quotas.filter((q) => JSON.stringify(q) !== JSON.stringify(before.find((b) => b.credential_id === q.credential_id)));
+      const gone = before.filter((b) => !quotas.some((q) => q.credential_id === b.credential_id));
+      for (const conn of connections) {
+        for (const quota of changed) conn.notify('_sloppod/quota', { credentialId: quota.credential_id, quota });
+        for (const quota of gone) conn.notify('_sloppod/quota', { credentialId: quota.credential_id, quota: null });
+      }
       return json(res, 200, {});
     }
     if (url.pathname === '/_mock/models' && req.method === 'POST') {

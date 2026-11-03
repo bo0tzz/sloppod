@@ -47,11 +47,14 @@ struct Kept {
     observed_at: DateTime<Utc>,
 }
 
-/// A credential's quota changed, for whoever needs to know at once.
+/// A credential's quota changed, for whoever needs to know at once: the session waits on usage limits, and the
+/// owner's UIs (`_sloppod/quota`).
 #[derive(Debug, Clone)]
 pub struct Change {
     pub owner: String,
-    pub quota: Quota,
+    pub credential_id: Uuid,
+    /// As it stands now; `None` once the credential is gone.
+    pub quota: Option<Quota>,
 }
 
 pub struct Quotas {
@@ -73,6 +76,104 @@ impl Quotas {
     pub fn subscribe(&self) -> broadcast::Receiver<Change> {
         self.changed.subscribe()
     }
+
+    /// Tells whoever follows quotas that a credential's quota is `quota` now, or gone.
+    pub fn send(&self, owner: &str, credential_id: Uuid, quota: Option<Quota>) {
+        let _ = self.changed.send(Change {
+            owner: owner.to_owned(),
+            credential_id,
+            quota,
+        });
+    }
+}
+
+/// Sends an owner's UI connection each change of `owner`'s quotas, as a `_sloppod/quota` notification:
+/// `{credentialId, quota}`, `quota` null once the credential is gone. Ends when the connection does; a connection that
+/// falls behind is told to reconnect (`lagged`), so it fetches them all again rather than miss one.
+pub async fn forward(
+    owner: &str,
+    mut changes: broadcast::Receiver<Change>,
+    out: tokio::sync::mpsc::Sender<Value>,
+    lagged: impl Fn(),
+) {
+    loop {
+        let change = match changes.recv().await {
+            Ok(change) => change,
+            Err(broadcast::error::RecvError::Lagged(_)) => return lagged(),
+            Err(broadcast::error::RecvError::Closed) => return,
+        };
+        if change.owner != owner {
+            continue;
+        }
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "_sloppod/quota",
+            "params": {"credentialId": change.credential_id, "quota": change.quota},
+        });
+        if out.send(notification).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Announces quotas when a reset passes: a limit that ends, or a window that starts over, changes what the quota
+/// says without anything being reported. Sleeps until the earliest reset of any quota, and plans again on every
+/// change, which may bring an earlier one.
+pub fn announce_resets(state: &AppState) {
+    let state = state.clone();
+    let mut changes = state.quotas.subscribe();
+    tokio::spawn(async move {
+        loop {
+            let now = Utc::now();
+            let planned = match all(&state.db, now).await {
+                Ok(quotas) => quotas,
+                Err(e) => {
+                    tracing::warn!(error = %e, "listing quotas for their resets");
+                    Vec::new()
+                }
+            };
+            let next = planned.iter().filter_map(|(_, q)| next_reset(q)).min();
+            // Without a reset to wait for, a change still wakes it; once an hour it looks again regardless.
+            let wait = next
+                .map(|at| (at - now).to_std().unwrap_or_default())
+                .unwrap_or(std::time::Duration::from_secs(3600))
+                + std::time::Duration::from_secs(1);
+            let closed = tokio::select! {
+                _ = tokio::time::sleep(wait) => false,
+                change = changes.recv() => matches!(change, Err(broadcast::error::RecvError::Closed)),
+            };
+            // However it woke: what's planned next is listed as it stands then, which no longer shows a reset that
+            // has passed, so a reset that passed meanwhile is announced now or never.
+            let now = Utc::now();
+            for (owner, quota) in due(&planned, now) {
+                if let Ok(fresh) = for_credential(&state.db, quota.credential_id, now).await {
+                    state.quotas.send(owner, quota.credential_id, fresh);
+                }
+            }
+            if closed {
+                return;
+            }
+        }
+    });
+}
+
+/// The planned quotas a reset of which has passed by `now`.
+fn due(planned: &[(String, Quota)], now: DateTime<Utc>) -> impl Iterator<Item = &(String, Quota)> {
+    planned
+        .iter()
+        .filter(move |(_, quota)| next_reset(quota).is_some_and(|at| at <= now))
+}
+
+/// The earliest reset a quota still has to come: its limit's end, or a window's.
+fn next_reset(quota: &Quota) -> Option<DateTime<Utc>> {
+    let parse = |at: &Option<String>| {
+        at.as_deref()
+            .and_then(|at| at.parse::<DateTime<Utc>>().ok())
+    };
+    std::iter::once(parse(&quota.resets_at))
+        .chain(quota.windows.iter().map(|w| parse(&w.resets_at)))
+        .flatten()
+        .min()
 }
 
 fn epoch(value: &Value) -> Option<DateTime<Utc>> {
@@ -366,6 +467,27 @@ pub async fn list(db: &PgPool, owner: &str, now: DateTime<Utc>) -> sqlx::Result<
     Ok(rows.into_iter().map(|row| row.into_quota(now)).collect())
 }
 
+/// Every quota that has been reported, with its credential's owner, as it stands at `now`.
+pub(crate) async fn all(db: &PgPool, now: DateTime<Utc>) -> sqlx::Result<Vec<(String, Quota)>> {
+    #[derive(sqlx::FromRow)]
+    struct Owned {
+        owner: String,
+        #[sqlx(flatten)]
+        row: QuotaRow,
+    }
+    let rows: Vec<Owned> = sqlx::query_as(sqlx::AssertSqlSafe(SELECT.replacen(
+        "select ",
+        "select c.owner, ",
+        1,
+    )))
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|o| (o.owner, o.row.into_quota(now)))
+        .collect())
+}
+
 /// A credential's quota as it stands at `now`, if one was reported.
 pub async fn for_credential(
     db: &PgPool,
@@ -425,10 +547,9 @@ pub async fn mark_limited(db: &PgPool, credential: Uuid, now: DateTime<Utc>) -> 
 /// Tells whoever follows quotas that a credential's changed.
 pub async fn announce(state: &AppState, credential: &CredentialRow) {
     if let Ok(Some(quota)) = for_credential(&state.db, credential.id, Utc::now()).await {
-        let _ = state.quotas.changed.send(Change {
-            owner: credential.owner.clone(),
-            quota,
-        });
+        state
+            .quotas
+            .send(&credential.owner, credential.id, Some(quota));
     }
 }
 
@@ -438,10 +559,7 @@ async fn record(state: &AppState, credential: Uuid, owner: &str, observation: Ob
         return;
     }
     if let Ok(Some(quota)) = for_credential(&state.db, credential, Utc::now()).await {
-        let _ = state.quotas.changed.send(Change {
-            owner: owner.to_owned(),
-            quota,
-        });
+        state.quotas.send(owner, credential, Some(quota));
     }
 }
 
@@ -489,9 +607,14 @@ pub async fn read_chatgpt(state: &AppState) {
         }
     };
     for login in logins {
-        if let Err(e) = read_chatgpt_of(state, &login).await {
-            tracing::warn!(owner = %login.owner, credential = %login.id, error = %e, "reading a ChatGPT login's limits");
-        }
+        read_chatgpt_login(state, &login).await;
+    }
+}
+
+/// Reads one ChatGPT login's limits, e.g. one just added.
+pub async fn read_chatgpt_login(state: &AppState, login: &CredentialRow) {
+    if let Err(e) = read_chatgpt_of(state, login).await {
+        tracing::warn!(owner = %login.owner, credential = %login.id, error = %e, "reading a ChatGPT login's limits");
     }
 }
 
@@ -526,6 +649,97 @@ mod tests {
 
     fn at(s: &str) -> DateTime<Utc> {
         s.parse().unwrap()
+    }
+
+    fn quota(name: &str, utilization: f64) -> Quota {
+        Quota {
+            credential_id: Uuid::nil(),
+            kind: CLAUDE.into(),
+            name: name.into(),
+            limited: false,
+            resets_at: None,
+            windows: vec![QuotaWindow {
+                window: "five_hour".into(),
+                utilization: Some(utilization),
+                resets_at: Some("2026-11-03T12:00:00Z".into()),
+                status: QuotaStatus::Allowed,
+            }],
+            observed_at: "2026-11-03T10:00:00Z".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_quota_change_reaches_its_owner_s_connections_and_no_one_else_s() {
+        let quotas = Quotas::new().unwrap();
+        let (out, mut ours) = tokio::sync::mpsc::channel(8);
+        let forwarding = tokio::spawn(forward("dev", quotas.subscribe(), out, || {}));
+        let gone = Uuid::from_u128(7);
+        quotas.send("someone-else", Uuid::nil(), Some(quota("theirs", 0.9)));
+        quotas.send("dev", Uuid::nil(), Some(quota("work", 0.4)));
+        quotas.send("dev", gone, None);
+
+        let first = ours.recv().await.unwrap();
+        assert_eq!(first["method"], "_sloppod/quota");
+        assert_eq!(first["params"]["quota"]["name"], "work");
+        assert_eq!(first["params"]["quota"]["windows"][0]["utilization"], 0.4);
+        // A credential that's gone takes its quota with it.
+        let second = ours.recv().await.unwrap();
+        assert_eq!(
+            second["params"],
+            serde_json::json!({"credentialId": gone, "quota": null})
+        );
+        assert!(ours.try_recv().is_err(), "nothing of anyone else's");
+
+        // The connection ending ends it.
+        drop(ours);
+        quotas.send("dev", Uuid::nil(), Some(quota("work", 0.5)));
+        forwarding.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_falls_behind_is_told_to_reconnect() {
+        let quotas = Quotas::new().unwrap();
+        let changes = quotas.subscribe();
+        for i in 0..100 {
+            quotas.send(
+                "dev",
+                Uuid::nil(),
+                Some(quota("work", f64::from(i) / 100.0)),
+            );
+        }
+        let (out, _ours) = tokio::sync::mpsc::channel(256);
+        let lagged = std::sync::atomic::AtomicBool::new(false);
+        forward("dev", changes, out, || {
+            lagged.store(true, std::sync::atomic::Ordering::SeqCst)
+        })
+        .await;
+        assert!(lagged.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_reset_that_passed_before_a_change_woke_it_is_still_announced() {
+        // Account A's window resets at noon; a report for account B wakes the task half a second later, inside the
+        // second it would have slept past the reset.
+        let a = ("dev".to_owned(), quota("a", 0.9));
+        let mut b = ("dev".to_owned(), quota("b", 0.1));
+        b.1.credential_id = Uuid::from_u128(2);
+        b.1.windows[0].resets_at = Some("2026-11-03T15:00:00Z".into());
+        let planned = [a, b];
+        let woken = at("2026-11-03T12:00:00.500Z");
+        let due: Vec<_> = due(&planned, woken).map(|(_, q)| q.name.as_str()).collect();
+        assert_eq!(due, ["a"]);
+        assert_eq!(super::due(&planned, at("2026-11-03T11:59:59Z")).count(), 0);
+    }
+
+    #[test]
+    fn the_next_reset_is_the_earliest_still_to_come() {
+        let mut limited = quota("work", 1.0);
+        assert_eq!(next_reset(&limited), Some(at("2026-11-03T12:00:00Z")));
+        limited.resets_at = Some("2026-11-03T11:00:00Z".into());
+        assert_eq!(next_reset(&limited), Some(at("2026-11-03T11:00:00Z")));
+        limited.resets_at = None;
+        limited.windows[0].resets_at = None;
+        assert_eq!(next_reset(&limited), None);
     }
 
     #[test]

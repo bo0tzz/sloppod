@@ -2133,3 +2133,31 @@ async fn a_session_remembers_the_image_it_was_asked_to_make_room_for(db: PgPool)
     let s = db::get_session(&db, id).await.unwrap().unwrap();
     assert_eq!(s.image_nudged.as_deref(), Some("session:new"));
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn every_reported_quota_is_listed_with_its_owner(db: PgPool) {
+    use crate::quota::{self, Observation};
+    let ours = credential(&db, "dev", "claude").await;
+    let theirs = credential(&db, "someone", "chatgpt").await;
+    credential(&db, "dev", "chatgpt").await;
+    let report = Observation {
+        observed_at: Utc::now(),
+        limited: false,
+        resets_at: None,
+        windows: Default::default(),
+    };
+    quota::store(&db, ours, &report).await.unwrap();
+    quota::store(&db, theirs, &report).await.unwrap();
+    let mut all: Vec<_> = quota::all(&db, Utc::now())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(owner, quota)| (owner, quota.credential_id))
+        .collect();
+    all.sort();
+    // Only those reported: the other login has none yet.
+    assert_eq!(
+        all,
+        [("dev".to_owned(), ours), ("someone".to_owned(), theirs)]
+    );
+}

@@ -227,6 +227,8 @@ type Credential = {
 
 What's left of the usage limits of the user's inference credentials, as last reported (#140). Claude Code reports a Claude subscription's limits in its sessions' `usage_update`s (`_meta["_claude/rateLimit"]`), under the Claude account last attached to the session's requests; they're known once a session has used it. Every ChatGPT login's are read from ChatGPT every five minutes, as the Codex CLI reads them, since codex-acp doesn't report them. Each report updates the windows it covers and keeps the others as they were; one that arrives after a newer one changes nothing the newer one said. A ChatGPT report that isn't as expected is logged and ignored. A quota reads as it stands now: a window whose reset has passed shows as unused, and a refusal ends at its `resets_at`; one reported without a reset reads as resetting 30 minutes after it was reported, when the account is tried again. Only credentials with a report are listed.
 
+Changes are pushed rather than polled: every `/acp` connection of the owner, whatever session it has loaded or none, gets `_sloppod/quota` (below) when a quota changes: a report from Claude Code or ChatGPT, a turn hitting the limit, a reset passing (the runtime wakes at the earliest reset of any quota), or the credential being deleted. A ChatGPT login's limits are read as soon as it's added. A UI fetches `GET /quotas` once each time its connection comes up, to catch what changed while it was down, and keeps up from the notifications. The web UI keeps a connection of its own for this while it shows the meters.
+
 ```
 GET /api/v1/quotas -> Quota[]
 ```
@@ -480,6 +482,7 @@ Runtime → UI:
 | `elicitation/create` (request) | The agent asks the user something, e.g. with `ask_user` (below). Delivered like a permission request. Params: `{sessionId, mode: "form", message, requestedSchema, toolCallId?}`; the schema is an object of primitive fields (below). Answer `{action: "accept", content}`, `{action: "decline"}` (skip: the agent is told the user didn't answer) or `{action: "cancel"}`. |
 | `_sloppod/queue` `{sessionId, messages: {id, prompt}[]}` | The messages waiting behind the running turn, sent whenever that changes and when a UI loads the session. |
 | `_sloppod/permission_resolved` `{sessionId, toolCallId, requestId}` | Sent to every UI, including the one that answered, once a permission request or question is answered or cancelled. `requestId` is the JSON-RPC id the request had on this connection. |
+| `_sloppod/quota` `{credentialId, quota: Quota \| null}` | One of the owner's quotas changed (see Quotas): `quota` as it stands now, or `null` once the credential is gone. Sent on every connection of the owner, with or without a session loaded. A connection that falls behind is dropped, so its UI reconnects and fetches them all. |
 | `_sloppod/session` `{session: Session}` | The session's phase, title, repository or grants changed, or the agent's running commands (`commands`, `command_lines`). |
 | `_sloppod/proposal` `{proposal: Proposal}` | A proposal for a loaded session was created or changed. |
 
