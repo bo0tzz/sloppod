@@ -1834,6 +1834,8 @@ test('lists sub-sessions under their parent', async ({ page }) => {
   const parentRow = list.locator('li').filter({ has: page.getByTestId('sub-sessions') });
   await expect(parentRow.getByTestId('session-row').first()).toContainText('Fan out the work');
   await expect(parentRow.getByTestId('sub-sessions').getByTestId('session-row')).toContainText('Fix the docs');
+  // A sub-session runs on the cheaper model unless the setting says otherwise.
+  await expect(parentRow.getByTestId('sub-sessions').getByTestId('session-model')).toHaveText('sonnet');
   // Not listed a second time at the top level.
   await expect(list.getByTestId('session-row').filter({ hasText: 'Fix the docs' })).toHaveCount(1);
 });
@@ -2883,6 +2885,25 @@ test.describe('work on a phone', () => {
     await page.keyboard.press('Escape');
     await expect(page.getByTestId('work-ready').getByTestId('work-item')).toHaveText([/Write the fix/, /Read the issue/]);
   });
+});
+
+test('saves the model sub-sessions run on', async ({ page }) => {
+  const defaults = page.getByTestId('session-defaults');
+  const field = defaults.getByRole('combobox', { name: 'Sub-sessions' });
+  await page.goto('/settings');
+  await expect(field).toContainText('A cheaper model (Sonnet)');
+  await field.click();
+  await page.getByRole('option', { name: 'The same as their parent', exact: true }).click();
+  await defaults.getByRole('button', { name: 'Save' }).click();
+  await expect(defaults.getByRole('button', { name: 'Save' })).toBeDisabled();
+  await page.reload();
+  await expect(field).toContainText('The same as their parent');
+  const settings: { sub_session_model: string | null; model: string | null } = await (
+    await page.request.get('/api/v1/settings')
+  ).json();
+  expect(settings.sub_session_model).toBe('parent');
+  expect(settings.model).toBeNull();
+  await page.request.put('/api/v1/settings', { data: { sub_session_model: null } });
 });
 
 test('a selection runs from one message across tool calls to the next', async ({ page }) => {

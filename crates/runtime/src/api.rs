@@ -140,7 +140,10 @@ async fn settings(state: &AppState, user: &str) -> ApiResult<serde_json::Value> 
         .unwrap_or_default();
     let review = db::user_review(&state.db, user).await?;
     let timezone = db::user_timezone(&state.db, user).await?;
-    Ok(json!({"model": model, "models": models, "review": review, "timezone": timezone}))
+    let sub_session_model = db::user_sub_session_model(&state.db, user).await?;
+    Ok(
+        json!({"model": model, "sub_session_model": sub_session_model, "models": models, "review": review, "timezone": timezone}),
+    )
 }
 
 /// Deserializes a field that's present, so `Option<Option<T>>` tells an absent field from a null one.
@@ -169,6 +172,8 @@ async fn get_settings(
 struct SettingsUpdate {
     #[serde(default, deserialize_with = "present")]
     model: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present")]
+    sub_session_model: Option<Option<String>>,
     review: Option<String>,
     timezone: Option<String>,
 }
@@ -192,6 +197,10 @@ async fn put_settings(
     if let Some(model) = &update.model {
         let model = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
         db::set_user_model(&state.db, &user, model).await?;
+    }
+    if let Some(model) = &update.sub_session_model {
+        let model = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+        db::set_user_sub_session_model(&state.db, &user, model).await?;
     }
     if let Some(review) = review {
         db::set_user_review(&state.db, &user, review).await?;

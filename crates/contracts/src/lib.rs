@@ -537,6 +537,11 @@ pub trait AgentAdapter: Send + Sync {
     fn credential(&self) -> NeededCredential;
     /// The capability a session needs for its model requests, e.g. `model`.
     fn inference_capability(&self) -> String;
+    /// The model sub-sessions run on unless the user or the parent says otherwise: a cheaper one than the agent's
+    /// default, if it offers one (#283). `None` leaves them on their parent's model.
+    fn sub_session_model(&self) -> Option<String> {
+        None
+    }
     fn launch(&self, context: &AgentContext) -> AgentLaunch;
 }
 

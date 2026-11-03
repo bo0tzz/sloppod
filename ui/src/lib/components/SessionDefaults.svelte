@@ -1,41 +1,36 @@
 <script lang="ts">
-  import { Alert, Button, Field, Heading, Input, LoadingSpinner, Select, Text, toastManager } from '@immich/ui';
+  import { Alert, Button, Field, Heading, LoadingSpinner, Select, Text, toastManager } from '@immich/ui';
   import { onMount } from 'svelte';
   import { api, type ReviewPolicy, type Settings } from '#lib/api.ts';
-
-  // The select needs a string for "no model set"; null means the agent's default.
-  const AGENT_DEFAULT = '__agent_default__';
-  // A model id the agent doesn't list, e.g. one the account has but Claude Code doesn't offer yet; typed in.
-  const OTHER = '__other__';
+  import ModelField from './ModelField.svelte';
 
   let settings = $state<Settings | null>(null);
   let loadError = $state<string | null>(null);
   let saving = $state(false);
   let model = $state('');
+  let subSessionModel = $state('');
   let review = $state<ReviewPolicy>('off');
-  let typing = $state(false);
 
-  const saved = $derived(settings?.model ?? '');
-  const changed = $derived(model.trim() !== saved || review !== (settings?.review ?? 'off'));
+  const changed = $derived(
+    model.trim() !== (settings?.model ?? '') ||
+      subSessionModel.trim() !== (settings?.sub_session_model ?? '') ||
+      review !== (settings?.review ?? 'off'),
+  );
   const reviewOptions = [
     { value: 'off', label: 'Only when the agent asks' },
     { value: 'required', label: 'Always, for pull requests' },
   ];
-  const options = $derived.by(() => {
-    if (!settings) return [];
-    const models = settings.models.map((entry) => ({ value: entry.value, label: entry.name }));
-    return [{ value: AGENT_DEFAULT, label: 'Agent default' }, ...models, { value: OTHER, label: 'Other…' }];
-  });
 
-  const offered = (value: string) => settings?.models.some((entry) => entry.value === value) ?? false;
-  // A saved model the agent doesn't list shows as typed in, rather than silently as the default.
-  const selected = $derived(typing || (model && !offered(model)) ? OTHER : model || AGENT_DEFAULT);
+  function load(loaded: Settings) {
+    settings = loaded;
+    model = loaded.model ?? '';
+    subSessionModel = loaded.sub_session_model ?? '';
+    review = loaded.review;
+  }
 
   onMount(async () => {
     try {
-      settings = await api.getSettings();
-      model = settings.model ?? '';
-      review = settings.review;
+      load(await api.getSettings());
     } catch (e) {
       loadError = e instanceof Error ? e.message : String(e);
     }
@@ -45,9 +40,13 @@
     event.preventDefault();
     saving = true;
     try {
-      settings = await api.updateSettings({ model: model.trim() || null, review });
-      model = settings.model ?? '';
-      review = settings.review;
+      load(
+        await api.updateSettings({
+          model: model.trim() || null,
+          sub_session_model: subSessionModel.trim() || null,
+          review,
+        }),
+      );
       toastManager.success('Saved your defaults');
     } catch (e) {
       toastManager.danger({ title: "Couldn't save", description: e instanceof Error ? e.message : String(e) });
@@ -70,27 +69,18 @@
   {:else}
     <form class="flex flex-wrap items-end gap-3" onsubmit={save}>
       <div class="min-w-48 grow">
-        {#if settings.models.length > 0}
-          <Field label="Model">
-            <Select
-              {options}
-              value={selected}
-              onChange={(value) => {
-                typing = value === OTHER;
-                if (value !== OTHER) model = value === AGENT_DEFAULT ? '' : value;
-              }}
-            />
-          </Field>
-          {#if selected === OTHER}
-            <Field label="Model id" description="Any model id your account has, e.g. one the agent doesn't list yet.">
-              <Input bind:value={model} placeholder="claude-…" autocomplete="off" data-testid="custom-model" />
-            </Field>
-          {/if}
-        {:else}
-          <Field label="Model" description="The list of models appears after your first session.">
-            <Input bind:value={model} placeholder="Agent default" autocomplete="off" />
-          </Field>
-        {/if}
+        <ModelField label="Model" bind:value={model} models={settings.models} unset="Agent default" />
+      </div>
+      <div class="min-w-48 grow">
+        <ModelField
+          label="Sub-sessions"
+          description="What sessions an agent starts run on, unless it names a model."
+          bind:value={subSessionModel}
+          models={settings.models}
+          unset="A cheaper model (Sonnet)"
+          choices={[{ value: 'parent', label: 'The same as their parent' }]}
+          testid="sub-session-model"
+        />
       </div>
       <div class="min-w-48 grow">
         <Field label="Review by Codex" description="Another model reviews proposals before you see them; needs a ChatGPT login.">

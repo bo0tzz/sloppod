@@ -70,6 +70,25 @@ fn child_grants(parent: &[Grant], keep: Option<&[String]>, child: Uuid) -> Vec<G
         .collect()
 }
 
+/// The `sub_session_model` setting that puts sub-sessions on their parent's model.
+pub const PARENT_MODEL: &str = "parent";
+
+/// The model a child runs on (#283): the one `spawn_session` names; else the owner's setting for sub-sessions, a
+/// model or [`PARENT_MODEL`]; unset, the agent's cheaper model if it has one, and its parent's if not.
+pub fn child_model(
+    named: Option<&str>,
+    setting: Option<&str>,
+    cheaper: Option<String>,
+    parent: Option<&str>,
+) -> Option<String> {
+    match (named, setting) {
+        (Some(model), _) => Some(model.to_owned()),
+        (None, Some(PARENT_MODEL)) => parent.map(str::to_owned),
+        (None, Some(model)) => Some(model.to_owned()),
+        (None, None) => cheaper.or_else(|| parent.map(str::to_owned)),
+    }
+}
+
 /// `spawn_session`: starts a child of `parent` on `task`.
 pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<String, String> {
     let task = arguments["task"]
@@ -128,7 +147,18 @@ pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<
             needed.name
         ));
     }
-    let model = arguments["model"].as_str().or(parent.model.as_deref());
+    let setting = db::user_sub_session_model(&state.db, &parent.owner)
+        .await
+        .map_err(|e| e.to_string())?;
+    let model = child_model(
+        arguments["model"]
+            .as_str()
+            .map(str::trim)
+            .filter(|m| !m.is_empty()),
+        setting.as_deref(),
+        adapter.sub_session_model(),
+        parent.model.as_deref(),
+    );
     let title = arguments["title"]
         .as_str()
         .map(str::to_owned)
@@ -157,7 +187,7 @@ pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<
             title: &title,
             custom_title: arguments["title"].is_string(),
             agent,
-            model,
+            model: model.as_deref(),
             review: parent.review,
             repo: repo.as_deref(),
             grants: &grants,
@@ -170,6 +200,10 @@ pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<
         Some(branch) => format!(" on branch `{branch}`"),
         None => String::new(),
     };
+    let on = match &child.model {
+        Some(model) => format!(", running {model}"),
+        None => String::new(),
+    };
     let mut warnings = Vec::new();
     for grant in &grants {
         if let Some(warning) =
@@ -179,7 +213,7 @@ pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<
         }
     }
     Ok(format!(
-        "Started sub-session {} \"{}\"{branch}. You're told when it reports; list_sessions shows how it's doing.{}",
+        "Started sub-session {} \"{}\"{branch}{on}. You're told when it reports; list_sessions shows how it's doing.{}",
         child.id,
         child.title,
         warnings.concat()
@@ -195,7 +229,7 @@ pub async fn list(state: &AppState, parent: Uuid) -> Result<String, String> {
         .iter()
         .map(|child| {
             let api = child.to_api();
-            json!({"id": child.id, "title": child.title, "phase": child.phase, "repo": api.repo, "branch": api.branch})
+            json!({"id": child.id, "title": child.title, "phase": child.phase, "model": child.model, "repo": api.repo, "branch": api.branch})
         })
         .collect();
     Ok(Value::Array(children).to_string())
@@ -361,7 +395,7 @@ pub fn tools() -> Vec<Value> {
                     "repo": {"type": "string", "description": "owner/name, one you have; defaults to yours"},
                     "grants": {"type": "array", "items": {"type": "string"}, "description": "The capabilities to give it, of yours (e.g. [\"github\", \"repo\", \"docs\"]); defaults to all of yours. Model access always stays"},
                     "agent": {"type": "string", "description": "claude-code or codex; defaults to yours"},
-                    "model": {"type": "string", "description": "defaults to yours"},
+                    "model": {"type": "string", "description": "defaults to the user's setting for sub-sessions, by default a cheaper model than yours where the agent has one (Sonnet for claude-code); name a model to give a hard task a bigger one"},
                 },
                 "required": ["task"],
             },
@@ -389,7 +423,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "list_sessions",
-            "description": "Your sub-sessions: each one's id, title, phase, repository and branch.",
+            "description": "Your sub-sessions: each one's id, title, phase, model, repository and branch.",
             "inputSchema": {"type": "object", "properties": {}},
         }),
     ]
@@ -417,6 +451,34 @@ mod tests {
         // A later report in review, or a review with findings to answer, keeps it going.
         assert!(!finished(&[(report, Executed), (report, InReview)]));
         assert!(!finished(&[(report, Executed), (review, ChangesRequested)]));
+    }
+
+    #[test]
+    fn a_child_runs_on_the_cheaper_model_unless_told_otherwise() {
+        let sonnet = || Some("sonnet".to_owned());
+        assert_eq!(
+            child_model(None, None, sonnet(), Some("opus")).as_deref(),
+            Some("sonnet")
+        );
+        // An agent without a cheaper model keeps the parent's.
+        assert_eq!(
+            child_model(None, None, None, Some("opus")).as_deref(),
+            Some("opus")
+        );
+        assert_eq!(
+            child_model(None, Some("haiku"), sonnet(), Some("opus")).as_deref(),
+            Some("haiku")
+        );
+        assert_eq!(
+            child_model(None, Some(PARENT_MODEL), sonnet(), Some("opus")).as_deref(),
+            Some("opus")
+        );
+        assert_eq!(child_model(None, Some(PARENT_MODEL), sonnet(), None), None);
+        // What the parent names wins.
+        assert_eq!(
+            child_model(Some("opus"), Some("haiku"), sonnet(), None).as_deref(),
+            Some("opus")
+        );
     }
 
     #[test]

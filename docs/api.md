@@ -29,7 +29,7 @@ GET    /api/v1/sessions/{id}/debug-bundle?message={messageId} -> DebugBundle  do
 GET    /api/v1/repos                -> string[]    repositories sessions can be granted, e.g. ["bo0tzz/sloppod"]
 GET    /api/v1/me                   -> {user: string, version: string | null, build: string | null}   version: the release, e.g. 0.1.2-main.153 (SLOPPOD_VERSION, the chart's version); build: the commit or tag it was built from (SLOPPOD_BUILD, the chart's app version)
 GET    /api/v1/settings             -> Settings
-PUT    /api/v1/settings             -> Settings    body: {model?: string | null, review?: "off" | "required", timezone?: string}; fields left out stay as they are; 400 for a timezone that isn't one
+PUT    /api/v1/settings             -> Settings    body: {model?: string | null, sub_session_model?: string | null, review?: "off" | "required", timezone?: string}; fields left out stay as they are; 400 for a timezone that isn't one
 ```
 
 ```ts
@@ -38,8 +38,12 @@ PUT    /api/v1/settings             -> Settings    body: {model?: string | null,
 // `timezone` is the user's, as an IANA name (e.g. "Europe/Amsterdam"), null until set; the UI sets the browser's
 // for a user without one. The time line agents get after a gap is in it, and their agents run with it as `TZ` from
 // their next start (#253); without one, both are UTC.
+// `sub_session_model` is what sub-sessions run on unless `spawn_session` names a model (#283): a model, "parent" for
+// their parent's, or null (the default) for the agent's cheaper model where it has one, Sonnet for Claude Code, and their
+// parent's otherwise.
 type Settings = {
   model: string | null;
+  sub_session_model: string | null;
   models: { value: string; name: string }[];
   review: "off" | "required";
   timezone: string | null;
@@ -117,6 +121,7 @@ type Session = {
   grants: Grant[];
   phase: Phase;
   agent: string;         // "claude-code" or "codex"
+  model?: string;        // the model it runs on, when one was chosen rather than the agent's default
   kind: "work" | "review" | "utility"; // "review": a session reviewing a proposal (ADR 24); "utility": an owner's session for the runtime's judgements (ADR 26); `GET /sessions` leaves both out
   review: "off" | "required"; // whether its pull requests are reviewed by another model first; from the user's settings
   created_at: string;    // RFC 3339
@@ -498,9 +503,9 @@ Session pods use four more endpoints, on their own port (8081, `sessions`); that
   - `request_owner_identity {repo, reason}` creates a `sloppod.repo.act_as_owner` proposal, to act on a repository with one of the user's GitHub tokens ([ADR 29](adr/0029-grants-name-their-credential.md)); refused for a sub-session, when the user has no token, when none reaches the repository, or when the session already acts as the user there.
   - `get_proposal {id}` returns a proposal's status and result. The agent is also told when its proposals are decided.
   - `withdraw_proposal {id, reason?}` withdraws one of the session's pending proposals: it becomes `withdrawn` (with the reason) and nothing is carried out.
-  - `spawn_session {task, title?, repo?, grants?, agent?, model?}` starts a sub-session ([ADR 27](adr/0027-sub-sessions.md)) with `task` as its first message, and answers in a sentence with its id, title and branch. It has the session's grants, or only the capabilities named in `grants` (model access always stays), and the session's owner, review policy and, unless given, agent and model. It works in `repo`, one the session can push to (by default the session's), on `<session branch>-<first 8 of its id>`, which starts from the session branch as pushed (from the default branch if it isn't pushed yet). A tree of sessions has at most 5 sub-sessions running at once (the tool's description says the same, from the same constant). A repository the session acts on as the user, the child acts on as them only to read it and push its own branches (above). The answer warns of any repository grant whose identity can't reach it: the GitHub App not installed there, or a token that doesn't list it. Work sessions only.
+  - `spawn_session {task, title?, repo?, grants?, agent?, model?}` starts a sub-session ([ADR 27](adr/0027-sub-sessions.md)) with `task` as its first message, and answers in a sentence with its id, title and branch. It has the session's grants, or only the capabilities named in `grants` (model access always stays), and the session's owner, review policy and, unless given, agent. Its model is `model` if given, else the user's `sub_session_model` setting (above): by default the agent's cheaper model, Sonnet for Claude Code; the answer names it. It works in `repo`, one the session can push to (by default the session's), on `<session branch>-<first 8 of its id>`, which starts from the session branch as pushed (from the default branch if it isn't pushed yet). A tree of sessions has at most 5 sub-sessions running at once (the tool's description says the same, from the same constant). A repository the session acts on as the user, the child acts on as them only to read it and push its own branches (above). The answer warns of any repository grant whose identity can't reach it: the GitHub App not installed there, or a token that doesn't list it. Work sessions only.
   - `list_work {graph?, view?, item?}` reads a work graph the session holds a `work` grant of (ADR 30): its items (`graph`, the default), what's ready in order (`frontier`), or one item with its description and history (`item`). `update_work {graph?, action, …}`, from `track`, adds and edits items, moves them between open, active and done, adds and removes blocks, and links and unlinks issues, pull requests, sessions (this one by default) and proposals, applied at once and recorded as the session's, so the user sees and can undo them. Ranking, reparenting, dropping and reopening are `plan` changes: `propose_work_plan`, shown only at `plan`, makes a `sloppod.work.plan` proposal. A session without a `work` grant gets none of these. A sub-session's grant of its parent's graph is at most `track`. A session holding a `work` grant, or linked to items, is told the graphs and those items in its prompt, and that the frontier is one call away.
-  - `list_sessions` lists the session's sub-sessions: `{id, title, phase, repo, branch}` each.
+  - `list_sessions` lists the session's sub-sessions: `{id, title, phase, model, repo, branch}` each.
   - `message_session {id, text}` sends a message to the session's parent or one of its sub-sessions, delivered as a notice; a parked sub-session is woken for it unless its tree is at the limit, in which case it's refused.
   - `park_session {id}` parks one of the session's own sub-sessions (any other id is refused, as is one in a turn), so it stops counting towards its tree's limit; a message wakes it as above. A sub-session also parks by itself once it has finished: a report of it was carried out, nothing of its is in review, has changes requested, or is pending or approved, and it has been idle for 5 minutes with nothing queued, no open request, and its supervisor saying none of its commands are running. That's checked every 2 minutes.
   - `report_done {summary, title?, head?, review?}`, for a sub-session, creates a `sloppod.session.report` proposal: reviewed like a pull request under the session's review policy, then delivered to the parent with the summary, the branch and how the review ended. `head` names the branch the work is on when it isn't the session branch, e.g. a reused child's later task on `<session branch>-<name>` (the same rule as `propose_pull_request`'s `head`); a named branch without commits on the base is refused. The base is the parent's branch the child started from, or the default branch when that was never pushed or is behind the default branch with nothing of its own (as for pull requests, above). `title` says what the task was, for a child reused for more than one.

@@ -37,7 +37,7 @@ const MODELS = [
   { value: 'haiku', name: 'Haiku' },
 ];
 /** The user's defaults for new sessions. `models` fills in once a session has offered them. */
-const settings = { model: null, models: [], review: 'off', timezone: null };
+const settings = { model: null, sub_session_model: null, models: [], review: 'off', timezone: null };
 const CANCELLED = Symbol('cancelled');
 
 /** @type {Map<string, MockSession>} */
@@ -1143,6 +1143,13 @@ function deriveRepo(prompt) {
 
 /** Creates a session from its first message, which is recorded right away and queued for the agent; `parent` makes it a
  * sub-session. */
+/** A new session's model, as the runtime picks it: a sub-session's from the setting for sub-sessions, Sonnet unless set. */
+function modelOf(parent) {
+  if (!parent) return settings.model ? { model: settings.model } : {};
+  const model = settings.sub_session_model === 'parent' ? sessions.get(parent)?.data.model : (settings.sub_session_model ?? 'sonnet');
+  return model ? { model } : {};
+}
+
 function createSession({ prompt, repo, title, capabilities, parent, starting }) {
   const id = starting?.id ?? randomUUID();
   const created = now();
@@ -1183,6 +1190,7 @@ function createSession({ prompt, repo, title, capabilities, parent, starting }) 
     agent: 'claude-code',
     kind: 'work',
     review: settings.review,
+    ...modelOf(parent),
     created_at: created,
     updated_at: created,
     active_at: created,
@@ -1524,6 +1532,12 @@ async function handleApi(req, res, url) {
       if ('model' in body) {
         if (body.model !== null && typeof body.model !== 'string') return json(res, 400, { error: 'model must be a string or null' });
         settings.model = body.model || null;
+      }
+      if ('sub_session_model' in body) {
+        if (body.sub_session_model !== null && typeof body.sub_session_model !== 'string') {
+          return json(res, 400, { error: 'sub_session_model must be a string or null' });
+        }
+        settings.sub_session_model = body.sub_session_model || null;
       }
       if ('review' in body) {
         if (!['off', 'required'].includes(body.review)) return json(res, 400, { error: 'review must be one of off, required' });
