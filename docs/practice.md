@@ -27,7 +27,7 @@ The parent session manages, and sub-sessions ([ADR 27](adr/0027-sub-sessions.md)
 - **One sub-session per issue.** A finished one can be reused for a follow-up in the same area: its volume keeps the checkout and build caches warm. Spawn a fresh one if its context looks muddled.
 - **Add sub-sessions slowly,** and talk the layout through with the user before a new batch.
 - **Keep them busy:** hand a finished sub-session its next task right away. "Idle" only means no turn is running; a sub-session waiting on its own background job (a Playwright run) shows idle too, so ask before assuming it's stuck.
-- **Before spawning,** bring the parent's session branch up to date with main. Sub-sessions start from it, and reports compare against it.
+- **Before spawning,** bring the parent's session branch up to date with main. Sub-sessions start from it, and reports compare against it, or against main where it's only behind main (#373).
 - **A brief says:**
   - read `CLAUDE.md` and the ADRs that apply;
   - start from the latest `origin/main`;
