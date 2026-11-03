@@ -1524,6 +1524,22 @@ test('questions asked in separate requests show one after another', async ({ pag
   await expect(agentMessages(page).filter({ hasText: 'Thanks, going with that. Tests: Unit.' })).toBeVisible();
 });
 
+test('an answer given while the agent is replying waits for the reply, and outlives a stop', async ({ page }) => {
+  await createSession(page, 'Ask me, then keep talking');
+  await expect(questionCard(page)).toBeVisible();
+  await questionField(page, 'question_0').getByRole('radio', { name: /Fixed/ }).check();
+  await questionCard(page).getByRole('button', { name: 'Answer' }).click();
+  await expect(questionCard(page)).toHaveCount(0);
+  // It isn't shown in the middle of the agent's reply, which would split it.
+  await expect(page.getByTestId('system-notice')).toHaveCount(0);
+
+  // Stopped before the agent took it, the answer still reaches it.
+  await page.getByRole('textbox', { name: 'Prompt' }).focus();
+  await page.keyboard.press('Escape');
+  await expect(page.getByTestId('system-notice')).toContainText('the user answered your question');
+  await expect(agentMessages(page).filter({ hasText: 'Thanks, going with that. Backoff: Fixed.' })).toBeVisible();
+});
+
 test('shows an open question again after a reload', async ({ page }) => {
   await createSession(page, 'Ask me something, then reload');
   await expect(questionCard(page)).toBeVisible();
