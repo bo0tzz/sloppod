@@ -182,7 +182,7 @@ impl ProposalKind for Report {
             let app = super::github_for(&self.credentials, session, repo).await?;
             // A child spawned before its parent pushed started from the default branch, so that's its base then. A
             // branch that was never pushed has nothing to hand over; a failed comparison is retried.
-            let mut base = base.to_owned();
+            let mut base = super::current_base(&app, session, repo, base.to_owned()).await?;
             let mut comparison = app.compare_if_found(repo, &base, head).await.map_err(err)?;
             if comparison.is_none() {
                 base = app.default_branch(repo).await.map_err(err)?;

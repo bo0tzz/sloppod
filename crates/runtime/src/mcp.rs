@@ -359,6 +359,7 @@ async fn call(state: &AppState, session: Uuid, params: &Value) -> Value {
         "spawn_session" => subsessions::spawn(state, session, &arguments).await,
         "list_sessions" => subsessions::list(state, session).await,
         "message_session" => subsessions::message(state, session, &arguments).await,
+        "park_session" => subsessions::park(state, session, &arguments).await,
         work::agent::LIST | work::agent::UPDATE => {
             work::agent::call(&state.db, &row.context(), name, &arguments).await
         }

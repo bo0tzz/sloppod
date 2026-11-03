@@ -300,19 +300,30 @@ pub async fn purge_deleted(state: &AppState) {
 
 /// Parks a session (ADR 5): its pod ends, and its volume, transcript, branch, grants and keys stay.
 pub async fn park(state: &AppState, session: &db::SessionRow) -> Result<(), ParkError> {
-    let id = session.id;
     state
         .hub
-        .park(id, || async {
-            state.placement.suspend(&id.to_string()).await?;
-            // A parked session holds no listener; waking applies its policy again. Startup releases what's left here.
-            // It's parked already, so no apply after this one gives its pod egress again.
-            if let Err(e) = state.hub.release_egress(id, &*state.enforcer).await {
-                tracing::warn!(session = %id, error = %e, "releasing a parked session's egress");
-            }
-            Ok(())
-        })
+        .park(session.id, || suspend(state, session.id))
         .await
+}
+
+/// Parks a session like [`park`], if it's idle with nothing going on ([`Hub::park_quiet`]); says whether it did.
+///
+/// [`Hub::park_quiet`]: crate::session::Hub::park_quiet
+pub async fn park_quiet(state: &AppState, session: &db::SessionRow) -> Result<bool, ParkError> {
+    state
+        .hub
+        .park_quiet(session.id, || suspend(state, session.id))
+        .await
+}
+
+async fn suspend(state: &AppState, id: Uuid) -> anyhow::Result<()> {
+    state.placement.suspend(&id.to_string()).await?;
+    // A parked session holds no listener; waking applies its policy again. Startup releases what's left here.
+    // It's parked already, so no apply after this one gives its pod egress again.
+    if let Err(e) = state.hub.release_egress(id, &*state.enforcer).await {
+        tracing::warn!(session = %id, error = %e, "releasing a parked session's egress");
+    }
+    Ok(())
 }
 
 /// How long a session has to have been quiet before its pod is replaced for a newer session image.

@@ -102,6 +102,7 @@ impl ProposalKind for PullRequest {
             Some(base) => base.to_owned(),
             None => app.default_branch(repo).await.map_err(err)?,
         };
+        let base = super::current_base(&app, session, repo, base).await?;
         let comparison = app.compare(repo, &base, head).await.map_err(err)?;
         if comparison.ahead_by == 0 {
             return Err(Error::new(format!(
@@ -368,6 +369,7 @@ impl ProposalKind for Stack {
             Some(base) => base.to_owned(),
             None => app.default_branch(repo).await.map_err(err)?,
         };
+        base = super::current_base(&app, session, repo, base).await?;
         let bottom = base.clone();
         let mut layers = Vec::new();
         for requested in requested {

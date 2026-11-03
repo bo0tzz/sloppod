@@ -3251,3 +3251,24 @@ async fn parking_releases_egress_after_an_apply_already_under_way() {
     assert!(!h.apply_egress(&enforcer).await.unwrap());
     assert_eq!(enforcer.last(), Some(None));
 }
+
+#[tokio::test]
+async fn parking_a_quiet_session_leaves_a_busy_one_alone() {
+    let mut h = Harness::ready().await;
+    let busy = || async { panic!("a busy session was parked") };
+    // Its supervisor hasn't said what's running yet.
+    assert!(!h.hub.park_quiet(h.id, busy).await.unwrap());
+    h.hub.set_commands(h.id, &h.agent, 1).await;
+    assert!(!h.hub.park_quiet(h.id, busy).await.unwrap());
+
+    h.hub.set_commands(h.id, &h.agent, 0).await;
+    let turn = h.prompt("Busy");
+    let request = h.next().await;
+    assert!(!h.hub.park_quiet(h.id, busy).await.unwrap());
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+
+    assert!(h.hub.park_quiet(h.id, || async { Ok(()) }).await.unwrap());
+    assert_eq!(h.phase().await, "parked");
+    assert!(!h.hub.park_quiet(h.id, busy).await.unwrap());
+}

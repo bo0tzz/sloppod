@@ -3,10 +3,11 @@
 
 use serde_json::{Value, json};
 use sloppod_contracts::{Grant, READ_WRITE, capability, operation, same_repo};
-use sloppod_protocol::api::{Phase, SessionKind};
+use sloppod_protocol::api::{Phase, ProposalStatus, SessionKind};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::session::ParkError;
 use crate::{AppState, db, lifecycle};
 
 /// The most sub-sessions a tree of sessions may have running at once.
@@ -261,6 +262,92 @@ pub async fn message(state: &AppState, from: Uuid, arguments: &Value) -> Result<
     Ok("Sent.".into())
 }
 
+/// `park_session`: parks one of `parent`'s sub-sessions, so it stops holding one of its tree's running slots. A
+/// message wakes it again.
+pub async fn park(state: &AppState, parent: Uuid, arguments: &Value) -> Result<String, String> {
+    let id: Uuid = arguments["id"]
+        .as_str()
+        .and_then(|id| id.parse().ok())
+        .ok_or("give the session's `id`")?;
+    let child = db::get_session(&state.db, id)
+        .await
+        .map_err(|e| e.to_string())?
+        .filter(|child| child.parent_id == Some(parent) && child.deleted_at.is_none())
+        .ok_or("you can park your own sub-sessions")?;
+    match lifecycle::park(state, &child).await {
+        Ok(()) => Ok("Parked. A message wakes it.".into()),
+        Err(ParkError::InTurn) => {
+            Err("it's in a turn; message it to wrap up, or try again once it's idle".into())
+        }
+        Err(ParkError::Stopped) => Err("that session is stopped".into()),
+        Err(ParkError::Failed(e)) => Err(format!("{e:#}")),
+    }
+}
+
+/// How long a sub-session that has finished its task waits, quiet, before it's parked.
+const PARK_FINISHED_AFTER: chrono::Duration = chrono::Duration::minutes(5);
+
+/// Whether a sub-session's proposals, by kind and status, say it has finished: a report of it was carried out, and
+/// nothing of its is in review, waiting on findings it may answer, or on its way to being carried out.
+fn finished(proposals: &[(&str, ProposalStatus)]) -> bool {
+    let reported = proposals.iter().any(|&(kind, status)| {
+        kind == crate::proposals::REPORT && status == ProposalStatus::Executed
+    });
+    let open = proposals.iter().any(|(_, status)| {
+        matches!(
+            status,
+            ProposalStatus::InReview
+                | ProposalStatus::ChangesRequested
+                | ProposalStatus::Pending
+                | ProposalStatus::Approved
+        )
+    });
+    reported && !open
+}
+
+/// Parks sub-sessions that have finished and been quiet for a while (#284), so they don't hold their tree's slots.
+pub async fn park_finished(state: &AppState) {
+    let sessions = match db::active_sessions(&state.db).await {
+        Ok(sessions) => sessions,
+        Err(e) => {
+            tracing::warn!(error = %e, "listing sessions to park finished sub-sessions");
+            return;
+        }
+    };
+    let quiet_since = chrono::Utc::now() - PARK_FINISHED_AFTER;
+    for session in sessions {
+        if session.parent_id.is_none()
+            || session.phase() != Phase::Idle
+            || session.active_at > quiet_since
+        {
+            continue;
+        }
+        let proposals = match db::list_proposals(&state.db, &session.owner, Some(session.id), None)
+            .await
+        {
+            Ok(proposals) => proposals,
+            Err(e) => {
+                tracing::warn!(session = %session.id, error = %e, "listing a sub-session's proposals");
+                continue;
+            }
+        };
+        let proposals: Vec<_> = proposals
+            .iter()
+            .map(|p| (p.kind.as_str(), p.status))
+            .collect();
+        if !finished(&proposals) {
+            continue;
+        }
+        match lifecycle::park_quiet(state, &session).await {
+            Ok(true) => tracing::info!(session = %session.id, "parked a finished sub-session"),
+            Ok(false) => {}
+            Err(e) => {
+                tracing::info!(session = %session.id, error = %e, "not parking a finished sub-session now")
+            }
+        }
+    }
+}
+
 pub fn tools() -> Vec<Value> {
     vec![
         json!({
@@ -292,6 +379,15 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "park_session",
+            "description": "Park one of your sub-sessions, by id: its pod stops, and it no longer counts towards the sub-sessions running at once. Its volume, branch and conversation stay, and a message wakes it. Sub-sessions that have reported and gone quiet are parked after a few minutes anyway.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+            },
+        }),
+        json!({
             "name": "list_sessions",
             "description": "Your sub-sessions: each one's id, title, phase, repository and branch.",
             "inputSchema": {"type": "object", "properties": {}},
@@ -305,6 +401,22 @@ mod tests {
 
     fn grant(capability: &str, params: Value) -> Grant {
         Grant::new(capability, params)
+    }
+
+    #[test]
+    fn a_child_has_finished_once_its_report_is_carried_out_and_nothing_else_is_open() {
+        use ProposalStatus::*;
+        let report = crate::proposals::REPORT;
+        let review = "sloppod.code_review";
+        assert!(!finished(&[]));
+        assert!(!finished(&[(report, InReview)]));
+        assert!(!finished(&[(report, ChangesRequested)]));
+        assert!(!finished(&[(review, Executed)]), "a review isn't a report");
+        assert!(finished(&[(report, Executed)]));
+        assert!(finished(&[(report, Withdrawn), (report, Executed)]));
+        // A later report in review, or a review with findings to answer, keeps it going.
+        assert!(!finished(&[(report, Executed), (report, InReview)]));
+        assert!(!finished(&[(report, Executed), (review, ChangesRequested)]));
     }
 
     #[test]
