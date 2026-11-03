@@ -173,7 +173,7 @@ export class SessionView {
 
   /** Tries to reconnect at once, instead of waiting out the backoff. */
   retryNow() {
-    app.reconnectNow();
+    app.reconnectNow(this.#consumer);
   }
 
   stop() {

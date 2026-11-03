@@ -761,6 +761,34 @@ test('a dropped connection leaves the state unknown, with a way to retry at once
   await expect(row.getByTestId('phase')).toHaveText('Idle');
 });
 
+test('Retry now also tries a session whose load failed on a connection that is up', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  const prompt = 'Say something, its load will fail once reconnected';
+  await createSession(page, prompt);
+  await finishTurn(page);
+
+  const loads: number[] = [];
+  page.on('websocket', (socket) =>
+    socket.on('framesent', ({ payload }) => {
+      if (JSON.parse(String(payload)).method === 'session/load') loads.push(Date.now());
+    }),
+  );
+  // The reconnect comes back up, but the runtime can't read the session: the load fails, and retries back off (1 s, 2 s…).
+  await page.request.post('/_mock/fail-loads?for=60000');
+  await page.request.post('/_mock/drop');
+  const banner = page.getByTestId('reconnecting');
+  await expect(banner).toBeVisible();
+  await expect.poll(() => loads.length).toBeGreaterThanOrEqual(2);
+
+  // The runtime can read it again, and the next automatic try is about two seconds off: Retry now doesn't wait for it.
+  await page.request.post('/_mock/fail-loads?for=0');
+  const before = loads.length;
+  await banner.getByRole('button', { name: 'Retry now' }).click();
+  await expect.poll(() => loads.length, { timeout: 800 }).toBeGreaterThan(before);
+  await expect(banner).toBeHidden({ timeout: 3000 });
+  await expect(phase(page)).toHaveText('Idle');
+});
+
 test('a stopped session says that a message does not start it again', async ({ page }) => {
   const sessions: { id: string; title: string }[] = await (await page.request.get('/api/v1/sessions')).json();
   const stopped = sessions.find((candidate) => candidate.title === 'Summarise the namespace resolution rules')!;
