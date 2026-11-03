@@ -57,8 +57,19 @@ const promptBlocks = ({ text, images = [] }: Outgoing): ContentBlock[] => [
   ...images.map((image) => ({ type: 'image' as const, ...image })),
 ];
 
-/** The sessions being closed on the app's connection, by id. */
+/**
+ * The sessions being closed on the app's connection, by id: what a view coming back to one waits for, or its load could
+ * be undone by the close of the one before.
+ */
 const closing = new Map<string, Promise<unknown>>();
+
+/** Puts `done` into the barrier for `id`, after whatever it already holds, and takes it out once it's the last. */
+function reserve(id: string, done: Promise<unknown>) {
+  const barrier = Promise.all([closing.get(id), done]).finally(() => {
+    if (closing.get(id) === barrier) closing.delete(id);
+  });
+  closing.set(id, barrier);
+}
 
 /** One open session: its ACP connection, transcript, and the REST state that goes with it. */
 export class SessionView {
@@ -83,6 +94,8 @@ export class SessionView {
   #stopped = false;
   /** A `session/load` is on its way over the shared connection. */
   #loading = false;
+  /** Lifts the barrier a stop put up for a load that was still on its way. */
+  #lifted: (() => void) | undefined;
 
   configOptions = $state<SessionConfigOption[]>([]);
   /** The agent's model picker, if it offers one. */
@@ -164,16 +177,22 @@ export class SessionView {
     this.#unregister?.();
     this.#unregister = undefined;
     // The runtime stops sending this session's events and requests on the shared connection; what it left open waits.
-    // A load still on its way ends with the close instead, or it would install what the close removed.
-    if (this.loaded && !this.#loading) this.#close();
+    // A load still on its way ends with the close instead, or it would install what the close removed. Meanwhile
+    // the barrier is up, so a view that comes back to the session waits for both.
+    if (this.#loading) {
+      reserve(this.id, new Promise<void>((resolve) => (this.#lifted = resolve)));
+    } else if (this.loaded) {
+      void this.#close();
+    }
   }
 
-  #close() {
+  /** Tells the runtime this view is done with the session, and holds the barrier until it has. */
+  #close(): Promise<void> {
     const closed = app
       .request('session/close', { sessionId: this.id })
-      .catch(() => {})
-      .finally(() => closing.delete(this.id));
-    closing.set(this.id, closed);
+      .then(() => {}, () => {});
+    reserve(this.id, closed);
+    return closed;
   }
 
   /**
@@ -227,7 +246,7 @@ export class SessionView {
       });
       // The view was left while the runtime read the session: it has subscribed this socket by now, and stops.
       if (this.#stopped) {
-        this.#close();
+        await this.#close();
         return;
       }
       this.transcript = this.#replay;
@@ -236,6 +255,8 @@ export class SessionView {
       this.configOptions = response?.configOptions ?? [];
     } finally {
       this.#loading = false;
+      this.#lifted?.();
+      this.#lifted = undefined;
       this.#replay = null;
       this.#replayUpdates = null;
     }

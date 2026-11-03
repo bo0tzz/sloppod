@@ -2733,6 +2733,51 @@ test('a session left while its load is on its way is closed once the load is thr
   expect(closed).toBeGreaterThan(answered);
 });
 
+test('a session left and entered again while its load is on its way is loaded once the first is closed', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  // Every load and close the page sends, from the first socket on.
+  const sent: { method: string; sessionId: string }[] = [];
+  page.on('websocket', (socket) =>
+    socket.on('framesent', ({ payload }) => {
+      const message = JSON.parse(String(payload));
+      if (message.method === 'session/load' || message.method === 'session/close') {
+        sent.push({ method: message.method, sessionId: message.params?.sessionId });
+      }
+    }),
+  );
+  const first = 'Say something, left and come back to';
+  const second = 'Say something, the other one meanwhile';
+  const firstId = await createSession(page, first);
+  await finishTurn(page);
+  await createSession(page, second);
+  await finishTurn(page);
+  const nav = page.getByRole('navigation', { name: 'Sessions' });
+  const row = (prompt: string) => nav.getByTestId('session-row').filter({ hasText: prompt });
+
+  const methods = () => sent.filter((frame) => frame.sessionId === firstId).map((frame) => frame.method);
+  // Entering the first session so far: one load, and a close when it was left for the second.
+  const before = methods().length;
+  // On a connection that's up, the runtime takes 3 s to answer a load: the first session is opened, left and opened
+  // again before it has.
+  await page.request.post('/_mock/slow-loads?for=3000');
+  await row(first).click();
+  await expect.poll(() => methods().slice(before)).toEqual(['session/load']);
+  await row(second).click();
+  await expect(page).not.toHaveURL(new RegExp(firstId));
+  await row(first).click();
+  await expect(page).toHaveURL(new RegExp(firstId));
+
+  // The second load waits for the first to be answered and closed, or the close would end the one that is shown.
+  await expect(agentMessages(page).filter({ hasText: FINAL })).toBeVisible();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+  expect(methods().slice(before)).toEqual(['session/load', 'session/close', 'session/load']);
+  // And the session is live on the socket: a message runs a turn.
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('And once more, back again');
+  await box.press('Enter');
+  await expect(permissionCard(page)).toBeVisible();
+});
+
 test("a connection's quotas fetched after a newer connection's never replace them", async ({ page }) => {
   // The first connection's fetch is held back until the connection has dropped and come back with its own.
   let first: (() => void) | undefined;

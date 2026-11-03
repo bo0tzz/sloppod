@@ -2461,6 +2461,10 @@ const server = http.createServer(async (req, res) => {
       proposeOnLoad = { fetched, served, used: false };
       return json(res, 200, {});
     }
+    if (url.pathname === '/_mock/slow-loads' && req.method === 'POST') {
+      slowLoadsUntil = Date.now() + Number(url.searchParams.get('for') ?? 0);
+      return json(res, 200, {});
+    }
     if (url.pathname === '/_mock/drop' && req.method === 'POST') {
       // With `?for=<ms>`, new connections are refused that long, so a UI stays disconnected for a while.
       refuseConnectionsUntil = Date.now() + Number(url.searchParams.get('for') ?? 0);
