@@ -782,8 +782,11 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
                 )
                 .await;
             }
-            FromSupervisor::Commands { running } => {
-                state.hub.set_commands(session_id, &agent, running).await;
+            FromSupervisor::Commands { running, lines } => {
+                state
+                    .hub
+                    .set_commands(session_id, &agent, running, lines)
+                    .await;
             }
             FromSupervisor::RunResult { id, output, error } => {
                 agent.run_result(id, output, error);

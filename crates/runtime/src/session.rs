@@ -211,9 +211,6 @@ struct LiveState {
     /// The agent is replaying history for `session/load`; that replay isn't new.
     loading: bool,
     turn_running: bool,
-    /// How many of the agent's commands its supervisor last said were running; `None` until it says, and from
-    /// supervisors that don't.
-    commands: Option<usize>,
     /// The agent is compacting its context; steers wait for it to end. A turn's end ends it too, in case the
     /// compaction's own end never came.
     compacting: bool,
@@ -294,6 +291,15 @@ impl LiveState {
 }
 
 impl Live {
+    /// How many of the agent's commands are running, if its supervisor says.
+    fn running_commands(&self) -> Option<usize> {
+        self.commands
+            .lock()
+            .expect("hub lock")
+            .as_ref()
+            .map(|c| c.running)
+    }
+
     /// Nothing of the agent's work is under way any more: its turn ended, or it was replaced, parked or stopped.
     fn end_work(&self, state: &mut LiveState) {
         state.compacting = false;
@@ -314,6 +320,16 @@ pub struct Live {
     boundary: Notify,
     /// When the agent was last heard from, for telling it the time after a gap; `None` until this runtime knows.
     heard_at: StdMutex<Option<DateTime<Utc>>>,
+    /// The agent's running commands, as its supervisor last said; `None` until it says, and from supervisors that
+    /// don't. Apart from `state`, so the session can be read while that's held (#413).
+    commands: StdMutex<Option<RunningCommands>>,
+}
+
+/// How many of the agent's commands are running, and their command lines when its supervisor sends them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningCommands {
+    pub running: usize,
+    pub lines: Vec<String>,
 }
 
 /// What `run_queued` does with its batch.
@@ -520,6 +536,7 @@ impl Hub {
                     egress: Mutex::default(),
                     boundary: Notify::new(),
                     heard_at: StdMutex::default(),
+                    commands: StdMutex::default(),
                 })
             })
             .clone()
@@ -556,7 +573,10 @@ impl Hub {
                 id,
                 UiEvent::Notification {
                     seq: None,
-                    message: notification("_sloppod/session", json!({"session": row.to_api()})),
+                    message: notification(
+                        "_sloppod/session",
+                        json!({"session": self.session_api(&row)}),
+                    ),
                 },
             );
         }
@@ -569,7 +589,10 @@ impl Hub {
                 id,
                 UiEvent::Notification {
                     seq: None,
-                    message: notification("_sloppod/session", json!({"session": row.to_api()})),
+                    message: notification(
+                        "_sloppod/session",
+                        json!({"session": self.session_api(&row)}),
+                    ),
                 },
             );
         }
@@ -638,7 +661,7 @@ impl Hub {
             }
             state.agent_session_id = None;
             state.turn_running = false;
-            state.commands = None;
+            *live.commands.lock().expect("hub lock") = None;
             live.end_work(&mut state);
             // The new link reports the requests the agent still has open, and they're asked again under it.
             take_agent_permissions(&mut state)
@@ -660,12 +683,48 @@ impl Hub {
     }
 
     /// What the supervisor of `agent`, the session's current one, says about the agent's running commands.
-    pub async fn set_commands(&self, id: Uuid, agent: &Arc<AgentConn>, running: usize) {
+    /// When that changes what the session shows, its UIs are told.
+    pub async fn set_commands(
+        &self,
+        id: Uuid,
+        agent: &Arc<AgentConn>,
+        running: usize,
+        lines: Vec<String>,
+    ) {
         let live = self.live(id);
-        let mut state = live.state.lock().await;
-        if state.runs_on(agent) {
-            state.commands = Some(running);
+        let changed = {
+            let state = live.state.lock().await;
+            if !state.runs_on(agent) {
+                return;
+            }
+            let now = Some(RunningCommands { running, lines });
+            let mut commands = live.commands.lock().expect("hub lock");
+            let changed = *commands != now;
+            *commands = now;
+            changed
+        };
+        if changed {
+            self.broadcast_session(id).await;
         }
+    }
+
+    /// The session as the API and its UIs see it: its row, with what's only known live, the agent's running
+    /// commands (#413).
+    pub fn session_api(&self, row: &crate::db::SessionRow) -> sloppod_protocol::api::Session {
+        let mut session = row.to_api();
+        let live = self
+            .sessions
+            .lock()
+            .expect("hub lock")
+            .get(&row.id)
+            .cloned();
+        if let Some(commands) =
+            live.and_then(|live| live.commands.lock().expect("hub lock").clone())
+        {
+            session.commands = Some(commands.running);
+            session.command_lines = commands.lines;
+        }
+        session
     }
 
     /// Whether anything is going on in the session: a turn, messages waiting, a question or permission request the
@@ -675,7 +734,7 @@ impl Hub {
         let live = self.live(id);
         let state = live.state.lock().await;
         let busy = state.turn_running || !state.queue.is_empty() || !state.permissions.is_empty();
-        match state.commands {
+        match live.running_commands() {
             _ if busy => Some(true),
             Some(running) => Some(running > 0),
             None => None,
@@ -684,7 +743,7 @@ impl Hub {
 
     /// How many of the agent's commands are running, if its supervisor says.
     pub async fn commands(&self, id: Uuid) -> Option<usize> {
-        self.live(id).state.lock().await.commands
+        self.live(id).running_commands()
     }
 
     pub async fn set_restart_notice(&self, id: Uuid, notice: String) {
@@ -1259,7 +1318,7 @@ impl Hub {
             state.link_lost();
             state.agent_session_id = None;
             state.turn_running = false;
-            state.commands = None;
+            *live.commands.lock().expect("hub lock") = None;
             live.end_work(&mut state);
             self.set_phase(id, Phase::Disconnected).await;
             take_agent_permissions(&mut state)
@@ -2287,7 +2346,10 @@ impl Hub {
                 id,
                 UiEvent::Notification {
                     seq: None,
-                    message: notification("_sloppod/session", json!({"session": row.to_api()})),
+                    message: notification(
+                        "_sloppod/session",
+                        json!({"session": self.session_api(&row)}),
+                    ),
                 },
             ),
             Ok(None) => {}
@@ -2469,7 +2531,7 @@ impl Hub {
             }
             let busy = !state.queue.is_empty()
                 || !state.permissions.is_empty()
-                || state.commands.is_none_or(|running| running > 0);
+                || live.running_commands().is_none_or(|running| running > 0);
             if quiet && busy {
                 return Ok(false);
             }
@@ -2518,7 +2580,7 @@ impl Hub {
             let busy = state.turn_running
                 || !state.queue.is_empty()
                 || !state.permissions.is_empty()
-                || state.commands.is_some_and(|running| running > 0);
+                || live.running_commands().is_some_and(|running| running > 0);
             if busy || state.agent_session_id.is_none() {
                 return Ok(false);
             }

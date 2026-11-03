@@ -57,7 +57,7 @@
             <Icon icon={mdiTimerSandComplete} size="1.1em" aria-label="Waiting for the usage limit" />
           </span>
         {/if}
-        <PhaseBadge phase={session.phase} />
+        <PhaseBadge phase={session.phase} commands={session.commands} commandLines={session.command_lines} />
       </div>
       <div class="text-muted flex min-w-0 items-center gap-1.5 text-xs">
         {#if session.repo}

@@ -27,6 +27,10 @@ export type Session = {
   parent_id?: string;
   /** When the session, waiting for its usage limit to reset, carries on by itself. */
   limited_until?: string;
+  /** How many of the agent's commands are running, foreground or background; `null` when its supervisor hasn't said. */
+  commands?: number | null;
+  /** Those commands' command lines, when the runtime has them. */
+  command_lines?: string[];
 };
 
 export type NewSession = {

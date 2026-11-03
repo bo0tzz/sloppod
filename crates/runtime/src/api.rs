@@ -237,7 +237,7 @@ async fn list_sessions(
     let sessions: Vec<_> = db::list_sessions(&state.db, &user)
         .await?
         .iter()
-        .map(|s| s.to_api())
+        .map(|s| state.hub.session_api(s))
         .collect();
     Ok(Json(sessions))
 }
@@ -250,7 +250,7 @@ async fn get_session(
     let session = db::owned_session(&state.db, id, &user)
         .await?
         .ok_or_else(not_found)?;
-    Ok(Json(session.to_api()))
+    Ok(Json(state.hub.session_api(&session)))
 }
 
 /// Repositories the user's GitHub App can act on; none without one.
@@ -305,7 +305,7 @@ async fn set_review(
     let session = db::get_session(&state.db, id)
         .await?
         .ok_or_else(not_found)?;
-    Ok(Json(session.to_api()))
+    Ok(Json(state.hub.session_api(&session)))
 }
 
 /// Gives a session write access to another repository and tells its agent.
@@ -342,7 +342,7 @@ async fn add_repo(
     let session = db::get_session(&state.db, id)
         .await?
         .ok_or_else(not_found)?;
-    Ok(Json(session.to_api()))
+    Ok(Json(state.hub.session_api(&session)))
 }
 
 /// Has a session act on `repo` with one of the owner's GitHub tokens (ADR 29): write access to it if the session
@@ -379,7 +379,7 @@ async fn add_repo_as(
     let session = db::get_session(&state.db, id)
         .await?
         .ok_or_else(not_found)?;
-    Ok(Json(session.to_api()))
+    Ok(Json(state.hub.session_api(&session)))
 }
 
 /// Grants a session a capability it doesn't hold (ADR 2), from its owner. Repositories go through `add_repo`.
@@ -446,7 +446,7 @@ async fn add_grant(
     let session = db::get_session(&state.db, id)
         .await?
         .ok_or_else(not_found)?;
-    Ok((StatusCode::CREATED, Json(session.to_api())))
+    Ok((StatusCode::CREATED, Json(state.hub.session_api(&session))))
 }
 
 /// Extends, shortens or clears a grant's expiry, narrows it, or changes the accounts a model grant acts with.
@@ -547,7 +547,7 @@ async fn change_grant(
     let session = db::get_session(&state.db, id)
         .await?
         .ok_or_else(not_found)?;
-    Ok(Json(session.to_api()))
+    Ok(Json(state.hub.session_api(&session)))
 }
 
 /// Revokes a grant; it stops counting at once, at the authorizer.
@@ -571,7 +571,7 @@ async fn revoke_grant(
     let session = db::get_session(&state.db, id)
         .await?
         .ok_or_else(not_found)?;
-    Ok(Json(session.to_api()))
+    Ok(Json(state.hub.session_api(&session)))
 }
 
 pub(crate) async fn accessible_repos(state: &AppState, user: &str) -> Vec<String> {
@@ -726,7 +726,7 @@ async fn create_session(
     )
     .await
     .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    Ok((StatusCode::CREATED, Json(row.to_api())))
+    Ok((StatusCode::CREATED, Json(state.hub.session_api(&row))))
 }
 
 #[derive(Deserialize)]
@@ -806,7 +806,7 @@ async fn restore_session(
     let session = db::get_session(&state.db, id)
         .await?
         .ok_or_else(not_found)?;
-    Ok(Json(session.to_api()))
+    Ok(Json(state.hub.session_api(&session)))
 }
 
 /// Parks a session for deletion, cancelling its turn first if it's in one.
@@ -844,7 +844,7 @@ async fn park_session(
     let session = db::get_session(&state.db, id)
         .await?
         .ok_or_else(not_found)?;
-    Ok(Json(session.to_api()))
+    Ok(Json(state.hub.session_api(&session)))
 }
 
 async fn wake_session(
@@ -865,7 +865,7 @@ async fn wake_session(
     let session = db::get_session(&state.db, id)
         .await?
         .ok_or_else(not_found)?;
-    Ok(Json(session.to_api()))
+    Ok(Json(state.hub.session_api(&session)))
 }
 
 #[derive(Deserialize)]

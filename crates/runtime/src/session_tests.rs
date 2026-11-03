@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::db::SessionRow;
 use crate::limits;
 use crate::link::{AgentConn, RpcError, from_agent};
-use crate::session::{Hub, TurnEnd};
+use crate::session::{Hub, TurnEnd, UiEvent};
 use crate::store::SessionStore;
 use crate::store::memory::MemoryStore;
 
@@ -921,7 +921,7 @@ async fn running_commands_are_known_from_the_current_agent_only() {
         None,
         "unknown until the supervisor says"
     );
-    h.hub.set_commands(h.id, &h.agent, 2).await;
+    h.hub.set_commands(h.id, &h.agent, 2, Vec::new()).await;
     assert_eq!(h.hub.commands(h.id).await, Some(2));
 
     // A new agent starts unknown, and an old one's word no longer counts.
@@ -929,10 +929,43 @@ async fn running_commands_are_known_from_the_current_agent_only() {
     let newer = Arc::new(AgentConn::new(tx));
     h.hub.attach_agent(h.id, newer.clone()).await;
     assert_eq!(h.hub.commands(h.id).await, None);
-    h.hub.set_commands(h.id, &h.agent, 5).await;
+    h.hub.set_commands(h.id, &h.agent, 5, Vec::new()).await;
     assert_eq!(h.hub.commands(h.id).await, None);
-    h.hub.set_commands(h.id, &newer, 0).await;
+    h.hub.set_commands(h.id, &newer, 0, Vec::new()).await;
     assert_eq!(h.hub.commands(h.id).await, Some(0));
+}
+
+#[tokio::test]
+async fn the_session_shows_its_running_commands_and_its_uis_hear_when_they_change() {
+    let h = Harness::ready().await;
+    let row = h.store.get_session(h.id).await.unwrap().unwrap();
+    let shown = h.hub.session_api(&row);
+    assert_eq!((shown.commands, shown.command_lines.len()), (None, 0));
+
+    let mut events = h.hub.subscribe(h.id);
+    let lines = vec!["cargo test".to_owned(), "npm run build".to_owned()];
+    h.hub.set_commands(h.id, &h.agent, 2, lines.clone()).await;
+    let shown = h.hub.session_api(&row);
+    assert_eq!(
+        (shown.commands, shown.command_lines),
+        (Some(2), lines.clone())
+    );
+    let told = |event: UiEvent| match event {
+        UiEvent::Notification { message, .. } if message["method"] == "_sloppod/session" => {
+            Some(message["params"]["session"]["commands"].clone())
+        }
+        _ => None,
+    };
+    assert_eq!(told(events.try_recv().unwrap()), Some(json!(2)));
+    // Told once: the same again isn't a change.
+    h.hub.set_commands(h.id, &h.agent, 2, lines).await;
+    assert!(events.try_recv().is_err());
+
+    // A dropped link makes it unknown again.
+    h.hub
+        .attach_agent(h.id, Arc::new(AgentConn::new(mpsc::unbounded_channel().0)))
+        .await;
+    assert_eq!(h.hub.session_api(&row).commands, None);
 }
 
 #[tokio::test]
@@ -979,7 +1012,7 @@ async fn a_busy_session_keeps_its_pod() {
 
     // Nor one whose agent has commands running.
     let h = Harness::ready().await;
-    h.hub.set_commands(h.id, &h.agent, 1).await;
+    h.hub.set_commands(h.id, &h.agent, 1, Vec::new()).await;
     let replaced = h
         .hub
         .replace_pod(h.id, || async {
@@ -3258,10 +3291,10 @@ async fn parking_a_quiet_session_leaves_a_busy_one_alone() {
     let busy = || async { panic!("a busy session was parked") };
     // Its supervisor hasn't said what's running yet.
     assert!(!h.hub.park_quiet(h.id, busy).await.unwrap());
-    h.hub.set_commands(h.id, &h.agent, 1).await;
+    h.hub.set_commands(h.id, &h.agent, 1, Vec::new()).await;
     assert!(!h.hub.park_quiet(h.id, busy).await.unwrap());
 
-    h.hub.set_commands(h.id, &h.agent, 0).await;
+    h.hub.set_commands(h.id, &h.agent, 0, Vec::new()).await;
     let turn = h.prompt("Busy");
     let request = h.next().await;
     assert!(!h.hub.park_quiet(h.id, busy).await.unwrap());

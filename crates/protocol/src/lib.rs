@@ -207,6 +207,13 @@ pub mod api {
         /// When the session, waiting for its usage limit to reset, carries on by itself (#251).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub limited_until: Option<String>,
+        /// How many of the agent's commands are running, foreground or background, as its supervisor last said;
+        /// `null` when it hasn't (#413).
+        #[serde(default)]
+        pub commands: Option<usize>,
+        /// Those commands' command lines, when the supervisor sends them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub command_lines: Vec<String>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -561,6 +568,9 @@ pub mod link {
         /// How many of the agent's commands are running, foreground or in the background; sent when it changes.
         Commands {
             running: usize,
+            /// Their command lines, each cut short; from supervisors that send them.
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            lines: Vec<String>,
         },
         /// What a `Run` printed, or why it failed (it couldn't start, timed out, or exited unsuccessfully).
         RunResult {

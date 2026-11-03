@@ -694,6 +694,25 @@ async function agentScript(session, turn, prompt) {
     return;
   }
 
+  // The supervisor's count of the agent's running commands (#413), which the runtime puts on the session.
+  if (/in the background/i.test(prompt)) {
+    await step(2);
+    await say("I've started the tests and a build in the background; I'll look at them when they finish.");
+    session.data.commands = 2;
+    session.data.command_lines = ['cargo test --workspace', 'npm run build'];
+    session.broadcast();
+    return;
+  }
+
+  if (/background work is done/i.test(prompt)) {
+    await step(2);
+    session.data.commands = 0;
+    session.data.command_lines = [];
+    session.broadcast();
+    await say('Both finished: the tests pass and the build is fine.');
+    return;
+  }
+
   if (/plan the work/i.test(prompt)) {
     await step(2);
     const graph = workGraphs[0];

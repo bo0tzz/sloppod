@@ -3023,3 +3023,24 @@ test('a proposal of a kind the UI does not know reads by its summary', async ({ 
   await expect(dialog.getByTestId('proposal-payload')).toContainText('a widget');
   await expect(dialog).not.toContainText('sloppod.example.future');
 });
+
+test('an idle session with commands running shows it is waiting on them', async ({ page }) => {
+  const prompt = 'Run the tests in the background';
+  await createSession(page, prompt);
+  await expect(agentMessages(page).filter({ hasText: 'in the background' })).toBeVisible();
+
+  const header = phase(page);
+  await expect(header).toHaveText('Waiting on 2 commands');
+  await expect(header).toHaveAttribute('data-phase', 'idle');
+  await expect(header).toHaveAttribute('title', /cargo test --workspace\nnpm run build/);
+  const row = page.getByTestId('session-row').filter({ hasText: prompt });
+  await expect(row.getByTestId('phase')).toHaveText('Waiting on 2 commands');
+
+  // Once they're done, it's idle again.
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Tell me when the background work is done');
+  await box.press('Enter');
+  await expect(agentMessages(page).filter({ hasText: 'Both finished' })).toBeVisible();
+  await expect(header).toHaveText('Idle');
+  await expect(row.getByTestId('phase')).toHaveText('Idle');
+});

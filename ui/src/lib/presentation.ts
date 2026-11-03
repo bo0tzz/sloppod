@@ -35,6 +35,25 @@ export const phases: Record<Phase, { label: string; color: Color; description: s
   stopped: { label: 'Stopped', color: 'secondary', description: 'The session has stopped' },
 };
 
+/**
+ * How a session's phase shows. An idle session whose agent still has commands running (a test run, a build) is
+ * waiting on them, not doing nothing (#413); hovering lists their command lines when the runtime has them.
+ */
+export function phaseShown(
+  phase: Phase,
+  commands: number | null | undefined,
+  commandLines: string[] | undefined,
+): { label: string; color: Color; description: string } {
+  const info = phases[phase] ?? { label: phase, color: 'secondary' as Color, description: '' };
+  if (phase !== 'idle' || !commands) return info;
+  const lines = commandLines?.length ? `:\n${commandLines.join('\n')}` : '';
+  return {
+    label: `Waiting on ${commands} ${commands === 1 ? 'command' : 'commands'}`,
+    color: 'info',
+    description: `No turn is running, but commands the agent started are${lines}`,
+  };
+}
+
 export const toolKindIcons: Record<ToolKind, string> = {
   read: mdiFileDocumentOutline,
   edit: mdiPencilOutline,
