@@ -1,24 +1,20 @@
-import { AcpConnection, acpUrl } from './acp/connection.ts';
+import { app } from './app-connection.svelte.ts';
 import { api, type Quota } from './api.ts';
 
 /**
- * The owner's quotas for the usage meters, kept current while one is shown. The runtime pushes each change over a
- * connection of the store's own (`_sloppod/quota`), and everything is fetched once on every (re)connect, for what
- * changed while it was down. There's no polling.
+ * The owner's quotas for the usage meters, kept current while one is shown. The runtime pushes each change over the app's
+ * connection (`_sloppod/quota`), and everything is fetched once on every (re)connect, for what changed while it was
+ * down. There's no polling.
  */
 class QuotaStore {
   list = $state<Quota[]>([]);
 
   #subscribers = 0;
-  #conn: AcpConnection | undefined;
+  #unregister: (() => void) | undefined;
   /** Changes that came while the list was being fetched, applied again over what it returns, which may predate them. */
   #duringFetch: [string, Quota | null][] | undefined;
   /** Counts the connection's comings-up, so only the latest one's fetch is kept. */
   #generation = 0;
-  // A socket that died while the tab was hidden or offline comes back without waiting out its backoff.
-  #wake = () => {
-    if (document.visibilityState === 'visible') this.#conn?.reconnectNow();
-  };
 
   /** A change pushed by the runtime: the credential's quota as it is now, or `null` once the credential is gone. */
   apply(credentialId: string, quota: Quota | null) {
@@ -36,7 +32,7 @@ class QuotaStore {
   subscribe() {
     this.#subscribers++;
     if (this.#subscribers === 1) {
-      this.#conn = new AcpConnection(acpUrl(), {
+      this.#unregister = app.register({
         // Changes are pushed from the moment the connection is up, so fetching after that misses nothing. A fetch that
         // fails drops the connection, which tries again.
         onReady: async () => {
@@ -59,19 +55,13 @@ class QuotaStore {
           this.#duringFetch?.push([credentialId, quota]);
           this.apply(credentialId, quota);
         },
-        onRequest: (id) => this.#conn?.respondError(id, -32601, 'not handled here'),
       });
-      this.#conn.connect();
-      document.addEventListener('visibilitychange', this.#wake);
-      window.addEventListener('online', this.#wake);
     }
     return () => {
       this.#subscribers--;
       if (this.#subscribers === 0) {
-        this.#conn?.close();
-        this.#conn = undefined;
-        document.removeEventListener('visibilitychange', this.#wake);
-        window.removeEventListener('online', this.#wake);
+        this.#unregister?.();
+        this.#unregister = undefined;
       }
     };
   }

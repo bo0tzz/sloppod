@@ -1,5 +1,5 @@
 import { readFile } from 'node:fs/promises';
-import { expect, test, type Page, type WebSocketRoute } from '@playwright/test';
+import { expect, test, type Page, type WebSocket as PageSocket, type WebSocketRoute } from '@playwright/test';
 import type { Proposal } from '../src/lib/api.ts';
 
 const FINAL = /Done\. The tests pass/;
@@ -1974,7 +1974,7 @@ test('a list fetched before a delete, arriving late, leaves the session deleted'
     await released;
     await route.fulfill({ json: stale });
   });
-  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await page.request.post('/_mock/drop');
   await expect.poll(() => holding).toBe(true);
 
   await page.getByRole('button', { name: 'Session actions' }).click();
@@ -1982,14 +1982,14 @@ test('a list fetched before a delete, arriving late, leaves the session deleted'
   await page.getByRole('button', { name: 'Delete', exact: true }).click();
   await expect(page).toHaveURL(/\/$/);
   const newer = page.waitForResponse((response) => response.url().endsWith('/api/v1/sessions') && response.status() === 200);
-  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await page.request.post('/_mock/drop');
   await newer;
   await expect(rows).toHaveCount(0);
 
   const late = page.waitForResponse((response) => response.url().endsWith('/api/v1/sessions'));
   release!();
   await late;
-  // Checked once, not retried: the next poll would hide a session the late list put back.
+  // Checked once, not retried: a later fetch would hide a session the late list put back.
   await page.waitForTimeout(300);
   expect(await rows.count()).toBe(0);
 });
@@ -2607,6 +2607,59 @@ test('the usage meters follow quota changes as they happen, without a reload', a
     await expect(page.getByTestId('sidebar').getByTestId('quota')).toHaveCount(0);
   } finally {
     await set(null);
+  }
+});
+
+test('the page keeps one socket for the list, the meters and the open session, across a reconnect', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  const sockets: PageSocket[] = [];
+  page.on('websocket', (socket) => sockets.push(socket));
+  await setWorkQuota(page, 20);
+  try {
+    const prompt = 'Propose a PR for sloppod, over one socket';
+    const id = await createSession(page, prompt);
+    await finishTurn(page);
+    const sidebar = page.getByTestId('sidebar');
+    const row = page.getByRole('navigation', { name: 'Sessions' }).getByTestId('session-row').filter({ hasText: prompt });
+    await expect(row.getByTestId('phase')).toHaveText('Waiting on you');
+    const meter = sidebar.getByTestId('quota-window');
+    await expect(meter).toContainText('20%');
+
+    // Moving about the app, a session after another and the settings, opens no other socket.
+    await page.getByRole('link', { name: 'New session' }).click();
+    const box = page.getByRole('textbox', { name: 'Prompt' });
+    await box.fill('Say something over the one socket');
+    await box.press('Enter');
+    await expect(page).toHaveURL(/\/sessions\/[0-9a-f-]+$/);
+    await finishTurn(page);
+    await page.getByRole('link', { name: 'Settings' }).first().click();
+    await expect(page).toHaveURL(/\/settings$/);
+    await row.click();
+    await expect(page).toHaveURL(new RegExp(id));
+    expect(sockets).toHaveLength(1);
+    expect(sockets[0].isClosed()).toBe(false);
+
+    // Down for a while: what changes meanwhile is read once it's back, with no timer to read it.
+    await page.request.post('/_mock/drop?for=1500');
+    const proposals: { id: string; status: string }[] = await (await page.request.get(`/api/v1/proposals?session=${id}`)).json();
+    await page.request.post(`/api/v1/proposals/${proposals.find((p) => p.status === 'pending')!.id}/reject`, { data: {} });
+    await setWorkQuota(page, 70);
+    await expect(meter).toContainText('70%');
+    await expect(row.getByTestId('phase')).toHaveText('Idle');
+    // Refused attempts show as sockets too: only one is open.
+    const open = () => sockets.filter((socket) => !socket.isClosed());
+    expect(open()).toHaveLength(1);
+
+    // And what changes after is pushed on the new socket: the meter, and the session shown.
+    await setWorkQuota(page, 80);
+    await expect(meter).toContainText('80%');
+    const again = page.getByRole('textbox', { name: 'Prompt' });
+    await again.fill('Propose a PR for sloppod, once more over the new socket');
+    await again.press('Enter');
+    await finishTurn(page);
+    expect(open()).toHaveLength(1);
+  } finally {
+    await setWorkQuota(page, null);
   }
 });
 
@@ -3284,7 +3337,7 @@ test('a list fetched before a push does not undo it', async ({ page }) => {
     await route.fulfill({ json: list });
     answered();
   });
-  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await page.request.post('/_mock/drop');
   await expect.poll(() => started).toBe(true);
 
   const proposals: { id: string; status: string }[] = await (await page.request.get(`/api/v1/proposals?session=${id}`)).json();

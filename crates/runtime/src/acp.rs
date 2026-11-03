@@ -193,6 +193,19 @@ impl Conn {
             }
             return;
         }
+        // The UI is done with a session (it moved on to another): no more of its events or requests on this connection.
+        // What it left open waits in the hub and comes with the next load.
+        if let ("session/close", Some(session)) = (method.as_str(), session) {
+            if let Some(task) = self.loaded.lock().await.remove(&session) {
+                task.abort();
+            }
+            self.permissions
+                .lock()
+                .await
+                .retain(|_, (s, _)| *s != session);
+            self.reply(id, Ok(json!({}))).await;
+            return;
+        }
         // Loading checks ownership, so sessions a connection loaded are the ones it may act on.
         if let Some(session) = session
             && !self.loaded.lock().await.contains_key(&session)

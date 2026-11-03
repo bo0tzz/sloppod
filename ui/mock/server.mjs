@@ -1552,6 +1552,16 @@ function handleCall(conn, message) {
       return;
     }
 
+    // The UI moved on to another session: nothing more of this one goes to the connection.
+    case 'session/close':
+      if (session) {
+        session.subscribers.delete(conn);
+        conn.loaded.delete(session.data.id);
+        for (const pending of session.pending.values()) pending.requests.delete(conn);
+      }
+      conn.respond(id, {});
+      return;
+
     case 'session/cancel':
       if (session) cancelTurn(session);
       return;
