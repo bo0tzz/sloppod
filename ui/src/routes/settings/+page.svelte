@@ -8,6 +8,7 @@
   import CredentialSection from '#lib/components/CredentialSection.svelte';
   import SessionDefaults from '#lib/components/SessionDefaults.svelte';
   import TimezoneSetting from '#lib/components/TimezoneSetting.svelte';
+  import InstructionsSetting from '#lib/components/InstructionsSetting.svelte';
   import StandingApprovals from '#lib/components/StandingApprovals.svelte';
   import DeletedSessions from '#lib/components/DeletedSessions.svelte';
   import { credentialKinds } from '#lib/presentation.ts';
@@ -43,6 +44,7 @@
     <div class="mx-auto flex w-full max-w-2xl flex-col gap-8 px-4 py-6">
       <SessionDefaults />
       <TimezoneSetting />
+      <InstructionsSetting />
       <StandingApprovals />
       <DeletedSessions />
       {#if error}

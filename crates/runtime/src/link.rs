@@ -524,7 +524,15 @@ pub async fn agent_context(
         // A review session's instructions are the reviewer's own, not the ones the owner's sessions work by.
         instructions: match session.kind {
             SessionKind::Review => Some(crate::reviews::INSTRUCTIONS.to_owned()),
-            SessionKind::Work => state.instructions.clone(),
+            SessionKind::Work => {
+                let own = db::user_instructions(&state.db, &session.owner)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(session = %session.id, error = %e, "reading the owner's instructions");
+                        None
+                    });
+                work_instructions(state.instructions.as_deref(), own.as_deref())
+            }
             SessionKind::Utility => None,
         },
         model: session.model.clone(),
@@ -1067,11 +1075,41 @@ async fn hello(
     }
 }
 
+/// What a work session's agent is told to work by (#342): the deployment's instructions (the chart's `instructions`),
+/// then its owner's own, which come last so they can refine the deployment's.
+fn work_instructions(deployment: Option<&str>, own: Option<&str>) -> Option<String> {
+    let parts: Vec<&str> = [deployment, own]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
 #[cfg(test)]
 mod shutdown_tests {
     use sloppod_protocol::link::RunningProcess;
 
     use super::*;
+
+    #[test]
+    fn a_work_session_gets_the_deployment_s_instructions_then_its_owner_s() {
+        assert_eq!(work_instructions(None, None), None);
+        assert_eq!(work_instructions(Some(" "), Some("")), None);
+        assert_eq!(
+            work_instructions(Some("Be brief."), None).as_deref(),
+            Some("Be brief.")
+        );
+        assert_eq!(
+            work_instructions(None, Some("Clone into $TMPDIR.\n")).as_deref(),
+            Some("Clone into $TMPDIR.")
+        );
+        assert_eq!(
+            work_instructions(Some("Be brief.\n"), Some("Clone into $TMPDIR.")).as_deref(),
+            Some("Be brief.\n\nClone into $TMPDIR.")
+        );
+    }
 
     #[test]
     fn the_agent_hears_what_its_pod_cut_off() {

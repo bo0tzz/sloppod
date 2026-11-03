@@ -2931,6 +2931,45 @@ test('a selection runs from one message across tool calls to the next', async ({
   expect(selected).toMatch(/approve it\.?\s*$/);
 });
 
+test('saves the instructions all sessions get', async ({ page }) => {
+  const section = page.getByTestId('instructions-setting');
+  const save = section.getByRole('button', { name: 'Save' });
+  await page.goto('/settings');
+  await expect(save).toBeDisabled();
+  await section.getByRole('textbox', { name: 'Instructions' }).fill('  - Only comment code for intent a reader could not infer.\n');
+  await save.click();
+  await expect(save).toBeDisabled();
+  await page.reload();
+  await expect(section.getByRole('textbox', { name: 'Instructions' })).toHaveValue(
+    '- Only comment code for intent a reader could not infer.',
+  );
+  const settings: { instructions: string | null } = await (await page.request.get('/api/v1/settings')).json();
+  expect(settings.instructions).toBe('- Only comment code for intent a reader could not infer.');
+  await page.request.put('/api/v1/settings', { data: { instructions: null } });
+});
+
+test('what is typed while the instructions save is kept', async ({ page }) => {
+  const section = page.getByTestId('instructions-setting');
+  const field = section.getByRole('textbox', { name: 'Instructions' });
+  const save = section.getByRole('button', { name: 'Save' });
+  await page.goto('/settings');
+  let release = () => {};
+  const held = new Promise<void>((resolve) => (release = resolve));
+  await page.route('**/api/v1/settings', async (route) => {
+    if (route.request().method() === 'PUT') await held;
+    await route.continue();
+  });
+  await field.fill('First line.');
+  await save.click();
+  await field.fill('First line.\nSecond line.');
+  release();
+  await expect(page.getByText('Saved your instructions')).toBeVisible();
+  await expect(field).toHaveValue('First line.\nSecond line.');
+  await expect(save).toBeEnabled();
+  await page.unroute('**/api/v1/settings');
+  await page.request.put('/api/v1/settings', { data: { instructions: null } });
+});
+
 test('a work-plan proposal reads as what it changes', async ({ page }) => {
   const graph = '0192f000-0000-7000-8000-000000000001';
   const add = async (title: string) => {

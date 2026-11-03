@@ -343,6 +343,9 @@ export type Settings = {
   review: ReviewPolicy;
   /** The user's timezone, e.g. `Europe/Amsterdam`, for the times agents are told and their pods' clocks. */
   timezone: string | null;
+  /** The user's own instructions for all their sessions, like a user-level CLAUDE.md; a change reaches a running
+   * session at its agent's next start. */
+  instructions: string | null;
 };
 
 /** Whether proposals are reviewed by another model before a human sees them. */
@@ -437,6 +440,7 @@ export const api = {
     sub_session_model?: string | null;
     review?: ReviewPolicy;
     timezone?: string;
+    instructions?: string | null;
   }) =>
     call<Settings>('PUT', '/settings', body),
   setSessionReview: (id: string, review: ReviewPolicy) =>

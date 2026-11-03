@@ -371,13 +371,12 @@ impl AgentAdapter for ClaudeCode {
             .unwrap_or_default(),
             overwrite: true,
         }];
-        if let Some(instructions) = &context.instructions {
-            files.push(AgentFile {
-                path: format!("{config_dir}/CLAUDE.md"),
-                content: instructions.clone(),
-                overwrite: true,
-            });
-        }
+        // Written even when empty, so instructions cleared since the last start don't linger on the volume.
+        files.push(AgentFile {
+            path: format!("{config_dir}/CLAUDE.md"),
+            content: context.instructions.clone().unwrap_or_default(),
+            overwrite: true,
+        });
 
         let mcp_servers = mcp_servers(context);
         let meta = json!({"claudeCode": {"options": {"plugins": plugins, "disallowedTools": DISALLOWED_TOOLS}}});
@@ -535,6 +534,22 @@ mod tests {
             json!({"repo": "o/r", "access": access, "branch": "sloppod/s"}),
         ));
         context
+    }
+
+    #[test]
+    fn cleared_instructions_replace_the_ones_written_before() {
+        let claude_md = |context: &AgentContext| {
+            ClaudeCode
+                .launch(context)
+                .files
+                .into_iter()
+                .find(|f| f.path.ends_with("/CLAUDE.md"))
+                .map(|f| (f.content, f.overwrite))
+        };
+        let mut cleared = context();
+        assert_eq!(claude_md(&cleared), Some(("Be brief.".into(), true)));
+        cleared.instructions = None;
+        assert_eq!(claude_md(&cleared), Some((String::new(), true)));
     }
 
     #[test]

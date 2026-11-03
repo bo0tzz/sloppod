@@ -43,7 +43,8 @@ memory:
   # Prepended to every memory namespace, e.g. `dev/` for a test install.
   namespacePrefix: ""
 
-# Rendered into every session as the agent's user-level instructions (CLAUDE.md).
+# Rendered into every work session as the agent's user-level instructions (CLAUDE.md), ahead of each user's own,
+# which they set in Settings.
 instructions: ""
 
 # CA bundle inside Cilium's Envoy for verifying real upstreams.
