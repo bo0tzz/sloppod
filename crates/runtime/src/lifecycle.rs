@@ -331,6 +331,10 @@ const ROLL_AFTER_IDLE: chrono::Duration = chrono::Duration::minutes(15);
 /// The same, for a session whose supervisor doesn't say whether the agent has commands running (one from before it
 /// could), so it's given longer for background work to finish.
 const ROLL_AFTER_IDLE_UNKNOWN: chrono::Duration = chrono::Duration::hours(2);
+/// The same, for a session whose agent was asked to make room for the image (#416): long enough that the supervisor's
+/// count of the agent's commands covers anything the last turn started in the background.
+const ROLL_AFTER_NUDGE: chrono::Duration =
+    chrono::Duration::seconds(3 * sloppod_protocol::link::COMMANDS_EVERY.as_secs() as i64);
 
 /// How long a session's pod may run an older image before its agent is asked to find a quiet moment (#230).
 const NUDGE_AFTER: chrono::Duration = chrono::Duration::hours(24);
@@ -355,9 +359,10 @@ const NUDGE: &str = "sloppod: a newer session image is out, and this session's p
 
 /// Whether a session's pod is due to be replaced for the current session image: it runs another, and the session
 /// is quiet enough that the replacement interrupts nothing. `busy` is [`Hub::busy`](crate::session::Hub::busy).
-/// A session whose agent was asked to make room for this image is replaced as soon as it's quiet (#416):
-/// a busy one gets a notice every few minutes, so it's never quiet for long. Others have to have been quiet for a
-/// while, as their agent might be about to pick work up again.
+/// A session whose agent was asked to make room for this image is replaced as soon as it's quiet (#416), once its
+/// supervisor has had time to report what the last turn left running: a busy one gets a notice every few minutes, so
+/// it's never quiet for long. Others have to have been quiet for a while, as their agent might be about to pick work
+/// up again.
 fn due_for_image(
     session: &db::SessionRow,
     running: Option<&str>,
@@ -368,7 +373,7 @@ fn due_for_image(
     let nudged = session.image_nudged.as_deref() == Some(current);
     let quiet_for = match busy {
         Some(true) => return false,
-        Some(false) if nudged => chrono::Duration::zero(),
+        Some(false) if nudged => ROLL_AFTER_NUDGE,
         Some(false) => ROLL_AFTER_IDLE,
         None => ROLL_AFTER_IDLE_UNKNOWN,
     };
@@ -577,11 +582,13 @@ mod tests {
         let due = |row: &db::SessionRow, busy: Option<bool>| {
             due_for_image(row, Some("session:old"), "session:new", busy, now)
         };
-        // Asked for this image: quiet now is enough.
-        assert!(due(&session(Some("session:new"), 0), Some(false)));
-        // Not while anything is going on, nor when its commands aren't known.
-        assert!(!due(&session(Some("session:new"), 0), Some(true)));
-        assert!(!due(&session(Some("session:new"), 0), None));
+        // Asked for this image: quiet for a minute is enough.
+        assert!(due(&session(Some("session:new"), 1), Some(false)));
+        // Not right after a turn, whose background commands the supervisor may not have counted yet (it reports
+        // every 20 seconds), nor while anything is going on, nor when its commands aren't known.
+        assert!(!due(&session(Some("session:new"), 0), Some(false)));
+        assert!(!due(&session(Some("session:new"), 1), Some(true)));
+        assert!(!due(&session(Some("session:new"), 1), None));
         // Never asked, or asked for an older image: it has to have been quiet a while.
         assert!(!due(&session(None, 0), Some(false)));
         assert!(!due(&session(Some("session:older"), 0), Some(false)));
