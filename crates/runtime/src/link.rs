@@ -793,11 +793,13 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
             }
             FromSupervisor::ShutdownReport { running } => {
                 tracing::info!(session = %session_id, commands = running.len(), "pod stopping with commands running");
-                // This agent is about to be stopped with its pod, so the notice waits for the next one.
+                // This agent is about to be stopped with its pod, so the notice waits for the next one. It doesn't wake
+                // a session that's being parked, which this report comes from too: it's for whenever the session is
+                // next woken.
                 state.hub.retire_agent(session_id, &agent).await;
                 state
                     .hub
-                    .notify(session_id, shutdown_notice(&running))
+                    .notify_later(session_id, shutdown_notice(&running))
                     .await;
             }
         }

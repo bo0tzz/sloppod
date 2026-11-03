@@ -855,7 +855,9 @@ async fn carry_out(
                     .notify_summarised(to, text.to_owned(), summary)
                     .await;
                 if let Ok(Some(recipient)) = db::get_session(&state.db, to).await
-                    && let Err(e) = lifecycle::wake(state, &recipient).await
+                    && let Err(e) =
+                        lifecycle::wake(state, &recipient, "a notice from a proposal it's told of")
+                            .await
                 {
                     tracing::warn!(session = %to, error = %e, "waking a session for a notice");
                 }

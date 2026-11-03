@@ -2161,3 +2161,119 @@ async fn every_reported_quota_is_listed_with_its_owner(db: PgPool) {
         [("dev".to_owned(), ours), ("someone".to_owned(), theirs)]
     );
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn review_sessions_left_up_with_nothing_to_review_are_found_to_park(db: PgPool) {
+    let author = session(&db, "dev").await;
+    let reviewer = |phase: Phase| {
+        let db = db.clone();
+        async move {
+            let id = session_of_kind(&db, "dev", SessionKind::Review).await;
+            db::set_phase(&db, id, phase).await.unwrap();
+            sqlx::query("update sessions set active_at = now() - interval '1 hour' where id = $1")
+                .bind(id)
+                .execute(&db)
+                .await
+                .unwrap();
+            id
+        }
+    };
+    let reviewed = |reviewer: Uuid, kind: &'static str, status: ProposalStatus| {
+        let db = db.clone();
+        async move {
+            let proposal = db::insert_proposal(&db, author, kind, status, &json!({}))
+                .await
+                .unwrap();
+            db::set_review_session(&db, proposal.id, reviewer)
+                .await
+                .unwrap();
+        }
+    };
+
+    // Kept after its report passed, but its park was lost (or undone): idle, its report long carried out.
+    let kept = reviewer(Phase::Idle).await;
+    reviewed(kept, "sloppod.session.report", ProposalStatus::Executed).await;
+    // Waiting on its author's fixes, with the park meant for between rounds lost the same way.
+    let between = reviewer(Phase::Idle).await;
+    reviewed(
+        between,
+        "github.pr.create",
+        ProposalStatus::ChangesRequested,
+    )
+    .await;
+    // Reviewing now, even if it's idle for a moment.
+    let reviewing = reviewer(Phase::Idle).await;
+    reviewed(
+        reviewing,
+        "sloppod.session.report",
+        ProposalStatus::Executed,
+    )
+    .await;
+    reviewed(reviewing, "github.pr.create", ProposalStatus::InReview).await;
+    // Parked already, or busy.
+    let parked = reviewer(Phase::Parked).await;
+    reviewed(parked, "sloppod.session.report", ProposalStatus::Executed).await;
+    let working = reviewer(Phase::Working).await;
+    reviewed(working, "github.pr.create", ProposalStatus::Pending).await;
+    // Just finished: its own park still has time.
+    let recent = reviewer(Phase::Idle).await;
+    sqlx::query("update sessions set active_at = now() where id = $1")
+        .bind(recent)
+        .execute(&db)
+        .await
+        .unwrap();
+    // A work session is never one of them.
+    db::set_phase(&db, author, Phase::Idle).await.unwrap();
+
+    let quiet_since = Utc::now() - Duration::minutes(12);
+    let found = db::reviewers_to_park(&db, quiet_since).await.unwrap();
+    assert!(found.contains(&kept), "a kept reviewer whose park was lost");
+    assert!(
+        found.contains(&between),
+        "a reviewer waiting between rounds"
+    );
+    for (other, why) in [
+        (reviewing, "reviewing"),
+        (parked, "parked"),
+        (working, "working"),
+        (recent, "recently active"),
+        (author, "a work session"),
+    ] {
+        assert!(!found.contains(&other), "{why}");
+    }
+    assert!(db::reviewing(&db, reviewing).await.unwrap());
+    assert!(!db::reviewing(&db, between).await.unwrap());
+
+    // Retired a while ago and not removed: its pod is still up. Retired just now, its removal still has time; deleted
+    // by its owner (restorable), or removed already, it's not one either.
+    assert!(db::retire_reviewer(&db, kept).await.unwrap());
+    sqlx::query("update sessions set deleted_at = now() - interval '1 hour' where id = $1")
+        .bind(kept)
+        .execute(&db)
+        .await
+        .unwrap();
+    assert!(db::retire_reviewer(&db, recent).await.unwrap());
+    let restorable = reviewer(Phase::Idle).await;
+    sqlx::query("update sessions set deleted_at = now() - interval '1 hour' where id = $1")
+        .bind(restorable)
+        .execute(&db)
+        .await
+        .unwrap();
+    let ids = |rows: Vec<db::SessionRow>| rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+    let retired = ids(db::retired_reviewers(&db, quiet_since).await.unwrap());
+    assert_eq!(retired, [kept]);
+    assert!(
+        !db::reviewers_to_park(&db, quiet_since)
+            .await
+            .unwrap()
+            .contains(&kept),
+        "it's retired, not kept"
+    );
+    db::finish_purge(&db, kept).await.unwrap();
+    assert!(
+        db::retired_reviewers(&db, quiet_since)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

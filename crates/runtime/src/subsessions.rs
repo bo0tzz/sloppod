@@ -304,7 +304,7 @@ pub async fn message(state: &AppState, from: Uuid, arguments: &Value) -> Result<
         )
         .await;
     // A no-op unless it's parked, also if it parked since it was looked at.
-    lifecycle::wake(state, &target)
+    lifecycle::wake(state, &target, "a message from another session")
         .await
         .map_err(|e| format!("sent, but waking it failed: {e:#}"))?;
     Ok("Sent.".into())
