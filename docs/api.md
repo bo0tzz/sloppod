@@ -29,7 +29,7 @@ GET    /api/v1/sessions/{id}/debug-bundle?message={messageId} -> DebugBundle  do
 GET    /api/v1/repos                -> string[]    repositories sessions can be granted, e.g. ["bo0tzz/sloppod"]
 GET    /api/v1/me                   -> {user: string, version: string | null, build: string | null}   version: the release, e.g. 0.1.2-main.153 (SLOPPOD_VERSION, the chart's version); build: the commit or tag it was built from (SLOPPOD_BUILD, the chart's app version)
 GET    /api/v1/settings             -> Settings
-PUT    /api/v1/settings             -> Settings    body: {model?: string | null, sub_session_model?: string | null, review?: "off" | "required", timezone?: string}; fields left out stay as they are; 400 for a timezone that isn't one
+PUT    /api/v1/settings             -> Settings    body: {model?: string | null, sub_session_model?: string | null, review?: "off" | "required", timezone?: string, instructions?: string | null}; fields left out stay as they are; 400 for a timezone that isn't one, or instructions over 32 KiB
 ```
 
 ```ts
@@ -41,12 +41,17 @@ PUT    /api/v1/settings             -> Settings    body: {model?: string | null,
 // `sub_session_model` is what sub-sessions run on unless `spawn_session` names a model (#283): a model, "parent" for
 // their parent's, or null (the default) for the agent's cheaper model where it has one, Sonnet for Claude Code, and their
 // parent's otherwise.
+// `instructions` are the user's own for all their sessions, like a user-level CLAUDE.md (#342), null until set, at most
+// 32 KiB, trimmed. Work sessions and their sub-sessions get their owner's after the deployment's (the chart's
+// `instructions`), from their agent's next start: in Claude Code's user-level CLAUDE.md, and in Codex's AGENTS.md ahead
+// of the session prompt. Review sessions keep the reviewer's own.
 type Settings = {
   model: string | null;
   sub_session_model: string | null;
   models: { value: string; name: string }[];
   review: "off" | "required";
   timezone: string | null;
+  instructions: string | null;
 };
 ```
 
