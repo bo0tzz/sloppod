@@ -2258,6 +2258,12 @@ const server = http.createServer(async (req, res) => {
       quotas = await readBody(req);
       return json(res, 200, {});
     }
+    if (url.pathname === '/_mock/models' && req.method === 'POST') {
+      // `?offered=0` forgets the models the agent offered, as before a user's first session; otherwise they're back.
+      if (url.searchParams.get('offered') === '0') settings.models = [];
+      else rememberModels();
+      return json(res, 200, settings);
+    }
     if (url.pathname === '/_mock/forget-timezone' && req.method === 'POST') {
       settings.timezone = null;
       return json(res, 200, {});
