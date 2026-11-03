@@ -1567,7 +1567,6 @@ fn batch(
         id: None,
         blocks: vec![json!({"type": "text", "text": text})],
         notice: false,
-        wakes: true,
         reply: Some(reply),
         seq: 0,
     };
@@ -3351,54 +3350,4 @@ async fn a_change_to_what_the_session_waits_on_is_told_to_its_owners_uis() {
         .answer_permission(h.id, pid, Ok(answer), "a test")
         .await;
     assert_eq!(changed.try_recv().unwrap(), h.id);
-}
-
-#[tokio::test]
-async fn a_notice_for_later_does_not_wake_a_parked_session_after_a_restart() {
-    let h = Harness::starting().await;
-    // What a pod stopping for a park leaves: a notice that its commands were ended, for whenever it's next woken.
-    assert!(
-        h.hub
-            .notify_later(h.id, "sloppod: your session's pod was stopped".into())
-            .await
-    );
-    let restarted = |woken: Arc<std::sync::Mutex<u32>>| {
-        let hub = Arc::new(Hub::new(h.store.clone()));
-        hub.set_waker(Arc::new(move |_| {
-            let woken = woken.clone();
-            Box::pin(async move {
-                *woken.lock().unwrap() += 1;
-                Ok(())
-            })
-        }));
-        hub
-    };
-    let woken = Arc::new(std::sync::Mutex::new(0));
-    let hub = restarted(woken.clone());
-    hub.restore_queues().await.unwrap();
-    assert_eq!(*woken.lock().unwrap(), 0, "a notice for later waits");
-
-    // Something meant to wake it still does, and the notice for later goes along.
-    assert!(
-        hub.notify(h.id, "sloppod: a proposal was decided".into())
-            .await
-    );
-    let woken = Arc::new(std::sync::Mutex::new(0));
-    let hub = restarted(woken.clone());
-    hub.restore_queues().await.unwrap();
-    assert_eq!(*woken.lock().unwrap(), 1);
-    let (tx, mut to_agent) = mpsc::unbounded_channel();
-    let agent = Arc::new(AgentConn::new(tx));
-    hub.attach_agent(h.id, agent.clone()).await;
-    hub.agent_ready(h.id, &agent, "agent-session".into(), json!({}), None)
-        .await;
-    let text = prompt_text(&next_prompt(&mut to_agent).await);
-    assert!(
-        text.iter().any(|t| t.contains("pod was stopped")),
-        "{text:?}"
-    );
-    assert!(
-        text.iter().any(|t| t.contains("proposal was decided")),
-        "{text:?}"
-    );
 }

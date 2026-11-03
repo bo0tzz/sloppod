@@ -42,9 +42,6 @@ pub(crate) struct Queued {
     pub(crate) id: Option<Uuid>,
     pub(crate) blocks: Vec<Value>,
     pub(crate) notice: bool,
-    /// Whether it wakes a parked session (after a restart, too). A notice of what happened to the session's own pod
-    /// doesn't: it waits for the next wake.
-    pub(crate) wakes: bool,
     pub(crate) reply: Option<oneshot::Sender<Result<Value, RpcError>>>,
     /// Where it joined the queue, counted per session; kept while it's held, so one that goes back after a failed
     /// steer takes its old place. Kept with the queue, and numbered afresh when a restart restores it; 0 for what's
@@ -64,7 +61,7 @@ fn has_queued(state: &LiveState, id: Uuid) -> bool {
 
 /// How a queued prompt is kept in the store.
 fn stored(q: &Queued) -> Value {
-    json!({"id": q.id, "blocks": q.blocks, "notice": q.notice, "wakes": q.wakes, "seq": q.seq})
+    json!({"id": q.id, "blocks": q.blocks, "notice": q.notice, "seq": q.seq})
 }
 
 /// A queued prompt from how it's kept in the store.
@@ -73,7 +70,6 @@ fn unstored(q: &Value) -> Queued {
         id: q["id"].as_str().and_then(|s| s.parse().ok()),
         blocks: q["blocks"].as_array().cloned().unwrap_or_default(),
         notice: q["notice"] == true,
-        wakes: q["wakes"] != false,
         reply: None,
         seq: q["seq"].as_u64().unwrap_or_default(),
     }
@@ -85,7 +81,6 @@ fn notice_queued(text: &str) -> Queued {
         id: None,
         blocks: vec![json!({"type": "text", "text": text})],
         notice: true,
-        wakes: true,
         reply: None,
         seq: 0,
     }
@@ -1299,11 +1294,6 @@ impl Hub {
         }
         for (id, restored, held) in restoring {
             let nothing = restored.is_empty() && held.is_empty();
-            // Only what's meant to wake a parked session does: not a notice of what happened to its own pod.
-            let wakes = restored.iter().any(|q| q.wakes)
-                || held
-                    .iter()
-                    .any(|h| h.stored.iter().any(|q| q["wakes"] != false));
             {
                 let live = self.live(id);
                 let mut state = live.state.lock().await;
@@ -1318,7 +1308,7 @@ impl Hub {
             }
             self.broadcast_queue(id).await;
             // One waiting for its usage limit is woken when that ends.
-            if !wakes || self.limited_until(id).await.is_some() {
+            if self.limited_until(id).await.is_some() {
                 continue;
             }
             if let Err(e) = self.wake_for_message(id).await {
@@ -1634,7 +1624,6 @@ impl Hub {
                     id: Some(logged_as),
                     blocks: blocks.clone(),
                     notice: false,
-                    wakes: true,
                     reply: None,
                     seq: 0,
                 };
@@ -1648,7 +1637,6 @@ impl Hub {
                     id: waiting.then_some(logged_as),
                     blocks: blocks.clone(),
                     notice: false,
-                    wakes: true,
                     reply: Some(reply),
                     seq: 0,
                 });
@@ -1972,15 +1960,6 @@ impl Hub {
         self.notify_summarised(id, text, None).await
     }
 
-    /// Tells the agent something that can wait for it: like [`Hub::notify`], but it never wakes a parked session,
-    /// even after a restart; it reaches the agent when the session is next woken for something else. For what happened
-    /// to the session's own pod, e.g. that parking it ended its commands.
-    pub async fn notify_later(self: &Arc<Self>, id: Uuid, text: String) -> bool {
-        let mut notice = notice_queued(&text);
-        notice.wakes = false;
-        self.notify_queued(id, notice, None).await
-    }
-
     /// A notice the UI shows folded as `summary`, e.g. a message from another session; the agent gets all of it.
     pub async fn notify_summarised(
         self: &Arc<Self>,
@@ -1988,15 +1967,7 @@ impl Hub {
         text: String,
         summary: Option<String>,
     ) -> bool {
-        self.notify_queued(id, notice_queued(&text), summary).await
-    }
-
-    async fn notify_queued(
-        self: &Arc<Self>,
-        id: Uuid,
-        notice: Queued,
-        summary: Option<String>,
-    ) -> bool {
+        let notice = notice_queued(&text);
         let blocks = notice.blocks.clone();
         let (delivery, kept) = {
             let live = self.live(id);
@@ -2107,7 +2078,6 @@ impl Hub {
                     id: message,
                     blocks,
                     notice,
-                    wakes: true,
                     reply: None,
                     seq: 0,
                 }];
@@ -2159,7 +2129,6 @@ impl Hub {
                     id: None,
                     blocks,
                     notice: false,
-                    wakes: true,
                     reply: None,
                     seq: 0,
                 });
@@ -2179,7 +2148,6 @@ impl Hub {
                 id: message,
                 blocks: blocks.clone(),
                 notice: false,
-                wakes: true,
                 reply: None,
                 seq: 0,
             };

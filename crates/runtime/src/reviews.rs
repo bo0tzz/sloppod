@@ -1058,7 +1058,11 @@ async fn park_between_rounds(
     session: &db::SessionRow,
     proposal: Uuid,
 ) -> anyhow::Result<()> {
-    lifecycle::park(state, session).await?;
+    // Not while its agent has commands running: parking would end them, and the notice saying so would wake it. The
+    // sweep (`settle_reviewers`) parks it once they're done.
+    if !lifecycle::park_quiet(state, session).await? {
+        return Ok(());
+    }
     let still_waiting = matches!(
         db::get_proposal(&state.db, proposal).await?,
         Some(p) if p.status == ProposalStatus::ChangesRequested
@@ -1111,7 +1115,10 @@ async fn park_kept(state: &AppState, session: Uuid) -> anyhow::Result<()> {
     let Some(row) = db::get_session(&state.db, session).await? else {
         return Ok(());
     };
-    lifecycle::park(state, &row).await?;
+    // As between rounds: not while its agent has commands running; the sweep parks it later.
+    if !lifecycle::park_quiet(state, &row).await? {
+        return Ok(());
+    }
     if db::has_active_review(&state.db, session).await?
         && let Some(row) = db::get_session(&state.db, session).await?
     {
@@ -1132,7 +1139,8 @@ const SETTLE_AFTER: chrono::Duration = chrono::Duration::minutes(12);
 
 /// Parks the review sessions that are up with nothing to review, and removes the retired ones that still have a pod.
 /// The park or removal that follows a verdict ([`keep`], [`rest`], [`end`]) is a task of its own, which a restart
-/// loses, so this runs at startup and every minute after.
+/// loses, and a park waits while the reviewer's agent has commands running (parking would end them, and the notice
+/// saying so would wake it at the next start), so this runs at startup and every minute after, until they're done.
 pub async fn settle_reviewers(state: &AppState) {
     let quiet_since = Utc::now() - SETTLE_AFTER;
     match db::reviewers_to_park(&state.db, quiet_since).await {
