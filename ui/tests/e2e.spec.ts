@@ -2884,3 +2884,28 @@ test.describe('work on a phone', () => {
     await expect(page.getByTestId('work-ready').getByTestId('work-item')).toHaveText([/Write the fix/, /Read the issue/]);
   });
 });
+
+test('a selection runs from one message across tool calls to the next', async ({ page }) => {
+  // Tall enough for the whole transcript, so the drag needs no scrolling.
+  await page.setViewportSize({ width: 1280, height: 2000 });
+  await createSession(page, 'Select across turns in sloppod');
+  await finishTurn(page);
+
+  // From a message, past the tool calls after it, to the last message: copied as on any page, tool calls included.
+  const before = agentMessages(page).filter({ hasText: 'Reconnects use a fixed' });
+  const after = agentMessages(page).filter({ hasText: FINAL });
+  const from = (await before.locator('p').first().boundingBox())!;
+  const to = (await after.locator('p').last().boundingBox())!;
+  expect(from.y).toBeGreaterThanOrEqual(0);
+  expect(to.y + to.height).toBeLessThanOrEqual(page.viewportSize()!.height);
+  // On the first line of one and the last of the other, not the gap between lines.
+  await page.mouse.move(from.x + 1, from.y + 8);
+  await page.mouse.down();
+  await page.mouse.move(to.x + to.width - 1, to.y + to.height - 8, { steps: 20 });
+  await page.mouse.up();
+
+  const selected = await page.evaluate(() => window.getSelection()?.toString() ?? '');
+  expect(selected).toMatch(/^Reconnects use a fixed/);
+  expect(selected).toContain('npm test -- reconnect');
+  expect(selected).toMatch(/approve it\.?\s*$/);
+});

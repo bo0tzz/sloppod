@@ -21,7 +21,7 @@
   data-kind={tool.kind}
 >
   <summary
-    class="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-sm select-none [&::-webkit-details-marker]:hidden"
+    class="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-sm [&::-webkit-details-marker]:hidden"
   >
     <Icon icon={toolKindIcons[tool.kind] ?? toolKindIcons.other} class="text-muted shrink-0" size="1.1em" aria-hidden />
     <span class="min-w-0 grow truncate {tool.kind === 'execute' ? 'font-mono text-xs' : ''}" title={tool.title}>
