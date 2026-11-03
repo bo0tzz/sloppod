@@ -3225,6 +3225,48 @@ test('the session list follows what waits on you as it is pushed, without fetchi
   await expect(row.getByTestId('phase')).not.toHaveText('Waiting on you');
 });
 
+test('a list fetched before a push does not undo it', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  const prompt = 'Propose a PR for sloppod, left for a stale list to undo';
+  const id = await createSession(page, prompt);
+  await finishTurn(page);
+  const row = page.getByRole('navigation', { name: 'Sessions' }).getByTestId('session-row').filter({ hasText: prompt });
+  await expect(row.getByTestId('phase')).toHaveText('Waiting on you');
+  await createSession(page, 'Say something while a list is on its way');
+  await finishTurn(page);
+
+  // A list fetch on its way, held until the proposal has been decided and the push has come: its copy of the session
+  // is the one from before, with the same updated_at, as what a session waits on doesn't move it.
+  let hold!: () => void;
+  const held = new Promise<void>((resolve) => (hold = resolve));
+  let answered!: () => void;
+  const done = new Promise<void>((resolve) => (answered = resolve));
+  let started = false;
+  await page.route('**/api/v1/sessions', async (route) => {
+    // Later fetches (the timer's) fail, so none is applied ahead of this one, which an older list never would be.
+    if (started) return route.abort();
+    started = true;
+    await held;
+    const list: { id: string; waiting: { proposals: number } }[] = await (await page.request.get('/api/v1/sessions')).json();
+    for (const session of list) if (session.id === id) session.waiting = { ...session.waiting, proposals: 1 };
+    await route.fulfill({ json: list });
+    answered();
+  });
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await expect.poll(() => started).toBe(true);
+
+  const proposals: { id: string; status: string }[] = await (await page.request.get(`/api/v1/proposals?session=${id}`)).json();
+  const pending = proposals.find((proposal) => proposal.status === 'pending')!;
+  await page.request.post(`/api/v1/proposals/${pending.id}/reject`, { data: {} });
+  // Idle again once the agent has taken the decision, so the badge is the only thing a stale copy could bring back.
+  await expect(row.getByTestId('phase')).toHaveText('Idle');
+  hold();
+  await done;
+  // Long enough for the list to have been applied; not retried, as a badge that came back would only go with a fetch.
+  await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 300)));
+  expect(await row.getByTestId('phase').textContent()).not.toContain('Waiting on you');
+});
+
 test('arrow keys move between the rows of the session list', async ({ page }) => {
   await page.setViewportSize({ width: 1400, height: 900 });
   await createSession(page, 'First session about arrows');

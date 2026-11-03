@@ -100,6 +100,11 @@ class MockSession {
 
   broadcast() {
     this.data.updated_at = now();
+    this.push();
+  }
+
+  /** Sends the session as it is: what it waits on changing doesn't move `updated_at` in the runtime. */
+  push() {
     // As the runtime pushes each change to the owner's connections, whichever session they show.
     for (const conn of connections) conn.notify('_sloppod/session', { session: this.data });
   }
@@ -457,7 +462,7 @@ function requestFromUser(session, { method, params, toolCallId, cancelled, block
     const pending = { method, params, toolCallId, cancelled, blocking, resolve, requests: new Map() };
     session.pending.set(pending, pending);
     if (blocking) session.setPhase('waiting');
-    else session.broadcast();
+    else session.push();
     for (const conn of session.subscribers) sendPending(session, pending, conn);
   });
 }
@@ -490,7 +495,7 @@ function resolvePending(session, pending, result) {
   pending.requests.clear();
   const blocked = [...session.pending.values()].some((other) => other.blocking);
   if (session.data.phase === 'waiting' && !blocked) session.setPhase('working');
-  else session.broadcast();
+  else session.push();
   pending.resolve(result);
 }
 
@@ -1248,7 +1253,7 @@ function broadcastProposal(proposal) {
   const session = sessions.get(proposal.session_id);
   for (const conn of session?.subscribers ?? []) conn.notify('_sloppod/proposal', { proposal: publicProposal(proposal) });
   // A proposal made or decided changes what the session waits on.
-  session?.broadcast();
+  session?.push();
 }
 
 const availableRepos = () => (credentials.some((c) => c.kind === 'github-app') ? REPOS : []);
