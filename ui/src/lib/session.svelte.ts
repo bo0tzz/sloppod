@@ -155,6 +155,11 @@ export class SessionView {
     window.addEventListener('online', this.#onVisible);
   }
 
+  /** Tries to reconnect at once, instead of waiting out the backoff. */
+  retryNow() {
+    this.#conn.reconnectNow();
+  }
+
   stop() {
     this.#stopped = true;
     clearTimeout(this.#loadRetry);

@@ -10,12 +10,15 @@ import { api, newerSession, sortSessions, type Session } from './api.ts';
 class SessionStore {
   list = $state<Session[]>([]);
   loaded = $state(false);
+  /** The connection was up and has gone: what the list says may be out of date until it's back. */
+  lost = $state(false);
   error = $state<string | null>(null);
   sorted = $derived(sortSessions(this.list));
 
   #subscribers = 0;
   #timer: ReturnType<typeof setInterval> | undefined;
   #conn: AcpConnection | undefined;
+  #everOpen = false;
   /** How many sessions were removed so far, and which, with the count when each was. */
   #removals = 0;
   #removed = new Map<string, number>();
@@ -92,6 +95,14 @@ class SessionStore {
           if (method === '_sloppod/session') this.#pushed((params as { session: Session }).session);
         },
         onRequest: (id) => this.#conn?.respondError(id, -32601, 'not handled here'),
+        onStateChange: (state) => {
+          if (state === 'open') {
+            this.#everOpen = true;
+            this.lost = false;
+          } else if (this.#everOpen) {
+            this.lost = true;
+          }
+        },
       });
       this.#conn.connect();
       this.#timer = setInterval(() => {
@@ -105,6 +116,8 @@ class SessionStore {
         clearInterval(this.#timer);
         this.#conn?.close();
         this.#conn = undefined;
+        this.#everOpen = false;
+        this.lost = false;
         document.removeEventListener('visibilitychange', this.#onVisible);
       }
     };

@@ -59,6 +59,6 @@
   {#if !sessions.loaded}
     <div class="flex justify-center py-12"><LoadingSpinner size="large" /></div>
   {:else}
-    <SessionList sessions={sessions.sorted} />
+    <SessionList sessions={sessions.sorted} unknown={sessions.lost} />
   {/if}
 </div>

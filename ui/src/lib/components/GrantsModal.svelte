@@ -4,7 +4,7 @@
   import { mdiShieldKeyOutline } from '@mdi/js';
   import { onMount } from 'svelte';
   import { api, type Credential, type Grant, type GrantChange, type Session, type WorkGraph, type WorkLevel } from '#lib/api.ts';
-  import { clockTime } from '#lib/format.ts';
+  import { absoluteTime, clockTime } from '#lib/format.ts';
 
   let {
     session,
@@ -176,7 +176,9 @@
               {/if}
             {/if}
             {#if grant.expires_at}
-              <Text color="muted" size="small">Runs out {clockTime(grant.expires_at)}</Text>
+              <Text color="muted" size="small" title={absoluteTime(grant.expires_at)}>Runs out {clockTime(grant.expires_at)}</Text>
+            {:else if changeable && grant.id}
+              <Text color="muted" size="small">Doesn't run out</Text>
             {/if}
             {#if changeable && grant.id}
               <div class="flex flex-wrap items-center gap-2">

@@ -30,7 +30,9 @@
   let removingId = $state<string | null>(null);
 
   const blockedReason = $derived.by(() => {
-    if (phase === 'stopped') return 'This session has stopped.';
+    if (phase === 'stopped') {
+      return 'This session has stopped for good: a message does not start it again. Start a new session to carry on.';
+    }
     return null;
   });
   const queuedHint = $derived(
