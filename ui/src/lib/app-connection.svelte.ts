@@ -109,12 +109,22 @@ class AppConnection {
     const message = error instanceof Error ? error.message : String(error);
     const attempts = (this.#failed.get(consumer)?.attempts ?? 0) + 1;
     clearTimeout(this.#failed.get(consumer)?.timer);
-    const timer = setTimeout(() => {
-      if (generation !== this.#generation || this.state !== 'open' || !this.#consumers.has(consumer)) return;
-      void this.#attempt(consumer, generation);
-    }, Math.min(30_000, 1000 * 2 ** (attempts - 1)));
-    this.#failed.set(consumer, { attempts, error: message, timer });
+    this.#failed.set(consumer, { attempts, error: message, timer: this.#wait(consumer, generation, Math.min(30_000, 1000 * 2 ** (attempts - 1))) });
     consumer.onStateChange?.('connecting', message);
+  }
+
+  /** Tries a failed consumer again after `delay`; if the connection is still coming up by then, waits a little longer. */
+  #wait(consumer: Consumer, generation: number, delay: number): ReturnType<typeof setTimeout> {
+    const timer = setTimeout(() => {
+      if (generation !== this.#generation || !this.#consumers.has(consumer)) return;
+      if (this.state !== 'open') {
+        const failure = this.#failed.get(consumer);
+        if (failure) failure.timer = this.#wait(consumer, generation, 500);
+        return;
+      }
+      void this.#attempt(consumer, generation);
+    }, delay);
+    return timer;
   }
 
   #open() {
@@ -133,6 +143,8 @@ class AppConnection {
         this.state = state;
         this.error = error ?? null;
         if (state !== 'open') {
+          // What's still on its way for the connection that's gone no longer counts.
+          this.#generation++;
           this.#initialized = false;
           this.#ready.clear();
           for (const consumer of [...this.#failed.keys()]) this.#forget(consumer);
@@ -196,14 +208,19 @@ class AppConnection {
     // One that left while it waited its turn isn't started.
     if (this.#ready.has(consumer) || !this.#consumers.has(consumer)) return false;
     this.#ready.add(consumer);
+    // What this did to the consumer's state counts only while the connection it ran on is the current one: a fetch that
+    // was left pending across a reconnect must not undo what the new connection's attempt has done meanwhile.
+    const current = () => generation === this.#generation && this.#consumers.has(consumer);
     try {
       await consumer.onReady(this);
+      if (!current()) return false;
       this.#forget(consumer);
       return true;
     } catch (error) {
+      if (!current()) return false;
       this.#ready.delete(consumer);
       // The connection moving on is its own failure, and takes everything up again.
-      if (generation === this.#generation && this.#consumers.has(consumer)) this.#retryLater(consumer, generation, error);
+      this.#retryLater(consumer, generation, error);
       return false;
     }
   }

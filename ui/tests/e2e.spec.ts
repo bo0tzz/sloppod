@@ -2820,6 +2820,70 @@ test("a session whose load keeps failing doesn't disturb the list or the meters,
   }
 });
 
+test("a consumer that failed early tries again though a later one is still loading", async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  const sockets: PageSocket[] = [];
+  page.on('websocket', (socket) => sockets.push(socket));
+  await setWorkQuota(page, 20);
+  try {
+    await createSession(page, 'Say something, the meters fail first');
+    await finishTurn(page);
+    const meter = page.getByTestId('sidebar').getByTestId('quota-window');
+    await expect(meter).toContainText('20%');
+
+    // After the reconnect the quotas fail once; the session's load, which comes after, takes longer than the retry's
+    // first delay, so the connection is still coming up when it's due.
+    let calls = 0;
+    await page.route('**/api/v1/quotas', (route) =>
+      ++calls === 1 ? route.fulfill({ status: 500, json: { error: 'the quotas are unavailable' } }) : route.fallback(),
+    );
+    const socketsBefore = sockets.length;
+    await page.request.post('/_mock/drop?slowload=3000');
+    await expect.poll(() => calls).toBe(1);
+    // The retry comes once the session's load is through and the connection is up, not before and not never.
+    await expect.poll(() => calls, { timeout: 20_000 }).toBe(2);
+    await setWorkQuota(page, 70);
+    await expect(meter).toContainText('70%');
+    // One reconnect, and nothing else.
+    expect(sockets).toHaveLength(socketsBefore + 1);
+  } finally {
+    await setWorkQuota(page, null);
+  }
+});
+
+test("a fetch left pending across a reconnect doesn't cancel the retry of the new connection's", async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  await setWorkQuota(page, 20);
+  try {
+    // The page's first quotas fetch is held; the one after the reconnect fails; the held one is let go afterwards.
+    let calls = 0;
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => (release = resolve));
+    await page.route('**/api/v1/quotas', async (route) => {
+      const call = ++calls;
+      if (call === 1) {
+        const response = await route.fetch();
+        await released;
+        await route.fulfill({ response });
+      } else if (call === 2) {
+        await route.fulfill({ status: 500, json: { error: 'the quotas are unavailable' } });
+      } else {
+        await route.fallback();
+      }
+    });
+    await page.goto('/settings');
+    await expect.poll(() => calls).toBe(1);
+    await page.request.post('/_mock/drop');
+    await expect.poll(() => calls).toBe(2);
+    release();
+    // The held fetch is old news; the retry of the failed one still comes, and fills the meters.
+    await expect(page.getByTestId('sidebar').getByTestId('quota-window')).toContainText('20%', { timeout: 20_000 });
+    expect(calls).toBeGreaterThanOrEqual(3);
+  } finally {
+    await setWorkQuota(page, null);
+  }
+});
+
 test("a connection's quotas fetched after a newer connection's never replace them", async ({ page }) => {
   // The first connection's fetch is held back until the connection has dropped and come back with its own.
   let first: (() => void) | undefined;
