@@ -54,6 +54,7 @@ export function phaseShown(
     waiting?.proposals ? plural(waiting.proposals, 'proposal', 'proposals') : '',
     waiting?.questions ? plural(waiting.questions, 'question', 'questions') : '',
     waiting?.permissions ? plural(waiting.permissions, 'permission request', 'permission requests') : '',
+    waiting?.highlights ? plural(waiting.highlights, 'highlight', 'highlights') : '',
   ].filter(Boolean);
   if (open.length > 0) {
     return { label: 'Waiting on you', color: 'warning', description: `Waiting for you: ${open.join(', ')}` };

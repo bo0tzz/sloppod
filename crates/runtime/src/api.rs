@@ -38,6 +38,11 @@ pub fn routes() -> Router<AppState> {
         .route("/sessions/{id}/wake", post(wake_session))
         .route("/sessions/{id}/review", put(set_review))
         .route("/sessions/{id}/debug-bundle", get(debug_bundle))
+        .route("/sessions/{id}/highlights", get(list_highlights))
+        .route(
+            "/sessions/{id}/highlights/{highlight}/seen",
+            post(mark_highlight_seen),
+        )
         .route("/repos", get(repos))
         .route(
             "/credentials",
@@ -868,6 +873,41 @@ async fn wake_session(
         .await?
         .ok_or_else(not_found)?;
     Ok(Json(state.hub.session_api(&session).await))
+}
+
+/// What the agent highlighted for the user in this session, oldest first, the ones marked seen included (#439).
+async fn list_highlights(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    db::owned_session(&state.db, id, &user)
+        .await?
+        .ok_or_else(not_found)?;
+    let highlights: Vec<_> = db::list_highlights(&state.db, id)
+        .await?
+        .iter()
+        .map(db::HighlightRow::to_api)
+        .collect();
+    Ok(Json(highlights))
+}
+
+/// The user marks a highlight seen: that's all it does. No turn starts and the agent isn't told, whatever it has done
+/// since.
+async fn mark_highlight_seen(
+    State(state): State<AppState>,
+    User(user): User,
+    Path((id, highlight)): Path<(Uuid, Uuid)>,
+) -> ApiResult<impl IntoResponse> {
+    db::owned_session(&state.db, id, &user)
+        .await?
+        .ok_or_else(not_found)?;
+    let row = db::mark_highlight_seen(&state.db, id, highlight)
+        .await?
+        .ok_or_else(not_found)?;
+    let highlight = row.to_api();
+    state.hub.broadcast_highlight(&highlight);
+    Ok(Json(highlight))
 }
 
 #[derive(Deserialize)]

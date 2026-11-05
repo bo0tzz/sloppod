@@ -1617,6 +1617,72 @@ test('a question asked with ask_user outlives the turn and a stop', async ({ pag
   await expect(agentMessages(page).filter({ hasText: 'Thanks, going with that. Backoff: Exponential, capped.' })).toBeVisible();
 });
 
+test('a highlight shows as a card in the chat and in the for-you list, and is still there after a reload', async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1000 });
+  const prompt = 'Highlight: Your question about mise tools: use `mise use`, see https://mise.jdx.dev';
+  const id = await createSession(page, prompt);
+  const card = page.getByTestId('highlight-card');
+  const item = page.getByTestId('side-panel').getByTestId('highlight-item');
+  await expect(card).toContainText('Your question about mise tools');
+  await expect(card.getByRole('link', { name: 'https://mise.jdx.dev' })).toBeVisible();
+  await expect(item).toContainText('Your question about mise tools');
+  // The tool call is the card, not another row beside it.
+  await expect(page.getByTestId('tool-call').filter({ hasText: 'highlight' })).toHaveCount(0);
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+  await expect(phase(page)).toHaveText('Waiting on you');
+  await expect(phase(page)).toHaveAttribute('title', /1 highlight/);
+
+  await page.reload();
+  await expect(page).toHaveURL(new RegExp(id));
+  await expect(page.getByTestId('highlight-card')).toContainText('Your question about mise tools');
+  await expect(page.getByTestId('side-panel').getByTestId('highlight-item')).toHaveCount(1);
+  await expect(phase(page)).toHaveText('Waiting on you');
+});
+
+test('several highlights are open at once, each until it is marked seen, and marking one starts no turn', async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1000 });
+  const prompt = 'Highlight: Merge pull request 12 by hand | Re-run the nightly job';
+  await createSession(page, prompt);
+  const panel = page.getByTestId('side-panel');
+  await expect(panel.getByTestId('highlight-item')).toHaveCount(2);
+  await expect(page.getByTestId('highlight-card')).toHaveCount(2);
+  await expect(phase(page)).toHaveAttribute('title', /2 highlights/);
+  const row = page.getByRole('navigation', { name: 'Sessions' }).getByTestId('session-row').filter({ hasText: 'Highlight: Merge pull request 12' });
+  await expect(row.getByTestId('phase')).toHaveText('Waiting on you');
+
+  // Marked seen from the list: the card in the chat shows it, and the other stays open.
+  const turnsBefore = await agentMessages(page).count();
+  const noticesBefore = await userMessages(page).count();
+  await panel.getByTestId('highlight-item').filter({ hasText: 'Merge pull request 12' }).getByRole('button', { name: 'Seen' }).click();
+  await expect(panel.getByTestId('highlight-item')).toHaveCount(1);
+  await expect(page.getByTestId('highlight-card').filter({ hasText: 'Merge pull request 12' })).toHaveAttribute('data-seen', 'true');
+  await expect(page.getByTestId('highlight-card').filter({ hasText: 'Re-run the nightly job' })).toHaveAttribute('data-seen', 'false');
+  await expect(phase(page)).toHaveText('Waiting on you');
+
+  // The last one, from its card in the chat: nothing waits on the user any more.
+  await page.getByTestId('highlight-card').filter({ hasText: 'Re-run the nightly job' }).getByRole('button', { name: 'Seen' }).click();
+  await expect(panel.getByTestId('highlight-item')).toHaveCount(0);
+  await expect(phase(page)).toHaveText('Idle');
+  await expect(row.getByTestId('phase')).toHaveText('Idle');
+  // No turn started, and the agent wasn't told: the chat has nothing new, and the session is idle.
+  await page.waitForTimeout(500);
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+  expect(await agentMessages(page).count()).toBe(turnsBefore);
+  expect(await userMessages(page).count()).toBe(noticesBefore);
+
+  // Seen stays seen after a reload.
+  await page.reload();
+  await expect(page.getByTestId('highlight-card')).toHaveCount(2);
+  await expect(page.getByTestId('highlight-card').first()).toHaveAttribute('data-seen', 'true');
+  await expect(page.getByTestId('highlight-item')).toHaveCount(0);
+});
+
+test('on a narrow screen the folded panel says how many highlights wait', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await createSession(page, 'Highlight: One thing for you | Another thing for you');
+  await expect(page.getByTestId('waiting-summary-text')).toHaveText('2 highlights for you');
+});
+
 test('questions asked in separate requests show one after another', async ({ page }) => {
   await createSession(page, 'Use ask_user twice');
   await expect(questionCard(page)).toHaveCount(1);

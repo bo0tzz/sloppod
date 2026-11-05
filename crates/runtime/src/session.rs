@@ -639,6 +639,19 @@ impl Hub {
         );
     }
 
+    /// Tells the UIs that a highlight was made or marked seen (#439), and the owner's, that what the session waits on
+    /// changed.
+    pub fn broadcast_highlight(&self, highlight: &sloppod_protocol::api::Highlight) {
+        let _ = self.touched.send(highlight.session_id);
+        self.broadcast(
+            highlight.session_id,
+            UiEvent::Notification {
+                seq: None,
+                message: notification("_sloppod/highlight", json!({"highlight": highlight})),
+            },
+        );
+    }
+
     /// When the agent was last heard from. Until this runtime has heard from it, that's the session's last activity,
     /// read before this runtime records or sends anything for the session.
     async fn heard_at(&self, id: Uuid) -> Option<DateTime<Utc>> {
@@ -741,6 +754,10 @@ impl Hub {
     /// commands (#413).
     pub async fn session_api(&self, row: &crate::db::SessionRow) -> sloppod_protocol::api::Session {
         let mut session = row.to_api();
+        session.waiting.highlights = self.store.open_highlights(row.id).await.unwrap_or_else(|e| {
+            tracing::warn!(session = %row.id, error = %e, "counting the session's open highlights");
+            0
+        });
         session.waiting.proposals = self.store.pending_proposals(row.id).await.unwrap_or_else(|e| {
             tracing::warn!(session = %row.id, error = %e, "counting the session's pending proposals");
             0

@@ -228,6 +228,22 @@ pub mod api {
         pub questions: usize,
         /// The agent's permission requests.
         pub permissions: usize,
+        /// What the agent highlighted for the user and they haven't marked seen (#439).
+        #[serde(default)]
+        pub highlights: usize,
+    }
+
+    /// Something the agent asked the user to see with its `highlight` tool: open until they mark it seen.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct Highlight {
+        pub id: Uuid,
+        pub session_id: Uuid,
+        /// What the agent wants the user to see, in Markdown.
+        pub text: String,
+        pub created_at: String,
+        /// When the user marked it seen; absent while it's open.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub seen_at: Option<String>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -43,6 +43,8 @@ const CANCELLED = Symbol('cancelled');
 /** @type {Map<string, MockSession>} */
 const sessions = new Map();
 const proposals = new Map();
+/** What agents highlighted for the user (#439), by id. */
+const highlights = new Map();
 /** Review rounds by proposal id (ADR 24). */
 const reviews = new Map();
 const connections = new Set();
@@ -68,6 +70,7 @@ class MockSession {
           proposals: [...proposals.values()].filter((p) => p.session_id === data.id && p.status === 'pending').length,
           questions: pending.filter((p) => p.method === 'elicitation/create').length,
           permissions: pending.filter((p) => p.method !== 'elicitation/create').length,
+          highlights: [...highlights.values()].filter((h) => h.session_id === data.id && !h.seen_at).length,
         };
       },
     });
@@ -746,6 +749,24 @@ async function agentScript(session, turn, prompt) {
     return;
   }
 
+  // The agent highlights something for the user, one call for each of the texts after `Highlight:`, split by |.
+  if (/^highlight:/i.test(prompt)) {
+    for (const text of prompt.replace(/^highlight:\s*/i, '').split('|').map((t) => t.trim()).filter(Boolean)) {
+      const highlightId = randomUUID();
+      tool({ toolCallId: highlightId, title: 'mcp__sloppod__highlight', kind: 'other', status: 'pending', rawInput: { text } });
+      await step(1);
+      const highlight = createHighlight(session, text);
+      update(highlightId, {
+        status: 'completed',
+        content: [
+          { type: 'content', content: { type: 'text', text: `Highlighted (highlight ${highlight.id}). It stays in the user's list until they mark it seen; nothing waits on it.` } },
+        ],
+      });
+    }
+    await say('Done.');
+    return;
+  }
+
   if (session.data.repo && /file issues/i.test(prompt)) {
     await step(2);
     const proposeId = randomUUID();
@@ -1247,6 +1268,20 @@ function createStack(session) {
 function publicProposal(proposal) {
   const { diff: _diff, commits: _commits, layers: _layers, current: _current, ...rest } = proposal;
   return rest;
+}
+
+/** The agent's `highlight` tool: kept with the session, the session's UIs told, and what it waits on changes. */
+function createHighlight(session, text) {
+  const highlight = { id: randomUUID(), session_id: session.data.id, text, created_at: now() };
+  highlights.set(highlight.id, highlight);
+  broadcastHighlight(highlight);
+  return highlight;
+}
+
+function broadcastHighlight(highlight) {
+  const session = sessions.get(highlight.session_id);
+  for (const conn of session?.subscribers ?? []) conn.notify('_sloppod/highlight', { highlight });
+  session?.push();
 }
 
 function broadcastProposal(proposal) {
@@ -1781,6 +1816,17 @@ async function handleApi(req, res, url) {
       session.data.review = body.review;
       session.broadcast();
       return json(res, 200, session.data);
+    }
+    if (parts.length === 3 && parts[2] === 'highlights' && method === 'GET') {
+      return json(res, 200, [...highlights.values()].filter((h) => h.session_id === session.data.id));
+    }
+    if (parts.length === 5 && parts[2] === 'highlights' && parts[4] === 'seen' && method === 'POST') {
+      const highlight = highlights.get(parts[3]);
+      if (!highlight || highlight.session_id !== session.data.id) return json(res, 404, { error: 'not found' });
+      // The user's alone: no turn starts and the agent isn't told.
+      highlight.seen_at ??= now();
+      broadcastHighlight(highlight);
+      return json(res, 200, highlight);
     }
     if (parts.length === 3 && parts[2] === 'debug-bundle' && method === 'GET') {
       const message = url.searchParams.get('message');

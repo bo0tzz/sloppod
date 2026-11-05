@@ -43,6 +43,19 @@ export type Waiting = {
   questions: number;
   /** The agent's permission requests. */
   permissions: number;
+  /** What the agent highlighted for the user and they haven't marked seen (#439). */
+  highlights?: number;
+};
+
+/** Something the agent asked the user to see with its `highlight` tool; open until they mark it seen. */
+export type Highlight = {
+  id: string;
+  session_id: string;
+  /** Markdown. */
+  text: string;
+  created_at: string;
+  /** When the user marked it seen; absent while it's open. */
+  seen_at?: string;
 };
 
 export type NewSession = {
@@ -470,6 +483,9 @@ export const api = {
   createCredential: (body: NewCredential) => call<Credential>('POST', '/credentials', body),
   makeDefaultCredential: (id: string) => call<Credential>('POST', `/credentials/${encodeURIComponent(id)}/default`, {}),
   deleteCredential: (id: string) => call<void>('DELETE', `/credentials/${encodeURIComponent(id)}`),
+  listHighlights: (session: string) => call<Highlight[]>('GET', `/sessions/${encodeURIComponent(session)}/highlights`),
+  markHighlightSeen: (session: string, highlight: string) =>
+    call<Highlight>('POST', `/sessions/${encodeURIComponent(session)}/highlights/${encodeURIComponent(highlight)}/seen`, {}),
   listProposals: (query: { session?: string; status?: ProposalStatus }) => {
     const params = new URLSearchParams();
     if (query.session) params.set('session', query.session);

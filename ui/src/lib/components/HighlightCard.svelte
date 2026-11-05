@@ -1,0 +1,51 @@
+<script lang="ts">
+  import { Button, Icon } from '@immich/ui';
+  import { mdiCheck, mdiStarFourPointsOutline } from '@mdi/js';
+  import type { Highlight } from '#lib/api.ts';
+  import { absoluteTime, timeAgo } from '#lib/format.ts';
+  import Markdown from './Markdown.svelte';
+
+  /**
+   * What the agent highlighted for the user: in the chat, where its tool call was, and in the session's "for you" list.
+   * Open until the user marks it seen, which is theirs alone: no turn starts and the agent isn't told.
+   */
+  let {
+    highlight,
+    onSeen,
+    testid = 'highlight-card',
+  }: { highlight: Highlight; onSeen: (highlight: Highlight) => Promise<void>; testid?: string } = $props();
+
+  const open = $derived(!highlight.seen_at);
+  let busy = $state(false);
+
+  async function seen() {
+    busy = true;
+    try {
+      await onSeen(highlight);
+    } finally {
+      busy = false;
+    }
+  }
+</script>
+
+<div
+  class="flex flex-col gap-2 rounded-2xl border px-4 py-3 text-left {open
+    ? 'border-primary/40 bg-primary/5'
+    : 'border-light-200 bg-light-50 text-muted'}"
+  data-testid={testid}
+  data-seen={open ? 'false' : 'true'}
+>
+  <div class="flex items-center gap-2 text-xs {open ? 'text-primary' : 'text-muted'}">
+    <Icon icon={mdiStarFourPointsOutline} size="1.1em" aria-hidden />
+    <span class="font-medium">{open ? 'For you' : 'Seen'}</span>
+    <time class="text-muted" datetime={highlight.created_at} title={absoluteTime(highlight.created_at)}>
+      {timeAgo(highlight.created_at)}
+    </time>
+  </div>
+  <Markdown text={highlight.text} class="text-sm" />
+  {#if open}
+    <div>
+      <Button size="small" shape="round" leadingIcon={mdiCheck} loading={busy} onclick={seen}>Seen</Button>
+    </div>
+  {/if}
+</div>

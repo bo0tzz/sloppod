@@ -37,6 +37,7 @@
   import PermissionCard from './PermissionCard.svelte';
   import QuestionCard from './QuestionCard.svelte';
   import PhaseBadge from './PhaseBadge.svelte';
+  import HighlightCard from './HighlightCard.svelte';
   import ProposalCard from './ProposalCard.svelte';
   import ProposalListModal from './ProposalListModal.svelte';
   import ProposalModal from './ProposalModal.svelte';
@@ -66,8 +67,11 @@
   // agent, not here.
   // The runtime pushes the session when questions or permission requests change, but not when a proposal is decided,
   // so the proposals this view already follows give the count (#368).
+  const openHighlights = $derived(view.highlights.filter((highlight) => !highlight.seen_at));
   const waitingOnYou = $derived(
-    session?.waiting && view.proposalsLoaded ? { ...session.waiting, proposals: pendingProposals.length } : session?.waiting,
+    session?.waiting && view.proposalsLoaded
+      ? { ...session.waiting, proposals: pendingProposals.length, highlights: openHighlights.length }
+      : session?.waiting,
   );
   const openProposals = $derived(
     view.proposals.filter((proposal) => proposal.status === 'pending' || proposal.status === 'approved'),
@@ -130,7 +134,9 @@
     autoApprovals = approvals.filter((a) => a.session_id === id && a.kind === 'github.pr.create').map((a) => a.id);
   }
 
-  const waiting = $derived(view.permissions.length > 0 || view.questions.length > 0 || openProposals.length > 0);
+  const waiting = $derived(
+    view.permissions.length > 0 || view.questions.length > 0 || openProposals.length > 0 || openHighlights.length > 0,
+  );
   let width = $state(0);
   // Room for the chat at its full width (max-w-3xl and its padding) with the panel beside it.
   const sidePanel = $derived(width >= 1184);
@@ -143,7 +149,8 @@
     if (!waiting) foldChoice = null;
   });
   const asking = $derived(view.questions.length > 0 || view.permissions.length > 0);
-  const folded = $derived(foldChoice ?? (small && asking));
+  // Highlights fold away too: their cards are in the chat, where the user reads them.
+  const folded = $derived(foldChoice ?? (small && (asking || openHighlights.length > 0)));
   let waitingItemsElement = $state<HTMLElement>();
   /** Unfolds the panel; a question card that was there all along, hidden, takes focus as if it had just appeared. */
   async function unfold() {
@@ -151,13 +158,17 @@
     await tick();
     waitingItemsElement?.querySelector<HTMLElement>('[data-testid="question-card"]')?.focus({ preventScroll: true });
   }
-  const waitingSummary = $derived.by((): { kind: 'question' | 'permission' | 'proposal'; text: string } => {
+  const waitingSummary = $derived.by((): { kind: 'question' | 'permission' | 'proposal' | 'highlight'; text: string } => {
     const question = view.questions[0];
     if (question) return { kind: 'question', text: `The agent asks: ${question.message.split('\n')[0]}` };
     const permission = view.permissions[0];
     if (permission) {
       const tool = view.transcript.tool(permission.toolCall.toolCallId);
       return { kind: 'permission', text: `Permission needed: ${toolTitle(permission.toolCall.title ?? tool?.title ?? 'a tool call').title}` };
+    }
+    if (openProposals.length === 0) {
+      const count = openHighlights.length;
+      return { kind: 'highlight', text: `${count} ${count === 1 ? 'highlight' : 'highlights'} for you` };
     }
     const count = pendingProposals.length || openProposals.length;
     return { kind: 'proposal', text: `${count} ${count === 1 ? 'proposal' : 'proposals'} ${pendingProposals.length ? 'to review' : 'being carried out'}` };
@@ -304,6 +315,10 @@
 </svelte:head>
 
 {#snippet waitingItems()}
+      <!-- What the agent highlighted and the user hasn't marked seen: each stays until they do. -->
+      {#each openHighlights as highlight (highlight.id)}
+        <HighlightCard {highlight} testid="highlight-item" onSeen={(h) => view.markHighlightSeen(h)} />
+      {/each}
       <!-- One request at a time; the rest wait their turn behind it. -->
       {#each view.questions.slice(0, 1) as question (question.key)}
         <QuestionCard
@@ -490,7 +505,13 @@
                     </Button>
                   </div>
                 {/if}
-                <TranscriptView items={view.transcript.items} running={view.turnRunning} sessionId={id} />
+                <TranscriptView
+                  items={view.transcript.items}
+                  running={view.turnRunning}
+                  sessionId={id}
+                  highlights={view.highlights}
+                  onSeen={(highlight) => view.markHighlightSeen(highlight)}
+                />
                 {#if activity}
                   <div class="text-muted flex items-center gap-2 py-1 text-sm" data-testid="activity">
                     <LoadingSpinner size="tiny" />

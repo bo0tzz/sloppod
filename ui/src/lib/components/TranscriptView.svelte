@@ -1,6 +1,9 @@
 <script lang="ts">
   import type { TranscriptItem } from '#lib/acp/transcript.svelte.ts';
+  import type { Highlight } from '#lib/api.ts';
+  import { matchHighlights } from '#lib/highlights.ts';
   import CompactionView from './CompactionView.svelte';
+  import HighlightCard from './HighlightCard.svelte';
   import MessageView from './MessageView.svelte';
   import NoticeView from './NoticeView.svelte';
   import PlanView from './PlanView.svelte';
@@ -12,7 +15,17 @@
     items,
     running = false,
     sessionId,
-  }: { items: TranscriptItem[]; running?: boolean; sessionId?: string } = $props();
+    highlights = [],
+    onSeen,
+  }: {
+    items: TranscriptItem[];
+    running?: boolean;
+    sessionId?: string;
+    /** What the agent highlighted: a `highlight` tool call that made one shows as its card. */
+    highlights?: Highlight[];
+    onSeen?: (highlight: Highlight) => Promise<void>;
+  } = $props();
+  const highlighted = $derived(matchHighlights(items, highlights));
 
   // The turn each item is part of, as the debug bundle's query names it: the message that started it, steered
   // messages aside. Loaded history can begin part way through a turn: what comes before the first message loaded is
@@ -43,6 +56,8 @@
       <MessageView message={item} bundleUrl={item.type === 'agent' ? bundleUrl(index) : undefined} />
     {:else if item.type === 'thought'}
       <ThoughtView thought={item} active={running && index === items.length - 1} />
+    {:else if item.type === 'tool' && highlighted.has(item.toolCallId) && onSeen}
+      <HighlightCard highlight={highlighted.get(item.toolCallId)!} {onSeen} />
     {:else if item.type === 'tool'}
       <ToolCallView tool={item} />
     {:else if item.type === 'plan'}
