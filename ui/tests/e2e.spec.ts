@@ -414,6 +414,23 @@ test('stops a running turn', async ({ page }) => {
   );
 });
 
+
+test('a stopped turn is resumed with one click', async ({ page }) => {
+  await createSession(page, 'Stop me in sloppod');
+  await expect(permissionCard(page)).toBeVisible();
+  await page.getByRole('button', { name: 'Stop' }).click();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+
+  // The stop is marked, with a way on.
+  const resume = page.getByTestId('resume-turn');
+  await expect(page.getByTestId('notice').filter({ hasText: 'Stopped' })).toBeVisible();
+  await expect(resume).toBeVisible();
+  await resume.click();
+  await expect(userMessages(page).filter({ hasText: 'Carry on where you left off.' })).toBeVisible();
+  // Once anything was sent after it, the marker has done its job.
+  await expect(resume).toHaveCount(0);
+  await expect(page.getByTestId('notice').filter({ hasText: 'Stopped' })).toBeVisible();
+});
 test('Esc stops a running turn, unless it closes a dialog first', async ({ page }) => {
   await createSession(page, 'Stop me with Esc in sloppod');
   await expect(permissionCard(page)).toBeVisible();

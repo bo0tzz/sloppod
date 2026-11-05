@@ -2083,6 +2083,25 @@ async fn every_turn_that_ends_is_counted_with_its_error() {
         h.hub.turns_ended(h.id).await,
         (2, Some(TurnEnd::Failed("upstream 503".into())))
     );
+    // A failed turn can be resumed too, and says why it failed.
+    let marker = last_notice(&h).expect("a failure marker");
+    assert_eq!(
+        (
+            marker["title"].as_str(),
+            marker["description"].as_str(),
+            marker["resume"].as_bool()
+        ),
+        (Some("The turn failed"), Some("upstream 503"), Some(true))
+    );
+}
+
+/// The last notice recorded in the session's transcript.
+fn last_notice(h: &Harness) -> Option<Value> {
+    h.store
+        .updates(h.id)
+        .into_iter()
+        .rev()
+        .find(|u| u["sessionUpdate"] == "notice")
 }
 
 #[tokio::test]
@@ -2105,6 +2124,12 @@ async fn a_turn_someone_stopped_isnt_checked_for_unfinished_work() {
         checked.load(std::sync::atomic::Ordering::SeqCst),
         0,
         "no nudge after a stop"
+    );
+    // The stop is marked in the transcript, for the user to resume from (#406).
+    let marker = last_notice(&h).expect("a stop marker");
+    assert_eq!(
+        (marker["title"].as_str(), marker["resume"].as_bool()),
+        (Some("Stopped"), Some(true))
     );
 
     let _done = h.prompt("Now a short one");

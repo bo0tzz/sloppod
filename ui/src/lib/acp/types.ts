@@ -74,7 +74,7 @@ export type SessionUpdate =
   | ({ sessionUpdate: 'plan'; entries: PlanEntry[] } & Meta)
   | ({ sessionUpdate: 'available_commands_update'; availableCommands: AvailableCommand[] } & Meta)
   | ({ sessionUpdate: 'session_info_update'; title?: string | null; updatedAt?: string | null } & Meta)
-  | ({ sessionUpdate: 'notice'; severity: string; title: string; description?: string | null } & Meta)
+  | ({ sessionUpdate: 'notice'; severity: string; title: string; description?: string | null; resume?: boolean } & Meta)
   | ({
       sessionUpdate: 'compaction_update';
       compactionId: string;

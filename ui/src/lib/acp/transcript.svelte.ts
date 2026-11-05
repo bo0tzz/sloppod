@@ -55,7 +55,15 @@ export type CompactionItem = {
   error?: string | null;
 };
 
-export type NoticeItem = { type: 'notice'; key: string; severity: string; title: string; description?: string | null };
+export type NoticeItem = {
+  type: 'notice';
+  key: string;
+  severity: string;
+  title: string;
+  description?: string | null;
+  /** A turn that was stopped or failed: the user can resume it (#406). */
+  resume?: boolean;
+};
 
 export type TranscriptItem = MessageItem | ToolItem | PlanItem | CompactionItem | NoticeItem;
 
@@ -143,6 +151,7 @@ export class Transcript {
           severity: update.severity,
           title: update.title,
           description: update.description,
+          resume: update.resume === true,
         });
         break;
     }
