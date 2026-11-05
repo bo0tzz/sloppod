@@ -2379,6 +2379,23 @@ impl Hub {
             tracing::info!(session = %id, %until, "the session hit its usage limit; it carries on then");
             self.resume_at(id, until);
         }
+        // A turn that was stopped, or failed, is marked in the transcript, where the user can resume it with one
+        // click (#406). One that hit the usage limit carries on by itself.
+        let marker = match &end {
+            TurnEnd::Cancelled => Some(("info", "Stopped", None)),
+            TurnEnd::Failed(error) => Some(("warning", "The turn failed", Some(error.clone()))),
+            TurnEnd::Ended | TurnEnd::Limited => None,
+        };
+        if let Some((severity, title, description)) = marker {
+            self.record(
+                id,
+                json!({
+                    "sessionUpdate": "notice", "severity": severity, "title": title, "description": description,
+                    "resume": true,
+                }),
+            )
+            .await;
+        }
         let turn_ended = self.turn_ended.lock().unwrap().clone();
         if let (TurnEnd::Ended, Some(turn_ended)) = (end, turn_ended) {
             tokio::spawn(turn_ended(id));

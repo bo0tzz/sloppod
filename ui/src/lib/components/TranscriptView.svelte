@@ -12,7 +12,8 @@
     items,
     running = false,
     sessionId,
-  }: { items: TranscriptItem[]; running?: boolean; sessionId?: string } = $props();
+    onResume,
+  }: { items: TranscriptItem[]; running?: boolean; sessionId?: string; onResume?: () => void } = $props();
 
   // The turn each item is part of, as the debug bundle's query names it: the message that started it, steered
   // messages aside. Loaded history can begin part way through a turn: what comes before the first message loaded is
@@ -50,7 +51,8 @@
     {:else if item.type === 'compaction'}
       <CompactionView compaction={item} />
     {:else if item.type === 'notice'}
-      <NoticeView notice={item} />
+      <!-- Resume only from the last thing in the transcript: anything sent since has carried on already. -->
+      <NoticeView notice={item} onResume={item.resume && !running && index === items.length - 1 ? onResume : undefined} />
     {/if}
   {/each}
 </div>
