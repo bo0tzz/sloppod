@@ -25,6 +25,7 @@
     mdiTrashCanOutline,
   } from '@mdi/js';
   import { onMount, tick } from 'svelte';
+  import { ConnectionClosedError } from '#lib/acp/connection.ts';
   import { api, type Proposal } from '#lib/api.ts';
   import { absoluteTime, clockTime, countdown } from '#lib/format.ts';
   import { toolTitle } from '#lib/presentation.ts';
@@ -240,6 +241,23 @@
     observer.observe(scroller);
     return () => observer.disconnect();
   });
+
+  /** Carries on with a turn that was stopped or failed, as one click (#406): a short message asking the agent to. */
+  function resume() {
+    const message = { id: crypto.randomUUID(), text: 'Carry on where you left off.' };
+    if (view.connection !== 'open') {
+      view.sendWhenConnected(message);
+      return;
+    }
+    view.prompt(message).catch((error) => {
+      // A dropped connection is the session view's to settle once it has reloaded.
+      if (error instanceof ConnectionClosedError) return;
+      toastManager.danger({
+        title: "Couldn't resume the turn",
+        description: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }
 
   async function toggleReview() {
     if (!session) return;
@@ -511,6 +529,7 @@
                   sessionId={id}
                   highlights={view.highlights}
                   onSeen={(highlight) => view.markHighlightSeen(highlight)}
+                  onResume={view.unsent.length > 0 ? undefined : resume}
                 />
                 {#if activity}
                   <div class="text-muted flex items-center gap-2 py-1 text-sm" data-testid="activity">

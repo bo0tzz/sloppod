@@ -795,6 +795,17 @@ impl Hub {
     }
 
     /// How many of the agent's commands are running, if its supervisor says.
+    /// How many questions the agent asked with its `ask_user` tool wait for the user's answer.
+    pub async fn open_questions(&self, id: Uuid) -> usize {
+        let live = self.live(id);
+        let state = live.state.lock().await;
+        state
+            .permissions
+            .values()
+            .filter(|p| matches!(p.asker, Asker::Tool { .. }))
+            .count()
+    }
+
     pub async fn commands(&self, id: Uuid) -> Option<usize> {
         self.live(id).running_commands()
     }
@@ -2384,6 +2395,23 @@ impl Hub {
         if let Some(until) = limited {
             tracing::info!(session = %id, %until, "the session hit its usage limit; it carries on then");
             self.resume_at(id, until);
+        }
+        // A turn that was stopped, or failed, is marked in the transcript, where the user can resume it with one
+        // click (#406). One that hit the usage limit carries on by itself.
+        let marker = match &end {
+            TurnEnd::Cancelled => Some(("info", "Stopped", None)),
+            TurnEnd::Failed(error) => Some(("warning", "The turn failed", Some(error.clone()))),
+            TurnEnd::Ended | TurnEnd::Limited => None,
+        };
+        if let Some((severity, title, description)) = marker {
+            self.record(
+                id,
+                json!({
+                    "sessionUpdate": "notice", "severity": severity, "title": title, "description": description,
+                    "resume": true,
+                }),
+            )
+            .await;
         }
         let turn_ended = self.turn_ended.lock().unwrap().clone();
         if let (TurnEnd::Ended, Some(turn_ended)) = (end, turn_ended) {

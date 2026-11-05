@@ -532,6 +532,8 @@ async function runTurn(session, text, { echo = true, messageId, images = [] } = 
           session.emit({ sessionUpdate: 'tool_call_update', toolCallId: update.toolCallId, status: 'failed' });
         }
       }
+      // As the runtime marks a stopped turn, for the user to resume (#406).
+      session.emit({ sessionUpdate: 'notice', severity: 'info', title: 'Stopped', description: null, resume: true });
       return 'cancelled';
     }
     throw error;

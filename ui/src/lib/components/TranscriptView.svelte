@@ -17,6 +17,7 @@
     sessionId,
     highlights = [],
     onSeen,
+    onResume,
   }: {
     items: TranscriptItem[];
     running?: boolean;
@@ -24,6 +25,7 @@
     /** What the agent highlighted: a `highlight` tool call that made one shows as its card. */
     highlights?: Highlight[];
     onSeen?: (highlight: Highlight) => Promise<void>;
+    onResume?: () => void;
   } = $props();
   const highlighted = $derived(matchHighlights(items, highlights));
 
@@ -65,7 +67,8 @@
     {:else if item.type === 'compaction'}
       <CompactionView compaction={item} />
     {:else if item.type === 'notice'}
-      <NoticeView notice={item} />
+      <!-- Resume only from the last thing in the transcript: anything sent since has carried on already. -->
+      <NoticeView notice={item} onResume={item.resume && !running && index === items.length - 1 ? onResume : undefined} />
     {/if}
   {/each}
 </div>
