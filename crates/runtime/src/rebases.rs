@@ -258,10 +258,8 @@ enum Outcome {
 fn notice(repo: &str, branch: &str, pull: u64, outcome: &Outcome) -> Option<String> {
     let pull_ref = crate::pulls::pull_ref(repo, pull);
     match outcome {
-        Outcome::Kept => Some(format!(
-            "sloppod: your push to `{branch}` only brought {pull_ref} up to date: the change it makes is the one that \
-             was reviewed, so it's set to merge once its checks pass again."
-        )),
+        // What was expected: nothing for the agent to do, and a notice would cost an idle session a turn.
+        Outcome::Kept => None,
         Outcome::Off(why) => Some(format!(
             "sloppod: `{branch}` is the head of {pull_ref}, which was set to merge once its checks pass. After \
              your push {why}, so auto-merge is off and it needs merging by hand. {} It's at {}.",
@@ -433,11 +431,8 @@ index 3333333..4444444 100644
 
     #[test]
     fn the_agent_hears_why() {
-        assert!(
-            notice("o/r", "s", 7, &Outcome::Kept)
-                .unwrap()
-                .contains("o/r#7 up to date")
-        );
+        // Auto-merge going back on is what was expected, and nothing to act on.
+        assert_eq!(notice("o/r", "s", 7, &Outcome::Kept), None);
         assert!(
             notice("o/r", "s", 7, &Outcome::Off("it's no longer open".into()))
                 .unwrap()
