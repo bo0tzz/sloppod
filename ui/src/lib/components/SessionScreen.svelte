@@ -508,7 +508,7 @@
                     </Button>
                   </div>
                 {/if}
-                <TranscriptView items={view.transcript.items} running={view.turnRunning} sessionId={id} onResume={resume} />
+                <TranscriptView items={view.transcript.items} running={view.turnRunning} sessionId={id} onResume={view.unsent.length > 0 ? undefined : resume} />
                 {#if activity}
                   <div class="text-muted flex items-center gap-2 py-1 text-sm" data-testid="activity">
                     <LoadingSpinner size="tiny" />
