@@ -40,6 +40,8 @@ export type ToolItem = {
   content: ToolCallContent[];
   locations: ToolCallLocation[];
   rawInput?: unknown;
+  /** What the agent reported as the call's result, when it doesn't give it as `content` (Codex's MCP calls). */
+  rawOutput?: unknown;
   /** Output the runtime delivered through the `_meta.terminal_output` extension, by terminal ID. */
   terminals: Record<string, string>;
 };
@@ -206,6 +208,7 @@ export class Transcript {
       content: call.content ?? [],
       locations: call.locations ?? [],
       rawInput: call.rawInput,
+      rawOutput: call.rawOutput,
       terminals: {},
     });
     this.#tools.set(call.toolCallId, item);
@@ -224,6 +227,7 @@ export class Transcript {
     if (update.content) item.content = update.content;
     if (update.locations) item.locations = update.locations;
     if (update.rawInput !== undefined) item.rawInput = update.rawInput;
+    if (update.rawOutput !== undefined) item.rawOutput = update.rawOutput;
     this.#terminalMeta(item, update._meta);
   }
 

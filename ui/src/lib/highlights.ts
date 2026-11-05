@@ -1,19 +1,32 @@
 import type { ToolItem, TranscriptItem } from './acp/transcript.svelte.ts';
 import type { Highlight } from './api.ts';
 
-/** What a highlight tool call is called by the agent: `mcp__sloppod__highlight`, or `highlight` where the server is dropped. */
-const isHighlightCall = (item: TranscriptItem): item is ToolItem => item.type === 'tool' && /(^|__)highlight$/.test(item.title);
+/**
+ * What agents call the tool: `mcp__sloppod__highlight` (Claude Code), `mcp.sloppod.highlight` (Codex), or `highlight`.
+ */
+const isHighlightCall = (item: TranscriptItem): item is ToolItem =>
+  item.type === 'tool' && /^(mcp__sloppod__|mcp\.sloppod\.)?highlight$/.test(item.title);
 
 const RESULT_ID = /highlight ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/;
 
-/** The id of the highlight a call made, from its result: `Highlighted (highlight <id>). …`. */
+/**
+ * The id of the highlight a call made, from its result: `Highlighted (highlight <id>). …`. Claude Code puts a result
+ * in `content`; Codex gives it as `rawOutput` (`{result: {content: […]}, error}`), so that's searched too.
+ */
 function resultId(item: ToolItem): string | undefined {
   for (const block of item.content) {
     const text = block.type === 'content' && block.content.type === 'text' ? block.content.text : '';
     const id = RESULT_ID.exec(text)?.[1];
     if (id) return id;
   }
-  return undefined;
+  return item.rawOutput === undefined ? undefined : RESULT_ID.exec(JSON.stringify(item.rawOutput))?.[1];
+}
+
+/** What the call asked to highlight: `rawInput.text`, or `rawInput.arguments.text` where Codex wraps it with the server and tool. */
+function inputText(item: ToolItem): string | undefined {
+  const input = item.rawInput as { text?: unknown; arguments?: { text?: unknown } } | undefined;
+  const text = input?.text ?? input?.arguments?.text;
+  return typeof text === 'string' ? text : undefined;
 }
 
 /**
@@ -34,8 +47,8 @@ export function matchHighlights(items: TranscriptItem[], highlights: Highlight[]
   }
   for (const item of calls) {
     if (matched.has(item.toolCallId) || resultId(item)) continue;
-    const text = (item.rawInput as { text?: unknown } | undefined)?.text;
-    if (typeof text !== 'string') continue;
+    const text = inputText(item);
+    if (text === undefined) continue;
     const index = unclaimed.findIndex((highlight) => highlight.text === text.trim());
     if (index === -1) continue;
     matched.set(item.toolCallId, unclaimed.splice(index, 1)[0]);

@@ -750,18 +750,26 @@ async function agentScript(session, turn, prompt) {
   }
 
   // The agent highlights something for the user, one call for each of the texts after `Highlight:`, split by |.
-  if (/^highlight:/i.test(prompt)) {
-    for (const text of prompt.replace(/^highlight:\s*/i, '').split('|').map((t) => t.trim()).filter(Boolean)) {
+  // With `Highlight (codex):` the calls are reported as codex-acp does: its own title, the input wrapped with the server and
+  // tool, and the result as `rawOutput` rather than content.
+  if (/^highlight( \(codex\))?:/i.test(prompt)) {
+    const codex = /^highlight \(codex\):/i.test(prompt);
+    for (const text of prompt.replace(/^highlight( \(codex\))?:\s*/i, '').split('|').map((t) => t.trim()).filter(Boolean)) {
       const highlightId = randomUUID();
-      tool({ toolCallId: highlightId, title: 'mcp__sloppod__highlight', kind: 'other', status: 'pending', rawInput: { text } });
+      tool(
+        codex
+          ? { toolCallId: highlightId, title: 'mcp.sloppod.highlight', kind: 'execute', status: 'in_progress', rawInput: { server: 'sloppod', tool: 'highlight', arguments: { text } } }
+          : { toolCallId: highlightId, title: 'mcp__sloppod__highlight', kind: 'other', status: 'pending', rawInput: { text } },
+      );
       await step(1);
       const highlight = createHighlight(session, text);
-      update(highlightId, {
-        status: 'completed',
-        content: [
-          { type: 'content', content: { type: 'text', text: `Highlighted (highlight ${highlight.id}). It stays in the user's list until they mark it seen; nothing waits on it.` } },
-        ],
-      });
+      const result = `Highlighted (highlight ${highlight.id}). It stays in the user's list until they mark it seen; nothing waits on it.`;
+      update(
+        highlightId,
+        codex
+          ? { status: 'completed', rawInput: { server: 'sloppod', tool: 'highlight', arguments: { text } }, rawOutput: { result: { content: [{ type: 'text', text: result }], structuredContent: null }, error: null } }
+          : { status: 'completed', content: [{ type: 'content', content: { type: 'text', text: result } }] },
+      );
     }
     await say('Done.');
     return;

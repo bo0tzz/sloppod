@@ -1677,6 +1677,24 @@ test('several highlights are open at once, each until it is marked seen, and mar
   await expect(page.getByTestId('highlight-item')).toHaveCount(0);
 });
 
+test('a highlight the way codex-acp reports it shows as a card too, after a reload as well', async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1000 });
+  const id = await createSession(page, 'Highlight (codex): Your question about mise tools: use mise use | Merge pull request 12 by hand');
+  // Its own title, the input wrapped with the server and tool, the result as rawOutput: still cards, one for each call.
+  await expect(page.getByTestId('highlight-card')).toHaveCount(2);
+  await expect(page.getByTestId('highlight-card').first()).toContainText('Your question about mise tools');
+  await expect(page.getByTestId('highlight-card').last()).toContainText('Merge pull request 12');
+  await expect(page.getByTestId('tool-call').filter({ hasText: 'highlight' })).toHaveCount(0);
+  await expect(page.getByTestId('side-panel').getByTestId('highlight-item')).toHaveCount(2);
+
+  await page.reload();
+  await expect(page).toHaveURL(new RegExp(id));
+  await expect(page.getByTestId('highlight-card')).toHaveCount(2);
+  await page.getByTestId('highlight-card').last().getByRole('button', { name: 'Seen' }).click();
+  await expect(page.getByTestId('highlight-card').last()).toHaveAttribute('data-seen', 'true');
+  await expect(page.getByTestId('highlight-card').first()).toHaveAttribute('data-seen', 'false');
+});
+
 test('on a narrow screen the folded panel says how many highlights wait', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await createSession(page, 'Highlight: One thing for you | Another thing for you');
