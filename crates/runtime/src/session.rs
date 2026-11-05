@@ -778,6 +778,17 @@ impl Hub {
     }
 
     /// How many of the agent's commands are running, if its supervisor says.
+    /// How many questions the agent asked with its `ask_user` tool wait for the user's answer.
+    pub async fn open_questions(&self, id: Uuid) -> usize {
+        let live = self.live(id);
+        let state = live.state.lock().await;
+        state
+            .permissions
+            .values()
+            .filter(|p| matches!(p.asker, Asker::Tool { .. }))
+            .count()
+    }
+
     pub async fn commands(&self, id: Uuid) -> Option<usize> {
         self.live(id).running_commands()
     }

@@ -221,7 +221,7 @@ pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<
 }
 
 /// What a child is doing, in words: an idle one with commands running waits on them, unlike one that's done (#413).
-fn doing(phase: Phase, commands: Option<usize>) -> String {
+pub(crate) fn doing(phase: Phase, commands: Option<usize>) -> String {
     match (phase, commands) {
         (Phase::Idle, Some(1)) => "waiting on 1 command it started".into(),
         (Phase::Idle, Some(n)) if n > 1 => format!("waiting on {n} commands it started"),
