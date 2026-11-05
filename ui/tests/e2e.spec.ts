@@ -1730,6 +1730,33 @@ test('a highlight the way codex-acp reports it shows as a card too, after a relo
   await expect(page.getByTestId('highlight-card').first()).toHaveAttribute('data-seen', 'false');
 });
 
+test('a highlight retried after a failed call shows as the retry\'s card, not the failed one\'s', async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1000 });
+  await createSession(page, 'Highlight (retry): Merge pull request 12 by hand');
+  // The result of the retry names no highlight, so it's matched by text: the failed call has the same text and mustn't take it.
+  await expect(page.getByTestId('highlight-card')).toHaveCount(1);
+  const failed = page.getByTestId('tool-call').filter({ hasText: 'highlight' });
+  await expect(failed).toHaveCount(1);
+  await expect(failed).toHaveAttribute('data-status', 'failed');
+  const order = await page.getByTestId('transcript').locator('[data-testid="tool-call"], [data-testid="highlight-card"]').evaluateAll((nodes) => nodes.map((node) => node.getAttribute('data-testid')));
+  expect(order).toEqual(['tool-call', 'highlight-card']);
+});
+
+test('a highlight that could not be marked seen says so, and can be tried again', async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1000 });
+  await createSession(page, 'Highlight: Re-run the nightly job');
+  const item = page.getByTestId('side-panel').getByTestId('highlight-item');
+  let failing = true;
+  await page.route('**/highlights/*/seen', (route) => (failing ? route.fulfill({ status: 500, json: { error: 'database unavailable' } }) : route.fallback()));
+  await item.getByRole('button', { name: 'Seen' }).click();
+  await expect(item.getByTestId('highlight-error')).toContainText('database unavailable');
+  await expect(item.getByRole('button', { name: 'Seen' })).toBeEnabled();
+  failing = false;
+  await item.getByRole('button', { name: 'Seen' }).click();
+  await expect(page.getByTestId('side-panel').getByTestId('highlight-item')).toHaveCount(0);
+  await expect(page.getByTestId('highlight-card')).toHaveAttribute('data-seen', 'true');
+});
+
 test('on a narrow screen the folded panel says how many highlights wait', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await createSession(page, 'Highlight: One thing for you | Another thing for you');

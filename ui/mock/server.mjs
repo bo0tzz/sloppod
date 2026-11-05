@@ -754,6 +754,21 @@ async function agentScript(session, turn, prompt) {
   // The agent highlights something for the user, one call for each of the texts after `Highlight:`, split by |.
   // With `Highlight (codex):` the calls are reported as codex-acp does: its own title, the input wrapped with the server and
   // tool, and the result as `rawOutput` rather than content.
+  // With `Highlight (retry):` a first call fails and is tried again; the result of the second says nothing of which highlight it made.
+  if (/^highlight \(retry\):/i.test(prompt)) {
+    const text = prompt.replace(/^highlight \(retry\):\s*/i, '').trim();
+    const failedId = randomUUID();
+    tool({ toolCallId: failedId, title: 'mcp__sloppod__highlight', kind: 'other', status: 'pending', rawInput: { text } });
+    await step(1);
+    update(failedId, { status: 'failed', content: [{ type: 'content', content: { type: 'text', text: 'The runtime could not be reached.' } }] });
+    const retryId = randomUUID();
+    tool({ toolCallId: retryId, title: 'mcp__sloppod__highlight', kind: 'other', status: 'pending', rawInput: { text } });
+    await step(1);
+    createHighlight(session, text);
+    update(retryId, { status: 'completed', content: [{ type: 'content', content: { type: 'text', text: 'Highlighted.' } }] });
+    await say('Done.');
+    return;
+  }
   if (/^highlight( \(codex\))?:/i.test(prompt)) {
     const codex = /^highlight \(codex\):/i.test(prompt);
     for (const text of prompt.replace(/^highlight( \(codex\))?:\s*/i, '').split('|').map((t) => t.trim()).filter(Boolean)) {

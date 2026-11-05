@@ -17,11 +17,16 @@
 
   const open = $derived(!highlight.seen_at);
   let busy = $state(false);
+  let error = $state<string | null>(null);
 
   async function seen() {
     busy = true;
+    error = null;
     try {
       await onSeen(highlight);
+    } catch (cause) {
+      // Not saved: Seen stays, to try again.
+      error = cause instanceof Error ? cause.message : String(cause);
     } finally {
       busy = false;
     }
@@ -46,6 +51,9 @@
   {#if open}
     <div>
       <Button size="small" shape="round" leadingIcon={mdiCheck} loading={busy} onclick={seen}>Seen</Button>
+      {#if error}
+        <p class="text-danger mt-1 text-xs" data-testid="highlight-error">Couldn't mark it seen: {error}</p>
+      {/if}
     </div>
   {/if}
 </div>

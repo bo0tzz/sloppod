@@ -46,7 +46,8 @@ export function matchHighlights(items: TranscriptItem[], highlights: Highlight[]
     if (index !== -1) matched.set(item.toolCallId, unclaimed.splice(index, 1)[0]);
   }
   for (const item of calls) {
-    if (matched.has(item.toolCallId) || resultId(item)) continue;
+    // Only a call that completed made one: a failed or still running call mustn't take the match of a retry's.
+    if (item.status !== 'completed' || matched.has(item.toolCallId) || resultId(item)) continue;
     const text = inputText(item);
     if (text === undefined) continue;
     const index = unclaimed.findIndex((highlight) => highlight.text === text.trim());
