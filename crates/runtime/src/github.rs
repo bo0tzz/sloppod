@@ -1180,12 +1180,35 @@ impl GitHubApp {
         .find(|(setting, _)| info[*setting].as_bool() == Some(true))
         .map(|(_, method)| method)
         .context("the repository allows no merge method")?;
+        // GitHub's own message for a squash lists every commit's author as a co-author, the bot among them, so the
+        // message is given: the pull request's title and description, as a person merging by hand would see them. A
+        // rebase keeps the commits' own messages.
+        if method == "REBASE" {
+            return self
+                .graphql(
+                    repo,
+                    "mutation($id: ID!, $method: PullRequestMergeMethod!, $head: GitObjectID!) { \
+                     enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: $method, \
+                     expectedHeadOid: $head}) { clientMutationId } }",
+                    json!({"id": pull_node_id, "method": method, "head": expected_head}),
+                )
+                .await
+                .map(|_| ());
+        }
+        let pull = self
+            .graphql(
+                repo,
+                "query($id: ID!) { node(id: $id) { ... on PullRequest { number title body } } }",
+                json!({"id": pull_node_id}),
+            )
+            .await?;
+        let (headline, body) = merge_message(&pull["data"]["node"]);
         self.graphql(
             repo,
-            "mutation($id: ID!, $method: PullRequestMergeMethod!, $head: GitObjectID!) { \
-             enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: $method, expectedHeadOid: $head}) \
-             { clientMutationId } }",
-            json!({"id": pull_node_id, "method": method, "head": expected_head}),
+            "mutation($id: ID!, $method: PullRequestMergeMethod!, $head: GitObjectID!, $headline: String!, \
+             $body: String!) { enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: $method, \
+             expectedHeadOid: $head, commitHeadline: $headline, commitBody: $body}) { clientMutationId } }",
+            json!({"id": pull_node_id, "method": method, "head": expected_head, "headline": headline, "body": body}),
         )
         .await
         .map(|_| ())
@@ -1623,6 +1646,19 @@ fn without_agent_credits_in(payload: &Value) -> Value {
     payload
 }
 
+/// The message a pull request merges with when auto-merge merges it: its title with its number, as GitHub's default
+/// headline has it, and its description, without the co-author trailers GitHub's default body adds or credits an agent
+/// wrote into it.
+fn merge_message(pull: &Value) -> (String, String) {
+    let title = pull["title"].as_str().unwrap_or_default();
+    let headline = match pull["number"].as_u64() {
+        Some(number) => format!("{title} (#{number})"),
+        None => title.to_owned(),
+    };
+    let body = without_agent_credits(pull["body"].as_str().unwrap_or_default());
+    (headline, body.trim().to_owned())
+}
+
 /// What sloppod writes to GitHub carries no credits an agent added for itself ("Co-Authored-By: Claude …",
 /// "Generated with Claude Code"), whatever the agent wrote: the owner decides how their work is attributed.
 pub fn without_agent_credits(text: &str) -> String {
@@ -1764,6 +1800,8 @@ pub(crate) mod tests {
         failing: Mutex<Vec<u64>>,
         /// Node ids of the pull requests marked ready for review.
         readied: Mutex<Vec<String>>,
+        /// The variables of each mutation turning auto-merge on.
+        auto_merges: Mutex<Vec<Value>>,
         /// The current installation has no public repository; otherwise `o/site` is one.
         pub(crate) all_private: bool,
         /// How many more private repositories, `p<n>`, come between `o/r2` and `o/site`.
@@ -1934,6 +1972,26 @@ pub(crate) mod tests {
 
     /// Turns auto-merge on or off for the pull request whose node id the mutation names.
     async fn graphql(State(fake): State<Arc<Fake>>, Json(body): Json<Value>) -> Json<Value> {
+        let query = body["query"].as_str().unwrap_or_default();
+        // A pull request by its node id, `PR<n>`, with an agent's credit in its description.
+        if query.contains("node(id:") {
+            let number: u64 = body["variables"]["id"]
+                .as_str()
+                .and_then(|id| id.strip_prefix("PR"))
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_default();
+            return Json(json!({"data": {"node": {
+                "number": number,
+                "title": format!("Pull {number}"),
+                "body": format!("Does {number}.\n\nCo-Authored-By: Claude <noreply@anthropic.com>"),
+            }}}));
+        }
+        if query.contains("enablePullRequestAutoMerge") {
+            fake.auto_merges
+                .lock()
+                .unwrap()
+                .push(body["variables"].clone());
+        }
         let on = body["query"]
             .as_str()
             .unwrap_or_default()
@@ -2161,6 +2219,33 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(auto_merging(&fake), [3]);
+    }
+
+    #[tokio::test]
+    async fn auto_merge_merges_with_the_pull_request_s_own_title_and_description() {
+        let (fake, app) = serve(unmerged()).await;
+        app.auto_merge_stack(
+            "o/r",
+            &merge(&[1, 2, 3]),
+            &PushLog::default(),
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+        // The top's title with its number, as GitHub's default headline; its description, without the agent's
+        // credit, instead of GitHub's default body with every commit author as a co-author.
+        let merges = fake.auto_merges.lock().unwrap();
+        assert_eq!(merges.len(), 1);
+        assert_eq!(merges[0]["headline"], "Pull 3 (#3)");
+        assert_eq!(merges[0]["body"], "Does 3.");
+        assert_eq!(merges[0]["method"], "SQUASH");
+    }
+
+    #[test]
+    fn a_merge_message_without_a_description_is_its_title() {
+        let (headline, body) =
+            merge_message(&json!({"number": 12, "title": "Fix it", "body": null}));
+        assert_eq!((headline.as_str(), body.as_str()), ("Fix it (#12)", ""));
     }
 
     #[tokio::test]
