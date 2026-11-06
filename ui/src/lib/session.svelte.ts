@@ -61,6 +61,12 @@ const promptBlocks = ({ text, images = [] }: Outgoing): ContentBlock[] => [
  * The sessions being closed on the app's connection, by id: what a view coming back to one waits for, or its load could
  * be undone by the close of the one before.
  */
+/** An update with its place in the session's log (0 where it has none). */
+type LoggedUpdate = { update: SessionUpdate; seq: number };
+
+const READ_THROTTLE_MS = 1000;
+const READ_RETRY_MS = 3000;
+
 const closing = new Map<string, Promise<unknown>>();
 
 /** Puts `done` into the barrier for `id`, after whatever it already holds, and takes it out once it's the last. */
@@ -130,8 +136,12 @@ export class SessionView {
   /** Receives the history replay of a (re)load, and replaces `transcript` once the load completes. */
   #replay: Transcript | null = null;
   /** The updates `transcript` is built from, oldest first, so older history can go in front of them. */
-  #updates: SessionUpdate[] = [];
-  #replayUpdates: SessionUpdate[] | null = null;
+  #updates: LoggedUpdate[] = [];
+  #replayUpdates: LoggedUpdate[] | null = null;
+  /** How far this user has read, as far as this device knows: the runtime's word or what was scrolled past since. */
+  #read = $state(0);
+  #readSent = 0;
+  #readTimer: ReturnType<typeof setTimeout> | undefined;
   /** Where to ask for older history, when the session has more than was loaded; `null` once it's all here. */
   historyBefore = $state<number | null>(null);
   loadingHistory = $state(false);
@@ -181,6 +191,7 @@ export class SessionView {
   stop() {
     this.#stopped = true;
     clearTimeout(this.#loadRetry);
+    this.#sendRead();
     this.#unregister?.();
     this.#unregister = undefined;
     // The runtime stops sending this session's events and requests on the shared connection; what it left open waits.
@@ -279,7 +290,7 @@ export class SessionView {
     switch (method) {
       case 'session/update': {
         const notification = params as SessionNotification;
-        if (notification.sessionId === this.id) this.#applyUpdate(notification.update);
+        if (notification.sessionId === this.id) this.#applyUpdate(notification.update, notification._meta?.sloppod?.seq);
         break;
       }
       case '_sloppod/session': {
@@ -345,7 +356,7 @@ export class SessionView {
     app.respondError(rpcId, -32601, `Method not found: ${method}`);
   }
 
-  #applyUpdate(update: SessionUpdate) {
+  #applyUpdate(update: SessionUpdate, seq = 0) {
     switch (update.sessionUpdate) {
       case 'config_option_update':
         this.configOptions = update.configOptions;
@@ -356,8 +367,8 @@ export class SessionView {
         if (update.title && this.session) this.setSession({ ...this.session, title: update.title });
         return;
     }
-    (this.#replay ?? this.transcript).apply(update);
-    (this.#replayUpdates ?? this.#updates).push(update);
+    (this.#replay ?? this.transcript).apply(update, seq);
+    (this.#replayUpdates ?? this.#updates).push({ update, seq });
   }
 
   /** Puts the page of history before what's loaded in front of it. */
@@ -373,14 +384,40 @@ export class SessionView {
       // A reload meanwhile has replaced what this page goes in front of.
       if (this.historyBefore !== before || !page) return;
       const transcript = new Transcript();
-      const updates = [...page.updates, ...this.#updates];
-      for (const update of updates) transcript.apply(update);
+      // An older page's events are before whatever was read, as far as the unread marker goes: they have no place.
+      const updates = [...page.updates.map((update) => ({ update, seq: 0 })), ...this.#updates];
+      for (const { update, seq } of updates) transcript.apply(update, seq);
       this.#updates = updates;
       this.transcript = transcript;
       this.historyBefore = page.before;
     } finally {
       this.loadingHistory = false;
     }
+  }
+
+  /** The seq of the last event read, in any of the user's UIs. */
+  readSeq = $derived(Math.max(this.session?.read_seq ?? 0, this.#read));
+
+  /** Notes that everything up to `seq` has been scrolled past. Only moves forward; reported to the runtime a moment later. */
+  markRead(seq: number) {
+    if (seq <= this.readSeq) return;
+    this.#read = seq;
+    this.#readTimer ??= setTimeout(() => this.#sendRead(), READ_THROTTLE_MS);
+  }
+
+  #sendRead() {
+    clearTimeout(this.#readTimer);
+    this.#readTimer = undefined;
+    if (this.#read <= this.#readSent) return;
+    const seq = this.#read;
+    const before = this.#readSent;
+    this.#readSent = seq;
+    // A failure costs only a bar in the wrong place on another device, so it's tried again later, not shown.
+    api.setRead(this.id, seq).catch((error) => {
+      if (this.#readSent === seq) this.#readSent = before;
+      if (this.#stopped || (error instanceof ApiError && error.status < 500)) return;
+      this.#readTimer ??= setTimeout(() => this.#sendRead(), READ_RETRY_MS);
+    });
   }
 
   setSession(session: Session) {

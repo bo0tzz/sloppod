@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::link::RpcError;
-use crate::session::{UiEvent, session_update};
+use crate::session::{UiEvent, session_update_at};
 use crate::users::User;
 use crate::{AppState, db, quota};
 
@@ -139,8 +139,8 @@ impl Conn {
             .events_before(session, until + 1, HISTORY_PAGE)
             .await
             .map_err(internal)?;
-        for (_, update) in &latest {
-            self.send(session_update(session, update)).await;
+        for (seq, update) in &latest {
+            self.send(session_update_at(session, *seq, update)).await;
         }
         let replay = self.state.hub.replay(session).await.map_err(internal)?;
         let task = tokio::spawn(self.clone().forward(session, events, until));

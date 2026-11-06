@@ -432,10 +432,12 @@ fn notification(method: &str, params: Value) -> Value {
     json!({"jsonrpc": "2.0", "method": method, "params": params})
 }
 
-pub fn session_update(session: Uuid, update: &Value) -> Value {
+/// An update as the log has it: with its seq, in `_meta.sloppod.seq`, which is what a UI reports as how far it has read
+/// (#48).
+pub fn session_update_at(session: Uuid, seq: i64, update: &Value) -> Value {
     notification(
         "session/update",
-        json!({"sessionId": session, "update": update}),
+        json!({"sessionId": session, "update": update, "_meta": {"sloppod": {"seq": seq}}}),
     )
 }
 
@@ -684,7 +686,7 @@ impl Hub {
                 id,
                 UiEvent::Notification {
                     seq: Some(seq),
-                    message: session_update(id, &update),
+                    message: session_update_at(id, seq, &update),
                 },
             ),
             Err(e) => tracing::error!(session = %id, error = %e, "recording event"),
@@ -754,6 +756,14 @@ impl Hub {
     /// commands (#413).
     pub async fn session_api(&self, row: &crate::db::SessionRow) -> sloppod_protocol::api::Session {
         let mut session = row.to_api();
+        session.read_seq = self
+            .store
+            .read_seq(row.id, &row.owner)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(session = %row.id, error = %e, "reading the session's read position");
+                None
+            });
         session.waiting.highlights = self.store.open_highlights(row.id).await.unwrap_or_else(|e| {
             tracing::warn!(session = %row.id, error = %e, "counting the session's open highlights");
             0
