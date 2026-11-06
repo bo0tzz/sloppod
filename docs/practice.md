@@ -11,6 +11,7 @@ What bo0tzz and the sessions working on sloppod have learned about working toget
 - **Design first where it's needed:** a change that contradicts or extends an ADR gets the ADR (or an amendment) proposed and discussed before it's built.
 - **Look before adding:** search the issues before filing one, and the ADRs before proposing one. A new ADR that restates an existing one is a dated amendment to that one instead, with only what's new.
 - **Decide what you can:** within agreed work, make the design calls yourself, say what you decided in the PR, and move on. Ask only what only the user can answer.
+- **A way in needs a way out:** a tool or feature that puts something in front of the user, or starts something, comes with a way to take it back or stop it, and a way to see that it happened. Check for it before building the way in: highlights and questions got `retract_highlight` and `withdraw_question` only after shipping without (#444), and a stopped turn had no way to carry on until it got a button (#406). The principle is in [ADR 4](adr/0004-asynchronous-interaction.md) (the 2026-11-06 note).
 
 ## Talking to the user
 
