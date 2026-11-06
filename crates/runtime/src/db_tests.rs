@@ -2515,15 +2515,17 @@ async fn a_stopped_sessions_volume_goes_after_a_week_unless_kept(db: PgPool) {
     );
     let _ = recent;
 
-    // Once purged, its objects are leftovers if any are found; a live session's aren't, nor are an unknown one's
-    // anything but leftovers.
+    // Once purged, its objects may go; a live session's may not, and an unknown one's are only reported.
     db::finish_purge(&db, old).await.unwrap();
     let unknown = Uuid::new_v4();
-    let live = db::sessions_with_objects(&db, &[old, kept, recent, unknown])
+    let (known, purged) = db::known_sessions(&db, &[old, kept, recent, unknown])
         .await
         .unwrap();
-    assert!(live.contains(&kept) && live.contains(&recent));
-    assert!(!live.contains(&old) && !live.contains(&unknown));
+    assert_eq!(purged, [old]);
+    for id in [old, kept, recent] {
+        assert!(known.contains(&id));
+    }
+    assert!(!known.contains(&unknown));
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]

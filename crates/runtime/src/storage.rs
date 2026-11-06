@@ -2,7 +2,8 @@
 //! volume and its Sandbox, which owns the volume, and loses its egress policy once its pod is gone: waking applies it
 //! again. A stopped session never starts again, so its policy and keys go at once, and its volume a week after it
 //! stopped unless the user keeps it. A deleted one loses everything when it's purged (`lifecycle::purge_deleted`).
-//! Objects whose session is purged or unknown, such as ones whose removal failed, are removed by a sweep.
+//! Objects whose session is purged, such as ones whose removal failed, are removed by a sweep; ones whose session the
+//! database doesn't know are only reported, as an empty or restored database would make every session unknown.
 
 use std::collections::BTreeSet;
 
@@ -108,16 +109,25 @@ pub async fn purge_stopped(state: &AppState) {
     }
 }
 
-/// The sessions objects are held for that have no business having any: not in the database, or purged.
-pub fn leftovers(held: &BTreeSet<Uuid>, live: &[Uuid]) -> Vec<Uuid> {
-    held.iter()
-        .filter(|id| !live.contains(id))
+/// What the held objects' sessions are, as the database knows them: to remove, of sessions it knows and has purged;
+/// and unknown, of sessions it doesn't know at all. Unknown ones are only reported, never removed: against an empty or
+/// restored database, or one of another install, every live session's objects would look unknown.
+pub fn leftovers(held: &BTreeSet<Uuid>, purged: &[Uuid], known: &[Uuid]) -> (Vec<Uuid>, Vec<Uuid>) {
+    let remove = held
+        .iter()
+        .filter(|id| purged.contains(id))
         .copied()
-        .collect()
+        .collect();
+    let unknown = held
+        .iter()
+        .filter(|id| !known.contains(id))
+        .copied()
+        .collect();
+    (remove, unknown)
 }
 
-/// Removes objects whose session is purged or unknown, through the placement backend and the enforcer (ADR 7), and
-/// says what it removed.
+/// Removes objects whose session the database knows and has purged, through the placement backend and the enforcer
+/// (ADR 7), and says what it removed. Objects of sessions it doesn't know are reported, once a sweep, and left alone.
 pub async fn sweep_leftovers(state: &AppState) {
     let mut held = BTreeSet::new();
     let lists = [
@@ -128,21 +138,29 @@ pub async fn sweep_leftovers(state: &AppState) {
         match listed {
             Ok(sessions) => held.extend(sessions.iter().filter_map(|s| s.parse::<Uuid>().ok())),
             Err(e) => {
-                // A partial list could make a live session's objects look like leftovers of nothing; it waits.
                 tracing::warn!(error = %e, what, "listing the sessions objects are held for");
                 return;
             }
         }
     }
     let ids: Vec<Uuid> = held.iter().copied().collect();
-    let live = match db::sessions_with_objects(&state.db, &ids).await {
-        Ok(live) => live,
+    let (known, purged) = match db::known_sessions(&state.db, &ids).await {
+        Ok(found) => found,
         Err(e) => {
             tracing::warn!(error = %e, "looking up the sessions objects are held for");
             return;
         }
     };
-    for id in leftovers(&held, &live) {
+    let (remove, unknown) = leftovers(&held, &purged, &known);
+    if !unknown.is_empty() {
+        let ids: Vec<String> = unknown.iter().map(Uuid::to_string).collect();
+        tracing::warn!(
+            count = unknown.len(),
+            sessions = %ids.join(", "),
+            "objects of sessions the database doesn't know; left alone (see docs/deploy.md)"
+        );
+    }
+    for id in remove {
         let session = id.to_string();
         let removed = async {
             state
@@ -157,12 +175,8 @@ pub async fn sweep_leftovers(state: &AppState) {
                 .map_err(|e| anyhow::anyhow!("enforcer: {e}"))
         };
         match removed.await {
-            Ok(()) => {
-                tracing::info!(%session, "removed the objects of a purged or unknown session")
-            }
-            Err(e) => {
-                tracing::warn!(%session, error = %e, "removing a purged or unknown session's objects")
-            }
+            Ok(()) => tracing::info!(%session, "removed the objects of a purged session"),
+            Err(e) => tracing::warn!(%session, error = %e, "removing a purged session's objects"),
         }
     }
 }
@@ -172,14 +186,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn objects_of_unknown_or_purged_sessions_are_leftovers() {
+    fn only_a_purged_sessions_objects_are_removed_and_an_unknown_ones_are_reported() {
         let (live, purged, unknown) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         let held = BTreeSet::from([live, purged, unknown]);
-        let mut found = leftovers(&held, &[live]);
-        found.sort();
-        let mut expected = vec![purged, unknown];
-        expected.sort();
-        assert_eq!(found, expected);
-        assert!(leftovers(&held, &[live, purged, unknown]).is_empty());
+        let (remove, reported) = leftovers(&held, &[purged], &[live, purged]);
+        assert_eq!(remove, [purged]);
+        assert_eq!(reported, [unknown]);
+        // Against an empty database every session is unknown: nothing is removed.
+        let (remove, reported) = leftovers(&held, &[], &[]);
+        assert!(remove.is_empty());
+        assert_eq!(reported.len(), 3);
     }
 }

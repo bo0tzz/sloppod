@@ -644,12 +644,15 @@ pub async fn set_volume_kept(db: &PgPool, id: Uuid, kept: bool) -> sqlx::Result<
     Ok(result.rows_affected() > 0)
 }
 
-/// Of `ids`, the sessions that exist and aren't purged: what may still have objects in the cluster.
-pub async fn sessions_with_objects(db: &PgPool, ids: &[Uuid]) -> sqlx::Result<Vec<Uuid>> {
-    sqlx::query_scalar("select id from sessions where id = any($1) and purged_at is null")
-        .bind(ids)
-        .fetch_all(db)
-        .await
+/// Of `ids`, the sessions the database knows, and of those the ones it has purged: whose objects may go.
+pub async fn known_sessions(db: &PgPool, ids: &[Uuid]) -> sqlx::Result<(Vec<Uuid>, Vec<Uuid>)> {
+    let rows: Vec<(Uuid, bool)> =
+        sqlx::query_as("select id, purged_at is not null from sessions where id = any($1)")
+            .bind(ids)
+            .fetch_all(db)
+            .await?;
+    let purged = rows.iter().filter(|(_, p)| *p).map(|(id, _)| *id).collect();
+    Ok((rows.into_iter().map(|(id, _)| id).collect(), purged))
 }
 
 /// Records that the session's agent was asked to make room for `image` (#416).
