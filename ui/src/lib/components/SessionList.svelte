@@ -126,17 +126,19 @@
 <div bind:this={container} {onkeydown} class="contents">
 <ul class="flex flex-col {compact ? 'gap-0.5 p-2' : 'gap-2'}" data-testid="session-list">
   {#each groups as group (group.key)}
-    {#if groups.length > 1}
+    {@const foldable = group.key === 'working' && group.sessions.length > FOLDABLE}
+    <!-- The heading, and with it the control that unfolds, stays while a working group can be folded, other groups or not. -->
+    {#if groups.length > 1 || foldable}
       <li class="flex items-center justify-between {compact ? 'px-3 pt-1' : 'pt-1'}" data-testid="session-group" data-group={group.key}>
         <Text size="tiny" color="muted" fontWeight="semi-bold">{group.title}{group.key === 'working' ? ` (${group.sessions.length})` : ''}</Text>
-        {#if group.key === 'working' && group.sessions.length > FOLDABLE}
+        {#if foldable}
           <button type="button" class="text-muted text-xs underline" aria-expanded={!workingFolded} onclick={() => (workingFolded = !workingFolded)}>
             {workingFolded ? 'Show' : 'Fold'}
           </button>
         {/if}
       </li>
     {/if}
-    {#if !(group.key === 'working' && workingFolded && group.sessions.length > FOLDABLE)}
+    {#if !(foldable && workingFolded)}
       {#each group.sessions as session (session.id)}
         {@render row(session)}
       {/each}

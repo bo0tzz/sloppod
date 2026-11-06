@@ -2592,6 +2592,13 @@ const server = http.createServer(async (req, res) => {
       if (!session) return json(res, 404, { error: 'session not found' });
       return json(res, 200, createHighlight(session, url.searchParams.get('text') ?? 'Look at this'));
     }
+    // Puts a session in a phase, as if its agent were there: for tests of lists of sessions.
+    if (url.pathname === '/_mock/phase' && req.method === 'POST') {
+      const session = sessions.get(url.searchParams.get('session') ?? '');
+      if (!session) return json(res, 404, { error: 'session not found' });
+      session.setPhase(url.searchParams.get('phase') ?? 'idle');
+      return json(res, 200, session.data);
+    }
     if (url.pathname === '/_mock/slow-loads' && req.method === 'POST') {
       slowLoadsUntil = Date.now() + Number(url.searchParams.get('for') ?? 0);
       return json(res, 200, {});

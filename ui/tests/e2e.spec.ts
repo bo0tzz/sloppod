@@ -2156,6 +2156,42 @@ test('a session that needs the user moves above the ones that do not, and drops 
   await expect.poll(() => above('the newer session', 'the older session')).toBe(true);
 });
 
+test('a folded working group can always be unfolded, even once no other group is left', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  const phases = async () => {
+    const sessions: { id: string; phase: string; parent_id?: string }[] = await (await page.request.get('/api/v1/sessions')).json();
+    return sessions;
+  };
+  const setPhase = (id: string, phase: string) => page.request.post(`/_mock/phase?session=${id}&phase=${phase}`);
+  const before = await phases();
+  try {
+    // Everything else parks, so only these are running; six at work and one idle make two groups.
+    for (const session of before) await setPhase(session.id, 'parked');
+    const ids: string[] = [];
+    for (let i = 0; i < 7; i++) {
+      const response = await page.request.post('/api/v1/sessions', { data: { prompt: `Start the tests in the background, number ${i} in a long list` } });
+      ids.push((await response.json()).id);
+    }
+    await page.goto('/');
+    // They finish their turns and sit idle (the background commands they started don't ask the user for anything).
+    for (const id of ids) await expect.poll(async () => (await phases()).find((s) => s.id === id)?.phase).toBe('idle');
+    for (const id of ids.slice(0, 6)) await setPhase(id, 'working');
+    // The home page's own list.
+    const nav = page.getByTestId('session-list');
+    await expect(nav.getByTestId('session-group').filter({ hasText: 'Working (6)' })).toBeVisible();
+    await nav.getByRole('button', { name: 'Fold' }).click();
+    await expect(nav.getByTestId('session-row').filter({ hasText: 'in a long list' })).toHaveCount(1);
+
+    // The last of the other group starts working: one group is left, and the way to unfold it is still there.
+    await setPhase(ids[6], 'working');
+    await expect(nav.getByRole('button', { name: 'Show' })).toBeVisible();
+    await nav.getByRole('button', { name: 'Show' }).click();
+    await expect(nav.getByTestId('session-row').filter({ hasText: 'in a long list' })).toHaveCount(7);
+  } finally {
+    for (const session of before) await setPhase(session.id, session.phase);
+  }
+});
+
 test('lists sub-sessions under their parent', async ({ page }) => {
   await page.setViewportSize({ width: 1400, height: 900 });
   await createSession(page, 'Fan out the work in sloppod');
