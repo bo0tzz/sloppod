@@ -3477,3 +3477,27 @@ async fn a_withdrawal_the_database_cannot_keep_leaves_the_question_open_to_try_a
     assert!(h.hub.replay(h.id).await.unwrap().permissions.is_empty());
     assert!(h.store.questions.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn an_update_goes_out_with_its_place_in_the_log() {
+    let h = Harness::ready().await;
+    let mut events = h.hub.subscribe(h.id);
+    h.hub
+        .record(h.id, json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Hello"}}))
+        .await;
+    let seq = loop {
+        match events.try_recv().unwrap() {
+            UiEvent::Notification {
+                message,
+                seq: Some(seq),
+                ..
+            } if message["method"] == "session/update" => {
+                // What a UI reports as read is the seq the message carries.
+                assert_eq!(message["params"]["_meta"]["sloppod"]["seq"], seq);
+                break seq;
+            }
+            _ => continue,
+        }
+    };
+    assert!(seq > 0);
+}
