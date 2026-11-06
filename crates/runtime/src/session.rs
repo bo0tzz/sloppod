@@ -2301,10 +2301,9 @@ impl Hub {
     /// user, stops counting as waiting, and is kept out of the restart's restore; the chat says it was withdrawn. The
     /// agent is told nothing: it did this itself, and nothing answers it.
     pub async fn withdraw_question(&self, id: Uuid, key: Uuid, reason: &str) -> Result<(), String> {
-        let (pid, questions) = {
-            let live = self.live(id);
-            let mut state = live.state.lock().await;
-            let found = state
+        let live = self.live(id);
+        let open = |state: &LiveState| {
+            state
                 .permissions
                 .iter()
                 .find_map(|(pid, p)| match &p.asker {
@@ -2313,19 +2312,28 @@ impl Hub {
                         questions,
                     } if *asked == key => Some((*pid, questions.clone())),
                     _ => None,
-                });
-            let Some((pid, questions)) = found else {
-                return Err(
-                    "no such open question of yours: it was answered or withdrawn already".into(),
-                );
+                })
+        };
+        const GONE: &str = "no such open question of yours: it was answered or withdrawn already";
+        if open(&*live.state.lock().await).is_none() {
+            return Err(GONE.into());
+        }
+        // Forgotten for good first: if that can't be done, it stays open and can be withdrawn again, rather than
+        // closing now and coming back after a restart.
+        self.store
+            .forget_question(key)
+            .await
+            .map_err(|e| format!("couldn't withdraw the question, it stays open: {e}"))?;
+        let (pid, questions) = {
+            let mut state = live.state.lock().await;
+            // Answered while it was being forgotten: its answer went to the agent, and there's nothing to take back.
+            let Some((pid, questions)) = open(&state) else {
+                return Err(GONE.into());
             };
             state.permissions.remove(&pid);
             live.sync_asks(&state);
             (pid, questions)
         };
-        if let Err(e) = self.store.forget_question(key).await {
-            tracing::warn!(session = %id, error = %e, "forgetting a withdrawn question");
-        }
         self.broadcast_session(id).await;
         self.broadcast(
             id,

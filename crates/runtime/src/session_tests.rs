@@ -3449,3 +3449,31 @@ async fn a_question_the_agent_withdraws_closes_without_an_answer() {
     // Gone for good: it can't be withdrawn again, and the agent was told nothing.
     assert!(h.hub.withdraw_question(h.id, key, "again").await.is_err());
 }
+
+#[tokio::test]
+async fn a_withdrawal_the_database_cannot_keep_leaves_the_question_open_to_try_again() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let h = Harness::ready().await;
+    let questions = json!([{"question": "Which backoff?", "options": [{"label": "Exponential"}, {"label": "Fixed"}]}]);
+    let key = h.hub.ask(h.id, questions).await.unwrap();
+
+    h.store.fail_forgetting_questions.store(true, Relaxed);
+    assert!(
+        h.hub
+            .withdraw_question(h.id, key, "answered")
+            .await
+            .is_err()
+    );
+    // Still open for the user and still kept, so a restart would show it too.
+    assert_eq!(h.hub.replay(h.id).await.unwrap().permissions.len(), 1);
+    assert_eq!(h.store.questions.lock().unwrap().len(), 1);
+
+    // The database is back: the same withdrawal goes through, and nothing is left to restore.
+    h.store.fail_forgetting_questions.store(false, Relaxed);
+    h.hub
+        .withdraw_question(h.id, key, "answered")
+        .await
+        .unwrap();
+    assert!(h.hub.replay(h.id).await.unwrap().permissions.is_empty());
+    assert!(h.store.questions.lock().unwrap().is_empty());
+}

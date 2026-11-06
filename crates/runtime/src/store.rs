@@ -204,6 +204,8 @@ pub mod memory {
         pub zones: Mutex<HashMap<String, chrono_tz::Tz>>,
         /// Makes reading unanswered questions fail, as a lost database would.
         pub fail_reading_questions: std::sync::atomic::AtomicBool,
+        /// Makes forgetting a question fail, as a lost database would.
+        pub fail_forgetting_questions: std::sync::atomic::AtomicBool,
         /// Makes saving this phase fail, as a lost database would.
         pub fail_phase: Mutex<Option<Phase>>,
         /// Makes keeping a session's queue fail, as a lost database would.
@@ -373,6 +375,12 @@ pub mod memory {
         }
 
         async fn forget_question(&self, question: Uuid) -> sqlx::Result<()> {
+            if self
+                .fail_forgetting_questions
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(sqlx::Error::PoolTimedOut);
+            }
             self.questions
                 .lock()
                 .unwrap()
