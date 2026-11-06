@@ -13,6 +13,8 @@ pub const SESSION_LABEL: &str = "sloppod.dev/session";
 #[derive(Clone)]
 pub struct PodIndex {
     store: Store<Pod>,
+    /// Whether the watch has listed the pods once; until then an empty store says nothing.
+    ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn session_of(pod: &Pod) -> Option<Uuid> {
@@ -36,6 +38,19 @@ fn sole_session(pods: &[std::sync::Arc<Pod>], ip: &str) -> Option<Uuid> {
         .filter_map(|pod| session_of(pod));
     let session = sessions.next()?;
     sessions.all(|other| other == session).then_some(session)
+}
+
+/// Whether the session has a pod, live or still terminating. Until the watch has listed the pods (`listed`), a
+/// session may have one the store doesn't know yet, so it's taken to have one.
+fn has_pod(pods: &[std::sync::Arc<Pod>], session: Uuid, listed: bool) -> bool {
+    !listed
+        || pods.iter().any(|pod| {
+            session_of(pod) == Some(session)
+                && !matches!(
+                    pod.status.as_ref().and_then(|s| s.phase.as_deref()),
+                    Some("Succeeded" | "Failed")
+                )
+        })
 }
 
 /// The session's live pod: the image it runs, and when it was made.
@@ -142,7 +157,16 @@ impl PodIndex {
                 }
             }
         });
-        Self { store }
+        let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let (store, ready) = (store.clone(), ready.clone());
+            tokio::spawn(async move {
+                if store.wait_until_ready().await.is_ok() {
+                    ready.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+        Self { store, ready }
     }
 
     /// The session whose live pod has `ip`. A pod that has finished (evicted, say) keeps its IP in its status while
@@ -169,13 +193,11 @@ impl PodIndex {
 
     /// Whether the session has a pod, live or still terminating: one being deleted holds its room until it's gone.
     pub fn has_pod(&self, session: Uuid) -> bool {
-        self.store.state().iter().any(|pod| {
-            session_of(pod) == Some(session)
-                && !matches!(
-                    pod.status.as_ref().and_then(|s| s.phase.as_deref()),
-                    Some("Succeeded" | "Failed")
-                )
-        })
+        has_pod(
+            &self.store.state(),
+            session,
+            self.ready.load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// The session pods the scheduler can't place, and why.
@@ -360,6 +382,17 @@ mod tests {
         let gated = unscheduled(a, "SchedulingGated", "waiting", 1_800_000_000);
         assert!(unschedulable(&gated, now).is_none());
         assert!(unschedulable(&deleting(memory), now).is_none());
+    }
+
+    #[test]
+    fn a_session_has_a_pod_while_it_is_terminating_and_until_the_watch_has_listed_them() {
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        let terminating = deleting(pod(a, "Running", IP));
+        assert!(has_pod(std::slice::from_ref(&terminating), a, true));
+        assert!(!has_pod(&[pod(a, "Succeeded", IP)], a, true));
+        assert!(!has_pod(std::slice::from_ref(&terminating), b, true));
+        // Before the first list, an empty store says nothing.
+        assert!(has_pod(&[], b, false));
     }
 
     #[test]

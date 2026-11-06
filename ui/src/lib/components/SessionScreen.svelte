@@ -28,7 +28,7 @@
   import { onMount, tick } from 'svelte';
   import { ConnectionClosedError } from '#lib/acp/connection.ts';
   import { api, type Proposal } from '#lib/api.ts';
-  import { absoluteTime, clockTime, countdown } from '#lib/format.ts';
+  import { absoluteTime, bytes, clockTime, countdown } from '#lib/format.ts';
   import { toolTitle } from '#lib/presentation.ts';
   import { SessionView } from '#lib/session.svelte.ts';
   import { sessionSidebar } from '#lib/session-sidebar.svelte.ts';
@@ -513,6 +513,15 @@
       {#snippet actions()}
         {#if session}
           <PhaseBadge phase={session.phase} commands={session.commands} commandLines={session.command_lines} waiting={waitingOnYou} unknown={showReconnecting} />
+          {#if session.disk}
+            <span
+              class="text-muted hidden shrink-0 text-xs sm:inline"
+              title="{bytes(session.disk.used)} of {bytes(session.disk.size)} of its volume used, as of {absoluteTime(session.disk.seen_at)}"
+              data-testid="session-disk"
+            >
+              {bytes(session.disk.used)}
+            </span>
+          {/if}
         {/if}
         <IconButton
           icon={mdiPageLayoutSidebarRight}

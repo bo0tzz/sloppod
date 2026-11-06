@@ -4444,3 +4444,20 @@ test('arrow keys move between the rows of the session list', async ({ page }) =>
   await page.keyboard.press('ArrowUp');
   await expect(top).toBeFocused();
 });
+
+test("a session's disk use shows in the list, its header and Settings, and stays while it's parked", async ({ page }) => {
+  const id = await createSession(page, 'Add backoff to the reconnect logic in sloppod');
+  await finishTurn(page);
+  const row = page.locator(`[data-testid="session-row"][href="/sessions/${id}"]`);
+  await expect(row.getByTestId('session-disk')).toHaveText('700 MB');
+  await expect(page.getByTestId('session-screen').getByTestId('session-disk')).toHaveText('700 MB');
+
+  await page.goto('/settings');
+  const storage = page.getByTestId('storage');
+  const listed = storage.locator(`[data-testid="storage-session"][data-session="${id}"]`);
+  await expect(listed.getByTestId('storage-used')).toHaveText('700 MB');
+  await expect(storage.getByTestId('storage-total')).toContainText(/used by \d+ sessions?/);
+  await listed.getByRole('button', { name: /^Park the session/ }).click();
+  await expect(listed.getByRole('button', { name: /^Park the session/ })).toHaveCount(0);
+  await expect(listed.getByTestId('storage-used')).toHaveText('700 MB');
+});

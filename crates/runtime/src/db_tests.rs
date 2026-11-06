@@ -1,6 +1,6 @@
 //! Tests of the queries against a real Postgres; `mise run check` provides one through `DATABASE_URL`.
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde_json::json;
 use sloppod_protocol::api::{Phase, ProposalStatus, ReviewPolicy, SessionKind};
 use sqlx::PgPool;
@@ -2454,6 +2454,107 @@ async fn sessions_that_could_make_room_are_the_quiet_idle_ones(db: PgPool) {
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
+async fn what_parked_and_stopped_sessions_keep_is_found_to_release(db: PgPool) {
+    let parked = session(&db, "dev").await;
+    db::set_phase(&db, parked, Phase::Parked).await.unwrap();
+    let stopped = session(&db, "dev").await;
+    db::set_phase(&db, stopped, Phase::Stopped).await.unwrap();
+    let running = session(&db, "dev").await;
+    db::set_phase(&db, running, Phase::Idle).await.unwrap();
+    let deleted = session(&db, "dev").await;
+    db::set_phase(&db, deleted, Phase::Parked).await.unwrap();
+    db::mark_deleted(&db, deleted).await.unwrap();
+
+    let ids = |rows: Vec<db::SessionRow>| rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+    let found = ids(db::unreleased(&db).await.unwrap());
+    assert!(found.contains(&parked) && found.contains(&stopped));
+    assert!(!found.contains(&running) && !found.contains(&deleted));
+
+    // Released once; placed again, it has its objects back and is released again when it next parks.
+    db::set_released(&db, parked, true).await.unwrap();
+    assert!(!ids(db::unreleased(&db).await.unwrap()).contains(&parked));
+    db::set_released(&db, parked, false).await.unwrap();
+    assert!(ids(db::unreleased(&db).await.unwrap()).contains(&parked));
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_stopped_sessions_volume_goes_after_a_week_unless_kept(db: PgPool) {
+    let stopped = |days: i32, kept: bool| {
+        let db = db.clone();
+        async move {
+            let id = session(&db, "dev").await;
+            db::set_phase(&db, id, Phase::Stopped).await.unwrap();
+            sqlx::query(
+                "update sessions set stopped_at = now() - make_interval(days => $2) where id = $1",
+            )
+            .bind(id)
+            .bind(days)
+            .execute(&db)
+            .await
+            .unwrap();
+            db::set_volume_kept(&db, id, kept).await.unwrap();
+            id
+        }
+    };
+    let old = stopped(8, false).await;
+    let kept = stopped(8, true).await;
+    let recent = stopped(2, false).await;
+    let claimed: Vec<Uuid> = db::claim_stopped_purges(&db, Duration::days(7))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(claimed, [old]);
+    assert!(
+        db::get_session(&db, kept)
+            .await
+            .unwrap()
+            .unwrap()
+            .volume_kept
+    );
+    let _ = recent;
+
+    // Once purged, its objects may go; a live session's may not, and an unknown one's are only reported.
+    db::finish_purge(&db, old).await.unwrap();
+    let unknown = Uuid::new_v4();
+    let (known, purged) = db::known_sessions(&db, &[old, kept, recent, unknown])
+        .await
+        .unwrap();
+    assert_eq!(purged, [old]);
+    for id in [old, kept, recent] {
+        assert!(known.contains(&id));
+    }
+    assert!(!known.contains(&unknown));
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_sessions_disk_use_is_kept_while_it_is_parked(db: PgPool) {
+    let id = session(&db, "dev").await;
+    assert!(
+        db::get_session(&db, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .to_api()
+            .disk
+            .is_none()
+    );
+    db::set_disk(&db, id, 700_000_000, 20_000_000_000)
+        .await
+        .unwrap();
+    db::set_phase(&db, id, Phase::Parked).await.unwrap();
+    let disk = db::get_session(&db, id)
+        .await
+        .unwrap()
+        .unwrap()
+        .to_api()
+        .disk
+        .unwrap();
+    assert_eq!((disk.used, disk.size), (700_000_000, 20_000_000_000));
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
 async fn a_users_read_position_only_moves_forward(db: PgPool) {
     let s = session(&db, "dev").await;
     let other = session(&db, "dev").await;
@@ -2467,4 +2568,103 @@ async fn a_users_read_position_only_moves_forward(db: PgPool) {
     // Per session, and per user.
     assert_eq!(db::read_seq(&db, other, "dev").await.unwrap(), None);
     assert_eq!(db::read_seq(&db, s, "someone-else").await.unwrap(), None);
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_claimed_volume_removal_cant_be_kept_and_is_retried_at_once(db: PgPool) {
+    let id = session(&db, "dev").await;
+    db::set_phase(&db, id, Phase::Stopped).await.unwrap();
+    sqlx::query("update sessions set stopped_at = now() - interval '8 days' where id = $1")
+        .bind(id)
+        .execute(&db)
+        .await
+        .unwrap();
+    let stopped_at = |db: PgPool| async move {
+        sqlx::query_scalar::<_, DateTime<Utc>>("select stopped_at from sessions where id = $1")
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .unwrap()
+    };
+    let first = stopped_at(db.clone()).await;
+    let claimed = db::claim_stopped_purges(&db, Duration::days(7))
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+
+    // Claimed: keeping it now would be a promise the removal under way breaks.
+    assert!(!db::set_volume_kept(&db, id, true).await.unwrap());
+    assert!(!db::get_session(&db, id).await.unwrap().unwrap().volume_kept);
+
+    // The removal failed after stopping it again: it keeps when it first stopped, and is claimed again at once.
+    db::set_phase(&db, id, Phase::Stopped).await.unwrap();
+    assert_eq!(stopped_at(db.clone()).await, first);
+    sqlx::query("update sessions set stopped_at = now() where id = $1")
+        .bind(id)
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        db::claim_stopped_purges(&db, Duration::days(7))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Removed: its disk use is forgotten in the same update that records it, so it no longer counts in Settings' storage.
+    db::set_disk(&db, id, 1, 2).await.unwrap();
+    db::finish_volume_removal(&db, id).await.unwrap();
+    assert!(
+        db::get_session(&db, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .to_api()
+            .disk
+            .is_none()
+    );
+    assert!(!db::set_volume_kept(&db, id, true).await.unwrap());
+    assert!(
+        db::claim_stopped_purges(&db, Duration::days(7))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // With its volume gone, it's still a session like any other: deleted, it can be restored.
+    db::mark_deleted(&db, id).await.unwrap();
+    assert!(
+        db::deleted_sessions(&db, "dev")
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.id == id)
+    );
+    assert!(db::restore(&db, id).await.unwrap());
+    assert!(
+        db::get_session(&db, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .deleted_at
+            .is_none()
+    );
+
+    // Before any claim, keeping it holds it back from the next one.
+    let kept = session(&db, "dev").await;
+    db::set_phase(&db, kept, Phase::Stopped).await.unwrap();
+    sqlx::query("update sessions set stopped_at = now() - interval '8 days' where id = $1")
+        .bind(kept)
+        .execute(&db)
+        .await
+        .unwrap();
+    assert!(db::set_volume_kept(&db, kept, true).await.unwrap());
+    assert!(
+        db::claim_stopped_purges(&db, Duration::days(7))
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.id != kept)
+    );
 }

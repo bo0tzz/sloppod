@@ -2874,6 +2874,27 @@ impl Hub {
             .map_err(|e| anyhow::anyhow!(e.to_string()))
     }
 
+    /// Runs `f` on a session while it's parked, under its transition lock, so it doesn't wake meanwhile; nothing if it
+    /// isn't parked (any more). For removing what a parked session doesn't need (#455): what waking puts back can't be
+    /// removed after it's put back.
+    pub async fn while_parked<T, F, Fut>(&self, id: Uuid, f: F) -> anyhow::Result<Option<T>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = anyhow::Result<T>>,
+    {
+        let live = self.live(id);
+        let _transition = live.transition.lock().await;
+        let parked = self
+            .store
+            .get_session(id)
+            .await?
+            .is_some_and(|row| row.phase() == Phase::Parked);
+        if !parked {
+            return Ok(None);
+        }
+        f().await.map(Some)
+    }
+
     /// Wakes a parked session: `place` brings its pod back. A failure leaves it parked, so waking can be retried.
     /// Sessions that aren't parked are left as they are.
     pub async fn wake<F, Fut>(&self, id: Uuid, place: F) -> anyhow::Result<()>

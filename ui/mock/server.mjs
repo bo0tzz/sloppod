@@ -1534,6 +1534,8 @@ function startAgent(session, ms) {
     rememberModels();
     delete session.data.agent_status;
     delete session.data.agent_error;
+    // What its supervisor says of its volume once it's up (#455): 700 MB of 20 GB.
+    session.data.disk ??= { used: 700_000_000, size: 20_000_000_000, seen_at: now() };
     session.setPhase('idle');
     const items = session.queue.splice(0);
     if (items.length === 0) return;
@@ -1948,6 +1950,12 @@ async function handleApi(req, res, url) {
     if (!session) return json(res, 404, { error: 'session not found' });
     if (parts.length === 2 && method === 'GET') {
       if (Date.now() < slowSessionsUntil) await sleep(slowSessionsUntil - Date.now());
+      return json(res, 200, session.data);
+    }
+    if (parts.length === 3 && parts[2] === 'volume' && method === 'PUT') {
+      const body = await readBody(req);
+      session.data.volume_kept = body.kept === true;
+      session.broadcast();
       return json(res, 200, session.data);
     }
     if (parts.length === 3 && parts[2] === 'read' && method === 'PUT') {

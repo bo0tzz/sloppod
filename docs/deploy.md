@@ -77,6 +77,17 @@ spec:
 
 The release name decides resource names. With release `sloppod`, the runtime Service is `sloppod`, port `http` (8080).
 
+## What a session keeps
+
+What each session holds in the cluster, by its phase ([ADR 25](adr/0025-session-lifecycle.md), #455):
+
+- **Running** (starting, idle, working, waiting): its Sandbox and pod, its workspace volume, its CiliumNetworkPolicy and CiliumEnvoyConfig listener, and its keys.
+- **Parked:** its Sandbox (suspended) and volume. The policy fences the pod in while it stops and is removed once the pod is gone; waking applies it again, and mints its keys if they're gone.
+- **Stopped** (it can't start again): its pod is ended, fenced in while it goes, and then its policy, listener and keys go. Its volume, with the suspended Sandbox that owns it, goes a week after it stopped, unless the user keeps it (Settings → Storage).
+- **Deleted:** everything stays, parked, for the 7 days it can be restored, then goes. A review session that's done goes at once.
+
+In every phase the transcript, proposals and branch stay: they live in the database and on GitHub. An hourly sweep removes Sandboxes, volume claims, policies and listeners whose session the database knows and has purged, such as ones whose removal failed, and logs each (`removed the objects of a purged session`). Objects of sessions the database doesn't know at all are left alone: started against an empty or restored database, a wrong `sloppod-db` Secret, or one shared with another install in the namespace, every session would look unknown, and removing them would lose their work. The sweep logs them instead, once an hour with a count and the ids (`objects of sessions the database doesn't know; left alone`). If they really are leftovers, remove them by hand: `kubectl delete sandbox sloppod-<id>`, `kubectl delete pvc workdir-sloppod-<id>`, `kubectl delete ciliumnetworkpolicy sloppod-session-<id>` and `kubectl delete ciliumenvoyconfig sloppod-egress-<id>`. Each session's supervisor reports its volume's use every 5 minutes; the session list, a session's header and Settings → Storage show it. The runtime needs `list` and `delete` on `persistentvolumeclaims`, which the chart grants.
+
 ## Exposing the UI
 
 The runtime has **no authentication of its own**. Every request acts as the user named in the `X-Forwarded-User` header (`auth.userHeader`), so put sloppod behind an authenticating proxy that sets it and strips it from client requests; with Envoy Gateway, an OIDC `SecurityPolicy` whose `jwt.claimToHeaders` maps `preferred_username` to that header. Users only see their own sessions and credentials ([ADR 23](adr/0023-users-and-ownership.md)). The UI needs WebSockets (`/acp`). From a browser, only sloppod's own pages can write through the API or open `/acp`: a request's `Origin` must be the scheme and host it was made to, as the proxy passes them on (`X-Forwarded-Proto` and `X-Forwarded-Host`, or `http` and `Host` without a proxy), so another site's page can't use the proxy's cookie to act as the user. Have the proxy set `X-Forwarded-Proto`, or HTTPS pages are refused. Serve the UI from another origin only by adding it to `auth.allowedOrigins`.

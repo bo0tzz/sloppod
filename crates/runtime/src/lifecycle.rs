@@ -250,6 +250,8 @@ pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result
     if !apply_egress(state, session.id).await? {
         anyhow::bail!("session {id} stopped acting while it was being placed");
     }
+    // Its policy is back, so it isn't released any more (#455).
+    db::set_released(&state.db, session.id, false).await?;
     state
         .placement
         .ensure(&PlacementSpec {
@@ -469,6 +471,12 @@ pub async fn remove_session(state: &AppState, session: &db::SessionRow) -> anyho
     state.tool_streams.forget(id);
     state.placement.delete(&id.to_string()).await?;
     state.hub.remove_egress(id, &*state.enforcer).await?;
+    remove_keys(state, session).await
+}
+
+/// Deletes the keys a session's pod uses: its memini key and its own key (#455). Placing the session mints them again.
+pub async fn remove_keys(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
+    let id = session.id;
     if crate::capabilities::holds(&session.context(), &crate::capabilities::Part::Memory)
         && let Some((admin, _)) = state.credentials.memini(&session.owner).await?
         && let Err(e) = admin

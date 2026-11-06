@@ -11,6 +11,7 @@
   import InstructionsSetting from '#lib/components/InstructionsSetting.svelte';
   import StandingApprovals from '#lib/components/StandingApprovals.svelte';
   import DeletedSessions from '#lib/components/DeletedSessions.svelte';
+  import StorageSection from '#lib/components/StorageSection.svelte';
   import { credentialKinds } from '#lib/presentation.ts';
 
   let credentials = $state<Credential[] | null>(null);
@@ -47,6 +48,7 @@
       <InstructionsSetting />
       <StandingApprovals />
       <DeletedSessions />
+      <StorageSection />
       {#if error}
         <Alert color="danger" size="small" title="Couldn't load credentials">{error}</Alert>
       {/if}

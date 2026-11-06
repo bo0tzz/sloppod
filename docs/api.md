@@ -25,6 +25,7 @@ POST   /api/v1/sessions/{id}/grants -> Session (201) body: {capability, expires_
 PATCH  /api/v1/sessions/{id}/grants/{grant} -> Session  body: {expires_at?: string | null, narrow?: true, credentials?: string[]}; changes when it runs out (null: never), narrows it (a repository it can push to becomes read only), or, for a `model` or `codex` grant, sets the accounts it acts with, in order (below)
 DELETE /api/v1/sessions/{id}/grants/{grant} -> Session  revokes it
 PUT    /api/v1/sessions/{id}/review -> Session     body: {review: "off" | "required"}
+PUT    /api/v1/sessions/{id}/volume -> Session     body: {kept: boolean}; keeps a stopped session's volume, or lets it be removed a week after the session stopped (#455)
 PUT    /api/v1/sessions/{id}/read   -> {seq: number}  body: {seq: number}; the user has read the session up to the event `seq` (below); only moves forward, so a late report from another UI changes nothing, and answers the position as it stands; 400 for a negative one
 GET    /api/v1/sessions/{id}/debug-bundle?message={messageId} -> DebugBundle  downloads (`Content-Disposition: attachment`) a debug bundle of the turn the user message `messageId` started; with `before={messageId}` instead, of the turn before that one; with neither, of the latest turn; 404 when the session has no such turn (below)
 GET    /api/v1/sessions/{id}/work-done -> WorkDone[]  the issues and pull requests the session has acted on (#205), newest first, built from its carried-out proposals and their results (nothing of it is stored): one entry per item, with what was done to it (below)
@@ -146,6 +147,8 @@ type Session = {
   command_lines?: string[]; // those commands' command lines, each cut to 300 characters, when the supervisor sends them
   waiting: { proposals: number; questions: number; permissions: number; highlights: number }; // what waits on the user: proposals awaiting a decision, open questions (`ask_user`'s too), the agent's permission requests and highlights neither marked seen nor retracted (#439), so a list of sessions can say which need them (#368). Counted when the session is sent (proposals from the database, the rest kept live) and pushed as `_sloppod/session` whenever it changes
   unschedulable?: string; // why the cluster can't place the session's pod, once it has been unschedulable for 20 s (#454): "waiting for room (insufficient memory)" when it's short of resources, otherwise the scheduler's own message (a taint, a volume that can't attach, a quota). Absent while a pod is merely being placed. Kept live and pushed as `_sloppod/session` when it changes
+  disk?: { used: number; size: number; seen_at: string }; // its workspace volume's use and size in bytes, as its supervisor last said (every 5 minutes), and when; kept while it's parked (#455)
+  volume_kept: boolean; // whether the user keeps the volume of a stopped session, otherwise removed a week after it stopped
 };
 
 // What the session may do (ADR 2). Capabilities so far: "model", "github" (read: public data, plus the "repo"
