@@ -5,7 +5,7 @@ use kube::api::{
     Api, ApiResource, DeleteParams, DynamicObject, GroupVersionKind, Patch, PatchParams,
 };
 use serde_json::json;
-use sloppod_contracts::{Error, Manifest, PlacementBackend, PlacementSpec, Result};
+use sloppod_contracts::{Error, Manifest, PlacementBackend, PlacementSpec, Result, Unschedulable};
 
 pub const WORKDIR: &str = "/workspace";
 pub const TOKEN_DIR: &str = "/var/run/secrets/sloppod";
@@ -19,6 +19,8 @@ pub struct AgentSandbox {
     pods: Api<k8s_openapi::api::core::v1::Pod>,
     service_account: String,
     pull_policy: String,
+    /// What's known of session pods, e.g. whether one can't be scheduled.
+    index: crate::pods::PodIndex,
 }
 
 impl AgentSandbox {
@@ -27,6 +29,7 @@ impl AgentSandbox {
         namespace: &str,
         service_account: String,
         pull_policy: String,
+        index: crate::pods::PodIndex,
     ) -> Self {
         let gvk = GroupVersionKind::gvk("agents.x-k8s.io", "v1beta1", "Sandbox");
         let resource = ApiResource::from_gvk_with_plural(&gvk, "sandboxes");
@@ -35,6 +38,7 @@ impl AgentSandbox {
             pods: Api::namespaced(client, namespace),
             service_account,
             pull_policy,
+            index,
         }
     }
 }
@@ -183,5 +187,15 @@ impl PlacementBackend for AgentSandbox {
             Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
             Err(e) => Err(err(e)),
         }
+    }
+
+    fn unschedulable(&self) -> Vec<Unschedulable> {
+        self.index.unschedulable()
+    }
+
+    fn has_pod(&self, session_id: &str) -> bool {
+        session_id
+            .parse()
+            .is_ok_and(|session| self.index.has_pod(session))
     }
 }

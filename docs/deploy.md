@@ -3,7 +3,7 @@
 sloppod ships as an OCI Helm chart, `oci://ghcr.io/bo0tzz/charts/sloppod`, published from `main` together with two images:
 
 - `ghcr.io/bo0tzz/sloppod`: the runtime and UI
-- `ghcr.io/bo0tzz/sloppod-session`: the session image with the supervisor, the Claude Code adapter, mise and the memini plugin. A new session image reaches running sessions as they go quiet: a session idle for 15 minutes, with no turn, nothing queued, no open request and none of its agent's commands running, whose pod runs another image, gets a new pod, and its agent resumes the conversation. A session whose agent was asked to make room for the image (its pod over a day old) gets one once it has been quiet for a minute, checked every minute. A session whose supervisor predates reporting its commands waits for 2 hours of quiet instead
+- `ghcr.io/bo0tzz/sloppod-session`: the session image with the supervisor, the Claude Code adapter, mise and the memini plugin. A new session image reaches running sessions as they go quiet: a session idle for 15 minutes, with no turn, nothing queued, no open request and none of its agent's commands running, whose pod runs another image, gets a new pod, and its agent resumes the conversation. While any session pod can't be placed for lack of resources, no pod is replaced (#454). A session whose agent was asked to make room for the image (its pod over a day old) gets one once it has been quiet for a minute, checked every minute. A session whose supervisor predates reporting its commands waits for 2 hours of quiet instead
 
 Releases are `v<version>` tags: chart `<version>` on images tagged `v<version>` (and `latest`). Every push to `main` also publishes chart `<last release, next patch>-main.<run>` (e.g. `0.1.1-main.12` after `v0.1.0`) on images tagged with the commit (and `main`); semver ranges without a prerelease part skip those. A release commit sets the version in `Chart.yaml` and `Cargo.toml`; the tag has to match both. Installing the chart from a checkout instead needs `image.tag` and `session.image.tag` set, because the in-repo `appVersion` isn't an image tag.
 
@@ -21,6 +21,7 @@ Releases are `v<version>` tags: chart `<version>` on images tagged `v<version>` 
   - the runtime → the Kubernetes API, GitHub and Postgres
 
   sloppod writes its own CiliumNetworkPolicy per session pod.
+- **Room for session pods:** each session pod requests its `session.memory` (and CPU) at the same priority as the others, so Kubernetes doesn't preempt one for another. When a session's pod can't be scheduled for lack of resources, the runtime parks quiet sessions to make room for it and holds back image rolls ([ADR 25](adr/0025-session-lifecycle.md)); the session shows why it waits. Size the nodes for the sessions you expect to have working at once; parked ones take no room. The runtime reads pods' `PodScheduled` condition, through its watch on session pods.
 
 ## Secrets
 

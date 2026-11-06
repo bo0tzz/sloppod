@@ -386,6 +386,10 @@ fn due_for_image(
 /// controller starts a new one from the current spec, the same path an evicted pod takes: the supervisor reports and
 /// syncs on its way out, and the agent resumes its conversation in the new pod.
 pub async fn roll_images(state: &AppState) {
+    // A pod replaced now would take room one that can't be placed is waiting for, or wait itself (#454).
+    if crate::room::short_of_room(&state.placement.unschedulable()) {
+        return;
+    }
     let sessions = match db::active_sessions(&state.db).await {
         Ok(sessions) => sessions,
         Err(e) => {

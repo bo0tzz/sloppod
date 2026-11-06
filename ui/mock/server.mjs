@@ -1563,7 +1563,17 @@ function failStart(session) {
   }, 1000);
 }
 
-const startupDelay = (prompt) => (/slow start|failing start/i.test(prompt) ? 3000 : DELAY * 8);
+/** Like a pod the cluster can't place for a while for lack of memory (#454). */
+function waitForRoom(session) {
+  session.data.unschedulable = 'waiting for room (insufficient memory)';
+  session.broadcast();
+  setTimeout(() => {
+    delete session.data.unschedulable;
+    session.broadcast();
+  }, 1500);
+}
+
+const startupDelay = (prompt) => (/slow start|failing start|no room/i.test(prompt) ? 3000 : DELAY * 8);
 
 function cancelTurn(session) {
   if (session.turn) session.turn.cancelled = true;
@@ -1928,6 +1938,7 @@ async function handleApi(req, res, url) {
       if (typeof body.model === 'string' && body.model) session.data.model = body.model;
       startAgent(session, startupDelay(body.prompt));
       if (/failing start/i.test(body.prompt)) failStart(session);
+      if (/no room/i.test(body.prompt)) waitForRoom(session);
       return json(res, 201, session.data);
     }
     if (parts.length === 2 && parts[1] === 'deleted' && method === 'GET') {

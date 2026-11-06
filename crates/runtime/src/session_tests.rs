@@ -3520,6 +3520,33 @@ async fn commands_ended_by_a_new_pod_are_told_to_the_agent() {
 }
 
 #[tokio::test]
+async fn a_session_whose_pod_cant_be_placed_says_why() {
+    let h = Harness::starting().await;
+    let row = h.store.get_session(h.id).await.unwrap().unwrap();
+    assert_eq!(h.hub.session_api(&row).await.unschedulable, None);
+    h.hub
+        .set_unschedulable(std::collections::HashMap::from([(
+            h.id,
+            "waiting for room (insufficient memory)".to_owned(),
+        )]))
+        .await;
+    assert_eq!(
+        h.hub.session_api(&row).await.unschedulable.as_deref(),
+        Some("waiting for room (insufficient memory)")
+    );
+    assert_eq!(
+        crate::subsessions::doing(
+            Phase::Starting,
+            None,
+            Some("waiting for room (insufficient memory)")
+        ),
+        "waiting for room (insufficient memory)"
+    );
+    h.hub.set_unschedulable(Default::default()).await;
+    assert_eq!(h.hub.session_api(&row).await.unschedulable, None);
+}
+
+#[tokio::test]
 async fn an_update_goes_out_with_its_place_in_the_log() {
     let h = Harness::ready().await;
     let mut events = h.hub.subscribe(h.id);

@@ -214,6 +214,11 @@ pub mod api {
         /// Those commands' command lines, when the supervisor sends them.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub command_lines: Vec<String>,
+        /// Why the cluster can't place the session's pod, while it can't (#454): `waiting for room (insufficient memory)`
+        /// when it's short of resources, otherwise the scheduler's own message, e.g. about a volume. Absent while the pod
+        /// is merely being placed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub unschedulable: Option<String>,
         /// What waits on the user in the session, so a list of sessions can say which need them (#368).
         #[serde(default)]
         pub waiting: Waiting,
