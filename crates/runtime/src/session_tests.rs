@@ -3545,3 +3545,27 @@ async fn a_session_whose_pod_cant_be_placed_says_why() {
     h.hub.set_unschedulable(Default::default()).await;
     assert_eq!(h.hub.session_api(&row).await.unschedulable, None);
 }
+
+#[tokio::test]
+async fn an_update_goes_out_with_its_place_in_the_log() {
+    let h = Harness::ready().await;
+    let mut events = h.hub.subscribe(h.id);
+    h.hub
+        .record(h.id, json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Hello"}}))
+        .await;
+    let seq = loop {
+        match events.try_recv().unwrap() {
+            UiEvent::Notification {
+                message,
+                seq: Some(seq),
+                ..
+            } if message["method"] == "session/update" => {
+                // What a UI reports as read is the seq the message carries.
+                assert_eq!(message["params"]["_meta"]["sloppod"]["seq"], seq);
+                break seq;
+            }
+            _ => continue,
+        }
+    };
+    assert!(seq > 0);
+}

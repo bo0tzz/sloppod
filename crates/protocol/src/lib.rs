@@ -222,6 +222,10 @@ pub mod api {
         /// What waits on the user in the session, so a list of sessions can say which need them (#368).
         #[serde(default)]
         pub waiting: Waiting,
+        /// The seq of the last event the user (the owner) has read up to in this session, as their UIs reported it
+        /// (`PUT /sessions/{id}/read`); absent until one has (#48).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub read_seq: Option<i64>,
     }
 
     /// What a session has open for the user to answer.

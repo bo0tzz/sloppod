@@ -8,7 +8,7 @@
   import { attach, attachmentSrc, MAX_IMAGES, type Attachment } from '#lib/images.ts';
   import Composer from './Composer.svelte';
 
-  let { view }: { view: SessionView } = $props();
+  let { view, onSend }: { view: SessionView; /** Called when a message is sent, so the chat can scroll to it (#48). */ onSend?: () => void } = $props();
 
   // Kept across a page reload, per session. The route remounts this per session, so the first id is the one.
   // svelte-ignore state_referenced_locally
@@ -120,6 +120,7 @@
     images = [];
     const id = crypto.randomUUID();
     const message: Outgoing = { id, text: content, ...(sent.length ? { images: sent } : {}) };
+    onSend?.();
     if (view.connection !== 'open') {
       view.sendWhenConnected(message);
       textarea?.focus();

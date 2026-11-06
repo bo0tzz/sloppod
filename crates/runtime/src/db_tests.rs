@@ -2452,3 +2452,19 @@ async fn sessions_that_could_make_room_are_the_quiet_idle_ones(db: PgPool) {
         assert_eq!(kept_of(other), None);
     }
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_users_read_position_only_moves_forward(db: PgPool) {
+    let s = session(&db, "dev").await;
+    let other = session(&db, "dev").await;
+    assert_eq!(db::read_seq(&db, s, "dev").await.unwrap(), None);
+
+    assert_eq!(db::set_read_seq(&db, s, "dev", 40).await.unwrap(), 40);
+    // A late report from another UI of theirs doesn't take it back.
+    assert_eq!(db::set_read_seq(&db, s, "dev", 25).await.unwrap(), 40);
+    assert_eq!(db::set_read_seq(&db, s, "dev", 41).await.unwrap(), 41);
+    assert_eq!(db::read_seq(&db, s, "dev").await.unwrap(), Some(41));
+    // Per session, and per user.
+    assert_eq!(db::read_seq(&db, other, "dev").await.unwrap(), None);
+    assert_eq!(db::read_seq(&db, s, "someone-else").await.unwrap(), None);
+}
