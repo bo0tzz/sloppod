@@ -601,6 +601,29 @@ test('approves a stack of pull requests', async ({ page }) => {
   await expect(page.getByTestId('system-notice')).toContainText('as stack #7. The stack merges once its required checks pass.');
 });
 
+test("a proposal shows at once, and only its changes wait for the detail", async ({ page }) => {
+  await createSession(page, 'Add backoff to the reconnect logic in sloppod');
+  await finishTurn(page);
+  await page.request.post('/_mock/slow-proposals?ms=2500');
+  try {
+    await page.getByTestId('proposal-card').getByRole('button', { name: 'Review' }).click();
+    const dialog = page.getByRole('dialog');
+    // The title and description from the list, straight away, with no spinner over them.
+    await expect(dialog.getByTestId('proposal-title')).toHaveText('Reconnect the ACP socket with exponential backoff', {
+      timeout: 1000,
+    });
+    await expect(dialog.getByTestId('proposal-status')).toBeVisible({ timeout: 1000 });
+    // Only where the changes go says they're coming, and approving waits for them.
+    await expect(dialog.getByTestId('proposal-changes-loading')).toBeVisible();
+    await expect(dialog.getByRole('button', { name: 'Approve' })).toBeDisabled();
+    await expect(dialog.getByTestId('changes')).toBeVisible({ timeout: 10_000 });
+    await expect(dialog.getByTestId('proposal-changes-loading')).toHaveCount(0);
+    await expect(dialog.getByRole('button', { name: 'Approve' })).toBeEnabled();
+  } finally {
+    await page.request.post('/_mock/slow-proposals?ms=0');
+  }
+});
+
 test('shows the review a proposal went through on request', async ({ page }) => {
   const id = await createSession(page, 'Propose a reviewed PR for sloppod');
   const put = await page.request.put(`/api/v1/sessions/${id}/review`, { data: { review: 'required' } });

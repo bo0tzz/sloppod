@@ -2080,6 +2080,7 @@ async function handleApi(req, res, url) {
     const proposal = proposals.get(parts[1]);
     if (!proposal) return json(res, 404, { error: 'proposal not found' });
     if (parts.length === 2 && method === 'GET') {
+      if (proposalDetailDelay) await sleep(proposalDetailDelay);
       if (proposal.kind !== 'sloppod.repo.act_as_owner') return json(res, 200, proposal);
       // As the runtime's detail: the tokens the user can pick from.
       const tokens = credentials
@@ -2502,6 +2503,10 @@ const server = http.createServer(async (req, res) => {
       }
       return json(res, 200, {});
     }
+    if (url.pathname === '/_mock/slow-proposals' && req.method === 'POST') {
+      proposalDetailDelay = Number(url.searchParams.get('ms') ?? 0);
+      return json(res, 200, {});
+    }
     if (url.pathname === '/_mock/models' && req.method === 'POST') {
       // `?offered=0` forgets the models the agent offered, as before a user's first session; otherwise they're back.
       if (url.searchParams.get('offered') === '0') settings.models = [];
@@ -2629,6 +2634,8 @@ let proposeOnLoad = null;
 let refuseConnectionsUntil = 0;
 /** Set by `/_mock/drop?slow=<ms>`: until then, reading a session waits, as a slow runtime's REST does. */
 let slowSessionsUntil = 0;
+/** Set by `/_mock/slow-proposals?ms=<ms>`: how long reading a proposal's detail takes, as a slow GitHub's diff does. */
+let proposalDetailDelay = 0;
 let slowLoadsUntil = 0;
 let failLoadsUntil = 0;
 

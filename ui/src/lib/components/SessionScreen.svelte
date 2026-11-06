@@ -632,14 +632,13 @@
 {/if}
 
 {#if openProposal}
-  <!-- Keyed, so moving on to the next proposal starts its form afresh. -->
-  {#key openProposal.id}
-    <ProposalModal
-      proposal={openProposal}
-      previous={decidedProposal}
-      onChange={(proposal) => view.upsertProposal(proposal)}
-      onDecided={openNextProposal}
-      onClose={() => (openProposalId = null)}
-    />
-  {/key}
+  <!-- Not keyed: moving on to the next proposal swaps the content in the same frame, and the modal starts its form
+       afresh itself. -->
+  <ProposalModal
+    proposal={openProposal}
+    previous={decidedProposal}
+    onChange={(proposal) => view.upsertProposal(proposal)}
+    onDecided={openNextProposal}
+    onClose={() => (openProposalId = null)}
+  />
 {/if}

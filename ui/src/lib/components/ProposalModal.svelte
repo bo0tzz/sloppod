@@ -57,10 +57,22 @@
   } = $props();
   const as = $derived(actingAs(proposal));
 
-  // svelte-ignore state_referenced_locally
-  const kind = proposal.kind;
+  const kind = $derived(proposal.kind);
 
   let detail = $state<ProposalDetail | null>(null);
+  /** What's shown: the detail once it's in, and the proposal as the list has it until then, so nothing waits on it
+   * but what only the detail has (diffs, commits, what an update replaces). */
+  const shown = $derived<ProposalDetail>(detail ?? proposal);
+  /** The detail is taking long enough to say so where it'll go; a quick one shows nothing meanwhile. */
+  let slow = $state(false);
+  $effect(() => {
+    if (detail) {
+      slow = false;
+      return;
+    }
+    const timer = setTimeout(() => (slow = true), 300);
+    return () => clearTimeout(timer);
+  });
   let loadError = $state<string | null>(null);
   let actionError = $state<string | null>(null);
   let busy = $state<'approve' | 'reject' | null>(null);
@@ -78,14 +90,12 @@
   let reason = $state('');
   let drafts = $state<(IssueDraft & { file: boolean })[]>([]);
 
-  const pr = $derived(detail?.kind === 'github.pr.create' ? (detail.payload as PullRequestPayload) : null);
-  const grant = $derived(detail?.kind === 'sloppod.repo.grant' ? (detail.payload as RepoGrantPayload) : null);
-  const issues = $derived(detail?.kind === 'github.issue.create' ? (detail.payload as IssuesPayload) : null);
+  const pr = $derived(shown.kind === 'github.pr.create' ? (shown.payload as PullRequestPayload) : null);
+  const grant = $derived(shown.kind === 'sloppod.repo.grant' ? (shown.payload as RepoGrantPayload) : null);
+  const issues = $derived(shown.kind === 'github.issue.create' ? (shown.payload as IssuesPayload) : null);
   // Updates to pull requests are shown like updates to issues: the same fields, and a draft can be marked ready.
   const issueUpdates = $derived(
-    detail?.kind === 'github.issue.update' || detail?.kind === 'github.pr.update'
-      ? (detail.payload as IssueUpdatesPayload)
-      : null,
+    shown.kind === 'github.issue.update' || shown.kind === 'github.pr.update' ? (shown.payload as IssueUpdatesPayload) : null,
   );
   const closeReasons = { completed: 'completed', not_planned: 'not planned', duplicate: 'a duplicate' };
   const closing = (close: NonNullable<IssueUpdate['close']>) => (close === true ? 'close' : `close as ${closeReasons[close]}`);
@@ -94,46 +104,70 @@
   const making = $derived(updateDrafts.filter((draft) => draft.make).length);
   // What the issues an update rewrites say now, to show its change against.
   const currentIssue = (number: number) => detail?.current?.find((issue) => issue.number === number);
-  const summary = $derived(proposalSummary(detail ?? proposal));
-  const stack = $derived(detail?.kind === 'github.stack.create' ? (detail.payload as StackPayload) : null);
-  const plan = $derived(detail?.kind === 'sloppod.work.plan' ? planChanges(detail) : null);
+  const summary = $derived(proposalSummary(shown));
+  const stack = $derived(shown.kind === 'github.stack.create' ? (shown.payload as StackPayload) : null);
+  const plan = $derived(shown.kind === 'sloppod.work.plan' ? planChanges(shown) : null);
   // The titles of the items a plan's moves point at, from the graph as it is now.
   let planTitles = $state(new Map<string, string>());
   $effect(() => {
-    const graph = detail?.kind === 'sloppod.work.plan' ? detail.payload.graph : undefined;
+    const graph = shown.kind === 'sloppod.work.plan' ? shown.payload.graph : undefined;
     if (typeof graph !== 'string') return;
     api
       .getWorkGraph(graph)
       .then((fetched) => (planTitles = new Map(fetched.items.map((item) => [item.id, item.title]))))
       .catch(() => {});
   });
-  const pending = $derived(detail?.status === 'pending');
+  const pending = $derived(shown.status === 'pending');
 
   // The proposal changes while the modal is open: it's decided in another tab, passes review, or a review round
   // re-pins it to a new head. Fetch the detail (with its diff) again then, and put the form back to the new payload.
-  const version = $derived(`${proposal.status}\n${JSON.stringify(proposal.payload)}`);
+  // Another proposal in its place (the next one waiting, after a decision) starts the modal over, in the same frame.
+  const version = $derived(`${proposal.id}\n${proposal.status}\n${JSON.stringify(proposal.payload)}`);
   let loaded = '';
+  let loadedId = '';
   let loads = 0;
   $effect(() => {
     if (version === loaded) return;
-    const payloadChanged = !detail || JSON.stringify(detail.payload) !== JSON.stringify(proposal.payload);
     loaded = version;
-    void load(payloadChanged);
+    if (proposal.id !== loadedId) {
+      loadedId = proposal.id;
+      startOver();
+    }
+    if (!detail || JSON.stringify(detail.payload) !== JSON.stringify(proposal.payload)) {
+      // What's shown is the new payload at once; its diff follows with the detail.
+      detail = null;
+      resetForm();
+    }
+    void load();
   });
 
-  async function load(resetForm: boolean) {
+  /** Forgets everything of the proposal shown before. */
+  function startOver() {
+    detail = null;
+    loadError = null;
+    actionError = null;
+    busy = null;
+    rejecting = false;
+    reason = '';
+    planTitles = new Map();
+  }
+
+  /** Puts the form back to the proposal's payload. */
+  function resetForm() {
+    editing = false;
+    autoMerge =
+      (shown.kind === 'github.pr.create' || shown.kind === 'github.stack.create') &&
+      (shown.payload as { auto_merge?: boolean }).auto_merge === true;
+    resetDrafts();
+  }
+
+  async function load() {
     const load = ++loads;
     try {
       const fetched = await api.getProposal(proposal.id);
       if (load !== loads) return;
       detail = fetched;
       loadError = null;
-      if (!resetForm) return;
-      editing = false;
-      autoMerge =
-        (fetched.kind === 'github.pr.create' || fetched.kind === 'github.stack.create') &&
-        (fetched.payload as { auto_merge?: boolean }).auto_merge === true;
-      resetDrafts();
     } catch (error) {
       if (load === loads) loadError = error instanceof Error ? error.message : String(error);
     }
@@ -142,11 +176,11 @@
   const diffCounts = (diff: string) => diffStats(parseUnifiedDiff(diff) ?? []);
 
   function resetDrafts() {
-    if (detail?.kind === 'github.issue.update' || detail?.kind === 'github.pr.update') {
-      updateDrafts = (detail.payload as IssueUpdatesPayload).updates.map((update) => ({ ...update, make: true }));
+    if (shown.kind === 'github.issue.update' || shown.kind === 'github.pr.update') {
+      updateDrafts = (shown.payload as IssueUpdatesPayload).updates.map((update) => ({ ...update, make: true }));
     }
-    if (detail?.kind !== 'github.issue.create') return;
-    drafts = (detail.payload as IssuesPayload).issues.map((issue) => ({ ...issue, labels: [...issue.labels], file: true }));
+    if (shown.kind !== 'github.issue.create') return;
+    drafts = (shown.payload as IssuesPayload).issues.map((issue) => ({ ...issue, labels: [...issue.labels], file: true }));
   }
 
   /** Records the decision; the modal only stays on this proposal to show a failure. */
@@ -178,11 +212,10 @@
   }
 
   async function reject() {
-    if (!detail) return;
     busy = 'reject';
     actionError = null;
     try {
-      applyResult(await api.rejectProposal(detail.id, reason.trim() || undefined));
+      applyResult(await api.rejectProposal(shown.id, reason.trim() || undefined));
       rejecting = false;
     } catch (error) {
       actionError = error instanceof Error ? error.message : String(error);
@@ -279,11 +312,10 @@
         </div>
       {/if}
       {#if loadError}
-        <Alert color="danger" title="Couldn't load the proposal" size="small">{loadError}</Alert>
-      {:else if !detail}
-        <div class="flex justify-center py-10"><LoadingSpinner size="large" /></div>
-      {:else}
-        {@const status = proposalStatus(detail)}
+        <Alert color="danger" title="Couldn't load the proposal's details" size="small">{loadError}</Alert>
+      {/if}
+      {#if shown}
+        {@const status = proposalStatus(shown)}
         <div class="flex flex-wrap items-center gap-2 text-sm">
           <Badge color={status.color} shape="round" size="small" data-testid="proposal-status">{status.label}</Badge>
           {#if pr?.draft}
@@ -306,17 +338,17 @@
           {/if}
         </div>
 
-        {#if detail.status === 'executed' && pr && detail.result}
+        {#if shown.status === 'executed' && pr && shown.result}
           <Alert color="success" size="small" title="Pull request opened">
-            <a href={detail.result.url} target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-1 underline" data-testid="proposal-result">
-              #{detail.result.number}
+            <a href={shown.result.url} target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-1 underline" data-testid="proposal-result">
+              #{shown.result.number}
               <Icon icon={mdiOpenInNew} aria-hidden />
             </a>
           </Alert>
-        {:else if detail.status === 'executed' && stack && detail.result?.pull_requests}
+        {:else if shown.status === 'executed' && stack && shown.result?.pull_requests}
           <Alert color="success" size="small" title="Pull requests opened">
             <ul class="flex flex-col gap-1">
-              {#each detail.result.pull_requests as opened (opened.number)}
+              {#each shown.result.pull_requests as opened (opened.number)}
                 <li>
                   <a href={opened.url} target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-1 underline" data-testid="proposal-result">
                     #{opened.number}
@@ -325,16 +357,16 @@
                 </li>
               {/each}
             </ul>
-            {#if detail.result.message}<p class="mt-1">{detail.result.message}</p>{/if}
+            {#if shown.result.message}<p class="mt-1">{shown.result.message}</p>{/if}
           </Alert>
-        {:else if detail.status === 'executed' && grant}
+        {:else if shown.status === 'executed' && grant}
           <Alert color="success" size="small" title="Access granted">
             The session can now push to <span class="font-mono">{grant.branch}</span> on {grant.repo}.
           </Alert>
-        {:else if detail.status === 'executed' && issues && detail.result?.issues}
+        {:else if shown.status === 'executed' && issues && shown.result?.issues}
           <Alert color="success" size="small" title="Issues filed">
             <ul class="flex flex-col gap-1">
-              {#each detail.result.issues as filed (filed.number)}
+              {#each shown.result.issues as filed (filed.number)}
                 <li>
                   <a href={filed.url} target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-1 underline" data-testid="filed-issue">
                     #{filed.number} {filed.title}
@@ -342,19 +374,19 @@
                   </a>
                 </li>
               {/each}
-              {#each detail.result.failed ?? [] as failure, index (index)}
+              {#each shown.result.failed ?? [] as failure, index (index)}
                 <li class="text-danger">{failure.title}: {failure.error}</li>
               {/each}
             </ul>
           </Alert>
-        {:else if detail.status === 'failed'}
-          <Alert color="danger" size="small" title="Execution failed">{detail.error ?? 'Unknown error'}</Alert>
-        {:else if detail.status === 'rejected'}
-          <Alert color="secondary" size="small" title="Rejected">{detail.reason || 'No reason given.'}</Alert>
+        {:else if shown.status === 'failed'}
+          <Alert color="danger" size="small" title="Execution failed">{shown.error ?? 'Unknown error'}</Alert>
+        {:else if shown.status === 'rejected'}
+          <Alert color="secondary" size="small" title="Rejected">{shown.reason || 'No reason given.'}</Alert>
         {/if}
 
-        {#if detail.review_session_id}
-          <ReviewHistory proposalId={detail.id} reviewSessionId={detail.review_session_id} />
+        {#if shown.review_session_id}
+          <ReviewHistory proposalId={shown.id} reviewSessionId={shown.review_session_id} />
         {/if}
 
         {#if pr}
@@ -402,6 +434,9 @@
                 {:else if update.comment}
                   <div class="bg-light-100 rounded-lg p-2 text-sm"><Markdown text={update.comment} /></div>
                 {/if}
+                {#if !detail && (update.title || update.body !== undefined)}
+                  {@render loadingChanges()}
+                {/if}
                 {#if current && update.body !== undefined}
                   {@const bodyDiff = diffTexts(`Body of #${update.number}`, current.body, update.body)}
                   {#if bodyDiff.additions + bodyDiff.deletions === 0}
@@ -441,7 +476,7 @@
             <div class="flex flex-col gap-1">
               <Text size="small" fontWeight="semi-bold">The agent's reason</Text>
               <p class="bg-light-100 rounded-xl p-3 text-sm whitespace-pre-wrap" data-testid="proposal-reason">
-                {(detail.payload.reason as string) || 'No reason given.'}
+                {(shown.payload.reason as string) || 'No reason given.'}
               </p>
             </div>
             <ul class="flex flex-col gap-1 text-sm">
@@ -454,12 +489,12 @@
           <div class="flex flex-col gap-2">
             <Heading tag="h2" size="tiny" data-testid="proposal-title">{summary.title}</Heading>
             <Text color="muted" size="small">This UI doesn't know this kind of proposal yet. Its payload:</Text>
-            <pre class="bg-light-100 max-h-[50dvh] overflow-auto rounded-lg p-3 font-mono text-xs" data-testid="proposal-payload">{JSON.stringify(detail.payload, null, 2)}</pre>
+            <pre class="bg-light-100 max-h-[50dvh] overflow-auto rounded-lg p-3 font-mono text-xs" data-testid="proposal-payload">{JSON.stringify(shown.payload, null, 2)}</pre>
           </div>
         {/if}
 
         <Text color="muted" size="tiny">
-          Proposed {absoluteTime(detail.created_at)}{#if detail.decided_at}, decided {absoluteTime(detail.decided_at)}{/if}{#if detail.decided_by?.startsWith('standing-approval:')}
+          Proposed {absoluteTime(shown.created_at)}{#if shown.decided_at}, decided {absoluteTime(shown.decided_at)}{/if}{#if shown.decided_by?.startsWith('standing-approval:')}
             by a standing approval{/if}
         </Text>
       {/if}
@@ -511,7 +546,7 @@
             color="success"
             shape="round"
             loading={busy === 'approve'}
-            disabled={busy === 'reject' || (issues !== null && filing === 0) || (issueUpdates !== null && making === 0)}
+            disabled={!detail || busy === 'reject' || (issues !== null && filing === 0) || (issueUpdates !== null && making === 0)}
             onclick={approve}
           >
             {#if issues}
@@ -564,13 +599,13 @@
   </div>
 {/snippet}
 
-{#snippet stackedPullRequests(detail: ProposalDetail, stack: StackPayload)}
+{#snippet stackedPullRequests(detail: ProposalDetail | null, stack: StackPayload)}
   <Text color="muted" size="small">
     Each pull request merges into the one before it, the first into <span class="font-mono">{stack.base}</span>. Approving
     opens them all and links them as a stack on GitHub.
   </Text>
   {#each stack.pull_requests as layer, index (layer.head)}
-    {@const changes = detail.layers?.[index]}
+    {@const changes = detail?.layers?.[index]}
     {@const counts = changes ? diffCounts(changes.diff) : null}
     <details class="group/layer border-light-200 rounded-2xl border" data-testid="stack-layer">
       <summary class="flex cursor-pointer list-none items-start gap-2 p-3">
@@ -594,13 +629,15 @@
         {/if}
         {#if changes}
           <PullRequestChanges diff={changes.diff} commits={changes.commits} bind:wrap={wrapLines} />
+        {:else if !detail}
+          {@render loadingChanges()}
         {/if}
       </div>
     </details>
   {/each}
 {/snippet}
 
-{#snippet pullRequest(detail: ProposalDetail, pr: PullRequestPayload)}
+{#snippet pullRequest(detail: ProposalDetail | null, pr: PullRequestPayload)}
   {#if editing}
     <div class="flex flex-col gap-3">
       <Field label="Title">
@@ -623,5 +660,19 @@
     </div>
   {/if}
 
-  <PullRequestChanges diff={detail.diff ?? ''} commits={detail.commits ?? []} bind:wrap={wrapLines} />
+  {#if detail}
+    <PullRequestChanges diff={detail.diff ?? ''} commits={detail.commits ?? []} bind:wrap={wrapLines} />
+  {:else}
+    {@render loadingChanges()}
+  {/if}
+{/snippet}
+
+<!-- Where the changes will be, while they're fetched: nothing for a quick fetch, a small note for a slow one. -->
+{#snippet loadingChanges()}
+  {#if slow && !loadError}
+    <div class="text-muted flex items-center gap-2 text-sm" data-testid="proposal-changes-loading">
+      <LoadingSpinner size="small" />
+      Loading the changes…
+    </div>
+  {/if}
 {/snippet}
