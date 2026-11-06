@@ -1220,6 +1220,61 @@ test('an update to a row already read does not mark the rows after it read', asy
   expect(divider).toBeLessThan((await page.getByText('Below the plan.').boundingBox())!.y);
 });
 
+const messageChunk = (text: string) => ({
+  sessionUpdate: 'agent_message_chunk',
+  messageId: 'grows',
+  content: { type: 'text', text },
+});
+const readCall = (toolCallId: string) => ({
+  sessionUpdate: 'tool_call',
+  toolCallId,
+  title: `Read ${toolCallId}.md`,
+  kind: 'read',
+  status: 'completed',
+});
+
+test('more of a message that was read is unread', async ({ page }) => {
+  await page.setViewportSize({ width: 1000, height: 500 });
+  const id = await createSession(page, 'Give me a long answer in sloppod');
+  await expect(page.getByText('The end.')).toBeInViewport({ timeout: 20_000 });
+  const first = await readPosition(page, id);
+  await page.request.post('/_mock/update', { data: messageChunk('The start of it.') });
+  await expect(page.getByText('The start of it.')).toBeInViewport();
+  await readPosition(page, id, first);
+
+  await page.getByText('The start of it.').hover();
+  await page.mouse.wheel(0, -2000);
+  await expect(page.getByText('The start of it.')).not.toBeInViewport();
+  await page.request.post('/_mock/update', { data: messageChunk(' And the rest.') });
+  await expect(page.getByTestId('unread-divider')).toHaveCount(1);
+
+  // Reloaded, the view opens at the message, not at the bottom.
+  await page.reload();
+  await expect(page.getByTestId('unread-divider')).toBeInViewport();
+  await expect(page.getByText('The start of it. And the rest.')).toBeInViewport();
+});
+
+test('a tool call added to a run that was read is unread', async ({ page }) => {
+  await page.setViewportSize({ width: 1000, height: 500 });
+  const id = await createSession(page, 'Give me a long answer in sloppod');
+  await expect(page.getByText('The end.')).toBeInViewport({ timeout: 20_000 });
+  const first = await readPosition(page, id);
+  await page.request.post('/_mock/update', { data: readCall('first') });
+  await page.request.post('/_mock/update', { data: readCall('second') });
+  await expect(page.getByTestId('tool-fold')).toBeInViewport();
+  await readPosition(page, id, first);
+
+  await page.getByTestId('tool-fold').hover();
+  await page.mouse.wheel(0, -2000);
+  await expect(page.getByTestId('tool-fold')).not.toBeInViewport();
+  await page.request.post('/_mock/update', { data: readCall('third') });
+  await expect(page.getByTestId('unread-divider')).toHaveCount(1);
+
+  await page.reload();
+  await expect(page.getByTestId('unread-divider')).toBeInViewport();
+  await expect(page.getByTestId('tool-fold')).toBeInViewport();
+});
+
 test('reads what an item grew by in place, at the bottom', async ({ page }) => {
   await page.setViewportSize({ width: 1000, height: 500 });
   const id = await createSession(page, 'Give me a long answer in sloppod');

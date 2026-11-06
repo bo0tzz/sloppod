@@ -296,7 +296,7 @@
     const read = view.session.read_seq;
     positioned = true;
     unreadAfter = read ?? null;
-    if (read === undefined || !view.transcript.items.some((item) => item.firstSeq > read)) {
+    if (read === undefined || !view.transcript.items.some((item) => item.addedSeq > read)) {
       unreadAfter = view.readSeq || null;
       scrollToBottom();
       void tick().then(() => scrollToBottom());

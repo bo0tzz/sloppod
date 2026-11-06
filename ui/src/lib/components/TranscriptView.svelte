@@ -84,11 +84,12 @@
   });
 
   const rowItems = (row: Row) => ('fold' in row ? row.fold : [row.item]);
-  /** The last event that touched the row, and the first one: the bar goes above the first row made after the read position. */
+  /** The last event that touched the row, the first one that made an item in it, and the last that added to one: the bar goes above the first row with something added after the read position. */
   const rowSeq = (row: Row) => Math.max(...rowItems(row).map((item) => item.seq));
   const rowFirstSeq = (row: Row) => Math.min(...rowItems(row).map((item) => item.firstSeq));
+  const rowAddedSeq = (row: Row) => Math.max(...rowItems(row).map((item) => item.addedSeq));
   const firstUnread = $derived(
-    unreadAfter === null ? -1 : rows.findIndex((row) => rowFirstSeq(row) > unreadAfter),
+    unreadAfter === null ? -1 : rows.findIndex((row) => rowAddedSeq(row) > unreadAfter),
   );
 
   // The turn each item is part of, as the debug bundle's query names it: the message that started it, steered
