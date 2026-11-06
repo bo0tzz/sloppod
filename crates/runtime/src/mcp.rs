@@ -245,6 +245,14 @@ fn review_tools() -> Vec<Value> {
     ]
 }
 
+const HIGHLIGHT: &str = "highlight";
+
+/// Whether a session has `highlight`: only one the user talks to, so not a sub-session, whose report reaches its
+/// parent (ADR 27), nor a reviewer.
+fn highlight_offered(role: &SessionRole) -> bool {
+    matches!(role, SessionRole::Work)
+}
+
 fn tools(state: &AppState, row: &db::SessionRow) -> Vec<Value> {
     let kind = row.kind;
     let context = row.context();
@@ -315,6 +323,11 @@ fn tools(state: &AppState, row: &db::SessionRow) -> Vec<Value> {
             "required": ["questions"],
         },
     }));
+    // Only a session the user talks to: a sub-session's report goes to its parent, which highlights what they need
+    // (ADR 27).
+    if highlight_offered(&row.role()) {
+        tools.push(highlight_tool());
+    }
     tools.push(json!({
         "name": "request_review",
         "description": "After a review asked for changes to your proposal or to a branch you asked `request_code_review` for, ask for the next round once you've pushed fixes. The proposal is re-pinned to your branch's new head.",
@@ -335,6 +348,23 @@ fn tools(state: &AppState, row: &db::SessionRow) -> Vec<Value> {
     tools
 }
 
+/// What the agent may highlight at most, in characters: a highlight is read in a list, not as a document.
+const HIGHLIGHT_LIMIT: usize = 2000;
+
+fn highlight_tool() -> Value {
+    json!({
+        "name": HIGHLIGHT,
+        "description": "Put something in front of the user that they'd want to find again without reading the whole conversation, instead of writing it as an ordinary reply: the answer to what they asked, something they have to do that isn't a decision, or a serious finding they didn't ask about. It shows as a highlighted card in the chat and in the session's \"for you\" list, where each stays until they mark it seen, and the session counts as waiting on them meanwhile. Marking one seen starts no turn and you aren't told. Read out of context: say what it answers, lead with the conclusion, keep it to a few lines, link what it refers to. Highlight each thing once; if it changes, highlight the new state. Not for progress, plans, or what a proposal or a question already shows.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "What the user should see, in Markdown, a few lines"},
+            },
+            "required": ["text"],
+        },
+    })
+}
+
 fn text(text: String, is_error: bool) -> Value {
     json!({"content": [{"type": "text", "text": text}], "isError": is_error})
 }
@@ -353,6 +383,7 @@ async fn call(state: &AppState, session: Uuid, params: &Value) -> Value {
         "submit_review" => reviews::submit(state, session, &arguments).await,
         "request_review" => reviews::request(state, session, &arguments).await,
         "ask_user" => ask_user(state, session, &arguments).await,
+        HIGHLIGHT => highlight(state, session, &arguments).await,
         LIST_GRANTS => list_grants_text(state, session).await,
         "get_proposal" => get_proposal(state, session, &arguments).await,
         "withdraw_proposal" => withdraw_proposal(state, session, &arguments).await,
@@ -369,6 +400,29 @@ async fn call(state: &AppState, session: Uuid, params: &Value) -> Value {
         Ok(message) => text(message, false),
         Err(e) => text(e, true),
     }
+}
+
+async fn highlight(state: &AppState, session: Uuid, arguments: &Value) -> Result<String, String> {
+    let text = arguments["text"]
+        .as_str()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or("give the `text` to highlight")?;
+    if text.chars().count() > HIGHLIGHT_LIMIT {
+        return Err(format!(
+            "a highlight is read in a list: keep it under {HIGHLIGHT_LIMIT} characters and leave the details in the chat"
+        ));
+    }
+    let row = db::insert_highlight(&state.db, session, text)
+        .await
+        .map_err(|e| e.to_string())?;
+    state.hub.broadcast_highlight(&row.to_api());
+    // The id is what ties the agent's tool call to the highlight: its result is in the transcript under the call, where
+    // the UI reads it, since the call itself doesn't carry the agent's tool call id.
+    Ok(format!(
+        "Highlighted (highlight {}). It stays in the user's list until they mark it seen; nothing waits on it.",
+        row.id
+    ))
 }
 
 async fn ask_user(state: &AppState, session: Uuid, arguments: &Value) -> Result<String, String> {
@@ -537,6 +591,17 @@ mod tests {
         assert!(!streams.stale(session, &after));
         // Never listed: nothing to be stale.
         assert!(!streams.stale(Uuid::new_v4(), &after));
+    }
+
+    #[test]
+    fn only_a_session_the_user_talks_to_can_highlight() {
+        assert!(highlight_offered(&SessionRole::Work));
+        assert!(!highlight_offered(&SessionRole::SubSession {
+            parent: "p".into()
+        }));
+        assert!(!highlight_offered(&SessionRole::Review));
+        assert!(!highlight_offered(&SessionRole::Utility));
+        assert_eq!(highlight_tool()["name"], HIGHLIGHT);
     }
 
     #[test]

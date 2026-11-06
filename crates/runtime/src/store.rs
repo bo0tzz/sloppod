@@ -16,6 +16,10 @@ pub trait SessionStore: Send + Sync {
     async fn pending_proposals(&self, _id: Uuid) -> sqlx::Result<usize> {
         Ok(0)
     }
+    /// How many of the session's highlights the user hasn't marked seen.
+    async fn open_highlights(&self, _id: Uuid) -> sqlx::Result<usize> {
+        Ok(0)
+    }
     async fn set_phase(&self, id: Uuid, phase: Phase) -> sqlx::Result<Option<SessionRow>>;
     async fn set_auto_title(&self, id: Uuid, title: &str) -> sqlx::Result<bool>;
     async fn set_session_model(&self, id: Uuid, model: &str) -> sqlx::Result<()>;
@@ -74,6 +78,10 @@ impl SessionStore for PgStore {
 
     async fn pending_proposals(&self, id: Uuid) -> sqlx::Result<usize> {
         db::pending_proposals(&self.0, id).await
+    }
+
+    async fn open_highlights(&self, id: Uuid) -> sqlx::Result<usize> {
+        db::open_highlights(&self.0, id).await
     }
 
     async fn owner_zone(&self, owner: &str) -> sqlx::Result<chrono_tz::Tz> {

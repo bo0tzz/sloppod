@@ -3376,3 +3376,26 @@ async fn a_change_to_what_the_session_waits_on_is_told_to_its_owners_uis() {
         .await;
     assert_eq!(changed.try_recv().unwrap(), h.id);
 }
+
+#[tokio::test]
+async fn a_highlight_is_told_to_the_session_and_changes_what_it_waits_on() {
+    let h = Harness::ready().await;
+    let mut changed = h.hub.changed_sessions();
+    let mut events = h.hub.subscribe(h.id);
+    let highlight = sloppod_protocol::api::Highlight {
+        id: Uuid::new_v4(),
+        session_id: h.id,
+        text: "It's done".into(),
+        created_at: START.into(),
+        seen_at: None,
+    };
+    h.hub.broadcast_highlight(&highlight);
+    assert_eq!(changed.try_recv().unwrap(), h.id);
+    match events.try_recv().unwrap() {
+        UiEvent::Notification { message, .. } => {
+            assert_eq!(message["method"], "_sloppod/highlight");
+            assert_eq!(message["params"]["highlight"]["text"], "It's done");
+        }
+        _ => panic!("the highlight comes as a notification"),
+    }
+}

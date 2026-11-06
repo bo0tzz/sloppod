@@ -26,6 +26,8 @@ PATCH  /api/v1/sessions/{id}/grants/{grant} -> Session  body: {expires_at?: stri
 DELETE /api/v1/sessions/{id}/grants/{grant} -> Session  revokes it
 PUT    /api/v1/sessions/{id}/review -> Session     body: {review: "off" | "required"}
 GET    /api/v1/sessions/{id}/debug-bundle?message={messageId} -> DebugBundle  downloads (`Content-Disposition: attachment`) a debug bundle of the turn the user message `messageId` started; with `before={messageId}` instead, of the turn before that one; with neither, of the latest turn; 404 when the session has no such turn (below)
+GET    /api/v1/sessions/{id}/highlights -> Highlight[]  what the agent highlighted for the user in this session (#439), oldest first, the ones marked seen included
+POST   /api/v1/sessions/{id}/highlights/{highlight}/seen -> Highlight  the user marks it seen; that's all it does: no turn starts and the agent isn't told. Marking one seen again changes nothing
 GET    /api/v1/repos                -> string[]    repositories sessions can be granted, e.g. ["bo0tzz/sloppod"]
 GET    /api/v1/me                   -> {user: string, version: string | null, build: string | null}   version: the release, e.g. 0.1.2-main.153 (SLOPPOD_VERSION, the chart's version); build: the commit or tag it was built from (SLOPPOD_BUILD, the chart's app version)
 GET    /api/v1/settings             -> Settings
@@ -139,7 +141,7 @@ type Session = {
   limited_until?: string; // the session hit the account's usage limit and carries on by itself then (see "When a turn fails on the account's usage limit" below)
   commands: number | null; // how many of the agent's commands are running, foreground or background, as its supervisor last said (`null` until it says, e.g. no pod); an `idle` session with some running is waiting on them, not done (#413). Kept live, not stored: a dropped link makes it `null` again
   command_lines?: string[]; // those commands' command lines, each cut to 300 characters, when the supervisor sends them
-  waiting: { proposals: number; questions: number; permissions: number }; // what waits on the user: proposals awaiting a decision, open questions (`ask_user`'s too) and the agent's permission requests, so a list of sessions can say which need them (#368). Counted when the session is sent (proposals from the database, the rest kept live) and pushed as `_sloppod/session` whenever it changes
+  waiting: { proposals: number; questions: number; permissions: number; highlights: number }; // what waits on the user: proposals awaiting a decision, open questions (`ask_user`'s too), the agent's permission requests and highlights not marked seen (#439), so a list of sessions can say which need them (#368). Counted when the session is sent (proposals from the database, the rest kept live) and pushed as `_sloppod/session` whenever it changes
 };
 
 // What the session may do (ADR 2). Capabilities so far: "model", "github" (read: public data, plus the "repo"
@@ -153,6 +155,15 @@ type Grant = {
   id?: string;           // for changing or revoking it
   created_at?: string;   // when it was granted
   expires_at?: string;   // when it runs out, if it does
+};
+
+// Something the agent asked the user to see with `highlight` (below); open until the user marks it seen.
+type Highlight = {
+  id: string;
+  session_id: string;
+  text: string;          // Markdown
+  created_at: string;
+  seen_at?: string;      // when the user marked it seen; absent while open
 };
 
 type Phase =
@@ -487,6 +498,7 @@ Runtime → UI:
 | `_sloppod/quota` `{credentialId, quota: Quota \| null}` | One of the owner's quotas changed (see Quotas): `quota` as it stands now, or `null` once the credential is gone. Sent on every connection of the owner, with or without a session loaded. A connection that falls behind is dropped, so its UI reconnects and fetches them all. |
 | `_sloppod/session` `{session: Session}` | The session's phase, title, repository or grants changed, the agent's running commands (`commands`, `command_lines`), or what waits on the user (`waiting`: a proposal made, decided, withdrawn or carried out, a question asked or answered, a permission request opened or resolved). Sent on every connection of the owner for any of the owner's sessions, with or without it loaded, so a session list follows them without fetching; a connection that falls behind is dropped, so its UI reconnects and fetches the list. A connection that has the session loaded may get it twice. |
 | `_sloppod/proposal` `{proposal: Proposal}` | A proposal for a loaded session was created or changed. |
+| `_sloppod/highlight` `{highlight: Highlight}` | The agent highlighted something for a loaded session, or the user marked one seen (so another tab shows it). Either also changes the session's `waiting.highlights`, which `_sloppod/session` carries to every connection of the owner. |
 
 ### Questions
 
@@ -498,12 +510,17 @@ Agents ask the user questions with sloppod's `ask_user` tool, which doesn't wait
 
 Other form elicitations (from MCP servers) use the same primitive field types: `string` (optionally with `oneOf`/`enum`), `number`, `integer`, `boolean`, and arrays of enums.
 
+### Highlights
+
+An agent puts something in front of the user with sloppod's `highlight {text}` tool instead of writing it as an ordinary reply ([ADR 4](adr/0004-asynchronous-interaction.md)): the answer to something they asked, something they have to do that isn't a decision, or a serious finding they didn't ask about. `text` is Markdown, a few lines, up to 2000 characters. The call returns at once. A highlight is kept (it survives a runtime restart and a reload) and stays open until the user marks it seen in the UI (`POST /sessions/{id}/highlights/{highlight}/seen`), however much the agent has done since; marking it seen starts no turn and tells the agent nothing. Any number can be open at once, and the session counts as waiting on the user ([#368](https://github.com/bo0tzz/sloppod/issues/368): `waiting.highlights`) while any is. A UI lists them with `GET /sessions/{id}/highlights`, hears of new ones and of those marked seen as `_sloppod/highlight`, and shows each as a card where the tool call is in the chat, and gathers the open ones in a "for you" list. The call's result, which the agent's own tool call carries in the transcript, reads `Highlighted (highlight <id>). …`: that id is what ties the card to the highlight, since the runtime's tool handler isn't given the agent's tool call id (a call whose result carries no id, from an agent that doesn't pass results on, is matched by its `rawInput.text` to the first highlight of that text not matched yet). Only a session the user talks to has the tool: sub-sessions ([ADR 27](adr/0027-sub-sessions.md)) and reviewers don't, and the prompt's section on when to use it goes only to the former.
+
 ## Session pods
 
 Every agent is told about its session in a prompt the runtime writes (`session_prompt` in `adapter.rs`): appended to Claude Code's system prompt, and in Codex's `AGENTS.md` after the owner's instructions. It has sections by what the session is for (`SessionRole`):
 - **Every session:** its environment (the checkout, the network boundary, mise), and what runtime messages are. A message from the runtime starts with `sloppod:`, as notices, answers, relayed messages and review rounds do. It reports what happened and isn't the user's approval of anything, except that `sloppod: the user answered your question: …` carries the user's own answer, which the agent acts on as their decision on what it asked.
 - **Work sessions and sub-sessions** (those that act) also get: their branches; proposals; working asynchronously ([ADR 4](adr/0004-asynchronous-interaction.md)); delegating (built-in subagents only for small things, where the agent has them, and sub-sessions for parallel work); and feedback on sloppod, where the agent mentions what got in its way.
 - **A sub-session** is also told its parent's id: that its chat replies only reach the user, that `message_session` reaches its parent, and that `report_done` hands its work back.
+- **A work session of its own** (not a sub-session) is also told when to use `highlight`: for the answer to what the user asked, something they have to do that isn't a decision, or a serious finding they didn't ask about; not for progress, plans or what a proposal or question already shows; read out of context, so it says what it answers, leads with the conclusion, stays short and links what it refers to.
 - **A review session** gets the environment and messages sections, with a read-only checkout, plus the reviewer's own instructions.
 
 Session pods use four more endpoints, on their own port (8081, `sessions`); that port is the only one they can reach, so they can't use the API above. Keep it off public routes.
@@ -517,6 +534,7 @@ Session pods use four more endpoints, on their own port (8081, `sessions`); that
   - `request_repository {repo, reason}` creates a `sloppod.repo.grant` proposal; a sub-session can't, as it works only where its parent can push, and is told to say in its report that it needs the repository. A refusal for a repository the session can't push to, and `list_grants`, point to this tool only where the session can use it.
   - `request_owner_identity {repo, reason}` creates a `sloppod.repo.act_as_owner` proposal, to act on a repository with one of the user's GitHub tokens ([ADR 29](adr/0029-grants-name-their-credential.md)); refused for a sub-session, when the user has no token, when none reaches the repository, or when the session already acts as the user there.
   - `get_proposal {id}` returns a proposal's status and result. The agent is also told when its proposals are decided.
+  - `highlight {text}` (see Highlights, above) puts text in the user's "for you" list and as a card in the chat; not for sub-sessions or reviewers.
   - `withdraw_proposal {id, reason?}` withdraws one of the session's pending proposals: it becomes `withdrawn` (with the reason) and nothing is carried out.
   - `spawn_session {task, title?, repo?, grants?, agent?, model?}` starts a sub-session ([ADR 27](adr/0027-sub-sessions.md)) with `task` as its first message, and answers in a sentence with its id, title and branch. It has the session's grants, or only the capabilities named in `grants` (model access always stays), and the session's owner, review policy and, unless given, agent. Its model is `model` if given, else the user's `sub_session_model` setting (above): by default the agent's cheaper model, Sonnet for Claude Code; the answer names it. It works in `repo`, one the session can push to (by default the session's), on `<session branch>-<first 8 of its id>`, which starts from the session branch as pushed (from the default branch if it isn't pushed yet). A tree of sessions has at most 5 sub-sessions running at once (the tool's description says the same, from the same constant). A repository the session acts on as the user, the child acts on as them only to read it and push its own branches (above). The answer warns of any repository grant whose identity can't reach it: the GitHub App not installed there, or a token that doesn't list it. Work sessions only.
   - `list_work {graph?, view?, item?}` reads a work graph the session holds a `work` grant of (ADR 30): its items (`graph`, the default), what's ready in order (`frontier`), or one item with its description and history (`item`). `update_work {graph?, action, …}`, from `track`, adds and edits items, moves them between open, active and done, adds and removes blocks, and links and unlinks issues, pull requests, sessions (this one by default) and proposals, applied at once and recorded as the session's, so the user sees and can undo them. Ranking, reparenting, dropping and reopening are `plan` changes: `propose_work_plan`, shown only at `plan`, makes a `sloppod.work.plan` proposal. A session without a `work` grant gets none of these. A sub-session's grant of its parent's graph is at most `track`. A session holding a `work` grant, or linked to items, is told the graphs and those items in its prompt, and that the frontier is one call away.

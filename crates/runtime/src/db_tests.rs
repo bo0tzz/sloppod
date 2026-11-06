@@ -2277,3 +2277,50 @@ async fn review_sessions_left_up_with_nothing_to_review_are_found_to_park(db: Pg
             .is_empty()
     );
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn highlights_stay_open_until_marked_seen(db: PgPool) {
+    let s = session(&db, "dev").await;
+    let other = session(&db, "dev").await;
+    assert_eq!(db::open_highlights(&db, s).await.unwrap(), 0);
+
+    let first = db::insert_highlight(&db, s, "It's done: https://example.com/pull/1")
+        .await
+        .unwrap();
+    let second = db::insert_highlight(&db, s, "Re-run the job")
+        .await
+        .unwrap();
+    db::insert_highlight(&db, other, "Another session's")
+        .await
+        .unwrap();
+    assert_eq!(db::open_highlights(&db, s).await.unwrap(), 2);
+    assert_eq!(db::open_highlights(&db, other).await.unwrap(), 1);
+
+    // Marked seen, it's no longer open but still listed, in order, with when.
+    let seen = db::mark_highlight_seen(&db, s, first.id)
+        .await
+        .unwrap()
+        .expect("the session's highlight");
+    assert!(seen.seen_at.is_some());
+    assert_eq!(db::open_highlights(&db, s).await.unwrap(), 1);
+    let listed = db::list_highlights(&db, s).await.unwrap();
+    assert_eq!(
+        listed.iter().map(|h| h.id).collect::<Vec<_>>(),
+        [first.id, second.id]
+    );
+    assert!(listed[0].seen_at.is_some() && listed[1].seen_at.is_none());
+
+    // Marking it again keeps when it was first seen; another session's highlight isn't this one's to mark.
+    let again = db::mark_highlight_seen(&db, s, first.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.seen_at, seen.seen_at);
+    assert!(
+        db::mark_highlight_seen(&db, other, second.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(db::open_highlights(&db, s).await.unwrap(), 1);
+}

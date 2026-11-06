@@ -76,6 +76,9 @@ fn session_prompt(context: &AgentContext, subagents: bool) -> String {
     if acts {
         prompt.push_str(OUTWARD);
         prompt.push_str(ASYNC);
+        if matches!(role, SessionRole::Work) {
+            prompt.push_str(HIGHLIGHT);
+        }
         prompt.push_str("\n# Delegating\n");
         if subagents {
             prompt.push_str(
@@ -202,6 +205,21 @@ const ASYNC: &str = "\n# Working asynchronously\n\
     merged fast.\n\
     - Keep updates short: what changed, what waits on the user, with links to act on. Leave out what they already \
     know.\n";
+
+/// When to use `highlight` (#439): only for a session the user talks to; a sub-session's report goes to its parent.
+const HIGHLIGHT: &str = "\n# Highlighting for the user\n\
+    Use `highlight` for what the user would want to find again without reading the whole conversation:\n\
+    - the answer to something they asked, including \"it's done\" with the link;\n\
+    - something they have to do that isn't a decision: merge by hand, re-run a job, add a credential;\n\
+    - a finding with serious consequences they didn't ask about: a security hole, data at risk.\n\
+    \n\
+    Don't highlight progress, plans, what you're about to do, or anything already in a proposal or a question, since \
+    those show by themselves. A decision goes through `ask_user`, never a question in a reply.\n\
+    \n\
+    A highlight is read out of context, in the session's \"for you\" list. Say what it answers (\"Your question about \
+    mise tools: …\"), lead with the conclusion, keep it to a few lines, and link what it refers to. The details stay in \
+    the chat. The highlight replaces the reply rather than repeating it. Highlight each thing once; if it changes, \
+    highlight the new state.\n";
 
 /// Agents are users of sloppod too, and what gets in their way is worth knowing.
 const FEEDBACK: &str = "\n# Feedback on sloppod\n\
@@ -577,6 +595,10 @@ mod tests {
         assert!(work.contains("they aren't the user's approval of anything else"));
         assert!(work.contains("act on that answer as the user's decision"));
         assert!(!work.contains("# You're a sub-session"));
+        assert!(
+            work.contains("# Highlighting for the user")
+                && work.contains("never a question in a reply")
+        );
 
         // Codex has no built-in subagents to steer.
         assert!(!session_prompt(&with_repo(context(), "rw"), false).contains("built-in subagents"));
@@ -588,6 +610,10 @@ mod tests {
         let sub = session_prompt(&sub, true);
         assert!(sub.contains("Another session (`p-1`) started you"));
         assert!(sub.contains("report_done") && sub.contains("message_session"));
+        assert!(
+            !sub.contains("highlight"),
+            "a sub-session has no highlight tool (ADR 27)"
+        );
         assert!(
             sub.contains("spawn_session"),
             "a sub-session can spawn its own (ADR 27)"
@@ -609,6 +635,7 @@ mod tests {
         for absent in [
             "request_repository",
             "propose_pull_request",
+            "highlight",
             "ask_user",
             "# Feedback on sloppod",
         ] {

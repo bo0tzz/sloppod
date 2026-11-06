@@ -12,7 +12,7 @@ import type {
   StopReason,
 } from './acp/types.ts';
 import { app, type Consumer } from './app-connection.svelte.ts';
-import { api, ApiError, newerProposal, newerSession, type Proposal, type Session } from './api.ts';
+import { api, ApiError, newerProposal, newerSession, type Highlight, type Proposal, type Session } from './api.ts';
 import { loadUnconfirmed, saveAnswer, saveUnconfirmed, type Outgoing } from './drafts.ts';
 import { sessions } from './sessions.svelte.ts';
 
@@ -86,6 +86,8 @@ export class SessionView {
   loadError = $state<string | null>(null);
   /** True once `proposals` is what the runtime listed, so counts taken from it can be trusted. */
   proposalsLoaded = $state(false);
+  /** What the agent highlighted for the user in this session, oldest first, the ones marked seen included (#439). */
+  highlights = $state<Highlight[]>([]);
   #loadFailures = 0;
   /** Refreshes started, and the latest one that succeeded: a failure of an older one than that isn't an error to show. */
   #refreshes = 0;
@@ -209,12 +211,14 @@ export class SessionView {
     clearTimeout(this.#loadRetry);
     const refresh = ++this.#refreshes;
     try {
-      const [session, proposals] = await Promise.all([
+      const [session, proposals, highlights] = await Promise.all([
         api.getSession(this.id),
         api.listProposals({ session: this.id }),
+        api.listHighlights(this.id),
       ]);
       this.setSession(session);
       for (const proposal of proposals) this.upsertProposal(proposal);
+      for (const highlight of highlights) this.upsertHighlight(highlight);
       this.proposalsLoaded = true;
       this.loadError = null;
       this.#loadFailures = 0;
@@ -291,6 +295,11 @@ export class SessionView {
       case '_sloppod/proposal': {
         const { proposal } = params as { proposal: Proposal };
         if (proposal.session_id === this.id) this.upsertProposal(proposal);
+        break;
+      }
+      case '_sloppod/highlight': {
+        const { highlight } = params as { highlight: Highlight };
+        if (highlight.session_id === this.id) this.upsertHighlight(highlight);
         break;
       }
       case '_sloppod/permission_resolved': {
@@ -377,6 +386,22 @@ export class SessionView {
   setSession(session: Session) {
     this.session = newerSession(this.session, session);
     sessions.upsert(session);
+  }
+
+  /** Adds a highlight or updates it; once seen, a copy that says it's open (a slow fetch's) doesn't reopen it. */
+  upsertHighlight(highlight: Highlight) {
+    const index = this.highlights.findIndex((existing) => existing.id === highlight.id);
+    if (index === -1) {
+      this.highlights.push(highlight);
+      this.highlights.sort((a, b) => a.created_at.localeCompare(b.created_at));
+    } else if (!this.highlights[index].seen_at) {
+      this.highlights[index] = highlight;
+    }
+  }
+
+  /** The user has seen a highlight. That's all: no turn starts and the agent isn't told. */
+  async markHighlightSeen(highlight: Highlight) {
+    this.upsertHighlight(await api.markHighlightSeen(this.id, highlight.id));
   }
 
   upsertProposal(proposal: Proposal) {

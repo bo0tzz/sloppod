@@ -1612,6 +1612,82 @@ pub async fn pending_proposals(db: &PgPool, session: Uuid) -> sqlx::Result<usize
     Ok(count as usize)
 }
 
+#[derive(sqlx::FromRow)]
+pub struct HighlightRow {
+    pub id: Uuid,
+    pub session_id: Uuid,
+    pub text: String,
+    pub created_at: DateTime<Utc>,
+    pub seen_at: Option<DateTime<Utc>>,
+}
+
+impl HighlightRow {
+    pub fn to_api(&self) -> sloppod_protocol::api::Highlight {
+        sloppod_protocol::api::Highlight {
+            id: self.id,
+            session_id: self.session_id,
+            text: self.text.clone(),
+            created_at: self.created_at.to_rfc3339(),
+            seen_at: self.seen_at.map(|at| at.to_rfc3339()),
+        }
+    }
+}
+
+const HIGHLIGHT_COLUMNS: &str = "id, session_id, text, created_at, seen_at";
+
+/// Keeps what the agent highlighted for the user (#439).
+pub async fn insert_highlight(
+    db: &PgPool,
+    session: Uuid,
+    text: &str,
+) -> sqlx::Result<HighlightRow> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "insert into highlights (id, session_id, text) values ($1, $2, $3) returning {HIGHLIGHT_COLUMNS}"
+    )))
+    .bind(Uuid::new_v4())
+    .bind(session)
+    .bind(text)
+    .fetch_one(db)
+    .await
+}
+
+/// A session's highlights, oldest first: the open ones and the ones marked seen.
+pub async fn list_highlights(db: &PgPool, session: Uuid) -> sqlx::Result<Vec<HighlightRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "select {HIGHLIGHT_COLUMNS} from highlights where session_id = $1 order by created_at, id"
+    )))
+    .bind(session)
+    .fetch_all(db)
+    .await
+}
+
+/// How many of the session's highlights the user hasn't marked seen.
+pub async fn open_highlights(db: &PgPool, session: Uuid) -> sqlx::Result<usize> {
+    let count: i64 = sqlx::query_scalar(
+        "select count(*) from highlights where session_id = $1 and seen_at is null",
+    )
+    .bind(session)
+    .fetch_one(db)
+    .await?;
+    Ok(count as usize)
+}
+
+/// Marks one of the session's highlights seen, if it's still open; the row either way, none if it isn't the session's.
+pub async fn mark_highlight_seen(
+    db: &PgPool,
+    session: Uuid,
+    id: Uuid,
+) -> sqlx::Result<Option<HighlightRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "update highlights set seen_at = coalesce(seen_at, now()) where id = $1 and session_id = $2 \
+         returning {HIGHLIGHT_COLUMNS}"
+    )))
+    .bind(id)
+    .bind(session)
+    .fetch_optional(db)
+    .await
+}
+
 /// A session's proposals that are still with their reviewer: in review, or waiting on the author's fixes.
 pub async fn proposals_in_review(db: &PgPool, session: Uuid) -> sqlx::Result<Vec<ProposalRow>> {
     sqlx::query_as(AssertSqlSafe(format!(

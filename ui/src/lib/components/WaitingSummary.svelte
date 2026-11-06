@@ -1,6 +1,6 @@
 <script lang="ts">
   import { Button, Icon } from '@immich/ui';
-  import { mdiChatQuestionOutline, mdiShieldAlertOutline, mdiSourcePull } from '@mdi/js';
+  import { mdiChatQuestionOutline, mdiShieldAlertOutline, mdiSourcePull, mdiStarFourPointsOutline } from '@mdi/js';
   import { claimsFocus } from '#lib/focus.ts';
 
   /** The waiting panel folded to one line (#374): what waits on the user, and a button that unfolds it. */
@@ -8,10 +8,15 @@
     kind,
     text,
     onUnfold,
-  }: { kind: 'question' | 'permission' | 'proposal'; text: string; onUnfold: () => void } = $props();
+  }: { kind: 'question' | 'permission' | 'proposal' | 'highlight'; text: string; onUnfold: () => void } = $props();
 
-  const icons = { question: mdiChatQuestionOutline, permission: mdiShieldAlertOutline, proposal: mdiSourcePull };
-  const actions = { question: 'Answer', permission: 'Review', proposal: 'Show' };
+  const icons = {
+    question: mdiChatQuestionOutline,
+    permission: mdiShieldAlertOutline,
+    proposal: mdiSourcePull,
+    highlight: mdiStarFourPointsOutline,
+  };
+  const actions = { question: 'Answer', permission: 'Review', proposal: 'Show', highlight: 'Show' };
 </script>
 
 {#snippet bar()}
