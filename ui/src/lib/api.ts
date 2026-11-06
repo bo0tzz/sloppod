@@ -23,6 +23,10 @@ export type Session = {
   agent_status?: string;
   /** Why the cluster can't place the session's pod, while it can't, e.g. "waiting for room (insufficient memory)". */
   unschedulable?: string;
+  /** How much of its workspace volume is used, as its supervisor last said; kept while it's parked. */
+  disk?: { used: number; size: number; seen_at: string };
+  /** Whether the user keeps a stopped session's volume, otherwise removed a week after it stopped. */
+  volume_kept?: boolean;
   /** Why the agent last failed to start or exited; it's started again meanwhile. */
   agent_error?: string;
   /** The session that spawned it, for a sub-session. */
@@ -430,6 +434,8 @@ export const api = {
   listDeletedSessions: () => call<Session[]>('GET', '/sessions/deleted'),
   restoreSession: (id: string) => call<Session>('POST', `/sessions/${encodeURIComponent(id)}/restore`, {}),
   parkSession: (id: string) => call<Session>('POST', `/sessions/${encodeURIComponent(id)}/park`, {}),
+  setVolumeKept: (id: string, kept: boolean) =>
+    call<Session>('PUT', `/sessions/${encodeURIComponent(id)}/volume`, { kept }),
   wakeSession: (id: string) => call<Session>('POST', `/sessions/${encodeURIComponent(id)}/wake`, {}),
   /** Write access to `repo`; with `credential`, one of the user's GitHub tokens, the session acts on it as them (ADR 29). */
   addSessionRepo: (id: string, repo: string, credential?: string) =>

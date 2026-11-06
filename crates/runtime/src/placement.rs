@@ -14,9 +14,21 @@ pub fn sandbox_name(session_id: &str) -> String {
     format!("sloppod-{session_id}")
 }
 
+/// The session's workspace volume claim, as agent-sandbox names it from the Sandbox's `workdir` claim template.
+fn claim_name(session_id: &str) -> String {
+    format!("workdir-{}", sandbox_name(session_id))
+}
+
+/// The session a claim is the workspace volume of, by its name.
+fn claim_session(name: &str) -> Option<&str> {
+    name.strip_prefix("workdir-sloppod-")
+        .filter(|rest| rest.parse::<uuid::Uuid>().is_ok())
+}
+
 pub struct AgentSandbox {
     api: Api<DynamicObject>,
     pods: Api<k8s_openapi::api::core::v1::Pod>,
+    claims: Api<k8s_openapi::api::core::v1::PersistentVolumeClaim>,
     service_account: String,
     pull_policy: String,
     /// What's known of session pods, e.g. whether one can't be scheduled.
@@ -35,7 +47,8 @@ impl AgentSandbox {
         let resource = ApiResource::from_gvk_with_plural(&gvk, "sandboxes");
         Self {
             api: Api::namespaced_with(client.clone(), namespace, &resource),
-            pods: Api::namespaced(client, namespace),
+            pods: Api::namespaced(client.clone(), namespace),
+            claims: Api::namespaced(client, namespace),
             service_account,
             pull_policy,
             index,
@@ -178,15 +191,58 @@ impl PlacementBackend for AgentSandbox {
     }
 
     async fn delete(&self, session_id: &str) -> Result<()> {
-        match self
-            .api
-            .delete(&sandbox_name(session_id), &DeleteParams::foreground())
-            .await
-        {
+        let gone = |result: kube::Result<_>| match result {
             Ok(_) => Ok(()),
             Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
             Err(e) => Err(err(e)),
-        }
+        };
+        // The Sandbox owns its pod and volume claim, so they go with it; the claim is deleted by name as well, for
+        // one left without its Sandbox (#455).
+        gone(
+            self.api
+                .delete(&sandbox_name(session_id), &DeleteParams::foreground())
+                .await
+                .map(|_| ()),
+        )?;
+        gone(
+            self.claims
+                .delete(&claim_name(session_id), &DeleteParams::default())
+                .await
+                .map(|_| ()),
+        )
+    }
+
+    async fn sessions(&self) -> Result<Vec<String>> {
+        let selector = kube::api::ListParams::default().labels(crate::pods::SESSION_LABEL);
+        let mut sessions: Vec<String> = self
+            .api
+            .list(&selector)
+            .await
+            .map_err(err)?
+            .items
+            .iter()
+            .filter_map(|sandbox| {
+                sandbox
+                    .metadata
+                    .labels
+                    .as_ref()?
+                    .get(crate::pods::SESSION_LABEL)
+                    .cloned()
+            })
+            .collect();
+        let claims = self
+            .claims
+            .list(&kube::api::ListParams::default())
+            .await
+            .map_err(err)?;
+        sessions.extend(
+            claims.items.iter().filter_map(|claim| {
+                claim_session(claim.metadata.name.as_deref()?).map(str::to_owned)
+            }),
+        );
+        sessions.sort();
+        sessions.dedup();
+        Ok(sessions)
     }
 
     fn unschedulable(&self) -> Vec<Unschedulable> {

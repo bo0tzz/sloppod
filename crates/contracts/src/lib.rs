@@ -460,6 +460,11 @@ pub trait PlacementBackend: Send + Sync {
     fn has_pod(&self, _session_id: &str) -> bool {
         false
     }
+    /// The sessions it holds objects for (pods, volumes), from the cluster, whether or not their sessions still exist:
+    /// what a sweep checks for leftovers (#455). None by default, for a backend that can't list them.
+    async fn sessions(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 }
 
 /// A session's pod the cluster can't place, as the placement backend sees it (#454).
@@ -493,6 +498,10 @@ pub trait Enforcer: Send + Sync {
     /// `apply` restores it.
     async fn release(&self, session_id: &str, pod_labels: &BTreeMap<String, String>) -> Result<()>;
     async fn remove(&self, session_id: &str) -> Result<()>;
+    /// The sessions it holds objects for (policies, listeners), as [`PlacementBackend::sessions`].
+    async fn sessions(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 }
 
 /// A file the supervisor writes before starting the agent.

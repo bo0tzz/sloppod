@@ -52,6 +52,12 @@ pub struct SessionRow {
     pub limited_until: Option<DateTime<Utc>>,
     /// The session image its agent was last asked to make room for (#416).
     pub image_nudged: Option<String>,
+    /// How much of its workspace volume is used, and its size, in bytes, as its supervisor last said, and when (#455).
+    pub disk_used: Option<i64>,
+    pub disk_size: Option<i64>,
+    pub disk_seen_at: Option<DateTime<Utc>>,
+    /// Whether the user keeps a stopped session's volume rather than have it removed a while after it stopped.
+    pub volume_kept: bool,
 }
 
 impl SessionRow {
@@ -80,6 +86,10 @@ impl SessionRow {
             parent_id: None,
             limited_until: None,
             image_nudged: None,
+            disk_used: None,
+            disk_size: None,
+            disk_seen_at: None,
+            volume_kept: false,
         }
     }
 
@@ -159,6 +169,15 @@ impl SessionRow {
             command_lines: Vec::new(),
             waiting: Default::default(),
             unschedulable: None,
+            disk: match (self.disk_used, self.disk_size, self.disk_seen_at) {
+                (Some(used), Some(size), Some(seen_at)) => Some(api::Disk {
+                    used: used.max(0) as u64,
+                    size: size.max(0) as u64,
+                    seen_at: seen_at.to_rfc3339(),
+                }),
+                _ => None,
+            },
+            volume_kept: self.volume_kept,
         }
     }
 
@@ -180,7 +199,7 @@ impl SessionRow {
     }
 }
 
-const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, repo, created_at, updated_at, active_at, deleted_at, agent_status, agent_error, parent_id, limited_until, image_nudged, \
+const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, repo, created_at, updated_at, active_at, deleted_at, agent_status, agent_error, parent_id, limited_until, image_nudged, disk_used, disk_size, disk_seen_at, volume_kept, \
      coalesce((select jsonb_agg(jsonb_build_object('id', g.id, 'capability', g.capability, 'params', g.params, \
      'created_at', g.created_at, 'expires_at', g.expires_at) order by g.created_at) \
      from session_grants g where g.session_id = sessions.id and (g.expires_at is null or g.expires_at > now())), \
@@ -542,6 +561,77 @@ pub async fn save_queue(db: &PgPool, id: Uuid, queue: &[Value]) -> sqlx::Result<
     .execute(db)
     .await
     .map(|_| ())
+}
+
+/// Keeps how much of the session's workspace volume is used, and its size, as its supervisor says (#455).
+pub async fn set_disk(db: &PgPool, id: Uuid, used: u64, size: u64) -> sqlx::Result<()> {
+    sqlx::query(
+        "update sessions set disk_used = $2, disk_size = $3, disk_seen_at = now() where id = $1",
+    )
+    .bind(id)
+    .bind(i64::try_from(used).unwrap_or(i64::MAX))
+    .bind(i64::try_from(size).unwrap_or(i64::MAX))
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
+/// Records whether the session's pod-side objects are removed (`true`) or it has been placed again (`false`).
+pub async fn set_released(db: &PgPool, id: Uuid, released: bool) -> sqlx::Result<()> {
+    sqlx::query(
+        "update sessions set released_at = case when $2 then coalesce(released_at, now()) end where id = $1",
+    )
+    .bind(id)
+    .bind(released)
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
+/// Sessions whose pod-side objects (egress policy, keys) are still there though they have no use for them: parked
+/// ones, which only need them back when they wake, and stopped ones, which never start again. Not deleted ones,
+/// which the purge removes, nor any purged.
+pub async fn unreleased(db: &PgPool) -> sqlx::Result<Vec<SessionRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "select {SESSION_COLUMNS} from sessions where phase in ('parked', 'stopped') and released_at is null \
+         and deleted_at is null and purged_at is null"
+    )))
+    .fetch_all(db)
+    .await
+}
+
+/// Claims stopped sessions, stopped longer than `age` ago, whose volumes the user doesn't keep, for removal: the
+/// purge of a deleted session, which leaves its transcript and proposals in the database.
+pub async fn claim_stopped_purges(
+    db: &PgPool,
+    age: chrono::Duration,
+) -> sqlx::Result<Vec<SessionRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "update sessions set purge_started_at = coalesce(purge_started_at, now()) \
+         where phase = 'stopped' and stopped_at < $1 and not volume_kept and deleted_at is null and purged_at is null \
+         returning {SESSION_COLUMNS}"
+    )))
+    .bind(Utc::now() - age)
+    .fetch_all(db)
+    .await
+}
+
+/// Keeps a stopped session's volume, or lets it go to be removed a week after the session stopped.
+pub async fn set_volume_kept(db: &PgPool, id: Uuid, kept: bool) -> sqlx::Result<()> {
+    sqlx::query("update sessions set volume_kept = $2 where id = $1")
+        .bind(id)
+        .bind(kept)
+        .execute(db)
+        .await
+        .map(|_| ())
+}
+
+/// Of `ids`, the sessions that exist and aren't purged: what may still have objects in the cluster.
+pub async fn sessions_with_objects(db: &PgPool, ids: &[Uuid]) -> sqlx::Result<Vec<Uuid>> {
+    sqlx::query_scalar("select id from sessions where id = any($1) and purged_at is null")
+        .bind(ids)
+        .fetch_all(db)
+        .await
 }
 
 /// Records that the session's agent was asked to make room for `image` (#416).

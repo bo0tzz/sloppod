@@ -2,7 +2,7 @@
   import { Icon, Text } from '@immich/ui';
   import { mdiSourceBranch, mdiTimerSandComplete } from '@mdi/js';
   import type { Session } from '#lib/api.ts';
-  import { absoluteTime, clockTime, timeAgo } from '#lib/format.ts';
+  import { absoluteTime, bytes, clockTime, timeAgo } from '#lib/format.ts';
   import PhaseBadge from './PhaseBadge.svelte';
 
   let {
@@ -105,6 +105,10 @@
         <time class="shrink-0" datetime={session.active_at} title={absoluteTime(session.active_at)}>
           {timeAgo(session.active_at, now)}
         </time>
+        {#if session.disk}
+          <span aria-hidden="true">·</span>
+          <span class="shrink-0" title="{bytes(session.disk.used)} of {bytes(session.disk.size)} of its volume used" data-testid="session-disk">{bytes(session.disk.used)}</span>
+        {/if}
         {#if session.parent_id && session.model}
           <span aria-hidden="true">·</span>
           <span class="truncate" title="Runs on {session.model}" data-testid="session-model">{session.model}</span>

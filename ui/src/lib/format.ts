@@ -40,3 +40,15 @@ export function countdown(iso: string, now = Date.now()): string {
   const rest = minutes % 60;
   return `in ${hours > 0 ? `${hours} h ` : ''}${hours > 0 && rest === 0 ? '' : `${rest} min`}`.trimEnd();
 }
+
+/** A size in bytes, in the largest unit that keeps it at one or more, e.g. "1.4 GB" (decimal units, as `df -H`). */
+export function bytes(n: number): string {
+  const sizes = ['B', 'kB', 'MB', 'GB', 'TB'];
+  let unit = 0;
+  let value = n;
+  while (value >= 1000 && unit < sizes.length - 1) {
+    value /= 1000;
+    unit++;
+  }
+  return `${unit === 0 || value >= 100 ? Math.round(value) : value.toFixed(1)} ${sizes[unit]}`;
+}

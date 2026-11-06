@@ -788,6 +788,15 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
                     .set_commands(session_id, &agent, running, lines)
                     .await;
             }
+            FromSupervisor::Disk { used, size } => {
+                // Kept with the session, so a parked one still shows its last known use (#455).
+                match db::set_disk(&state.db, session_id, used, size).await {
+                    Ok(()) => state.hub.broadcast_session(session_id).await,
+                    Err(e) => {
+                        tracing::warn!(session = %session_id, error = %e, "keeping a session's disk use")
+                    }
+                }
+            }
             FromSupervisor::RunResult { id, output, error } => {
                 agent.run_result(id, output, error);
             }

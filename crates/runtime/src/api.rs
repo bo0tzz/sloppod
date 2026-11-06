@@ -37,6 +37,7 @@ pub fn routes() -> Router<AppState> {
         .route("/sessions/{id}/park", post(park_session))
         .route("/sessions/{id}/wake", post(wake_session))
         .route("/sessions/{id}/review", put(set_review))
+        .route("/sessions/{id}/volume", put(set_volume))
         .route("/sessions/{id}/debug-bundle", get(debug_bundle))
         .route("/sessions/{id}/highlights", get(list_highlights))
         .route(
@@ -305,6 +306,29 @@ async fn set_review(
         .await?
         .ok_or_else(not_found)?;
     db::set_session_review(&state.db, id, review_policy(&body.review)?).await?;
+    state.hub.broadcast_session(id).await;
+    let session = db::get_session(&state.db, id)
+        .await?
+        .ok_or_else(not_found)?;
+    Ok(Json(state.hub.session_api(&session).await))
+}
+
+#[derive(Deserialize)]
+struct SetVolume {
+    kept: bool,
+}
+
+/// Keeps a stopped session's volume, or lets it be removed a week after the session stopped (#455).
+async fn set_volume(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetVolume>,
+) -> ApiResult<impl IntoResponse> {
+    db::owned_session(&state.db, id, &user)
+        .await?
+        .ok_or_else(not_found)?;
+    db::set_volume_kept(&state.db, id, body.kept).await?;
     state.hub.broadcast_session(id).await;
     let session = db::get_session(&state.db, id)
         .await?

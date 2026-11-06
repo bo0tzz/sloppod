@@ -62,3 +62,5 @@ Milestone 1, 2026-10-26: the session-scoped identity is the pod's projected Serv
 
 
 2026-11-06: the shutdown report of a session being parked no longer reaches its agent ([#454](https://github.com/bo0tzz/sloppod/issues/454)). Queued like any other notice, it woke the parked session at the next runtime start (ADR 4), undoing the park. Now, when the session is parked, the commands ended are recorded in its transcript as a notice the UI shows, and nothing is queued; a pod replaced for a new image or moved still tells the agent.
+
+2026-11-06: the supervisor reports how much of the workspace volume is used, and its size (`Disk`, from `df`, every 5 minutes), for the runtime to keep with the session and show (#455).

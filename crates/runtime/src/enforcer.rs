@@ -421,6 +421,43 @@ impl Enforcer for Cilium {
                 .await,
         )
     }
+
+    async fn sessions(&self) -> Result<Vec<String>> {
+        let labelled = kube::api::ListParams::default().labels("sloppod.dev/session");
+        let mut sessions: Vec<String> = self
+            .policies
+            .list(&labelled)
+            .await
+            .map_err(err)?
+            .items
+            .iter()
+            .filter_map(|policy| {
+                policy
+                    .metadata
+                    .labels
+                    .as_ref()?
+                    .get("sloppod.dev/session")
+                    .cloned()
+            })
+            .collect();
+        let configs = self
+            .envoy_configs
+            .list(&kube::api::ListParams::default())
+            .await
+            .map_err(err)?;
+        sessions.extend(configs.items.iter().filter_map(|config| {
+            listener_session(config.metadata.name.as_deref()?).map(str::to_owned)
+        }));
+        sessions.sort();
+        sessions.dedup();
+        Ok(sessions)
+    }
+}
+
+/// The session a CiliumEnvoyConfig is the listener of, by its name; not the shared one.
+fn listener_session(name: &str) -> Option<&str> {
+    name.strip_prefix("sloppod-egress-")
+        .filter(|rest| rest.parse::<uuid::Uuid>().is_ok())
 }
 
 #[cfg(test)]

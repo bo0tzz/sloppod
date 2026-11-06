@@ -219,9 +219,23 @@ pub mod api {
         /// is merely being placed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub unschedulable: Option<String>,
+        /// How much of the session's workspace volume is used, as its supervisor last said; kept while it's parked (#455).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub disk: Option<Disk>,
+        /// Whether the user keeps the volume of a stopped session, which is otherwise removed a week after it stopped.
+        #[serde(default)]
+        pub volume_kept: bool,
         /// What waits on the user in the session, so a list of sessions can say which need them (#368).
         #[serde(default)]
         pub waiting: Waiting,
+    }
+
+    /// A session's workspace volume: bytes used and its size, and when its supervisor said so.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct Disk {
+        pub used: u64,
+        pub size: u64,
+        pub seen_at: String,
     }
 
     /// What a session has open for the user to answer.
@@ -438,6 +452,9 @@ pub mod link {
     /// are running (`Commands`). A count is at most this old.
     pub const COMMANDS_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
 
+    /// How often the supervisor says how much of the workspace volume is used.
+    pub const DISK_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+
     /// Whether `name` can be a transcript file: a plain `.jsonl` file name, nothing that reaches outside the
     /// transcript directory. Checked when the runtime stores a file and again when a supervisor restores it.
     pub fn is_transcript_file_name(name: &str) -> bool {
@@ -605,6 +622,11 @@ pub mod link {
         },
         Error {
             message: String,
+        },
+        /// How much of the workspace volume is used, and its size, in bytes; sent every [`DISK_EVERY`] (#455).
+        Disk {
+            used: u64,
+            size: u64,
         },
         /// How many of the agent's commands are running, foreground or in the background; sent when it changes.
         Commands {

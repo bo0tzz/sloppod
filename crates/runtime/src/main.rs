@@ -37,6 +37,7 @@ mod session;
 #[cfg(test)]
 mod session_tests;
 mod starting;
+mod storage;
 mod store;
 mod subsessions;
 mod tls;
@@ -312,6 +313,7 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 every.tick().await;
                 lifecycle::sweep_expired_grants(&state).await;
+                storage::release_unused(&state).await;
                 reviews::sweep_kept_reviewers(&state).await;
             }
         });
@@ -323,6 +325,8 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 every.tick().await;
                 lifecycle::purge_deleted(&state).await;
+                storage::purge_stopped(&state).await;
+                storage::sweep_leftovers(&state).await;
             }
         });
     }

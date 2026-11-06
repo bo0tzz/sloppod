@@ -318,6 +318,7 @@ async fn run(
         Terminate,
     }
     let mut ping = tokio::time::interval(sloppod_protocol::link::COMMANDS_EVERY);
+    let mut disk = tokio::time::interval(sloppod_protocol::link::DISK_EVERY);
     // What the runtime was last told about the agent's commands; a new link starts out telling it.
     let mut commands_told = None;
     // Results of commands the runtime asked to run, sent back on this link.
@@ -414,6 +415,13 @@ async fn run(
                         break Event::LinkEnded;
                     }
                     commands_told = Some(lines);
+                }
+            }
+            _ = disk.tick() => {
+                if let Some((used, size)) = disk_use(&args.workdir).await
+                    && send(&mut sink, &FromSupervisor::Disk { used, size }).await.is_err()
+                {
+                    break Event::LinkEnded;
                 }
             }
             _ = &mut deadline => {
@@ -991,6 +999,26 @@ async fn run_cmd(
     Ok(())
 }
 
+/// How much of the volume `path` is on is used, and its size, in bytes, as `df` says.
+async fn disk_use(path: &std::path::Path) -> Option<(u64, u64)> {
+    let output = tokio::process::Command::new("df")
+        .args(["-B1", "--output=used,size"])
+        .arg(path)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_df(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// `df -B1 --output=used,size`'s numbers: a header line, then used and size.
+fn parse_df(output: &str) -> Option<(u64, u64)> {
+    let mut numbers = output.lines().nth(1)?.split_whitespace();
+    Some((numbers.next()?.parse().ok()?, numbers.next()?.parse().ok()?))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1185,5 +1213,15 @@ mod run_tests {
             .await
             .unwrap_err();
         assert!(slow.contains("longer than"), "{slow}");
+    }
+}
+
+#[cfg(test)]
+mod disk_tests {
+    #[test]
+    fn reads_dfs_used_and_size() {
+        let output = "      Used  1B-blocks\n 734003200 21003583488\n";
+        assert_eq!(super::parse_df(output), Some((734_003_200, 21_003_583_488)));
+        assert_eq!(super::parse_df("Used 1B-blocks\n"), None);
     }
 }
