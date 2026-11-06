@@ -20,6 +20,8 @@ export type MessagePart =
 export type MessageItem = {
   type: 'user' | 'agent' | 'thought';
   key: string;
+  /** The place in the session's log of the last event that touched this item, 0 where the runtime didn't say. */
+  seq: number;
   messageId: string | null;
   /** A user message delivered into a running turn (the runtime marks the echo with `_meta.sloppod.steering`). */
   steering: boolean;
@@ -33,6 +35,8 @@ export type MessageItem = {
 export type ToolItem = {
   type: 'tool';
   key: string;
+  /** The place in the session's log of the last event that touched this item, 0 where the runtime didn't say. */
+  seq: number;
   toolCallId: string;
   title: string;
   kind: ToolKind;
@@ -46,11 +50,13 @@ export type ToolItem = {
   terminals: Record<string, string>;
 };
 
-export type PlanItem = { type: 'plan'; key: string; entries: PlanEntry[] };
+export type PlanItem = { type: 'plan'; key: string; seq: number; entries: PlanEntry[] };
 
 export type CompactionItem = {
   type: 'compaction';
   key: string;
+  /** The place in the session's log of the last event that touched this item, 0 where the runtime didn't say. */
+  seq: number;
   compactionId: string;
   status: string;
   summary: string;
@@ -60,6 +66,8 @@ export type CompactionItem = {
 export type NoticeItem = {
   type: 'notice';
   key: string;
+  /** The place in the session's log of the last event that touched this item, 0 where the runtime didn't say. */
+  seq: number;
   severity: string;
   title: string;
   description?: string | null;
@@ -118,7 +126,11 @@ export class Transcript {
   #compactions = new Map<string, CompactionItem>();
   #plan: PlanItem | null = null;
 
-  apply(update: SessionUpdate) {
+  #at = 0;
+
+  /** `seq` is the update's place in the session's log (`_meta.sloppod.seq` on the notification). */
+  apply(update: SessionUpdate, seq = 0) {
+    this.#at = seq;
     switch (update.sessionUpdate) {
       case 'user_message_chunk':
       case 'agent_message_chunk':
@@ -147,7 +159,7 @@ export class Transcript {
         });
         break;
       case 'notice':
-        this.#push({
+        this.#push<NoticeItem>({
           type: 'notice',
           key: this.#key(),
           severity: update.severity,
@@ -163,8 +175,8 @@ export class Transcript {
     return `i${this.#seq++}`;
   }
 
-  #push<T extends TranscriptItem>(item: T): T {
-    this.items.push(item);
+  #push<T extends TranscriptItem>(item: Omit<T, 'seq'>): T {
+    this.items.push({ ...item, seq: this.#at } as T);
     // Return the reactive proxy so later mutations are tracked.
     return this.items[this.items.length - 1] as T;
   }
@@ -183,6 +195,7 @@ export class Transcript {
       } else {
         last.parts.push(part);
       }
+      last.seq = this.#at;
       return;
     }
 
@@ -190,7 +203,7 @@ export class Transcript {
       this.#plan = null;
     }
     const sloppodMeta = chunk._meta?.sloppod as { steering?: boolean; notice?: boolean; summary?: string } | undefined;
-    this.#push({
+    this.#push<MessageItem>({
       type,
       key: this.#key(),
       messageId,
@@ -230,6 +243,7 @@ export class Transcript {
       this.#toolCall({ ...update, title: update.title ?? 'Tool call' } as ToolCall);
       return;
     }
+    item.seq = this.#at;
     if (update.title) item.title = update.title;
     if (update.kind) item.kind = update.kind;
     if (update.status) item.status = update.status;
@@ -253,6 +267,7 @@ export class Transcript {
   #planUpdate(entries: PlanEntry[]) {
     if (this.#plan) {
       this.#plan.entries = entries;
+      this.#plan.seq = this.#at;
     } else {
       this.#plan = this.#push<PlanItem>({ type: 'plan', key: this.#key(), entries });
     }
@@ -270,6 +285,7 @@ export class Transcript {
       });
       this.#compactions.set(compactionId, item);
     }
+    item.seq = this.#at;
     mutate(item);
   }
 

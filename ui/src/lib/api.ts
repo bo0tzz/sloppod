@@ -33,6 +33,8 @@ export type Session = {
   command_lines?: string[];
   /** What waits on the user in the session (#368). */
   waiting?: Waiting;
+  /** The seq of the last event the user has scrolled past in this session (#48); follows them between devices. */
+  read_seq?: number;
 };
 
 /** What a session has open for the user to answer. */
@@ -486,6 +488,8 @@ export const api = {
   createCredential: (body: NewCredential) => call<Credential>('POST', '/credentials', body),
   makeDefaultCredential: (id: string) => call<Credential>('POST', `/credentials/${encodeURIComponent(id)}/default`, {}),
   deleteCredential: (id: string) => call<void>('DELETE', `/credentials/${encodeURIComponent(id)}`),
+  setRead: (session: string, seq: number) =>
+    call<{ seq: number }>('PUT', `/sessions/${encodeURIComponent(session)}/read`, { seq }),
   listHighlights: (session: string) => call<Highlight[]>('GET', `/sessions/${encodeURIComponent(session)}/highlights`),
   markHighlightSeen: (session: string, highlight: string) =>
     call<Highlight>('POST', `/sessions/${encodeURIComponent(session)}/highlights/${encodeURIComponent(highlight)}/seen`, {}),

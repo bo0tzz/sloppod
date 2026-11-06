@@ -1117,6 +1117,108 @@ test('follows new output while the reader is at the bottom, across a reconnect',
   await expect(page.getByText('Still held.')).not.toBeInViewport();
 });
 
+/** Waits for the runtime to have the session's read position beyond `seq`, as the UI reports it a moment after reading. */
+async function readPosition(page: Page, id: string, above = 0) {
+  let seq = 0;
+  await expect
+    .poll(async () => {
+      const session = await (await page.request.get(`/api/v1/sessions/${id}`)).json();
+      seq = session.read_seq ?? 0;
+      return seq;
+    })
+    .toBeGreaterThan(above);
+  return seq;
+}
+
+const LONG_SAY = Array.from({ length: 12 }, (_, line) => `line ${line}`).join('%0A%0A');
+
+test('marks where the reader left off, and opens there, on this device or another', async ({ page, context }) => {
+  await page.setViewportSize({ width: 1000, height: 500 });
+  const id = await createSession(page, 'Give me a long answer in sloppod');
+  await expect(page.getByText('The end.')).toBeInViewport({ timeout: 20_000 });
+  const divider = page.getByTestId('unread-divider');
+  // Everything is read at the bottom: no bar, and the position is kept.
+  await expect(divider).toHaveCount(0);
+  const read = await readPosition(page, id);
+
+  // Scrolled up, new output arrives under the bar.
+  await page.getByText('The end.').hover();
+  await page.mouse.wheel(0, -2000);
+  await expect(page.getByText('The end.')).not.toBeInViewport();
+  await page.request.post(`/_mock/say?text=Unread%20first.%0A%0A${LONG_SAY}`);
+  await page.request.post(`/_mock/say?text=Unread%20last.%0A%0A${LONG_SAY}`);
+  await expect(page.getByText('Unread last.')).toBeAttached();
+  await expect(divider).toHaveCount(1);
+  const dividerTop = (await divider.boundingBox())!.y;
+  const firstTop = (await page.getByText('Unread first.').boundingBox())!.y;
+  expect(dividerTop).toBeLessThan(firstTop);
+  // Nothing past what was read has been reported.
+  expect(await readPosition(page, id)).toBe(read);
+
+  // A reload starts at the bar, with what comes before it in view too, not at the bottom.
+  await page.reload();
+  await expect(divider).toBeInViewport();
+  await expect(page.getByText('Unread first.')).toBeInViewport();
+  await expect(page.getByText('Unread last.')).not.toBeInViewport();
+  await expect(page.getByText('The end.')).toBeInViewport();
+
+  // So does another device: the position is the user's, not the browser's.
+  const phone = await context.newPage();
+  await phone.setViewportSize({ width: 500, height: 500 });
+  await phone.goto(page.url());
+  await expect(phone.getByTestId('unread-divider')).toBeInViewport();
+  await expect(phone.getByText('Unread last.')).not.toBeInViewport();
+
+  // Reading to the end takes the bar away, and moves the position on for both.
+  await page.getByText('Unread first.').hover();
+  await page.mouse.wheel(0, 5000);
+  await expect(divider).toHaveCount(0);
+  const moved = await readPosition(page, id, read);
+  await phone.reload();
+  await expect(phone.getByText('line 11', { exact: true }).last()).toBeInViewport();
+  await expect(phone.getByTestId('unread-divider')).toHaveCount(0);
+  expect(await readPosition(phone, id)).toBe(moved);
+  await phone.close();
+});
+
+test('sending a message scrolls the chat to it, and so does scrolling the session list past its end', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 500 });
+  await createSession(page, 'Give me a long answer in sloppod');
+  const end = page.getByText('The end.');
+  await expect(end).toBeInViewport({ timeout: 20_000 });
+  const scroller = page.getByTestId('transcript-scroller');
+  const scrollTop = () => scroller.evaluate((element) => element.scrollTop);
+
+  // Once the list has nowhere left to scroll (it may have a lot of sessions in it), the wheel goes on to the chat, either way.
+  await end.hover();
+  await page.mouse.wheel(0, -2000);
+  await expect(end).not.toBeInViewport();
+  const up = await scrollTop();
+  await page.getByTestId('sidebar').hover();
+  await expect
+    .poll(async () => {
+      await page.mouse.wheel(0, 300);
+      return scrollTop();
+    })
+    .toBeGreaterThan(up);
+  const down = await scrollTop();
+  await expect
+    .poll(async () => {
+      await page.mouse.wheel(0, -200);
+      return scrollTop();
+    })
+    .toBeLessThan(down);
+
+  // A message sent from up there is scrolled to.
+  await page.request.post('/_mock/say?text=Unseen.');
+  await expect(page.getByText('Unseen.')).toBeAttached();
+  await expect(page.getByText('Unseen.')).not.toBeInViewport();
+  const message = 'Where did that go?';
+  await page.getByRole('textbox', { name: 'Prompt' }).fill(message);
+  await page.getByRole('button', { name: 'Send' }).click();
+  await expect(userMessages(page).filter({ hasText: message })).toBeInViewport();
+});
+
 test('says what the pod is doing while the agent starts, and why a start failed', async ({ page }) => {
   await createSession(page, 'failing start: fix the build in bo0tzz/sloppod');
   const activity = page.getByTestId('activity');

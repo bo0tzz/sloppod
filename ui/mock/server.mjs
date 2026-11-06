@@ -90,7 +90,8 @@ class MockSession {
   }
 
   emit(update) {
-    const params = { sessionId: this.data.id, update };
+    // Like the runtime, an update says where it falls in the log, from 1: what a read position counts in.
+    const params = { sessionId: this.data.id, update, _meta: { sloppod: { seq: this.log.length + 1 } } };
     this.log.push(params);
     this.data.active_at = now();
     for (const conn of this.subscribers) conn.notify('session/update', params);
@@ -1937,6 +1938,16 @@ async function handleApi(req, res, url) {
     if (parts.length === 2 && method === 'GET') {
       if (Date.now() < slowSessionsUntil) await sleep(slowSessionsUntil - Date.now());
       return json(res, 200, session.data);
+    }
+    if (parts.length === 3 && parts[2] === 'read' && method === 'PUT') {
+      const body = await readBody(req);
+      if (!Number.isInteger(body.seq) || body.seq < 0) return json(res, 400, { error: 'seq must not be negative' });
+      // Forward only, and pushed to every connection of the user's when it moves.
+      if (body.seq > (session.data.read_seq ?? 0)) {
+        session.data.read_seq = body.seq;
+        session.push();
+      }
+      return json(res, 200, { seq: session.data.read_seq });
     }
     if (parts.length === 3 && parts[2] === 'review' && method === 'PUT') {
       const body = await readBody(req);
