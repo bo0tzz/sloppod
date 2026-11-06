@@ -1102,6 +1102,8 @@ test('follows new output while the reader is at the bottom, across a reconnect',
 
   // So does dragging the scrollbar, however long the drag is held before it moves.
   await scroller.evaluate((element) => element.scrollTo({ top: element.scrollHeight }));
+  // The view has noticed it's at the bottom before more output arrives.
+  await expect(page.getByRole('button', { name: 'Scroll to the latest message' })).toBeHidden();
   await page.request.post('/_mock/say?text=Back%20at%20the%20bottom.');
   await expect(page.getByText('Back at the bottom.')).toBeInViewport();
   // A scrollbar drag scrolls with the pointer held and no wheel, touch or key.
