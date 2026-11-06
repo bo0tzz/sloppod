@@ -2270,14 +2270,14 @@ function approve(proposal, body, decidedBy) {
     ack = 'Great, the stack is open.';
   } else if (proposal.kind === 'github.issue.update') {
     if (Array.isArray(body.updates)) proposal.payload.updates = body.updates;
-    const updated = proposal.payload.updates.map((u) => ({ number: u.number, did: didOf(u) }));
+    const updated = proposal.payload.updates.map((u, index) => ({ number: u.number, did: didOf(u), index }));
     proposal.status = 'executed';
     proposal.result = { updated, failed: [], message: `Updated ${updated.map((u) => `#${u.number}`).join(', ')}.` };
     notice = `Your issue updates were approved and made: ${proposal.result.message}`;
     ack = 'Thanks, the tracker is tidy.';
   } else if (proposal.kind === 'github.pr.update') {
     if (Array.isArray(body.updates)) proposal.payload.updates = body.updates;
-    const updated = proposal.payload.updates.map((u) => ({ number: u.number, did: didOf(u) }));
+    const updated = proposal.payload.updates.map((u, index) => ({ number: u.number, did: didOf(u), index }));
     proposal.status = 'executed';
     proposal.result = { updated, failed: [], message: `Updated ${updated.map((u) => `#${u.number}`).join(', ')}.` };
     notice = `Your pull request updates were approved and made: ${proposal.result.message}`;

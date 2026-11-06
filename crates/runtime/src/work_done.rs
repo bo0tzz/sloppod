@@ -82,11 +82,16 @@ pub fn work_done(proposals: &[ProposalRow], watches: &[(String, i64, Value)]) ->
                     let Some(number) = done["number"].as_u64() else {
                         continue;
                     };
-                    let title = updates
-                        .into_iter()
-                        .flatten()
-                        .find(|u| u["number"].as_u64() == Some(number))
-                        .and_then(|u| u["title"].as_str());
+                    // The update that was made, by its place in the payload; a result from before it said so is
+                    // matched by number.
+                    let made = match done["index"].as_u64() {
+                        Some(index) => updates.and_then(|u| u.get(index as usize)),
+                        None => updates
+                            .into_iter()
+                            .flatten()
+                            .find(|u| u["number"].as_u64() == Some(number)),
+                    };
+                    let title = made.and_then(|u| u["title"].as_str());
                     note(
                         number,
                         kind == "github.pr.update",
@@ -259,6 +264,30 @@ mod tests {
             ("open", Some("failure"), ["check".to_owned()].as_slice())
         );
         assert!(done[0].state.is_none() && done[2].state.is_none());
+    }
+
+    #[test]
+    fn the_title_is_the_one_an_update_that_went_through_gave() {
+        let payload = json!({"repo": "o/r", "updates": [
+            {"number": 9, "title": "First"},
+            {"number": 9, "comment": "Done"},
+            {"number": 9, "title": "Last"},
+            {"number": 4, "title": "Never applied"},
+            {"number": 4, "comment": "Applied"},
+        ]});
+        // The first retitle of #4 failed, so only its comment is in the result.
+        let result = json!({"updated": [
+            {"number": 9, "did": "retitled", "index": 0},
+            {"number": 9, "did": "commented", "index": 1},
+            {"number": 9, "did": "retitled", "index": 2},
+            {"number": 4, "did": "commented", "index": 4},
+        ], "failed": [{"number": 4, "error": "no"}]});
+        let done = work_done(&[proposal("github.issue.update", 1, payload, result)], &[]);
+        let titles: Vec<_> = done
+            .iter()
+            .map(|w| (w.number, w.title.as_deref()))
+            .collect();
+        assert_eq!(titles, [(4, None), (9, Some("Last"))]);
     }
 
     #[test]

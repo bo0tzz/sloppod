@@ -233,17 +233,20 @@ export class SessionView {
     clearTimeout(this.#loadRetry);
     const refresh = ++this.#refreshes;
     try {
-      const [session, proposals, highlights, work] = await Promise.all([
+      const [session, proposals, highlights] = await Promise.all([
         api.getSession(this.id),
         api.listProposals({ session: this.id }),
         api.listHighlights(this.id),
-        // A log beside the chat: not worth failing the load for.
-        api.listWorkDone(this.id).catch(() => null),
       ]);
       this.setSession(session);
+      // The work done is fetched once below, not for each proposal that turns out to be executed.
+      this.#listing = true;
       for (const proposal of proposals) this.upsertProposal(proposal);
+      this.#listing = false;
       for (const highlight of highlights) this.upsertHighlight(highlight);
-      if (work) this.workDone = work;
+      // After the proposals, so what it lists is at least as new as they are. A log beside the chat: not worth failing
+      // the load for.
+      await this.#fetchWorkDone().catch(() => {});
       this.proposalsLoaded = true;
       this.loadError = null;
       this.#loadFailures = 0;
@@ -464,16 +467,20 @@ export class SessionView {
       this.proposals[index] = newerProposal(this.proposals[index], proposal);
     }
     // Carried out: the item it acted on belongs in the work done.
-    if (proposal.status === 'executed' && before !== 'executed' && this.proposalsLoaded) void this.#refreshWorkDone();
+    if (proposal.status === 'executed' && before !== 'executed' && !this.#listing) this.#fetchWorkDone().catch(() => {});
   }
 
-  async #refreshWorkDone() {
-    try {
-      const work = await api.listWorkDone(this.id);
-      if (!this.#stopped) this.workDone = work;
-    } catch {
-      // The next refresh gets it.
-    }
+  #listing = false;
+  #workRequests = 0;
+  #workApplied = 0;
+
+  /** Fetches the work done. Answers can come back in any order, so one is only kept if no later request has been kept. */
+  async #fetchWorkDone() {
+    const request = ++this.#workRequests;
+    const work = await api.listWorkDone(this.id);
+    if (this.#stopped || request < this.#workApplied) return;
+    this.#workApplied = request;
+    this.workDone = work;
   }
 
   /**
