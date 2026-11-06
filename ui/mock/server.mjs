@@ -754,6 +754,24 @@ async function agentScript(session, turn, prompt) {
   // The agent highlights something for the user, one call for each of the texts after `Highlight:`, split by |.
   // With `Highlight (codex):` the calls are reported as codex-acp does: its own title, the input wrapped with the server and
   // tool, and the result as `rawOutput` rather than content.
+  // A turn whose tool calls have thoughts between them, as agents interleave them (#446): `Think between tools`.
+  if (/^think between tools/i.test(prompt)) {
+    const read = async (name) => {
+      const id = randomUUID();
+      tool({ toolCallId: id, title: `Read ${name}`, kind: 'read', status: 'pending', rawInput: { file_path: name } });
+      await step(1);
+      update(id, { status: 'completed' });
+    };
+    await say('First, a look at the layout.', 'agent_thought_chunk');
+    await read('src/one.ts');
+    await say('That points at two.', 'agent_thought_chunk');
+    await read('src/two.ts');
+    await say('And then three.', 'agent_thought_chunk');
+    await read('src/three.ts');
+    await say('That is enough to answer.', 'agent_thought_chunk');
+    await say('Here is the answer.');
+    return;
+  }
   // A turn with several tool calls in a row between two messages (#446): `Use several tools`. With `and a highlight` a
   // highlight and a failed call come among them; with `slowly` the last call runs a while before it completes.
   if (/^use several tools/i.test(prompt)) {

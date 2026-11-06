@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { ToolItem, TranscriptItem } from '#lib/acp/transcript.svelte.ts';
+  import type { MessageItem, ToolItem, TranscriptItem } from '#lib/acp/transcript.svelte.ts';
   import type { Highlight } from '#lib/api.ts';
   import { matchHighlights } from '#lib/highlights.ts';
   import CompactionView from './CompactionView.svelte';
@@ -44,20 +44,32 @@
     /(^|__|\.)(highlight|retract_highlight)$/.test(item.title);
 
   /**
-   * What's drawn: each item as it is, except that a run of two or more consecutive tool calls with nothing in them the
-   * user needs folds into one block, which keeps the place of its first call (#446).
+   * What's drawn: each item as it is, except that a run with two or more tool calls folds into one block (#446). A run is
+   * tool calls with nothing in them the user needs, and the thoughts between them, which agents interleave with their
+   * calls; the fold goes from its first call to its last, so a thought before or after it, such as the live one at the
+   * end of a running turn, stays out in the open. It keeps the place of its first call.
    */
-  type Row = { item: TranscriptItem; index: number } | { fold: ToolItem[]; key: string; index: number };
+  type Folded = ToolItem | MessageItem;
+  type Row = { item: TranscriptItem; index: number } | { fold: Folded[]; key: string; index: number };
   const rows = $derived.by((): Row[] => {
     const rows: Row[] = [];
-    let run: { item: ToolItem; index: number }[] = [];
+    let run: { item: Folded; index: number }[] = [];
     const flush = () => {
-      if (run.length >= 2) rows.push({ fold: run.map((r) => r.item), key: `fold-${run[0].item.key}`, index: run[0].index });
-      else rows.push(...run);
+      const calls = run.flatMap((entry, at) => (entry.item.type === 'tool' ? [at] : []));
+      if (calls.length >= 2) {
+        const first = calls[0];
+        const last = calls[calls.length - 1];
+        rows.push(...run.slice(0, first));
+        const folded = run.slice(first, last + 1);
+        rows.push({ fold: folded.map((entry) => entry.item), key: `fold-${folded[0].item.key}`, index: folded[0].index });
+        rows.push(...run.slice(last + 1));
+      } else {
+        rows.push(...run);
+      }
       run = [];
     };
     items.forEach((item, index) => {
-      if (item.type === 'tool' && !needsUser(item)) {
+      if ((item.type === 'tool' && !needsUser(item)) || item.type === 'thought') {
         run.push({ item, index });
       } else {
         flush();
@@ -94,7 +106,7 @@
     <!-- Off-screen rows aren't laid out or painted until they come near (a long transcript stays smooth). -->
     <div class="[contain-intrinsic-size:auto_4rem] [content-visibility:auto]">
       {#if 'fold' in row}
-        <ToolFold calls={row.fold} />
+        <ToolFold items={row.fold} />
       {:else}
         {@const item = row.item}
         {@const index = row.index}

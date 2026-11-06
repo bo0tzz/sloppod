@@ -144,6 +144,26 @@ test('consecutive tool calls fold into one block between two messages, and expan
   await expect(page.getByTestId('tool-call')).toHaveCount(0);
 });
 
+test('the thoughts between tool calls fold with them, the ones before and after stay out', async ({ page }) => {
+  await createSession(page, 'Think between tools');
+  await expect(agentMessages(page).filter({ hasText: 'Here is the answer.' })).toBeVisible();
+  const fold = page.getByTestId('tool-fold');
+  await expect(fold).toHaveCount(1);
+  // Three calls, however many thoughts come between them.
+  await expect(fold.getByTestId('tool-fold-count')).toHaveText('3 tool calls');
+  // A thought before the first call and one after the last stay in the open.
+  const order = await page
+    .getByTestId('transcript')
+    .locator('[data-testid="thought"], [data-testid="tool-fold"], [data-testid="message-agent"]')
+    .evaluateAll((nodes) => nodes.map((node) => node.getAttribute('data-testid')));
+  expect(order).toEqual(['thought', 'tool-fold', 'thought', 'message-agent']);
+
+  // Opened, the fold holds the three calls and the two thoughts between them.
+  await fold.locator(':scope > summary').click();
+  await expect(page.getByTestId('tool-call')).toHaveCount(3);
+  await expect(page.getByTestId('thought')).toHaveCount(4);
+});
+
 test('a highlight and a failed call among tool calls stay outside the folds', async ({ page }) => {
   await createSession(page, 'Use several tools in a row, and a highlight');
   await expect(agentMessages(page).filter({ hasText: 'That is all of it.' })).toBeVisible();
