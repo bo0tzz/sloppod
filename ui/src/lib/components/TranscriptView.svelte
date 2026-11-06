@@ -83,10 +83,12 @@
     return rows;
   });
 
-  /** Items with no place in the log (older history, or where the runtime didn't say) count as read. */
-  const rowSeq = (row: Row) => ('fold' in row ? Math.max(...row.fold.map((item) => item.seq)) : row.item.seq);
+  const rowItems = (row: Row) => ('fold' in row ? row.fold : [row.item]);
+  /** The last event that touched the row, and the first one: the bar goes above the first row made after the read position. */
+  const rowSeq = (row: Row) => Math.max(...rowItems(row).map((item) => item.seq));
+  const rowFirstSeq = (row: Row) => Math.min(...rowItems(row).map((item) => item.firstSeq));
   const firstUnread = $derived(
-    unreadAfter === null ? -1 : rows.findIndex((row) => rowSeq(row) > unreadAfter),
+    unreadAfter === null ? -1 : rows.findIndex((row) => rowFirstSeq(row) > unreadAfter),
   );
 
   // The turn each item is part of, as the debug bundle's query names it: the message that started it, steered
@@ -120,7 +122,7 @@
       </div>
     {/if}
     <!-- Off-screen rows aren't laid out or painted until they come near (a long transcript stays smooth). -->
-    <div class="[contain-intrinsic-size:auto_4rem] [content-visibility:auto]" data-seq={rowSeq(row)}>
+    <div class="[contain-intrinsic-size:auto_4rem] [content-visibility:auto]" data-seq={rowSeq(row)} data-first-seq={rowFirstSeq(row)}>
       {#if 'fold' in row}
         <ToolFold items={row.fold} />
       {:else}

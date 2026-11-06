@@ -65,6 +65,7 @@ const promptBlocks = ({ text, images = [] }: Outgoing): ContentBlock[] => [
 type LoggedUpdate = { update: SessionUpdate; seq: number };
 
 const READ_THROTTLE_MS = 1000;
+const READ_RETRY_MS = 3000;
 
 const closing = new Map<string, Promise<unknown>>();
 
@@ -409,10 +410,13 @@ export class SessionView {
     this.#readTimer = undefined;
     if (this.#read <= this.#readSent) return;
     const seq = this.#read;
+    const before = this.#readSent;
     this.#readSent = seq;
-    // Best effort: the next scroll reports again, and a failure costs only a divider in the wrong place.
-    api.setRead(this.id, seq).catch(() => {
-      if (this.#readSent === seq) this.#readSent = 0;
+    // A failure costs only a bar in the wrong place on another device, so it's tried again later, not shown.
+    api.setRead(this.id, seq).catch((error) => {
+      if (this.#readSent === seq) this.#readSent = before;
+      if (this.#stopped || (error instanceof ApiError && error.status < 500)) return;
+      this.#readTimer ??= setTimeout(() => this.#sendRead(), READ_RETRY_MS);
     });
   }
 

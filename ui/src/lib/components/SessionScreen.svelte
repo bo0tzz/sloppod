@@ -184,12 +184,16 @@
   onMount(() => {
     loadAutoApprovals().catch(() => {});
     view.start();
-    return () => view.stop();
+    return () => {
+      clearTimeout(readTimer);
+      reportRead();
+      view.stop();
+    };
   });
 
   function onScroll() {
     if (!scroller || !positioned) return;
-    reportRead();
+    scheduleRead();
     if (holdBar) return;
     if (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80) {
       atBottom = true;
@@ -228,6 +232,12 @@
     scroller?.scrollTo({ top: scroller.scrollHeight, behavior });
   }
 
+  function jumpToLatest() {
+    holdBar = false;
+    atBottom = true;
+    scrollToBottom('smooth');
+  }
+
   /** What the reader has scrolled past, and where the "Unread" bar goes (#48). */
   const CONTEXT_ABOVE_UNREAD = 96;
   /** Set once the view has started where it's going to, at the bar or the bottom: until then nothing counts as read. */
@@ -243,17 +253,42 @@
 
   const rowElements = () => (content ? [...content.querySelectorAll<HTMLElement>('[data-seq]')] : []);
 
-  /** Reports the seq of the last item fully above the bottom of the view as read. */
+  /**
+   * Reports what's been scrolled past as read: the last event of the rows fully above the bottom of the view, but never
+   * beyond the first event of the row below them. An update to a row that is already read (a plan, a tool call) comes
+   * later in the log than rows after it that haven't been seen.
+   */
   function reportRead() {
     if (!positioned || !scroller) return;
     const bottom = scroller.getBoundingClientRect().bottom + 1;
     let seq = 0;
+    let below = Infinity;
     for (const row of rowElements()) {
-      if (row.getBoundingClientRect().bottom > bottom) break;
+      if (row.getBoundingClientRect().bottom > bottom) {
+        below = Number(row.dataset.firstSeq);
+        break;
+      }
       seq = Math.max(seq, Number(row.dataset.seq));
     }
+    seq = Math.min(seq, below - 1);
     if (seq > 0) view.markRead(seq);
   }
+
+  /**
+   * Measures once the view has settled for a moment: rows off screen are laid out at a guess until they come near, so
+   * what's measured while scrolling or resizing can show a tall row as short and fully in view.
+   */
+  let readTimer: ReturnType<typeof setTimeout> | undefined;
+  function scheduleRead() {
+    clearTimeout(readTimer);
+    readTimer = setTimeout(reportRead, 200);
+  }
+
+  // An item changing in place, a message getting another word on its line, moves no scroll or size.
+  $effect(() => {
+    if (view.transcript.seq === 0) return;
+    void tick().then(scheduleRead);
+  });
 
   /** On opening, the view starts at the "Unread" bar with a little context above it, or at the bottom with nothing unread. */
   $effect(() => {
@@ -261,7 +296,7 @@
     const read = view.session.read_seq;
     positioned = true;
     unreadAfter = read ?? null;
-    if (read === undefined || !view.transcript.items.some((item) => item.seq > read)) {
+    if (read === undefined || !view.transcript.items.some((item) => item.firstSeq > read)) {
       unreadAfter = view.readSeq || null;
       scrollToBottom();
       void tick().then(() => scrollToBottom());
@@ -271,7 +306,7 @@
     holdBar = true;
     void tick().then(() => {
       scrollToBar();
-      reportRead();
+      scheduleRead();
     });
   });
 
@@ -300,7 +335,7 @@
       // Rows off screen are laid out at a guess until they come near, so the bar's place keeps moving as they do.
       if (holdBar) scrollToBar();
       else if (atBottom) scrollToBottom();
-      reportRead();
+      scheduleRead();
     });
     observer.observe(content);
     observer.observe(scroller);
@@ -616,7 +651,7 @@
                 color="secondary"
                 size="small"
                 class="shadow-md"
-                onclick={() => scrollToBottom('smooth')}
+                onclick={jumpToLatest}
               />
             </div>
           {/if}

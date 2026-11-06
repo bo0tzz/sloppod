@@ -22,6 +22,8 @@ export type MessageItem = {
   key: string;
   /** The place in the session's log of the last event that touched this item, 0 where the runtime didn't say. */
   seq: number;
+  /** The place of the event that made it: an unread marker goes by this, since an update to an old item isn't news. */
+  firstSeq: number;
   messageId: string | null;
   /** A user message delivered into a running turn (the runtime marks the echo with `_meta.sloppod.steering`). */
   steering: boolean;
@@ -37,6 +39,8 @@ export type ToolItem = {
   key: string;
   /** The place in the session's log of the last event that touched this item, 0 where the runtime didn't say. */
   seq: number;
+  /** The place of the event that made it: an unread marker goes by this, since an update to an old item isn't news. */
+  firstSeq: number;
   toolCallId: string;
   title: string;
   kind: ToolKind;
@@ -50,13 +54,15 @@ export type ToolItem = {
   terminals: Record<string, string>;
 };
 
-export type PlanItem = { type: 'plan'; key: string; seq: number; entries: PlanEntry[] };
+export type PlanItem = { type: 'plan'; key: string; seq: number; firstSeq: number; entries: PlanEntry[] };
 
 export type CompactionItem = {
   type: 'compaction';
   key: string;
   /** The place in the session's log of the last event that touched this item, 0 where the runtime didn't say. */
   seq: number;
+  /** The place of the event that made it: an unread marker goes by this, since an update to an old item isn't news. */
+  firstSeq: number;
   compactionId: string;
   status: string;
   summary: string;
@@ -68,6 +74,8 @@ export type NoticeItem = {
   key: string;
   /** The place in the session's log of the last event that touched this item, 0 where the runtime didn't say. */
   seq: number;
+  /** The place of the event that made it: an unread marker goes by this, since an update to an old item isn't news. */
+  firstSeq: number;
   severity: string;
   title: string;
   description?: string | null;
@@ -127,10 +135,13 @@ export class Transcript {
   #plan: PlanItem | null = null;
 
   #at = 0;
+  /** The place of the latest update applied, for what needs to look again whenever any item changes. */
+  seq = $state(0);
 
   /** `seq` is the update's place in the session's log (`_meta.sloppod.seq` on the notification). */
   apply(update: SessionUpdate, seq = 0) {
     this.#at = seq;
+    if (seq > this.seq) this.seq = seq;
     switch (update.sessionUpdate) {
       case 'user_message_chunk':
       case 'agent_message_chunk':
@@ -175,8 +186,8 @@ export class Transcript {
     return `i${this.#seq++}`;
   }
 
-  #push<T extends TranscriptItem>(item: Omit<T, 'seq'>): T {
-    this.items.push({ ...item, seq: this.#at } as T);
+  #push<T extends TranscriptItem>(item: Omit<T, 'seq' | 'firstSeq'>): T {
+    this.items.push({ ...item, seq: this.#at, firstSeq: this.#at } as T);
     // Return the reactive proxy so later mutations are tracked.
     return this.items[this.items.length - 1] as T;
   }

@@ -2613,6 +2613,12 @@ const server = http.createServer(async (req, res) => {
       }
       return json(res, 200, {});
     }
+    if (url.pathname === '/_mock/update' && req.method === 'POST') {
+      // Any session update, as the agent might send it, in every session: the body is the update.
+      const update = await readBody(req);
+      for (const session of sessions.values()) session.emit(update);
+      return json(res, 200, {});
+    }
     if (url.pathname === '/_mock/spawn' && req.method === 'POST') {
       // A sub-session of `parent`, as if its agent called spawn_session.
       const parent = sessions.get(url.searchParams.get('parent') ?? '');
