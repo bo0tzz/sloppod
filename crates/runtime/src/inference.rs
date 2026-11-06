@@ -288,7 +288,11 @@ impl InFlight {
             }
             let working = matches!(shown.phase, Phase::Working | Phase::Starting)
                 || shown.commands.is_some_and(|n| n > 0);
-            let doing = crate::subsessions::doing(shown.phase, shown.commands);
+            let doing = crate::subsessions::doing(
+                shown.phase,
+                shown.commands,
+                shown.unschedulable.as_deref(),
+            );
             in_flight
                 .children
                 .push((child.title.clone(), working, doing));

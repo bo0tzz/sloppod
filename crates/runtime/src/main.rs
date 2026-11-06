@@ -32,6 +32,7 @@ mod questions;
 mod quota;
 mod rebases;
 mod reviews;
+mod room;
 mod session;
 #[cfg(test)]
 mod session_tests;
@@ -227,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
         &config.namespace,
         config.session_service_account.clone(),
         config.session_image_pull_policy.clone(),
+        pods.clone(),
     ));
     let instructions = match &config.instructions_file {
         Some(path) => Some(std::fs::read_to_string(path).context("reading instructions")?),
@@ -333,6 +335,16 @@ async fn main() -> anyhow::Result<()> {
                 // First, so a review session that ought to be parked isn't given a new pod instead.
                 reviews::settle_reviewers(&state).await;
                 lifecycle::roll_images(&state).await;
+            }
+        });
+    }
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                every.tick().await;
+                room::check(&state).await;
             }
         });
     }

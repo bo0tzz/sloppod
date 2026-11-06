@@ -220,8 +220,12 @@ pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<
     ))
 }
 
-/// What a child is doing, in words: an idle one with commands running waits on them, unlike one that's done (#413).
-pub(crate) fn doing(phase: Phase, commands: Option<usize>) -> String {
+/// What a child is doing, in words: an idle one with commands running waits on them, unlike one that's done (#413);
+/// one whose pod the cluster can't place says why (#454).
+pub(crate) fn doing(phase: Phase, commands: Option<usize>, unschedulable: Option<&str>) -> String {
+    if let Some(why) = unschedulable {
+        return why.to_owned();
+    }
     match (phase, commands) {
         (Phase::Idle, Some(1)) => "waiting on 1 command it started".into(),
         (Phase::Idle, Some(n)) if n > 1 => format!("waiting on {n} commands it started"),
@@ -242,7 +246,7 @@ pub async fn list(state: &AppState, parent: Uuid) -> Result<String, String> {
         let api = state.hub.session_api(child).await;
         listed.push(json!({
                 "id": child.id, "title": child.title, "phase": child.phase, "model": child.model, "repo": api.repo,
-                "branch": api.branch, "doing": doing(api.phase, api.commands), "commands": api.commands,
+                "branch": api.branch, "doing": doing(api.phase, api.commands, api.unschedulable.as_deref()), "commands": api.commands,
                 "command_lines": api.command_lines,
             }));
     }

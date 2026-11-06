@@ -86,7 +86,13 @@
     return () => clearInterval(timer);
   });
   const activity = $derived.by(() => {
-    const status = session?.agent_status ? `${session.agent_status[0].toUpperCase()}${session.agent_status.slice(1)}…` : null;
+    const sentence = (text: string) => `${text[0].toUpperCase()}${text.slice(1)}`;
+    // Why its pod can't be placed comes first: nothing happens in it until it is.
+    const status = session?.unschedulable
+      ? `${sentence(session.unschedulable)}…`
+      : session?.agent_status
+        ? `${sentence(session.agent_status)}…`
+        : null;
     switch (session?.phase) {
       case 'starting':
         return status ?? (session.agent_error ? 'Starting the agent again…' : 'Starting the agent…');

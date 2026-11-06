@@ -21,6 +21,8 @@ export type Session = {
   deleted_at?: string;
   /** What the pod is doing while the agent starts, e.g. cloning the repository. */
   agent_status?: string;
+  /** Why the cluster can't place the session's pod, while it can't, e.g. "waiting for room (insufficient memory)". */
+  unschedulable?: string;
   /** Why the agent last failed to start or exited; it's started again meanwhile. */
   agent_error?: string;
   /** The session that spawned it, for a sub-session. */

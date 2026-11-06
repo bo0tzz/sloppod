@@ -158,6 +158,7 @@ impl SessionRow {
             commands: None,
             command_lines: Vec::new(),
             waiting: Default::default(),
+            unschedulable: None,
         }
     }
 
@@ -1521,6 +1522,27 @@ pub async fn move_proposal(
     .bind(payload)
     .fetch_optional(db)
     .await
+}
+
+/// Sessions that could be parked to make room for a pod the cluster can't place (`room::check`): up and idle, quiet
+/// since before `quiet_since`, not deleted; each with whether it's a review session with nothing to review.
+pub async fn room_candidates(
+    db: &PgPool,
+    quiet_since: DateTime<Utc>,
+) -> sqlx::Result<Vec<(SessionRow, bool)>> {
+    let rows: Vec<SessionRow> = sqlx::query_as(AssertSqlSafe(format!(
+        "select {SESSION_COLUMNS} from sessions where deleted_at is null and phase = 'idle' and active_at < $1 \
+         order by active_at"
+    )))
+    .bind(quiet_since)
+    .fetch_all(db)
+    .await?;
+    let mut candidates = Vec::with_capacity(rows.len());
+    for row in rows {
+        let kept = row.kind == SessionKind::Review && !reviewing(db, row.id).await?;
+        candidates.push((row, kept));
+    }
+    Ok(candidates)
 }
 
 /// Review sessions that are up with nothing to review, quiet since before `quiet_since`, with when each was last

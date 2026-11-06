@@ -2395,3 +2395,60 @@ async fn an_agent_takes_back_a_highlight_the_user_has_not_seen(db: PgPool) {
         .unwrap();
     assert!(after.seen_at.is_none() && after.retracted_at.is_some());
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn sessions_that_could_make_room_are_the_quiet_idle_ones(db: PgPool) {
+    let make = |kind: SessionKind, phase: Phase, minutes_ago: i64| {
+        let db = db.clone();
+        async move {
+            let id = session_of_kind(&db, "dev", kind).await;
+            db::set_phase(&db, id, phase).await.unwrap();
+            sqlx::query(
+                "update sessions set active_at = now() - make_interval(mins => $2) where id = $1",
+            )
+            .bind(id)
+            .bind(minutes_ago as i32)
+            .execute(&db)
+            .await
+            .unwrap();
+            id
+        }
+    };
+    let quiet = make(SessionKind::Work, Phase::Idle, 60).await;
+    let kept = make(SessionKind::Review, Phase::Idle, 10).await;
+    let reviewing = make(SessionKind::Review, Phase::Idle, 30).await;
+    let author = session(&db, "dev").await;
+    let proposal = db::insert_proposal(
+        &db,
+        author,
+        "github.pr.create",
+        ProposalStatus::InReview,
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    db::set_review_session(&db, proposal.id, reviewing)
+        .await
+        .unwrap();
+    let recent = make(SessionKind::Work, Phase::Idle, 1).await;
+    let working = make(SessionKind::Work, Phase::Working, 60).await;
+    let parked = make(SessionKind::Work, Phase::Parked, 60).await;
+
+    let found = db::room_candidates(&db, Utc::now() - Duration::minutes(5))
+        .await
+        .unwrap();
+    let kept_of = |id: Uuid| {
+        found
+            .iter()
+            .find(|(row, _)| row.id == id)
+            .map(|(_, kept)| *kept)
+    };
+    // Longest quiet first, each with whether it's a reviewer with nothing to review.
+    assert_eq!(found.first().map(|(row, _)| row.id), Some(quiet));
+    assert_eq!(kept_of(quiet), Some(false));
+    assert_eq!(kept_of(kept), Some(true));
+    assert_eq!(kept_of(reviewing), Some(false));
+    for other in [recent, working, parked] {
+        assert_eq!(kept_of(other), None);
+    }
+}

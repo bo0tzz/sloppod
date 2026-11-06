@@ -1157,6 +1157,14 @@ test('says what the pod is doing while the agent starts, and why a start failed'
   await expect(failure).toBeVisible();
 });
 
+test("a session whose pod can't be placed says why, then starts", async ({ page }) => {
+  await createSession(page, 'no room: fix the build in bo0tzz/sloppod');
+  const activity = page.getByTestId('activity');
+  await expect(activity).toHaveText('Waiting for room (insufficient memory)…');
+  await expect(permissionCard(page)).toBeVisible({ timeout: 20_000 });
+  await finishTurn(page);
+});
+
 test('a long session opens at its latest messages, and older ones load on the way up', async ({ page }) => {
   const prompt = 'Write a long history in sloppod';
   await createSession(page, prompt);

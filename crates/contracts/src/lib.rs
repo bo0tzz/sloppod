@@ -450,6 +450,24 @@ pub trait PlacementBackend: Send + Sync {
     /// running session onto a new image.
     async fn replace_pod(&self, session_id: &str) -> Result<()>;
     async fn delete(&self, session_id: &str) -> Result<()>;
+    /// The session pods the cluster can't place now, and why, from what the backend last saw. None by default, for
+    /// a backend that can't tell.
+    fn unschedulable(&self) -> Vec<Unschedulable> {
+        Vec::new()
+    }
+}
+
+/// A session's pod the cluster can't place, as the placement backend sees it (#454).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unschedulable {
+    pub session_id: String,
+    /// The scheduler's own words, e.g. `0/4 nodes are available: 4 Insufficient memory.`
+    pub message: String,
+    /// What there isn't enough of when lack of room is why (e.g. `memory`, `cpu`); empty for any other reason, such
+    /// as a taint or an affinity, a volume that can't attach, or a quota.
+    pub short_of: Vec<String>,
+    /// How long it has been unschedulable.
+    pub pending_for: std::time::Duration,
 }
 
 /// A session's egress: hosts redirected to the authorizing listener, and hosts reachable directly.

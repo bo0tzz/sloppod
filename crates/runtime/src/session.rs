@@ -388,6 +388,8 @@ pub type LimitHit =
 
 pub struct Hub {
     store: Arc<dyn SessionStore>,
+    /// Why the cluster can't place each session pod it can't place, in words (`room::check`).
+    unschedulable: StdMutex<HashMap<Uuid, String>>,
     waker: StdMutex<Option<Waker>>,
     /// The proposal kinds, for the summary each proposal goes out with.
     proposal_kinds: StdMutex<Option<crate::proposals::ProposalKinds>>,
@@ -451,6 +453,7 @@ impl Hub {
     pub fn new(store: Arc<dyn SessionStore>) -> Self {
         Self {
             store,
+            unschedulable: StdMutex::default(),
             waker: StdMutex::default(),
             proposal_kinds: StdMutex::default(),
             turn_ended: StdMutex::default(),
@@ -607,6 +610,27 @@ impl Hub {
         Ok(())
     }
 
+    /// Records why each session pod the cluster can't place can't be placed, replacing what was recorded, and tells
+    /// the UIs of the sessions whose reason changed.
+    pub async fn set_unschedulable(&self, now: HashMap<Uuid, String>) {
+        let changed: Vec<Uuid> = {
+            let mut known = self.unschedulable.lock().expect("hub lock");
+            let changed = known
+                .keys()
+                .chain(now.keys())
+                .filter(|id| known.get(id) != now.get(id))
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            *known = now;
+            changed
+        };
+        for id in changed {
+            self.broadcast_session(id).await;
+        }
+    }
+
     pub async fn broadcast_session(&self, id: Uuid) {
         let _ = self.touched.send(id);
         if let Ok(Some(row)) = self.store.get_session(id).await {
@@ -754,6 +778,12 @@ impl Hub {
     /// commands (#413).
     pub async fn session_api(&self, row: &crate::db::SessionRow) -> sloppod_protocol::api::Session {
         let mut session = row.to_api();
+        session.unschedulable = self
+            .unschedulable
+            .lock()
+            .expect("hub lock")
+            .get(&row.id)
+            .cloned();
         session.waiting.highlights = self.store.open_highlights(row.id).await.unwrap_or_else(|e| {
             tracing::warn!(session = %row.id, error = %e, "counting the session's open highlights");
             0
