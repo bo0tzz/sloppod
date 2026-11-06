@@ -2984,7 +2984,8 @@ test('the page keeps one socket for the list, the meters and the open session, a
   page.on('websocket', (socket) => sockets.push(socket));
   await setWorkQuota(page, 20);
   try {
-    const prompt = 'Propose a PR for sloppod, over one socket';
+    // Its own title each run: a retry, or a repeat, against the same mock finds its own row, not an earlier run's.
+    const prompt = `Propose a PR for sloppod, over one socket ${Date.now().toString(36)}`;
     const id = await createSession(page, prompt);
     await finishTurn(page);
     const sidebar = page.getByTestId('sidebar');
@@ -2995,6 +2996,9 @@ test('the page keeps one socket for the list, the meters and the open session, a
 
     // Moving about the app, a session after another and the settings, opens no other socket.
     await page.getByRole('link', { name: 'New session' }).click();
+    // Until the new-session page is up, the session's own composer is the "Prompt" box: typing then would send there.
+    await expect(page).toHaveURL(/\/new$/);
+    await expect(page.getByTestId('session-title')).toHaveText('New session');
     const box = page.getByRole('textbox', { name: 'Prompt' });
     await box.fill('Say something over the one socket');
     await box.press('Enter');
