@@ -50,10 +50,12 @@ pub struct Candidate {
 
 /// Which sessions to park to make room, in order: one for each pod that has waited [`MAKE_ROOM_AFTER`] for lack of
 /// room, kept reviewers first, then the longest quiet. A pod waiting for another reason (a taint, a volume, a quota)
-/// doesn't make anything park, and neither does a session whose own pod waits.
+/// doesn't make anything park, and neither does a session whose own pod waits. `releasing` counts parked sessions whose
+/// pods are still going: the room they free is on its way, so they count against what's needed.
 pub fn to_park(
     pending: &[Unschedulable],
     candidates: &[Candidate],
+    releasing: usize,
     now: DateTime<Utc>,
 ) -> Vec<Uuid> {
     let waiting: Vec<&Unschedulable> = pending
@@ -71,7 +73,7 @@ pub fn to_park(
     parkable.sort_by_key(|c| (!c.kept_reviewer, c.active_at));
     parkable
         .into_iter()
-        .take(waiting.len())
+        .take(waiting.len().saturating_sub(releasing))
         .map(|c| c.id)
         .collect()
 }
@@ -112,7 +114,18 @@ pub async fn check(state: &AppState) {
             quiet,
         });
     }
-    for id in to_park(&pending, &candidates, now) {
+    // Parks under way: their pods may take a while (up to their termination grace) to go and free the room.
+    let releasing = match db::parked_sessions(&state.db).await {
+        Ok(parked) => parked
+            .iter()
+            .filter(|row| state.placement.has_pod(&row.id.to_string()))
+            .count(),
+        Err(e) => {
+            tracing::warn!(error = %e, "listing parked sessions");
+            return;
+        }
+    };
+    for id in to_park(&pending, &candidates, releasing, now) {
         let Ok(Some(row)) = db::get_session(&state.db, id).await else {
             continue;
         };
@@ -170,7 +183,7 @@ mod tests {
         );
         let candidates = [recent.clone(), longest.clone(), busy];
         assert_eq!(
-            to_park(std::slice::from_ref(&memory), &candidates, now),
+            to_park(std::slice::from_ref(&memory), &candidates, 0, now),
             [longest.id]
         );
 
@@ -178,7 +191,7 @@ mod tests {
         let reviewer = candidate(6, true, true, now);
         let candidates = [recent.clone(), longest.clone(), reviewer.clone()];
         assert_eq!(
-            to_park(std::slice::from_ref(&memory), &candidates, now),
+            to_park(std::slice::from_ref(&memory), &candidates, 0, now),
             [reviewer.id]
         );
 
@@ -189,18 +202,64 @@ mod tests {
             &["memory"],
             30,
         );
-        assert!(to_park(&[brief], std::slice::from_ref(&longest), now).is_empty());
+        assert!(to_park(&[brief], std::slice::from_ref(&longest), 0, now).is_empty());
         assert!(
             to_park(
                 std::slice::from_ref(&memory),
                 &[candidate(2, false, true, now)],
+                0,
                 now
             )
             .is_empty()
         );
         let mut itself = longest.clone();
         itself.id = waiting;
-        assert!(to_park(&[memory], &[itself], now).is_empty());
+        assert!(to_park(&[memory], &[itself], 0, now).is_empty());
+    }
+
+    #[test]
+    fn a_park_still_releasing_its_room_counts_towards_what_a_waiting_pod_needs() {
+        let now = Utc::now();
+        let memory = pending(
+            Uuid::new_v4(),
+            "0/4 nodes are available: 4 Insufficient memory.",
+            &["memory"],
+            120,
+        );
+        let (first, second) = (
+            candidate(60, false, true, now),
+            candidate(30, false, true, now),
+        );
+        // The first check parks one.
+        let parked = to_park(
+            std::slice::from_ref(&memory),
+            &[first.clone(), second.clone()],
+            0,
+            now,
+        );
+        assert_eq!(parked, [first.id]);
+        // Its pod is still terminating at the next checks, and the same pod still waits: nothing more parks.
+        for _ in 0..3 {
+            assert!(
+                to_park(
+                    std::slice::from_ref(&memory),
+                    std::slice::from_ref(&second),
+                    1,
+                    now
+                )
+                .is_empty()
+            );
+        }
+        // Its pod gone, a pod still waiting is short of more room than that.
+        assert_eq!(
+            to_park(
+                std::slice::from_ref(&memory),
+                std::slice::from_ref(&second),
+                0,
+                now
+            ),
+            [second.id]
+        );
     }
 
     #[test]
@@ -216,6 +275,7 @@ mod tests {
             to_park(
                 std::slice::from_ref(&volume),
                 &[candidate(60, true, true, now)],
+                0,
                 now
             )
             .is_empty()

@@ -192,4 +192,10 @@ impl PlacementBackend for AgentSandbox {
     fn unschedulable(&self) -> Vec<Unschedulable> {
         self.index.unschedulable()
     }
+
+    fn has_pod(&self, session_id: &str) -> bool {
+        session_id
+            .parse()
+            .is_ok_and(|session| self.index.has_pod(session))
+    }
 }

@@ -167,6 +167,17 @@ impl PodIndex {
         any_with_ip(&self.store.state(), ip)
     }
 
+    /// Whether the session has a pod, live or still terminating: one being deleted holds its room until it's gone.
+    pub fn has_pod(&self, session: Uuid) -> bool {
+        self.store.state().iter().any(|pod| {
+            session_of(pod) == Some(session)
+                && !matches!(
+                    pod.status.as_ref().and_then(|s| s.phase.as_deref()),
+                    Some("Succeeded" | "Failed")
+                )
+        })
+    }
+
     /// The session pods the scheduler can't place, and why.
     pub fn unschedulable(&self) -> Vec<Unschedulable> {
         let now = k8s_openapi::jiff::Timestamp::now();

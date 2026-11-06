@@ -455,6 +455,11 @@ pub trait PlacementBackend: Send + Sync {
     fn unschedulable(&self) -> Vec<Unschedulable> {
         Vec::new()
     }
+    /// Whether the session still has a pod, running or on its way out. False by default, for a backend that can't
+    /// tell.
+    fn has_pod(&self, _session_id: &str) -> bool {
+        false
+    }
 }
 
 /// A session's pod the cluster can't place, as the placement backend sees it (#454).
