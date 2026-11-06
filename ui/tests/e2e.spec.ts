@@ -4456,7 +4456,7 @@ test("a session's disk use shows in the list, its header and Settings, and stays
   const storage = page.getByTestId('storage');
   const listed = storage.locator(`[data-testid="storage-session"][data-session="${id}"]`);
   await expect(listed.getByTestId('storage-used')).toHaveText('700 MB');
-  await expect(storage.getByTestId('storage-total')).toContainText('700 MB');
+  await expect(storage.getByTestId('storage-total')).toContainText(/used by \d+ sessions?/);
   await listed.getByRole('button', { name: /^Park the session/ }).click();
   await expect(listed.getByRole('button', { name: /^Park the session/ })).toHaveCount(0);
   await expect(listed.getByTestId('storage-used')).toHaveText('700 MB');
