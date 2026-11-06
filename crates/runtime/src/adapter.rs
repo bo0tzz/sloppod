@@ -218,8 +218,9 @@ const HIGHLIGHT: &str = "\n# Highlighting for the user\n\
     \n\
     A highlight is read out of context, in the session's \"for you\" list. Say what it answers (\"Your question about \
     mise tools: …\"), lead with the conclusion, keep it to a few lines, and link what it refers to. The details stay in \
-    the chat. The highlight replaces the reply rather than repeating it. Highlight each thing once; if it changes, \
-    highlight the new state.\n";
+    the chat. A highlight shows in the chat where you call it, like a message of yours, so don't also write its \
+    content in a reply before or after it: a reply around it adds only what isn't in it. Highlight each thing once; \
+    if it changes, highlight the new state.\n";
 
 /// Agents are users of sloppod too, and what gets in their way is worth knowing.
 const FEEDBACK: &str = "\n# Feedback on sloppod\n\
@@ -598,6 +599,9 @@ mod tests {
         assert!(
             work.contains("# Highlighting for the user")
                 && work.contains("never a question in a reply")
+                && work.contains(
+                    "like a message of yours, so don't also write its content in a reply"
+                )
         );
 
         // Codex has no built-in subagents to steer.
