@@ -2104,6 +2104,33 @@ test('wide screens show what waits on the user in a side panel', async ({ page }
   await expect(page.getByTestId('proposals-bar')).toContainText('2 proposals to review');
 });
 
+test("the next proposal waiting shows its own review history, not the last one's", async ({ page }) => {
+  const id = await createSession(page, 'Propose a reviewed PR for sloppod');
+  const put = await page.request.put(`/api/v1/sessions/${id}/review`, { data: { review: 'required' } });
+  expect(put.status()).toBe(200);
+  await finishTurn(page);
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Propose another reviewed PR for sloppod');
+  await box.press('Enter');
+  await permissionCard(page).getByRole('button', { name: 'Allow', exact: true }).click();
+  await expect(page.getByTestId('proposals-bar')).toContainText('2 proposals to review');
+
+  await page.getByTestId('proposals-bar').getByRole('button', { name: 'Review' }).click();
+  const history = page.getByTestId('review-history');
+  await history.getByText('Review by Codex').click();
+  const rounds = history.getByTestId('review-round');
+  await expect(rounds).toHaveCount(2);
+  const first = await rounds.first().textContent();
+  await page.getByRole('button', { name: 'Approve', exact: true }).click();
+
+  // The next one opens in its place with its history folded, and its own rounds once opened.
+  await expect(page.getByTestId('proposal-previous')).toBeVisible();
+  await expect(rounds).toHaveCount(0);
+  await history.getByText('Review by Codex').click();
+  await expect(rounds).toHaveCount(2);
+  expect(await rounds.first().textContent()).not.toBe(first);
+});
+
 test('deciding a proposal moves on to the next one waiting', async ({ page }) => {
   await createSession(page, 'Propose a PR for sloppod');
   await finishTurn(page);

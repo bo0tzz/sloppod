@@ -311,6 +311,8 @@
           </Alert>
         </div>
       {/if}
+      <!-- Keyed: the next proposal in the same frame gets its parts afresh (its review history, which files are open). -->
+      {#key shown.id}
       {#if loadError}
         <Alert color="danger" title="Couldn't load the proposal's details" size="small">{loadError}</Alert>
       {/if}
@@ -498,6 +500,7 @@
             by a standing approval{/if}
         </Text>
       {/if}
+      {/key}
     </div>
   </ModalBody>
 
