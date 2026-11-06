@@ -25,22 +25,16 @@ pub async fn release_unused(state: &AppState) {
     for session in sessions {
         let id = session.id;
         let released = match session.phase() {
-            // Its pod may run on for a while after it's told to stop; the fence holds until it's gone.
-            Phase::Parked if state.placement.has_pod(&id.to_string()) => continue,
-            Phase::Parked => state.hub.remove_egress(id, &*state.enforcer).await,
+            Phase::Parked => release_parked(state, id).await,
             Phase::Stopped => release_stopped(state, &session).await,
             _ => continue,
         };
-        let recorded = match released {
-            Ok(()) => db::set_released(&state.db, id, true)
-                .await
-                .map_err(Into::into),
-            Err(e) => Err(e),
-        };
-        match recorded {
-            Ok(()) => {
+        match released {
+            Ok(true) => {
                 tracing::info!(session = %id, phase = %session.phase, "released a session's pod-side objects")
             }
+            // Its pod is still going, or it woke meanwhile; the next sweep looks again.
+            Ok(false) => {}
             Err(e) => {
                 tracing::warn!(session = %id, error = %e, "releasing a session's pod-side objects")
             }
@@ -48,15 +42,41 @@ pub async fn release_unused(state: &AppState) {
     }
 }
 
-async fn release_stopped(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
+/// Removes a parked session's egress policy once its pod is gone, and records it, all under its transition lock: a
+/// wake waits for it, and so can't have its newly applied policy removed. Says whether it released it.
+async fn release_parked(state: &AppState, id: Uuid) -> anyhow::Result<bool> {
+    let released = state
+        .hub
+        .while_parked(id, || async {
+            // Its pod may run on for a while after it's told to stop; the fence holds until it's gone.
+            if state.placement.has_pod(&id.to_string()) {
+                return Ok(false);
+            }
+            state.hub.remove_egress(id, &*state.enforcer).await?;
+            db::set_released(&state.db, id, true).await?;
+            Ok(true)
+        })
+        .await?;
+    Ok(released == Some(true))
+}
+
+/// Ends a stopped session's pod, and once it's gone removes its egress policy and keys, and records it. While the pod
+/// is still going it's fenced in (denied all egress), as a parked one is. Says whether it released it.
+async fn release_stopped(state: &AppState, session: &db::SessionRow) -> anyhow::Result<bool> {
     let id = session.id;
     state
         .placement
         .suspend(&id.to_string())
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    if state.placement.has_pod(&id.to_string()) {
+        state.hub.release_egress(id, &*state.enforcer).await?;
+        return Ok(false);
+    }
     state.hub.remove_egress(id, &*state.enforcer).await?;
-    lifecycle::remove_keys(state, session).await
+    lifecycle::remove_keys(state, session).await?;
+    db::set_released(&state.db, id, true).await?;
+    Ok(true)
 }
 
 /// Removes the volumes, and everything else, of sessions stopped longer than [`lifecycle::RESTORABLE_FOR`] whose
@@ -71,12 +91,15 @@ pub async fn purge_stopped(state: &AppState) {
         }
     };
     for session in sessions {
-        let purged = match lifecycle::remove_session(state, &session).await {
-            Ok(()) => db::finish_purge(&state.db, session.id)
-                .await
-                .map_err(Into::into),
-            Err(e) => Err(e),
-        };
+        // A failure leaves it claimed, so the next sweep tries again at once.
+        let purged = async {
+            lifecycle::remove_session(state, &session).await?;
+            db::finish_purge(&state.db, session.id).await?;
+            // Its volume is gone: nothing of it counts towards what sessions use.
+            db::clear_disk(&state.db, session.id).await?;
+            anyhow::Ok(())
+        }
+        .await;
         match purged {
             Ok(()) => tracing::info!(session = %session.id, "removed a stopped session's volume"),
             Err(e) => {

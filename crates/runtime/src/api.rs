@@ -330,7 +330,12 @@ async fn set_volume(
     db::owned_session(&state.db, id, &user)
         .await?
         .ok_or_else(not_found)?;
-    db::set_volume_kept(&state.db, id, body.kept).await?;
+    if !db::set_volume_kept(&state.db, id, body.kept).await? {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "the volume is being removed, or already is".into(),
+        ));
+    }
     state.hub.broadcast_session(id).await;
     let session = db::get_session(&state.db, id)
         .await?

@@ -1,6 +1,6 @@
 //! Tests of the queries against a real Postgres; `mise run check` provides one through `DATABASE_URL`.
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde_json::json;
 use sloppod_protocol::api::{Phase, ProposalStatus, ReviewPolicy, SessionKind};
 use sqlx::PgPool;
@@ -2566,4 +2566,79 @@ async fn a_users_read_position_only_moves_forward(db: PgPool) {
     // Per session, and per user.
     assert_eq!(db::read_seq(&db, other, "dev").await.unwrap(), None);
     assert_eq!(db::read_seq(&db, s, "someone-else").await.unwrap(), None);
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_claimed_volume_removal_cant_be_kept_and_is_retried_at_once(db: PgPool) {
+    let id = session(&db, "dev").await;
+    db::set_phase(&db, id, Phase::Stopped).await.unwrap();
+    sqlx::query("update sessions set stopped_at = now() - interval '8 days' where id = $1")
+        .bind(id)
+        .execute(&db)
+        .await
+        .unwrap();
+    let stopped_at = |db: PgPool| async move {
+        sqlx::query_scalar::<_, DateTime<Utc>>("select stopped_at from sessions where id = $1")
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .unwrap()
+    };
+    let first = stopped_at(db.clone()).await;
+    let claimed = db::claim_stopped_purges(&db, Duration::days(7))
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+
+    // Claimed: keeping it now would be a promise the removal under way breaks.
+    assert!(!db::set_volume_kept(&db, id, true).await.unwrap());
+    assert!(!db::get_session(&db, id).await.unwrap().unwrap().volume_kept);
+
+    // The removal failed after stopping it again: it keeps when it first stopped, and is claimed again at once.
+    db::set_phase(&db, id, Phase::Stopped).await.unwrap();
+    assert_eq!(stopped_at(db.clone()).await, first);
+    sqlx::query("update sessions set stopped_at = now() where id = $1")
+        .bind(id)
+        .execute(&db)
+        .await
+        .unwrap();
+    assert_eq!(
+        db::claim_stopped_purges(&db, Duration::days(7))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Removed: its disk use is forgotten, so it no longer counts in Settings' storage.
+    db::set_disk(&db, id, 1, 2).await.unwrap();
+    db::finish_purge(&db, id).await.unwrap();
+    db::clear_disk(&db, id).await.unwrap();
+    assert!(
+        db::get_session(&db, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .to_api()
+            .disk
+            .is_none()
+    );
+    assert!(!db::set_volume_kept(&db, id, true).await.unwrap());
+
+    // Before any claim, keeping it holds it back from the next one.
+    let kept = session(&db, "dev").await;
+    db::set_phase(&db, kept, Phase::Stopped).await.unwrap();
+    sqlx::query("update sessions set stopped_at = now() - interval '8 days' where id = $1")
+        .bind(kept)
+        .execute(&db)
+        .await
+        .unwrap();
+    assert!(db::set_volume_kept(&db, kept, true).await.unwrap());
+    assert!(
+        db::claim_stopped_purges(&db, Duration::days(7))
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.id != kept)
+    );
 }

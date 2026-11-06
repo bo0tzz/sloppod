@@ -3569,3 +3569,44 @@ async fn an_update_goes_out_with_its_place_in_the_log() {
     };
     assert!(seq > 0);
 }
+
+#[tokio::test]
+async fn a_release_while_parked_and_a_wake_dont_interleave() {
+    let h = Harness::starting().await;
+    h.store.set_phase(h.id, Phase::Parked).await.unwrap();
+    let order = Arc::new(std::sync::Mutex::new(Vec::<&str>::new()));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let release = {
+        let (hub, id, order) = (h.hub.clone(), h.id, order.clone());
+        tokio::spawn(async move {
+            hub.while_parked(id, || async move {
+                let _ = started_tx.send(());
+                order.lock().unwrap().push("release started");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                order.lock().unwrap().push("release done");
+                Ok(())
+            })
+            .await
+            .unwrap()
+        })
+    };
+    started_rx.await.unwrap();
+    // The wake waits for the release, so what it puts back stays.
+    let woken = {
+        let order = order.clone();
+        h.hub.wake(h.id, || async move {
+            order.lock().unwrap().push("placed");
+            Ok(())
+        })
+    };
+    woken.await.unwrap();
+    assert_eq!(release.await.unwrap(), Some(()));
+    assert_eq!(
+        *order.lock().unwrap(),
+        ["release started", "release done", "placed"]
+    );
+
+    // Once it's woken, a release finds it not parked and does nothing.
+    let ran = h.hub.while_parked(h.id, || async { Ok(()) }).await.unwrap();
+    assert_eq!(ran, None);
+}

@@ -83,7 +83,7 @@ What each session holds in the cluster, by its phase ([ADR 25](adr/0025-session-
 
 - **Running** (starting, idle, working, waiting): its Sandbox and pod, its workspace volume, its CiliumNetworkPolicy and CiliumEnvoyConfig listener, and its keys.
 - **Parked:** its Sandbox (suspended) and volume. The policy fences the pod in while it stops and is removed once the pod is gone; waking applies it again, and mints its keys if they're gone.
-- **Stopped** (it can't start again): its policy, listener and keys go at once, and its pod if it has one. Its volume, with the suspended Sandbox that owns it, goes a week after it stopped, unless the user keeps it (Settings → Storage).
+- **Stopped** (it can't start again): its pod is ended, fenced in while it goes, and then its policy, listener and keys go. Its volume, with the suspended Sandbox that owns it, goes a week after it stopped, unless the user keeps it (Settings → Storage).
 - **Deleted:** everything stays, parked, for the 7 days it can be restored, then goes. A review session that's done goes at once.
 
 In every phase the transcript, proposals and branch stay: they live in the database and on GitHub. An hourly sweep removes Sandboxes, volume claims, policies and listeners whose session is purged or unknown, such as ones whose removal failed, and logs each (`removed the objects of a purged or unknown session`). Each session's supervisor reports its volume's use every 5 minutes; the session list, a session's header and Settings → Storage show it. The runtime needs `list` and `delete` on `persistentvolumeclaims`, which the chart grants.

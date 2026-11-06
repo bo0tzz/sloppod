@@ -486,7 +486,7 @@ pub async fn owned_session(db: &PgPool, id: Uuid, owner: &str) -> sqlx::Result<O
 pub async fn set_phase(db: &PgPool, id: Uuid, phase: Phase) -> sqlx::Result<Option<SessionRow>> {
     let stopped = phase == Phase::Stopped;
     sqlx::query_as(AssertSqlSafe(format!(
-        "update sessions set phase = $2, updated_at = now(), stopped_at = case when $3 then now() else stopped_at end \
+        "update sessions set phase = $2, updated_at = now(), stopped_at = case when $3 then coalesce(stopped_at, now()) else stopped_at end \
          where id = $1 and (phase <> 'stopped' or $3) returning {SESSION_COLUMNS}"
     )))
     .bind(id)
@@ -620,7 +620,7 @@ pub async fn claim_stopped_purges(
 ) -> sqlx::Result<Vec<SessionRow>> {
     sqlx::query_as(AssertSqlSafe(format!(
         "update sessions set purge_started_at = coalesce(purge_started_at, now()) \
-         where phase = 'stopped' and stopped_at < $1 and not volume_kept and deleted_at is null and purged_at is null \
+         where phase = 'stopped' and (stopped_at < $1 or purge_started_at is not null) and not volume_kept and deleted_at is null and purged_at is null \
          returning {SESSION_COLUMNS}"
     )))
     .bind(Utc::now() - age)
@@ -628,14 +628,29 @@ pub async fn claim_stopped_purges(
     .await
 }
 
-/// Keeps a stopped session's volume, or lets it go to be removed a week after the session stopped.
-pub async fn set_volume_kept(db: &PgPool, id: Uuid, kept: bool) -> sqlx::Result<()> {
-    sqlx::query("update sessions set volume_kept = $2 where id = $1")
-        .bind(id)
-        .bind(kept)
-        .execute(db)
-        .await
-        .map(|_| ())
+/// Keeps a stopped session's volume, or lets it go to be removed a week after the session stopped. Says whether it
+/// did: not once the volume's removal has been claimed (`claim_stopped_purges`), when keeping it would be a promise the
+/// removal under way breaks.
+pub async fn set_volume_kept(db: &PgPool, id: Uuid, kept: bool) -> sqlx::Result<bool> {
+    let result = sqlx::query(
+        "update sessions set volume_kept = $2 where id = $1 and purge_started_at is null and purged_at is null",
+    )
+    .bind(id)
+    .bind(kept)
+    .execute(db)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Forgets a session's disk use, once its volume is gone.
+pub async fn clear_disk(db: &PgPool, id: Uuid) -> sqlx::Result<()> {
+    sqlx::query(
+        "update sessions set disk_used = null, disk_size = null, disk_seen_at = null where id = $1",
+    )
+    .bind(id)
+    .execute(db)
+    .await
+    .map(|_| ())
 }
 
 /// Of `ids`, the sessions that exist and aren't purged: what may still have objects in the cluster.
