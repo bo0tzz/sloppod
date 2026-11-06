@@ -2286,7 +2286,7 @@ impl Hub {
 
     /// Shows the user questions from the agent's `ask_user` tool, without the agent waiting: the answer reaches it
     /// as a notice.
-    pub async fn ask(&self, id: Uuid, questions: Value) -> Result<(), String> {
+    pub async fn ask(&self, id: Uuid, questions: Value) -> Result<Uuid, String> {
         let params = crate::questions::elicitation(&questions, &id.to_string())?;
         let key = Uuid::new_v4();
         self.store
@@ -2294,6 +2294,56 @@ impl Hub {
             .await
             .map_err(|e| format!("couldn't keep the question: {e}"))?;
         self.show_question(id, key, questions, params).await;
+        Ok(key)
+    }
+
+    /// The agent takes back a question it asked with `ask_user` that no longer applies, saying why: it closes for the
+    /// user, stops counting as waiting, and is kept out of the restart's restore; the chat says it was withdrawn. The
+    /// agent is told nothing: it did this itself, and nothing answers it.
+    pub async fn withdraw_question(&self, id: Uuid, key: Uuid, reason: &str) -> Result<(), String> {
+        let (pid, questions) = {
+            let live = self.live(id);
+            let mut state = live.state.lock().await;
+            let found = state
+                .permissions
+                .iter()
+                .find_map(|(pid, p)| match &p.asker {
+                    Asker::Tool {
+                        key: asked,
+                        questions,
+                    } if *asked == key => Some((*pid, questions.clone())),
+                    _ => None,
+                });
+            let Some((pid, questions)) = found else {
+                return Err(
+                    "no such open question of yours: it was answered or withdrawn already".into(),
+                );
+            };
+            state.permissions.remove(&pid);
+            live.sync_asks(&state);
+            (pid, questions)
+        };
+        if let Err(e) = self.store.forget_question(key).await {
+            tracing::warn!(session = %id, error = %e, "forgetting a withdrawn question");
+        }
+        self.broadcast_session(id).await;
+        self.broadcast(
+            id,
+            UiEvent::PermissionResolved {
+                id: pid,
+                tool_call_id: None,
+            },
+        );
+        let asked = questions[0]["question"].as_str().unwrap_or_default();
+        self.record(
+            id,
+            json!({
+                "sessionUpdate": "notice", "severity": "info",
+                "title": format!("Withdrawn: {reason}"),
+                "description": format!("The agent took back its question: {asked}"),
+            }),
+        )
+        .await;
         Ok(())
     }
 

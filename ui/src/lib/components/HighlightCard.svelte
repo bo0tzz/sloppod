@@ -15,7 +15,8 @@
     testid = 'highlight-card',
   }: { highlight: Highlight; onSeen: (highlight: Highlight) => Promise<void>; testid?: string } = $props();
 
-  const open = $derived(!highlight.seen_at);
+  const retracted = $derived(Boolean(highlight.retracted_at));
+  const open = $derived(!highlight.seen_at && !retracted);
   let busy = $state(false);
   let error = $state<string | null>(null);
 
@@ -38,16 +39,20 @@
     ? 'border-primary/40 bg-primary/5'
     : 'border-light-200 bg-light-50 text-muted'}"
   data-testid={testid}
-  data-seen={open ? 'false' : 'true'}
+  data-seen={highlight.seen_at ? 'true' : 'false'}
+  data-retracted={retracted ? 'true' : 'false'}
 >
   <div class="flex items-center gap-2 text-xs {open ? 'text-primary' : 'text-muted'}">
     <Icon icon={mdiStarFourPointsOutline} size="1.1em" aria-hidden />
-    <span class="font-medium">{open ? 'For you' : 'Seen'}</span>
+    <span class="font-medium">{retracted ? 'Retracted' : open ? 'For you' : 'Seen'}</span>
     <time class="text-muted" datetime={highlight.created_at} title={absoluteTime(highlight.created_at)}>
       {timeAgo(highlight.created_at)}
     </time>
   </div>
-  <Markdown text={highlight.text} class="text-sm" />
+  <Markdown text={highlight.text} class="text-sm {retracted ? 'line-through' : ''}" />
+  {#if retracted}
+    <p class="text-sm" data-testid="highlight-retraction">Retracted: {highlight.retraction_reason}</p>
+  {/if}
   {#if open}
     <div>
       <Button size="small" shape="round" leadingIcon={mdiCheck} loading={busy} onclick={seen}>Seen</Button>

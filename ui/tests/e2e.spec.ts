@@ -1757,6 +1757,37 @@ test('a highlight that could not be marked seen says so, and can be tried again'
   await expect(page.getByTestId('highlight-card')).toHaveAttribute('data-seen', 'true');
 });
 
+test('a highlight the agent takes back leaves the for-you list, and its card stays muted with the reason', async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1000 });
+  const id = await createSession(page, 'Highlight (retract): Merge pull request 12 by hand | It was pull request 21, not 12');
+  const card = page.getByTestId('highlight-card');
+  await expect(card).toHaveCount(1);
+  await expect(card).toHaveAttribute('data-retracted', 'true');
+  await expect(card.getByTestId('highlight-retraction')).toHaveText('Retracted: It was pull request 21, not 12');
+  await expect(card).toContainText('Merge pull request 12 by hand');
+  await expect(card.getByRole('button', { name: 'Seen' })).toHaveCount(0);
+  // Not for the user any more: no list item, and nothing waits on them.
+  await expect(page.getByTestId('highlight-item')).toHaveCount(0);
+  await expect(phase(page)).toHaveText('Idle');
+  const row = page.getByRole('navigation', { name: 'Sessions' }).getByTestId('session-row').filter({ hasText: 'Highlight (retract)' });
+  await expect(row.getByTestId('phase')).toHaveText('Idle');
+
+  await page.reload();
+  await expect(page).toHaveURL(new RegExp(id));
+  await expect(page.getByTestId('highlight-card')).toHaveAttribute('data-retracted', 'true');
+  await expect(page.getByTestId('highlight-item')).toHaveCount(0);
+});
+
+test('a question the agent withdraws closes, with a note in the chat, and stops counting as waiting', async ({ page }) => {
+  await createSession(page, 'Withdraw the question: The user answered in the chat');
+  await expect(page.getByTestId('notice')).toContainText('Withdrawn: The user answered in the chat');
+  await expect(page.getByTestId('question-card')).toHaveCount(0);
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+  await expect(phase(page)).toHaveText('Idle');
+  // The agent was told nothing: the answer would have come as a message, and the chat has none.
+  await expect(page.getByText('sloppod: the user dismissed your question')).toHaveCount(0);
+});
+
 test('on a narrow screen the folded panel says how many highlights wait', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await createSession(page, 'Highlight: One thing for you | Another thing for you');

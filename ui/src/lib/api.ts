@@ -56,6 +56,9 @@ export type Highlight = {
   created_at: string;
   /** When the user marked it seen; absent while it's open. */
   seen_at?: string;
+  /** When the agent took it back (it was wrong, or no longer applies): no longer open, and kept in the chat with why. */
+  retracted_at?: string;
+  retraction_reason?: string;
 };
 
 export type NewSession = {

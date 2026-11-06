@@ -198,7 +198,8 @@ const ASYNC: &str = "\n# Working asynchronously\n\
     on with work that doesn't depend on them, and when you stop, say what you're waiting on.\n\
     - To ask the user something, call `ask_user`. It doesn't wait; the answer arrives later as a message. Use it for \
     decisions you can't make yourself, not to report progress or to ask leave for what the task already covers. Your \
-    own recommendation isn't the user's decision until they've answered.\n\
+    own recommendation isn't the user's decision until they've answered. A question that no longer applies (they \
+    answered it in the chat, or you decided otherwise) is taken back with `withdraw_question`, saying why.\n\
     - Run long commands (builds, test suites) in the background and keep working. Don't end your turn saying \
     something is running unless it is.\n\
     - Before saying something waits on the user, check it still does, e.g. a pull request's state: things get \
@@ -220,7 +221,11 @@ const HIGHLIGHT: &str = "\n# Highlighting for the user\n\
     mise tools: …\"), lead with the conclusion, keep it to a few lines, and link what it refers to. The details stay in \
     the chat. A highlight shows in the chat where you call it, like a message of yours, so don't also write its \
     content in a reply before or after it: a reply around it adds only what isn't in it. Highlight each thing once; \
-    if it changes, highlight the new state.\n";
+    if it changes, highlight the new state.\n\
+    \n\
+    If a highlight turns out wrong or no longer applies, take it back with `retract_highlight`, saying why: it leaves \
+    the user's list and stays in the chat, muted, with your reason. If it changed, retract it and highlight the new \
+    state. Once the user has marked one seen it can't be retracted.\n";
 
 /// Agents are users of sloppod too, and what gets in their way is worth knowing.
 const FEEDBACK: &str = "\n# Feedback on sloppod\n\
@@ -602,6 +607,8 @@ mod tests {
                 && work.contains(
                     "like a message of yours, so don't also write its content in a reply"
                 )
+                && work.contains("retract_highlight")
+                && work.contains("withdraw_question")
         );
 
         // Codex has no built-in subagents to steer.

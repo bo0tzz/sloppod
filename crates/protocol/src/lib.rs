@@ -244,6 +244,12 @@ pub mod api {
         /// When the user marked it seen; absent while it's open.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub seen_at: Option<String>,
+        /// When the agent took it back (it no longer applies, or changed): no longer open, and kept in the chat with
+        /// the reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub retracted_at: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub retraction_reason: Option<String>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
