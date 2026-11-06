@@ -2226,7 +2226,22 @@ async fn review_sessions_left_up_with_nothing_to_review_are_found_to_park(db: Pg
     db::set_phase(&db, author, Phase::Idle).await.unwrap();
 
     let quiet_since = Utc::now() - Duration::minutes(12);
-    let found = db::reviewers_to_park(&db, quiet_since).await.unwrap();
+    let parkable = || async {
+        db::reviewers_to_park(&db, quiet_since)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>()
+    };
+    let found = parkable().await;
+    // With when each was last active, which tells one stuck on a command (`reviews::settle_reviewers`).
+    let active = db::reviewers_to_park(&db, quiet_since).await.unwrap();
+    assert!(
+        active
+            .iter()
+            .any(|(id, at)| *id == kept && Utc::now() - *at > Duration::minutes(59))
+    );
     assert!(found.contains(&kept), "a kept reviewer whose park was lost");
     assert!(
         found.contains(&between),
@@ -2262,13 +2277,7 @@ async fn review_sessions_left_up_with_nothing_to_review_are_found_to_park(db: Pg
     let ids = |rows: Vec<db::SessionRow>| rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
     let retired = ids(db::retired_reviewers(&db, quiet_since).await.unwrap());
     assert_eq!(retired, [kept]);
-    assert!(
-        !db::reviewers_to_park(&db, quiet_since)
-            .await
-            .unwrap()
-            .contains(&kept),
-        "it's retired, not kept"
-    );
+    assert!(!parkable().await.contains(&kept), "it's retired, not kept");
     db::finish_purge(&db, kept).await.unwrap();
     assert!(
         db::retired_reviewers(&db, quiet_since)

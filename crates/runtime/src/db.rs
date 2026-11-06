@@ -1535,12 +1535,16 @@ pub async fn move_proposal(
     .await
 }
 
-/// Review sessions that are up with nothing to review, quiet since before `quiet_since`: idle, not deleted, and with
-/// no proposal in review. One kept for a carried-over review, or between rounds while its author works on findings,
-/// is parked then (`reviews::settle_reviewers`) whatever happened to the park that was meant to follow its verdict.
-pub async fn reviewers_to_park(db: &PgPool, quiet_since: DateTime<Utc>) -> sqlx::Result<Vec<Uuid>> {
-    sqlx::query_scalar(
-        "select s.id from sessions s where s.kind = 'review' and s.deleted_at is null and s.phase = 'idle' \
+/// Review sessions that are up with nothing to review, quiet since before `quiet_since`, with when each was last
+/// active: idle, not deleted, and with no proposal in review. One kept for a carried-over review, or between rounds
+/// while its author works on findings, is parked then (`reviews::settle_reviewers`) whatever happened to the park
+/// that was meant to follow its verdict.
+pub async fn reviewers_to_park(
+    db: &PgPool,
+    quiet_since: DateTime<Utc>,
+) -> sqlx::Result<Vec<(Uuid, DateTime<Utc>)>> {
+    sqlx::query_as(
+        "select s.id, s.active_at from sessions s where s.kind = 'review' and s.deleted_at is null and s.phase = 'idle' \
          and s.active_at < $1 \
          and not exists (select 1 from proposals p where p.review_session_id = s.id and p.status = 'in_review') \
          order by s.active_at",

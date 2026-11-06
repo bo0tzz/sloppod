@@ -1991,6 +1991,26 @@ impl Hub {
         true
     }
 
+    /// Says that the session's pod was stopped while commands of its agent ran, which ended them (`what` lists them).
+    /// For a pod replaced (a new image, a move) the agent is told, to start again what it still needs. For a parked
+    /// session it's only recorded in its transcript: queued for the agent, it would wake the session at the next
+    /// start (#454), when it was parked to stay parked.
+    pub async fn commands_ended(self: &Arc<Self>, id: Uuid, what: String) {
+        let parked = matches!(self.store.get_session(id).await, Ok(Some(row)) if row.phase() == Phase::Parked);
+        if !parked {
+            self.notify(id, what).await;
+            return;
+        }
+        self.record(
+            id,
+            json!({
+                "sessionUpdate": "notice", "severity": "info", "title": "Commands ended by parking",
+                "description": what,
+            }),
+        )
+        .await;
+    }
+
     /// Tells the agent something: a new turn when it's idle, steered into the running one, or queued until it's
     /// up. Kept in the stored queue until it reaches the agent, so a restart doesn't lose it (#237); says whether
     /// it was kept.
