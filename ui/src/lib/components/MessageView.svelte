@@ -2,12 +2,17 @@
   import { Icon, IconButton } from '@immich/ui';
   import { mdiAlertCircleOutline, mdiBugOutline, mdiCheck, mdiContentCopy, mdiLinkVariant, mdiSteering } from '@mdi/js';
   import { messageMarkdown, type MessageItem } from '#lib/acp/transcript.svelte.ts';
+  import { MediaQuery } from 'svelte/reactivity';
   import Markdown from './Markdown.svelte';
 
   /** `bundleUrl`: where the debug bundle of the message's turn downloads from (#378). */
   let { message, bundleUrl }: { message: MessageItem; bundleUrl?: string } = $props();
 
   const user = $derived(message.type === 'user');
+  // With a pointer the actions overlay the message's last line, so they're small enough to fit inside it; touch keeps
+  // the size a finger needs.
+  const fine = new MediaQuery('(pointer: fine)');
+  const actionSize = $derived(fine.current ? 'tiny' : 'small');
 
   let copyState = $state<'idle' | 'copied' | 'failed'>('idle');
   let copyTimer: ReturnType<typeof setTimeout> | undefined;
@@ -36,7 +41,7 @@
   <div
     class={user
       ? `max-w-[85%] rounded-2xl rounded-ee-md px-4 py-2.5 ${message.steering ? 'bg-warning-500/15' : 'bg-primary/10'}`
-      : 'group w-full min-w-0'}
+      : 'group relative w-full min-w-0'}
   >
     {#if message.steering}
       <div class="text-warning-700 dark:text-warning-400 mb-1 flex items-center gap-1 text-xs font-medium">
@@ -62,15 +67,20 @@
       {/if}
     {/each}
     {#if !user}
-      <!-- Revealed on hover where there's a pointer to hover with, always shown on touch screens. -->
-      <div data-testid="message-actions" class="pointer-fine:opacity-0 pointer-fine:group-hover:opacity-100 pointer-fine:focus-within:opacity-100 -ms-2 transition-opacity">
+      <!-- With a pointer, a small toolbar over the message's bottom corner, where a last line seldom reaches, shown on
+           hover or keyboard focus and taking no room of its own: it can't stick out of the message, as the transcript's
+           rows contain their paint. On touch screens it's always shown, as one row under the message. -->
+      <div
+        data-testid="message-actions"
+        class="-ms-2 flex items-center transition-opacity pointer-fine:pointer-events-none pointer-fine:absolute pointer-fine:bottom-0 pointer-fine:right-0 pointer-fine:ms-0 pointer-fine:rounded-full pointer-fine:bg-light-50 pointer-fine:opacity-0 pointer-fine:shadow-sm pointer-fine:group-hover:pointer-events-auto pointer-fine:group-hover:opacity-100 pointer-fine:focus-within:pointer-events-auto pointer-fine:focus-within:opacity-100"
+      >
         <IconButton
           icon={copyFeedback[copyState].icon}
           aria-label={copyFeedback[copyState].label}
           variant="ghost"
           shape="round"
           color={copyState === 'failed' ? 'danger' : 'secondary'}
-          size="small"
+          size={actionSize}
           onclick={copy}
         />
         <span class="sr-only" role="status">{copyFeedback[copyState].status}</span>
@@ -83,7 +93,7 @@
             variant="ghost"
             shape="round"
             color="secondary"
-            size="small"
+            size={actionSize}
             href={bundleUrl}
             download
           />

@@ -218,6 +218,24 @@ test('a debug bundle finds the turn of a message loaded without the message that
   expect((await firstEvent()).update.content.text).toBe(prompt);
 });
 
+test('with a pointer, the message actions take no room under a message', async ({ page }) => {
+  await createSession(page, 'Add backoff to the reconnect logic in sloppod');
+  await finishTurn(page);
+  await page.mouse.move(0, 0);
+  // A message ends where its text ends: the actions overlay its last line instead of adding a row under it.
+  for (const message of await agentMessages(page).all()) {
+    const gap = await message.evaluate((node) => {
+      const blocks = node.querySelectorAll('p, ul, ol, pre');
+      return node.getBoundingClientRect().bottom - blocks[blocks.length - 1].getBoundingClientRect().bottom;
+    });
+    expect(gap).toBeLessThanOrEqual(1);
+  }
+  // Keyboard users get them too: focus reveals them.
+  const message = agentMessages(page).filter({ hasText: FINAL });
+  await message.getByRole('button', { name: 'Copy message' }).focus();
+  await expect(message.getByTestId('message-actions')).toHaveCSS('opacity', '1');
+});
+
 test('touch screens always show the copy button', async ({ page, browser }) => {
   await createSession(page, 'Add backoff to the reconnect logic in sloppod');
   await finishTurn(page);
