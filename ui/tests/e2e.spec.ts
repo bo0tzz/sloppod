@@ -2130,6 +2130,32 @@ test('the sidebar folds away on narrow screens', async ({ page }) => {
   await expect(sidebar).toBeVisible();
 });
 
+test('a session that needs the user moves above the ones that do not, and drops back once it does not', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  const older = 'Say something, the older session in the order';
+  const newer = 'Say something, the newer session in the order';
+  const olderId = await createSession(page, older);
+  await finishTurn(page);
+  await createSession(page, newer);
+  await finishTurn(page);
+  const rows = page.getByRole('navigation', { name: 'Sessions' }).getByTestId('session-row');
+  // Where each is in the list, as the sessions of other tests come and go around them.
+  const above = async (first: string, second: string) => {
+    const texts = await rows.evaluateAll((nodes) => nodes.map((node) => node.textContent ?? ''));
+    return texts.findIndex((text) => text.includes(first)) < texts.findIndex((text) => text.includes(second));
+  };
+  await expect.poll(() => above('the newer session', 'the older session')).toBe(true);
+
+  // Something opens in the older one (nothing else happens in it): it goes above the newer one, without a reload.
+  const highlight = await (await page.request.post(`/_mock/highlight?session=${olderId}&text=Look%20at%20this`)).json();
+  await expect.poll(() => above('the older session', 'the newer session')).toBe(true);
+  await expect(page.getByTestId('session-group').filter({ hasText: 'Waiting on you' })).toHaveCount(1);
+
+  // The user has seen it: it drops back to where its last activity puts it.
+  await page.request.post(`/api/v1/sessions/${olderId}/highlights/${highlight.id}/seen`, { data: {} });
+  await expect.poll(() => above('the newer session', 'the older session')).toBe(true);
+});
+
 test('lists sub-sessions under their parent', async ({ page }) => {
   await page.setViewportSize({ width: 1400, height: 900 });
   await createSession(page, 'Fan out the work in sloppod');
@@ -3850,7 +3876,10 @@ test('arrow keys move between the rows of the session list', async ({ page }) =>
   await expect(rows.nth(1)).toBeFocused();
   await page.keyboard.press('ArrowUp');
   await expect(rows.first()).toBeFocused();
-  // The newest session is the first of the list: nothing above it.
+
+  // The first row of the list has nothing above it: the key leaves it where it is.
+  const top = page.getByRole('navigation', { name: 'Sessions' }).getByTestId('session-row').first();
+  await top.focus();
   await page.keyboard.press('ArrowUp');
-  await expect(rows.first()).toBeFocused();
+  await expect(top).toBeFocused();
 });

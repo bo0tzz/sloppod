@@ -26,7 +26,30 @@
   const roots = $derived(sessions.filter((session) => !session.parent_id || !sessions.some((s) => s.id === session.parent_id)));
   const isRunning = (session: Session): boolean =>
     session.phase !== 'parked' || (children.get(session.id) ?? []).some(isRunning);
-  const running = $derived(roots.filter(isRunning));
+  // What the user does first: a session with something open for them (a question, a permission request, a proposal, a
+  // highlight), then one at work, then the rest, the most recent first within each (#445). A tree goes by its most
+  // urgent session.
+  const rank = (session: Session): number => {
+    const own =
+      session.phase === 'waiting' ||
+      Object.values(session.waiting ?? {}).some((count) => count > 0)
+        ? 0
+        : session.phase === 'working' || session.phase === 'starting'
+          ? 1
+          : 2;
+    return Math.min(own, ...(children.get(session.id) ?? []).map(rank));
+  };
+  const running = $derived(roots.filter(isRunning).sort((a, b) => rank(a) - rank(b)));
+  const groups = $derived(
+    [
+      { key: 'waiting', title: 'Waiting on you', sessions: running.filter((s) => rank(s) === 0) },
+      { key: 'working', title: 'Working', sessions: running.filter((s) => rank(s) === 1) },
+      { key: 'rest', title: 'Other', sessions: running.filter((s) => rank(s) === 2) },
+    ].filter((group) => group.sessions.length > 0),
+  );
+  // Only told apart by a heading when there's more than one group; a long working group can be folded away.
+  const FOLDABLE = 5;
+  let workingFolded = $state(false);
   const parked = $derived(roots.filter((session) => !isRunning(session)));
 
   let container = $state<HTMLElement>();
@@ -102,8 +125,22 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div bind:this={container} {onkeydown} class="contents">
 <ul class="flex flex-col {compact ? 'gap-0.5 p-2' : 'gap-2'}" data-testid="session-list">
-  {#each running as session (session.id)}
-    {@render row(session)}
+  {#each groups as group (group.key)}
+    {#if groups.length > 1}
+      <li class="flex items-center justify-between {compact ? 'px-3 pt-1' : 'pt-1'}" data-testid="session-group" data-group={group.key}>
+        <Text size="tiny" color="muted" fontWeight="semi-bold">{group.title}{group.key === 'working' ? ` (${group.sessions.length})` : ''}</Text>
+        {#if group.key === 'working' && group.sessions.length > FOLDABLE}
+          <button type="button" class="text-muted text-xs underline" aria-expanded={!workingFolded} onclick={() => (workingFolded = !workingFolded)}>
+            {workingFolded ? 'Show' : 'Fold'}
+          </button>
+        {/if}
+      </li>
+    {/if}
+    {#if !(group.key === 'working' && workingFolded && group.sessions.length > FOLDABLE)}
+      {#each group.sessions as session (session.id)}
+        {@render row(session)}
+      {/each}
+    {/if}
   {:else}
     <li>
       <Text color="muted" size="small" class="px-3 py-6 text-center">{parked.length ? 'No running sessions.' : 'No sessions yet.'}</Text>

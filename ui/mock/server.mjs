@@ -2586,6 +2586,12 @@ const server = http.createServer(async (req, res) => {
       failLoadsUntil = Date.now() + Number(url.searchParams.get('for') ?? 0);
       return json(res, 200, {});
     }
+    // A highlight appears in an existing session with nothing else happening in it: it asks for the user, and no turn runs.
+    if (url.pathname === '/_mock/highlight' && req.method === 'POST') {
+      const session = sessions.get(url.searchParams.get('session') ?? '');
+      if (!session) return json(res, 404, { error: 'session not found' });
+      return json(res, 200, createHighlight(session, url.searchParams.get('text') ?? 'Look at this'));
+    }
     if (url.pathname === '/_mock/slow-loads' && req.method === 'POST') {
       slowLoadsUntil = Date.now() + Number(url.searchParams.get('for') ?? 0);
       return json(res, 200, {});
