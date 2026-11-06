@@ -18,6 +18,23 @@
   // The home page is the full session list, so the sidebar would only repeat it.
   const showSidebar = $derived(sidebar.available && page.route.id !== '/');
 
+  /**
+   * Scrolling the session list with nowhere left to scroll goes on to the chat (#48), as if the wheel were over it. The
+   * wheel is passed on as an event too, so the chat takes it as its reader scrolling, not the browser moving it.
+   */
+  function overscrollToChat(list: HTMLElement) {
+    const onWheel = (event: WheelEvent) => {
+      const chat = document.querySelector<HTMLElement>('[data-testid="transcript-scroller"]');
+      if (!chat || event.deltaY === 0) return;
+      const room = event.deltaY > 0 ? list.scrollHeight - list.clientHeight - list.scrollTop : list.scrollTop;
+      if (room >= 1) return;
+      chat.dispatchEvent(new WheelEvent('wheel', { deltaY: event.deltaY, bubbles: false }));
+      chat.scrollBy({ top: event.deltaY });
+    };
+    list.addEventListener('wheel', onWheel, { passive: true });
+    return { destroy: () => list.removeEventListener('wheel', onWheel) };
+  }
+
   afterNavigate(() => {
     if (!sidebar.wide) sidebar.open = false;
   });
@@ -60,7 +77,7 @@
               {/if}
             </div>
           </div>
-          <div class="min-h-0 grow overflow-y-auto">
+          <div class="min-h-0 grow overflow-y-auto" use:overscrollToChat>
             <SessionList compact sessions={sessions.sorted} activeId={page.params.id} unknown={sessions.lost} />
           </div>
           <QuotaMeters />

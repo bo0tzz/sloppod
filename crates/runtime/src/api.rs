@@ -38,6 +38,7 @@ pub fn routes() -> Router<AppState> {
         .route("/sessions/{id}/wake", post(wake_session))
         .route("/sessions/{id}/review", put(set_review))
         .route("/sessions/{id}/debug-bundle", get(debug_bundle))
+        .route("/sessions/{id}/read", put(set_read))
         .route("/sessions/{id}/highlights", get(list_highlights))
         .route(
             "/sessions/{id}/highlights/{highlight}/seen",
@@ -873,6 +874,34 @@ async fn wake_session(
         .await?
         .ok_or_else(not_found)?;
     Ok(Json(state.hub.session_api(&session).await))
+}
+
+#[derive(Deserialize)]
+struct ReadBody {
+    seq: i64,
+}
+
+/// The user's UI reports how far they've read the session (#48): the seq of the last event they scrolled past. It only
+/// moves forward, so a late report from another UI can't take it back. The owner's other UIs hear of it as the
+/// session's `read_seq`.
+async fn set_read(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ReadBody>,
+) -> ApiResult<impl IntoResponse> {
+    if body.seq < 0 {
+        return Err(bad_request("seq can't be negative"));
+    }
+    db::owned_session(&state.db, id, &user)
+        .await?
+        .ok_or_else(not_found)?;
+    let before = db::read_seq(&state.db, id, &user).await?;
+    let seq = db::set_read_seq(&state.db, id, &user, body.seq).await?;
+    if before != Some(seq) {
+        state.hub.broadcast_session(id).await;
+    }
+    Ok(Json(json!({"seq": seq})))
 }
 
 /// What the agent highlighted for the user in this session, oldest first, the ones marked seen included (#439).

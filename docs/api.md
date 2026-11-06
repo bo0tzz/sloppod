@@ -25,6 +25,7 @@ POST   /api/v1/sessions/{id}/grants -> Session (201) body: {capability, expires_
 PATCH  /api/v1/sessions/{id}/grants/{grant} -> Session  body: {expires_at?: string | null, narrow?: true, credentials?: string[]}; changes when it runs out (null: never), narrows it (a repository it can push to becomes read only), or, for a `model` or `codex` grant, sets the accounts it acts with, in order (below)
 DELETE /api/v1/sessions/{id}/grants/{grant} -> Session  revokes it
 PUT    /api/v1/sessions/{id}/review -> Session     body: {review: "off" | "required"}
+PUT    /api/v1/sessions/{id}/read   -> {seq: number}  body: {seq: number}; the user has read the session up to the event `seq` (below); only moves forward, so a late report from another UI changes nothing, and answers the position as it stands; 400 for a negative one
 GET    /api/v1/sessions/{id}/debug-bundle?message={messageId} -> DebugBundle  downloads (`Content-Disposition: attachment`) a debug bundle of the turn the user message `messageId` started; with `before={messageId}` instead, of the turn before that one; with neither, of the latest turn; 404 when the session has no such turn (below)
 GET    /api/v1/sessions/{id}/highlights -> Highlight[]  what the agent highlighted for the user in this session (#439), oldest first, the ones marked seen included
 POST   /api/v1/sessions/{id}/highlights/{highlight}/seen -> Highlight  the user marks it seen; that's all it does: no turn starts and the agent isn't told. Marking one seen again changes nothing
@@ -138,6 +139,7 @@ type Session = {
   agent_status?: string; // what the pod is doing while the agent starts, e.g. "cloning https://github.com/…"
   agent_error?: string;  // why the agent last failed to start or exited; it's started again meanwhile. Both clear once it's ready
   parent_id?: string;    // the session that spawned it, for a sub-session (ADR 27)
+  read_seq?: number;      // the seq of the last event the user has read in this session, if they have (see "Read position" below)
   limited_until?: string; // the session hit the account's usage limit and carries on by itself then (see "When a turn fails on the account's usage limit" below)
   commands: number | null; // how many of the agent's commands are running, foreground or background, as its supervisor last said (`null` until it says, e.g. no pod); an `idle` session with some running is waiting on them, not done (#413). Kept live, not stored: a dropped link makes it `null` again
   command_lines?: string[]; // those commands' command lines, each cut to 300 characters, when the supervisor sends them
@@ -493,6 +495,7 @@ Runtime → UI:
 | Method | Notes |
 |---|---|
 | `session/update` | Standard ACP updates: `user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `available_commands_update`, `config_option_update`, compaction reports, and `notice` (`{severity, title, description, resume?}`, e.g. why the agent failed to start; recorded once per distinct failure). A turn that was stopped (`Stopped`) or failed (`The turn failed`, with the error) is marked with one too, `resume: true` (#406): the web UI shows a Resume button on it while it's the last thing in the transcript and no turn runs, which sends "Carry on where you left off." as a message. A turn that hit the usage limit isn't marked: it carries on by itself. Prompts sent by any UI are echoed as `user_message_chunk` with a `messageId` per prompt, so every viewer sees them; steers carry `_meta.sloppod.steering: true`, and notices to the agent (see Proposals) `_meta.sloppod.notice: true`. |
+| `session/update` `_meta.sloppod.seq` | On every `session/update`: the update's place in the session's log, which a read position counts in (above). |
 | `session/request_permission` (request) | Sent to every UI that has the session loaded, including requests still open when a UI loads the session (after the `session/load` response). The first answer wins. |
 | `elicitation/create` (request) | The agent asks the user something, e.g. with `ask_user` (below). Delivered like a permission request. Params: `{sessionId, mode: "form", message, requestedSchema, toolCallId?}`; the schema is an object of primitive fields (below). Answer `{action: "accept", content}`, `{action: "decline"}` (skip: the agent is told the user didn't answer) or `{action: "cancel"}`. |
 | `_sloppod/queue` `{sessionId, messages: {id, prompt}[]}` | The messages waiting behind the running turn, sent whenever that changes and when a UI loads the session. |
@@ -501,6 +504,10 @@ Runtime → UI:
 | `_sloppod/session` `{session: Session}` | The session's phase, title, repository or grants changed, the agent's running commands (`commands`, `command_lines`), or what waits on the user (`waiting`: a proposal made, decided, withdrawn or carried out, a question asked or answered, a permission request opened or resolved). Sent on every connection of the owner for any of the owner's sessions, with or without it loaded, so a session list follows them without fetching; a connection that falls behind is dropped, so its UI reconnects and fetches the list. A connection that has the session loaded may get it twice. |
 | `_sloppod/proposal` `{proposal: Proposal}` | A proposal for a loaded session was created or changed. |
 | `_sloppod/highlight` `{highlight: Highlight}` | The agent highlighted something for a loaded session, or the user marked one seen (so another tab shows it). Either also changes the session's `waiting.highlights`, which `_sloppod/session` carries to every connection of the owner. |
+
+### Read position
+
+Where the user has read up to is kept per user and session in the runtime ([#48](https://github.com/bo0tzz/sloppod/issues/48)), so it follows them between a browser and a phone. It's counted in events: each `session/update` carries its place in the session's log as `_meta.sloppod.seq` (live and in the replay of `session/load`). A UI reports the seq of the last event it has scrolled past, the bottom of what's on screen, with `PUT /sessions/{id}/read` (the web UI a moment after scrolling, not on every scroll); the runtime keeps the highest it's told, and when it moves pushes the session (`read_seq`) as `_sloppod/session` to all of the user's connections. The web UI marks the first item after it with an "Unread" bar while there's something unread, opens a session at that bar with a little context above it (at the bottom when nothing is unread), and keeps the bar where it was while the reader is scrolled up. Older history (`_sloppod/history`) carries no seqs; the UI takes it as read.
 
 ### Questions
 

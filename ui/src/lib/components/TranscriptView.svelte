@@ -20,6 +20,7 @@
     onSeen,
     onResume,
     awaiting = new Set<string>(),
+    unreadAfter = null,
   }: {
     items: TranscriptItem[];
     running?: boolean;
@@ -30,6 +31,8 @@
     onResume?: () => void;
     /** The ids of the tool calls waiting for the user's permission: they stay out of a fold. */
     awaiting?: Set<string>;
+    /** The seq of the last event read (#48): an "Unread" bar goes above the first item after it. `null` for no bar. */
+    unreadAfter?: number | null;
   } = $props();
   const highlighted = $derived(matchHighlights(items, highlights));
 
@@ -80,6 +83,15 @@
     return rows;
   });
 
+  const rowItems = (row: Row) => ('fold' in row ? row.fold : [row.item]);
+  /** The last event that touched the row, the first one that made an item in it, and the last that added to one: the bar goes above the first row with something added after the read position. */
+  const rowSeq = (row: Row) => Math.max(...rowItems(row).map((item) => item.seq));
+  const rowFirstSeq = (row: Row) => Math.min(...rowItems(row).map((item) => item.firstSeq));
+  const rowAddedSeq = (row: Row) => Math.max(...rowItems(row).map((item) => item.addedSeq));
+  const firstUnread = $derived(
+    unreadAfter === null ? -1 : rows.findIndex((row) => rowAddedSeq(row) > unreadAfter),
+  );
+
   // The turn each item is part of, as the debug bundle's query names it: the message that started it, steered
   // messages aside. Loaded history can begin part way through a turn: what comes before the first message loaded is
   // in the turn before that message's or, with no message loaded, in the latest.
@@ -102,9 +114,16 @@
 </script>
 
 <div class="flex flex-col gap-3" data-testid="transcript">
-  {#each rows as row ('fold' in row ? row.key : row.item.key)}
+  {#each rows as row, at ('fold' in row ? row.key : row.item.key)}
+    {#if at === firstUnread}
+      <div class="text-primary flex items-center gap-3 text-xs font-medium" data-testid="unread-divider" data-unread-divider>
+        <span class="bg-primary/40 h-px grow"></span>
+        Unread
+        <span class="bg-primary/40 h-px grow"></span>
+      </div>
+    {/if}
     <!-- Off-screen rows aren't laid out or painted until they come near (a long transcript stays smooth). -->
-    <div class="[contain-intrinsic-size:auto_4rem] [content-visibility:auto]">
+    <div class="[contain-intrinsic-size:auto_4rem] [content-visibility:auto]" data-seq={rowSeq(row)} data-first-seq={rowFirstSeq(row)}>
       {#if 'fold' in row}
         <ToolFold items={row.fold} />
       {:else}
