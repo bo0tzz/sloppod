@@ -460,6 +460,12 @@ pub trait PlacementBackend: Send + Sync {
     fn has_pod(&self, _session_id: &str) -> bool {
         false
     }
+    /// Whether the session has no pod, running or terminating, as the cluster says now rather than from a cache: what
+    /// removing a pod's network fence waits for (#455). False by default, for a backend that can't tell, so nothing
+    /// relying on it goes ahead.
+    async fn pod_gone(&self, _session_id: &str) -> Result<bool> {
+        Ok(false)
+    }
     /// The sessions it holds objects for (pods, volumes), from the cluster, whether or not their sessions still exist:
     /// what a sweep checks for leftovers (#455). None by default, for a backend that can't list them.
     async fn sessions(&self) -> Result<Vec<String>> {

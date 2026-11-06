@@ -249,6 +249,16 @@ impl PlacementBackend for AgentSandbox {
         self.index.unschedulable()
     }
 
+    async fn pod_gone(&self, session_id: &str) -> Result<bool> {
+        let selector = format!("{}={session_id}", crate::pods::SESSION_LABEL);
+        let pods = self
+            .pods
+            .list(&kube::api::ListParams::default().labels(&selector))
+            .await
+            .map_err(err)?;
+        Ok(pods.items.is_empty())
+    }
+
     fn has_pod(&self, session_id: &str) -> bool {
         session_id
             .parse()

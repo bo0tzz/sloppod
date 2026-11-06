@@ -43,6 +43,15 @@ pub async fn release_unused(state: &AppState) {
     }
 }
 
+/// Whether the session's pod is gone, as the cluster says now.
+async fn pod_gone(state: &AppState, id: Uuid) -> anyhow::Result<bool> {
+    state
+        .placement
+        .pod_gone(&id.to_string())
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
+}
+
 /// Removes a parked session's egress policy once its pod is gone, and records it, all under its transition lock: a
 /// wake waits for it, and so can't have its newly applied policy removed. Says whether it released it.
 async fn release_parked(state: &AppState, id: Uuid) -> anyhow::Result<bool> {
@@ -50,7 +59,8 @@ async fn release_parked(state: &AppState, id: Uuid) -> anyhow::Result<bool> {
         .hub
         .while_parked(id, || async {
             // Its pod may run on for a while after it's told to stop; the fence holds until it's gone.
-            if state.placement.has_pod(&id.to_string()) {
+            // Asked of the cluster, not a cache that may not have caught up (e.g. just after a restart).
+            if !pod_gone(state, id).await? {
                 return Ok(false);
             }
             state.hub.remove_egress(id, &*state.enforcer).await?;
@@ -70,7 +80,7 @@ async fn release_stopped(state: &AppState, session: &db::SessionRow) -> anyhow::
         .suspend(&id.to_string())
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    if state.placement.has_pod(&id.to_string()) {
+    if !pod_gone(state, id).await? {
         state.hub.release_egress(id, &*state.enforcer).await?;
         return Ok(false);
     }
@@ -96,7 +106,7 @@ pub async fn purge_stopped(state: &AppState) {
         let purged = async {
             lifecycle::remove_session(state, &session).await?;
             // Its disk use goes with it, in the same update: nothing of it counts towards what sessions use.
-            db::finish_purge(&state.db, session.id).await?;
+            db::finish_volume_removal(&state.db, session.id).await?;
             anyhow::Ok(())
         }
         .await;

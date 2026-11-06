@@ -462,7 +462,15 @@ async fn reconcile(state: &AppState) {
     match db::parked_sessions(&state.db).await {
         Ok(parked) => {
             for session in parked {
-                if let Err(e) = state.hub.release_egress(session.id, &*state.enforcer).await {
+                // The fence it puts back is the parked session's policy again, which the storage sweep removes once its
+                // pod is confirmed gone (#455), so it's no longer released.
+                let fenced = match state.hub.release_egress(session.id, &*state.enforcer).await {
+                    Ok(()) => db::set_released(&state.db, session.id, false)
+                        .await
+                        .map_err(Into::into),
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = fenced {
                     tracing::warn!(session = %session.id, error = %e, "releasing a parked session's egress");
                 }
             }

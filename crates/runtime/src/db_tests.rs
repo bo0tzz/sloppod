@@ -2614,7 +2614,7 @@ async fn a_claimed_volume_removal_cant_be_kept_and_is_retried_at_once(db: PgPool
 
     // Removed: its disk use is forgotten in the same update that records it, so it no longer counts in Settings' storage.
     db::set_disk(&db, id, 1, 2).await.unwrap();
-    db::finish_purge(&db, id).await.unwrap();
+    db::finish_volume_removal(&db, id).await.unwrap();
     assert!(
         db::get_session(&db, id)
             .await
@@ -2625,6 +2625,31 @@ async fn a_claimed_volume_removal_cant_be_kept_and_is_retried_at_once(db: PgPool
             .is_none()
     );
     assert!(!db::set_volume_kept(&db, id, true).await.unwrap());
+    assert!(
+        db::claim_stopped_purges(&db, Duration::days(7))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // With its volume gone, it's still a session like any other: deleted, it can be restored.
+    db::mark_deleted(&db, id).await.unwrap();
+    assert!(
+        db::deleted_sessions(&db, "dev")
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.id == id)
+    );
+    assert!(db::restore(&db, id).await.unwrap());
+    assert!(
+        db::get_session(&db, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .deleted_at
+            .is_none()
+    );
 
     // Before any claim, keeping it holds it back from the next one.
     let kept = session(&db, "dev").await;
