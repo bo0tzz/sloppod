@@ -39,6 +39,7 @@ pub fn routes() -> Router<AppState> {
         .route("/sessions/{id}/review", put(set_review))
         .route("/sessions/{id}/debug-bundle", get(debug_bundle))
         .route("/sessions/{id}/read", put(set_read))
+        .route("/sessions/{id}/work-done", get(work_done))
         .route("/sessions/{id}/highlights", get(list_highlights))
         .route(
             "/sessions/{id}/highlights/{highlight}/seen",
@@ -902,6 +903,21 @@ async fn set_read(
         state.hub.broadcast_session(id).await;
     }
     Ok(Json(json!({"seq": seq})))
+}
+
+/// The issues and pull requests the session has acted on, newest first (#205).
+async fn work_done(
+    State(state): State<AppState>,
+    User(user): User,
+    Path(id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    db::owned_session(&state.db, id, &user)
+        .await?
+        .ok_or_else(not_found)?;
+    let proposals =
+        db::list_proposals(&state.db, &user, Some(id), Some(ProposalStatus::Executed)).await?;
+    let watches = db::session_pull_watches(&state.db, id).await?;
+    Ok(Json(crate::work_done::work_done(&proposals, &watches)))
 }
 
 /// What the agent highlighted for the user in this session, oldest first, the ones marked seen included (#439).

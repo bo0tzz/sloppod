@@ -27,6 +27,7 @@ DELETE /api/v1/sessions/{id}/grants/{grant} -> Session  revokes it
 PUT    /api/v1/sessions/{id}/review -> Session     body: {review: "off" | "required"}
 PUT    /api/v1/sessions/{id}/read   -> {seq: number}  body: {seq: number}; the user has read the session up to the event `seq` (below); only moves forward, so a late report from another UI changes nothing, and answers the position as it stands; 400 for a negative one
 GET    /api/v1/sessions/{id}/debug-bundle?message={messageId} -> DebugBundle  downloads (`Content-Disposition: attachment`) a debug bundle of the turn the user message `messageId` started; with `before={messageId}` instead, of the turn before that one; with neither, of the latest turn; 404 when the session has no such turn (below)
+GET    /api/v1/sessions/{id}/work-done -> WorkDone[]  the issues and pull requests the session has acted on (#205), newest first, built from its carried-out proposals and their results (nothing of it is stored): one entry per item, with what was done to it (below)
 GET    /api/v1/sessions/{id}/highlights -> Highlight[]  what the agent highlighted for the user in this session (#439), oldest first, the ones marked seen included
 POST   /api/v1/sessions/{id}/highlights/{highlight}/seen -> Highlight  the user marks it seen; that's all it does: no turn starts and the agent isn't told. Marking one seen again changes nothing
 GET    /api/v1/repos                -> string[]    repositories sessions can be granted, e.g. ["bo0tzz/sloppod"]
@@ -504,6 +505,23 @@ Runtime → UI:
 | `_sloppod/session` `{session: Session}` | The session's phase, title, repository or grants changed, the agent's running commands (`commands`, `command_lines`), or what waits on the user (`waiting`: a proposal made, decided, withdrawn or carried out, a question asked or answered, a permission request opened or resolved). Sent on every connection of the owner for any of the owner's sessions, with or without it loaded, so a session list follows them without fetching; a connection that falls behind is dropped, so its UI reconnects and fetches the list. A connection that has the session loaded may get it twice. |
 | `_sloppod/proposal` `{proposal: Proposal}` | A proposal for a loaded session was created or changed. |
 | `_sloppod/highlight` `{highlight: Highlight}` | The agent highlighted something for a loaded session, or the user marked one seen (so another tab shows it). Either also changes the session's `waiting.highlights`, which `_sloppod/session` carries to every connection of the owner. |
+
+### Work done
+
+`GET /sessions/{id}/work-done` is the log a session's right sidebar shows ([#205](https://github.com/bo0tzz/sloppod/issues/205)): what its carried-out (`executed`) proposals did to which issues and pull requests, from their results. One entry per item, newest (by when the last thing was done to it) first:
+
+```ts
+type WorkDone = {
+  repo: string;            // owner/repo, lower case
+  number: number;
+  kind: "pull_request" | "issue";
+  title?: string;          // as a proposal gave it (a pull request opened, an issue filed, a retitle); absent for an item only updated without a retitle
+  url: string;
+  did: string[];           // in order, without repeats: "opened" (a pull request or a stack's), "filed" (an issue), then what updates did: "commented", "closed", "reopened", "marked ready", "retitled", "body replaced", "relabelled"...
+  at: string;              // when the last of it was carried out
+  state?: { state: "open" | "merged" | "closed"; checks?: "success" | "failure" | "error"; failing?: string[] };  // a pull request the runtime watches, as it last saw it (`pull_watches`, Proposals above)
+};
+```
 
 ### Read position
 

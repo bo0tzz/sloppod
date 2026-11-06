@@ -49,6 +49,23 @@ export type Waiting = {
   highlights?: number;
 };
 
+/** An issue or pull request the session has acted on, from its carried-out proposals (#205). */
+export type WorkDone = {
+  /** `owner/repo`, lower case. */
+  repo: string;
+  number: number;
+  kind: 'pull_request' | 'issue';
+  /** What the proposals call it, when one did. */
+  title?: string;
+  url: string;
+  /** What was done, in order: `opened`, `filed`, `commented`, `closed`... */
+  did: string[];
+  /** When the last of it was carried out. */
+  at: string;
+  /** Where a pull request stands now, if the runtime watches it. */
+  state?: { state: 'open' | 'merged' | 'closed'; checks?: 'success' | 'failure' | 'error'; failing?: string[] };
+};
+
 /** Something the agent asked the user to see with its `highlight` tool; open until they mark it seen. */
 export type Highlight = {
   id: string;
@@ -490,6 +507,7 @@ export const api = {
   deleteCredential: (id: string) => call<void>('DELETE', `/credentials/${encodeURIComponent(id)}`),
   setRead: (session: string, seq: number) =>
     call<{ seq: number }>('PUT', `/sessions/${encodeURIComponent(session)}/read`, { seq }),
+  listWorkDone: (session: string) => call<WorkDone[]>('GET', `/sessions/${encodeURIComponent(session)}/work-done`),
   listHighlights: (session: string) => call<Highlight[]>('GET', `/sessions/${encodeURIComponent(session)}/highlights`),
   markHighlightSeen: (session: string, highlight: string) =>
     call<Highlight>('POST', `/sessions/${encodeURIComponent(session)}/highlights/${encodeURIComponent(highlight)}/seen`, {}),

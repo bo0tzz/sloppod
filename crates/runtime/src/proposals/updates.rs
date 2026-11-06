@@ -213,7 +213,8 @@ pub async fn comment_and_label(
     Ok(())
 }
 
-/// Carries out `apply` for each update, given its position, and answers `{updated, failed, message}`; an error only when none went
+/// Carries out `apply` for each update, given its position, and answers `{updated, failed, message}`, each update's result
+/// naming its `index` in the payload (an item can be updated more than once); an error only when none went
 /// through. `item` is the plural, for the message.
 pub async fn execute_all<F, Fut>(
     updates: &[Value],
@@ -229,7 +230,7 @@ where
     for (item, update) in updates.iter().enumerate() {
         let number = update["number"].as_u64().unwrap_or_default();
         match apply(item, number, update.clone()).await {
-            Ok(()) => done.push(json!({"number": number, "did": describe(update)})),
+            Ok(()) => done.push(json!({"number": number, "did": describe(update), "index": item})),
             Err(e) => failed.push(json!({"number": number, "error": format!("{e:#}")})),
         }
     }
