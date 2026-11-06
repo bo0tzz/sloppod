@@ -530,6 +530,7 @@
                   highlights={view.highlights}
                   onSeen={(highlight) => view.markHighlightSeen(highlight)}
                   onResume={view.unsent.length > 0 ? undefined : resume}
+                  awaiting={new Set(view.permissions.map((request) => request.toolCall.toolCallId))}
                 />
                 {#if activity}
                   <div class="text-muted flex items-center gap-2 py-1 text-sm" data-testid="activity">

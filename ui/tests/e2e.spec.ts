@@ -22,6 +22,17 @@ const phase = (page: Page) => page.getByTestId('session-screen').getByTestId('ph
 const agentMessages = (page: Page) => page.getByTestId('message-agent');
 const userMessages = (page: Page) => page.getByTestId('message-user');
 
+/** Opens every fold of tool calls in the transcript, to see the calls in them. */
+async function expandFolds(page: Page) {
+  for (const summary of await page.locator('[data-testid="tool-fold"]:not([open]) > summary').all()) await summary.click();
+}
+
+/** How many tool calls the transcript holds, folded or not. */
+async function toolCallsInTranscript(page: Page) {
+  const folds = await page.getByTestId('tool-fold-count').allTextContents();
+  return folds.reduce((total, text) => total + Number.parseInt(text, 10), 0) + (await page.getByTestId('tool-call').count());
+}
+
 async function finishTurn(page: Page) {
   await permissionCard(page).getByRole('button', { name: 'Allow', exact: true }).click();
   await expect(agentMessages(page).filter({ hasText: FINAL })).toBeVisible();
@@ -111,6 +122,52 @@ test("downloads a debug bundle for an agent message's turn", async ({ page }) =>
   await expect(userMessages(page).getByRole('link', { name: 'Download debug bundle' })).toHaveCount(0);
 });
 
+test('consecutive tool calls fold into one block between two messages, and expand to every call', async ({ page }) => {
+  await createSession(page, 'Use several tools in a row');
+  await expect(agentMessages(page).filter({ hasText: 'That is all of it.' })).toBeVisible();
+  const fold = page.getByTestId('tool-fold');
+  await expect(fold).toHaveCount(1);
+  await expect(fold.getByTestId('tool-fold-count')).toHaveText('5 tool calls');
+  // Folded, the calls aren't drawn at all.
+  await expect(page.getByTestId('tool-call')).toHaveCount(0);
+  const order = await page
+    .getByTestId('transcript')
+    .locator('[data-testid="message-agent"], [data-testid="tool-fold"]')
+    .evaluateAll((nodes) => nodes.map((node) => node.getAttribute('data-testid')));
+  expect(order).toEqual(['message-agent', 'tool-fold', 'message-agent']);
+
+  await fold.locator(':scope > summary').click();
+  await expect(page.getByTestId('tool-call')).toHaveCount(5);
+  await expect(page.getByTestId('tool-call').first()).toContainText('Read src/one.ts');
+  await expect(page.getByTestId('tool-call').last()).toContainText('Read src/five.ts');
+  await fold.locator(':scope > summary').click();
+  await expect(page.getByTestId('tool-call')).toHaveCount(0);
+});
+
+test('a highlight and a failed call among tool calls stay outside the folds', async ({ page }) => {
+  await createSession(page, 'Use several tools in a row, and a highlight');
+  await expect(agentMessages(page).filter({ hasText: 'That is all of it.' })).toBeVisible();
+  // Three calls, then the highlight and a failed call, which show as they are, then two more.
+  const order = await page
+    .getByTestId('transcript')
+    .locator('[data-testid="message-agent"], [data-testid="tool-fold"], [data-testid="highlight-card"], [data-testid="tool-call"]')
+    .evaluateAll((nodes) => nodes.map((node) => node.getAttribute('data-testid')));
+  expect(order).toEqual(['message-agent', 'tool-fold', 'highlight-card', 'tool-call', 'tool-fold', 'message-agent']);
+  await expect(page.getByTestId('highlight-card')).toContainText('The answer is in src/three.ts');
+  await expect(page.getByTestId('tool-call')).toHaveAttribute('data-status', 'failed');
+  await expect(page.getByTestId('tool-fold-count')).toHaveText(['3 tool calls', '2 tool calls']);
+});
+
+test('a fold shows the call that is running', async ({ page }) => {
+  await createSession(page, 'Use several tools in a row, slowly');
+  const fold = page.getByTestId('tool-fold');
+  await expect(fold.getByTestId('tool-fold-running')).toHaveText('Read src/slow.ts');
+  await expect(fold).toHaveAttribute('data-running', 'true');
+  await expect(agentMessages(page).filter({ hasText: 'That is all of it.' })).toBeVisible();
+  await expect(fold).toHaveAttribute('data-running', 'false');
+  await expect(fold.getByTestId('tool-fold-running')).toHaveCount(0);
+});
+
 test('a debug bundle finds the turn of a message loaded without the message that started it', async ({ page }) => {
   const prompt = 'Write a long history in sloppod';
   await createSession(page, prompt);
@@ -160,9 +217,15 @@ test('answers a permission request', async ({ page }) => {
   await expect(card).toContainText('Edit ui/src/lib/acp/connection.ts');
   await expect(card.getByTestId('diff')).toContainText('MAX_BACKOFF_MS');
   await expect(phase(page)).toHaveAttribute('data-phase', 'waiting');
+  // The call asking for permission is out in the open, not in a fold.
+  await expect(page.getByTestId('tool-call').filter({ hasText: 'Edit ui/src/lib/acp/connection.ts' })).toBeVisible();
 
   await card.getByRole('button', { name: 'Allow', exact: true }).click();
   await expect(card).toBeHidden();
+  await expect(agentMessages(page).filter({ hasText: FINAL })).toBeVisible();
+
+  // The calls of a run are folded together; open them to see each.
+  await expandFolds(page);
   await expect(page.getByTestId('tool-call').filter({ hasText: 'Edit ui/src/lib/acp/connection.ts' })).toHaveAttribute(
     'data-status',
     'completed',
@@ -173,8 +236,6 @@ test('answers a permission request', async ({ page }) => {
   await expect(testRun).toHaveAttribute('data-status', 'completed');
   await testRun.locator('summary').click();
   await expect(testRun.getByTestId('tool-output')).toContainText('3 passed');
-
-  await expect(agentMessages(page).filter({ hasText: FINAL })).toBeVisible();
 });
 
 test('a permission answered elsewhere disappears', async ({ page, context }) => {
@@ -729,7 +790,7 @@ async function expectTranscriptOnce(page: Page, prompt: string) {
   await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(1);
   await expect(agentMessages(page).filter({ hasText: FINAL })).toHaveCount(1);
   await expect(agentMessages(page).filter({ hasText: "I'll start by reading" })).toHaveCount(1);
-  await expect(page.getByTestId('tool-call')).toHaveCount(5);
+  await expect.poll(() => toolCallsInTranscript(page)).toBe(5);
   await expect(page.getByTestId('plan')).toHaveCount(1);
 }
 
@@ -3598,6 +3659,8 @@ test('a selection runs from one message across tool calls to the next', async ({
   await page.setViewportSize({ width: 1280, height: 2000 });
   await createSession(page, 'Select across turns in sloppod');
   await finishTurn(page);
+  // The tool calls are folded away unless opened; open them, as the selection takes them in.
+  await expandFolds(page);
 
   // From a message, past the tool calls after it, to the last message: copied as on any page, tool calls included.
   const before = agentMessages(page).filter({ hasText: 'Reconnects use a fixed' });

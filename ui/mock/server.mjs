@@ -754,6 +754,46 @@ async function agentScript(session, turn, prompt) {
   // The agent highlights something for the user, one call for each of the texts after `Highlight:`, split by |.
   // With `Highlight (codex):` the calls are reported as codex-acp does: its own title, the input wrapped with the server and
   // tool, and the result as `rawOutput` rather than content.
+  // A turn with several tool calls in a row between two messages (#446): `Use several tools`. With `and a highlight` a
+  // highlight and a failed call come among them; with `slowly` the last call runs a while before it completes.
+  if (/^use several tools/i.test(prompt)) {
+    await say('Looking at a few files.');
+    const read = async (name, fields = {}) => {
+      const id = randomUUID();
+      tool({ toolCallId: id, title: `Read ${name}`, kind: 'read', status: 'pending', rawInput: { file_path: name } });
+      await step(1);
+      update(id, { status: 'completed', ...fields });
+    };
+    await read('src/one.ts');
+    await read('src/two.ts');
+    await read('src/three.ts');
+    if (/and a highlight/i.test(prompt)) {
+      const text = 'The answer is in src/three.ts';
+      const highlightId = randomUUID();
+      tool({ toolCallId: highlightId, title: 'mcp__sloppod__highlight', kind: 'other', status: 'pending', rawInput: { text } });
+      await step(1);
+      const highlight = createHighlight(session, text);
+      update(highlightId, {
+        status: 'completed',
+        content: [{ type: 'content', content: { type: 'text', text: `Highlighted (highlight ${highlight.id}). Nothing waits on it.` } }],
+      });
+      const failedId = randomUUID();
+      tool({ toolCallId: failedId, title: 'Read src/missing.ts', kind: 'read', status: 'pending', rawInput: { file_path: 'src/missing.ts' } });
+      await step(1);
+      update(failedId, { status: 'failed' });
+    }
+    await read('src/four.ts');
+    if (/slowly/i.test(prompt)) {
+      const id = randomUUID();
+      tool({ toolCallId: id, title: 'Read src/slow.ts', kind: 'read', status: 'in_progress', rawInput: { file_path: 'src/slow.ts' } });
+      await sleep(2500);
+      update(id, { status: 'completed' });
+    } else {
+      await read('src/five.ts');
+    }
+    await say('That is all of it.');
+    return;
+  }
   // With `Highlight (retry):` a first call fails and is tried again; the result of the second says nothing of which highlight it made.
   // With `Highlight (retract): <text> | <reason>` the agent highlights, then takes it back (`retract_highlight`).
   if (/^highlight \(retract\):/i.test(prompt)) {
