@@ -75,7 +75,7 @@
     <Text size="small" data-testid="storage-total">{bytes(total)} used by {listed.length} {listed.length === 1 ? 'session' : 'sessions'}</Text>
     <ul class="border-light-200 divide-light-200 divide-y rounded-xl border text-sm">
       {#each listed as session (session.id)}
-        <li class="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2" data-testid="storage-session">
+        <li class="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2" data-testid="storage-session" data-session={session.id}>
           <a href="/sessions/{session.id}" class="min-w-0 grow truncate font-medium hover:underline">{session.title || 'New session'}</a>
           {#if session.deleted_at}
             <Text color="muted" size="small">deleted</Text>
