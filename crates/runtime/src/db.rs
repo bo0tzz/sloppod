@@ -401,6 +401,17 @@ pub async fn watched_pulls(db: &PgPool) -> sqlx::Result<Vec<WatchedPull>> {
     .await
 }
 
+/// What the runtime last saw of each pull request it watches for a session.
+pub async fn session_pull_watches(
+    db: &PgPool,
+    session: Uuid,
+) -> sqlx::Result<Vec<(String, i64, Value)>> {
+    sqlx::query_as("select repo, number, observed from pull_watches where session_id = $1")
+        .bind(session)
+        .fetch_all(db)
+        .await
+}
+
 /// The owner's utility session (ADR 26), if they have one that isn't stopped.
 pub async fn utility_session(db: &PgPool, owner: &str) -> sqlx::Result<Option<SessionRow>> {
     sqlx::query_as(AssertSqlSafe(format!(

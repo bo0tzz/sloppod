@@ -847,6 +847,110 @@ test('files issues, leaving one out and editing another', async ({ page }) => {
   ]);
 });
 
+test('the right sidebar stays up beside the chat, and folds away', async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1000 });
+  const id = await createSession(page, 'Give me a long answer in sloppod');
+  const panel = page.getByTestId('side-panel');
+  // Open with nothing waiting, so the chat doesn't move when something does.
+  await expect(panel).toBeVisible();
+  await expect(panel.getByRole('heading', { name: 'Nothing waiting on you' })).toBeVisible();
+  await expect(panel.getByTestId('work-done-empty')).toBeVisible();
+  const chat = page.getByTestId('transcript-scroller');
+  const width = (await chat.boundingBox())!.width;
+  await page.request.post(`/_mock/highlight?session=${id}&text=Look%20here`);
+  await expect(panel.getByTestId('highlight-item')).toBeVisible();
+  expect((await chat.boundingBox())!.width).toBe(width);
+
+  await panel.getByRole('button', { name: 'Close the sidebar' }).click();
+  await expect(panel).toBeHidden();
+  // What waits shows under the chat meanwhile.
+  await expect(page.getByTestId('waiting-panel')).toBeVisible();
+  const toggle = page.getByRole('button', { name: 'Show details' });
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  await toggle.click();
+  await expect(panel).toBeVisible();
+  await expect(page.getByTestId('waiting-panel')).toBeHidden();
+  await expect(page.getByRole('button', { name: 'Hide details' })).toHaveAttribute('aria-expanded', 'true');
+});
+
+test('on a narrow screen the sidebar is folded away, and opens over the chat', async ({ page }) => {
+  await page.setViewportSize({ width: 600, height: 900 });
+  await createSession(page, 'Give me a long answer in sloppod');
+  const panel = page.getByTestId('side-panel');
+  await expect(panel).toBeHidden();
+  await page.getByRole('button', { name: 'Show details' }).click();
+  await expect(panel).toBeVisible();
+  await expect(panel.getByTestId('work-done-empty')).toBeVisible();
+  await panel.getByRole('button', { name: 'Close the sidebar' }).click();
+  await expect(panel).toBeHidden();
+});
+
+test('lists the pull requests and issues a session acted on, with where a pull request stands', async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1000 });
+  const id = await createSession(page, 'Propose a PR for sloppod');
+  await finishTurn(page);
+  const panel = page.getByTestId('side-panel');
+  await expect(panel.getByTestId('work-done-empty')).toBeVisible();
+  await panel.getByTestId('proposal-card').getByRole('button', { name: 'Review' }).click();
+  await page.getByRole('button', { name: 'Approve', exact: true }).click();
+
+  const item = panel.getByTestId('work-done-item');
+  await expect(item).toHaveCount(1);
+  await expect(item.getByTestId('work-done-title')).toHaveText('Reconnect the ACP socket with exponential backoff');
+  await expect(item.getByTestId('work-done-did')).toHaveText('opened');
+  await expect(item.getByRole('link')).toHaveAttribute('href', /github\.com\/bo0tzz\/sloppod\/pull\/\d+$/);
+  await expect(item.getByTestId('work-done-state')).toBeHidden();
+
+  // What the runtime has seen of the pull request is there after a reload.
+  const proposals: Proposal[] = await (await page.request.get(`/api/v1/proposals?session=${id}`)).json();
+  const { number } = proposals.find((p) => p.kind === 'github.pr.create')!.result as { number: number };
+  await page.request.post(`/_mock/pull?repo=bo0tzz/sloppod&number=${number}&state=open&checks=failure&failing=check,lint`);
+  await page.reload();
+  await expect(item.getByTestId('work-done-state')).toHaveText('Open');
+  await expect(item.getByTestId('work-done-checks')).toHaveText('checks failing: check, lint');
+});
+
+test('an older answer about the work done does not replace a newer one', async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1000 });
+  const id = await createSession(page, 'Propose a PR for sloppod');
+  await finishTurn(page);
+  const proposals: Proposal[] = await (await page.request.get(`/api/v1/proposals?session=${id}`)).json();
+  const pending = proposals.find((p) => p.kind === 'github.pr.create')!;
+
+  // The load's first request is answered with the history as it was, but only once the proposal has been carried out.
+  let requests = 0;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  await page.route('**/api/v1/sessions/*/work-done', async (route) => {
+    const request = ++requests;
+    const response = await route.fetch();
+    if (request === 1) await held;
+    await route.fulfill({ response });
+  });
+  await page.reload();
+  // The load fetches twice (before and after `session/load`); the first answer is the one that's held.
+  await expect.poll(() => requests).toBeGreaterThanOrEqual(2);
+  await page.request.post(`/api/v1/proposals/${pending.id}/approve`, { data: {} });
+  const panel = page.getByTestId('side-panel');
+  await expect(panel.getByTestId('work-done-item')).toHaveCount(1);
+
+  release();
+  await page.waitForTimeout(500);
+  await expect(panel.getByTestId('work-done-item')).toHaveCount(1);
+});
+
+test('files issues, which the work done lists with what was done to them', async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1000 });
+  await createSession(page, 'File issues for sloppod');
+  const panel = page.getByTestId('side-panel');
+  await panel.getByTestId('proposal-card').getByRole('button', { name: 'Review' }).click();
+  await page.getByRole('button', { name: /^File \d+ issues$/ }).click();
+  const items = panel.getByTestId('work-done-item');
+  await expect(items).toHaveCount(3);
+  await expect(items.first().getByTestId('work-done-did')).toHaveText('filed');
+  await expect(items.first().getByRole('link')).toHaveAttribute('href', /github\.com\/bo0tzz\/sloppod\/issues\/\d+$/);
+});
+
 async function expectTranscriptOnce(page: Page, prompt: string) {
   await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(1);
   await expect(agentMessages(page).filter({ hasText: FINAL })).toHaveCount(1);
@@ -1397,6 +1501,8 @@ test('sending a message scrolls the chat to it, and so does scrolling the sessio
     })
     .toBeGreaterThan(up);
   const down = await scrollTop();
+  // Back up through the list, however long it is, to its top; then the wheel goes on to the chat.
+  await page.mouse.wheel(0, -100_000);
   await expect
     .poll(async () => {
       await page.mouse.wheel(0, -200);
