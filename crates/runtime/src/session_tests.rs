@@ -3477,3 +3477,44 @@ async fn a_withdrawal_the_database_cannot_keep_leaves_the_question_open_to_try_a
     assert!(h.hub.replay(h.id).await.unwrap().permissions.is_empty());
     assert!(h.store.questions.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn commands_ended_by_a_park_are_recorded_not_queued_so_the_next_start_leaves_it_parked() {
+    let h = Harness::ready().await;
+    h.store.set_phase(h.id, Phase::Parked).await.unwrap();
+    h.hub
+        .commands_ended(h.id, "sloppod: these were ended:\n- `sleep 999`".into())
+        .await;
+    assert!(
+        kept_texts(&h).await.is_empty(),
+        "nothing queued for the agent"
+    );
+    let last = h.store.updates(h.id).pop().unwrap();
+    assert_eq!(last["sessionUpdate"], "notice");
+    assert!(last["description"].as_str().unwrap().contains("sleep 999"));
+
+    // At the next start, nothing wakes it.
+    let woken = Arc::new(std::sync::Mutex::new(0));
+    let hub = Arc::new(Hub::new(h.store.clone()));
+    {
+        let woken = woken.clone();
+        hub.set_waker(Arc::new(move |_| {
+            let woken = woken.clone();
+            Box::pin(async move {
+                *woken.lock().unwrap() += 1;
+                Ok(())
+            })
+        }));
+    }
+    hub.restore_queues().await.unwrap();
+    assert_eq!(*woken.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn commands_ended_by_a_new_pod_are_told_to_the_agent() {
+    let h = Harness::starting().await;
+    h.hub
+        .commands_ended(h.id, "sloppod: these were ended:\n- `sleep 999`".into())
+        .await;
+    assert_eq!(kept_texts(&h).await.len(), 1);
+}

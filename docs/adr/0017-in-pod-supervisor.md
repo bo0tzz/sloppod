@@ -60,3 +60,5 @@ Milestone 1, 2026-10-26: the session-scoped identity is the pod's projected Serv
 
 2026-11-03: `Commands` carries the commands' command lines too (`lines`, each cut to 300 characters), and is sent whenever they change, not only the count ([#413](https://github.com/bo0tzz/sloppod/issues/413)). The runtime keeps the last word live and puts it on the session (`commands`, `command_lines`), so a UI and a parent session can tell a session waiting on commands it started from one that's done. An older supervisor sends no lines, and those sessions show the count alone.
 
+
+2026-11-06: the shutdown report of a session being parked no longer reaches its agent ([#454](https://github.com/bo0tzz/sloppod/issues/454)). Queued like any other notice, it woke the parked session at the next runtime start (ADR 4), undoing the park. Now, when the session is parked, the commands ended are recorded in its transcript as a notice the UI shows, and nothing is queued; a pod replaced for a new image or moved still tells the agent.

@@ -1137,16 +1137,27 @@ async fn park_kept(state: &AppState, session: Uuid) -> anyhow::Result<()> {
 /// idle session waits for a new image, so it's parked before its pod is replaced.
 const SETTLE_AFTER: chrono::Duration = chrono::Duration::minutes(12);
 
+/// How much longer than [`SETTLE_AFTER`] a review session with nothing to review may keep a command of its agent's
+/// running before it's parked anyway, ending the command (#454): a command that never ends would otherwise hold its
+/// pod's room until the kept reviewer is deleted a day later.
+const STUCK_AFTER: chrono::Duration = chrono::Duration::minutes(15);
+
+/// Whether a review session last active at `active_at` has waited on a command too long by `now`.
+fn stuck(active_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now - active_at > SETTLE_AFTER + STUCK_AFTER
+}
+
 /// Parks the review sessions that are up with nothing to review, and removes the retired ones that still have a pod.
 /// The park or removal that follows a verdict ([`keep`], [`rest`], [`end`]) is a task of its own, which a restart
-/// loses, and a park waits while the reviewer's agent has commands running (parking would end them, and the notice
-/// saying so would wake it at the next start), so this runs at startup and every minute after, until they're done.
+/// loses, and a park waits while the reviewer's agent has commands running, so this runs at startup and every minute
+/// after: until they're done, or have run [`STUCK_AFTER`] too long, when the reviewer is parked anyway.
 pub async fn settle_reviewers(state: &AppState) {
-    let quiet_since = Utc::now() - SETTLE_AFTER;
+    let now = Utc::now();
+    let quiet_since = now - SETTLE_AFTER;
     match db::reviewers_to_park(&state.db, quiet_since).await {
         Ok(sessions) => {
-            for session in sessions {
-                if let Err(e) = park_idle(state, session).await {
+            for (session, active_at) in sessions {
+                if let Err(e) = park_idle(state, session, stuck(active_at, now)).await {
                     tracing::warn!(%session, error = %e, "parking an idle review session");
                 }
             }
@@ -1176,15 +1187,20 @@ pub async fn settle_reviewers(state: &AppState) {
     }
 }
 
-/// Parks a review session if it's quiet, and wakes it again if a proposal claimed it meanwhile, as [`park_kept`] does.
-async fn park_idle(state: &AppState, session: Uuid) -> anyhow::Result<()> {
+/// Parks a review session if it's quiet, or anyway if it's `stuck` on a command; and wakes it again if a proposal
+/// claimed it meanwhile, as [`park_kept`] does.
+async fn park_idle(state: &AppState, session: Uuid, stuck: bool) -> anyhow::Result<()> {
     let Some(row) = db::get_session(&state.db, session).await? else {
         return Ok(());
     };
-    if !lifecycle::park_quiet(state, &row).await? {
+    if lifecycle::park_quiet(state, &row).await? {
+        tracing::info!(%session, "parked a review session with nothing to review");
+    } else if stuck {
+        lifecycle::park(state, &row).await?;
+        tracing::info!(%session, "parked a review session stuck on a command, ending it");
+    } else {
         return Ok(());
     }
-    tracing::info!(%session, "parked a review session with nothing to review");
     if db::reviewing(&state.db, session).await?
         && let Some(row) = db::get_session(&state.db, session).await?
     {
@@ -1508,6 +1524,13 @@ mod tests {
             stall(None, 0, false, round_timed_out(expired, none, false, now)),
             Stall::GiveUp
         );
+    }
+
+    #[test]
+    fn a_reviewer_waits_on_a_command_for_a_while_before_it_is_parked_anyway() {
+        let now = Utc::now();
+        assert!(!stuck(now - chrono::Duration::minutes(20), now));
+        assert!(stuck(now - chrono::Duration::minutes(28), now));
     }
 
     #[test]
