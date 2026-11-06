@@ -237,6 +237,40 @@ pub mod api {
         pub highlights: usize,
     }
 
+    /// An issue or pull request the session has acted on (#205): what its carried-out proposals did to it.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct WorkDone {
+        /// `owner/repo`, lower case.
+        pub repo: String,
+        pub number: u64,
+        /// `pull_request` or `issue`.
+        pub kind: String,
+        /// What the proposals call it, when one did; an update that doesn't retitle it doesn't.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub title: Option<String>,
+        pub url: String,
+        /// What was done, in the order it was: `opened`, `filed`, `commented`, `closed`...
+        pub did: Vec<String>,
+        /// When the last of it was carried out.
+        pub at: String,
+        /// Where a pull request stands now, if the runtime watches it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub state: Option<WorkState>,
+    }
+
+    /// What the runtime last saw of a pull request (`pull_watches`).
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct WorkState {
+        /// `open`, `merged` or `closed`.
+        pub state: String,
+        /// `success`, `failure` or `error`, once the checks have settled.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub checks: Option<String>,
+        /// The checks that failed, when they did.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub failing: Vec<String>,
+    }
+
     /// Something the agent asked the user to see with its `highlight` tool: open until they mark it seen.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct Highlight {

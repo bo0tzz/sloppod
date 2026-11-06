@@ -12,7 +12,16 @@ import type {
   StopReason,
 } from './acp/types.ts';
 import { app, type Consumer } from './app-connection.svelte.ts';
-import { api, ApiError, newerProposal, newerSession, type Highlight, type Proposal, type Session } from './api.ts';
+import {
+  api,
+  ApiError,
+  newerProposal,
+  newerSession,
+  type Highlight,
+  type Proposal,
+  type Session,
+  type WorkDone,
+} from './api.ts';
 import { loadUnconfirmed, saveAnswer, saveUnconfirmed, type Outgoing } from './drafts.ts';
 import { sessions } from './sessions.svelte.ts';
 
@@ -92,6 +101,8 @@ export class SessionView {
   loadError = $state<string | null>(null);
   /** True once `proposals` is what the runtime listed, so counts taken from it can be trusted. */
   proposalsLoaded = $state(false);
+  /** The issues and pull requests the session has acted on, newest first. */
+  workDone = $state<WorkDone[]>([]);
   /** What the agent highlighted for the user in this session, oldest first, the ones marked seen included (#439). */
   highlights = $state<Highlight[]>([]);
   #loadFailures = 0;
@@ -222,14 +233,17 @@ export class SessionView {
     clearTimeout(this.#loadRetry);
     const refresh = ++this.#refreshes;
     try {
-      const [session, proposals, highlights] = await Promise.all([
+      const [session, proposals, highlights, work] = await Promise.all([
         api.getSession(this.id),
         api.listProposals({ session: this.id }),
         api.listHighlights(this.id),
+        // A log beside the chat: not worth failing the load for.
+        api.listWorkDone(this.id).catch(() => null),
       ]);
       this.setSession(session);
       for (const proposal of proposals) this.upsertProposal(proposal);
       for (const highlight of highlights) this.upsertHighlight(highlight);
+      if (work) this.workDone = work;
       this.proposalsLoaded = true;
       this.loadError = null;
       this.#loadFailures = 0;
@@ -443,10 +457,22 @@ export class SessionView {
 
   upsertProposal(proposal: Proposal) {
     const index = this.proposals.findIndex((existing) => existing.id === proposal.id);
+    const before = this.proposals[index]?.status;
     if (index === -1) {
       this.proposals.push(proposal);
     } else {
       this.proposals[index] = newerProposal(this.proposals[index], proposal);
+    }
+    // Carried out: the item it acted on belongs in the work done.
+    if (proposal.status === 'executed' && before !== 'executed' && this.proposalsLoaded) void this.#refreshWorkDone();
+  }
+
+  async #refreshWorkDone() {
+    try {
+      const work = await api.listWorkDone(this.id);
+      if (!this.#stopped) this.workDone = work;
+    } catch {
+      // The next refresh gets it.
     }
   }
 

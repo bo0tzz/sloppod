@@ -18,6 +18,7 @@
     mdiPauseCircleOutline,
     mdiPlayCircleOutline,
     mdiMagnifyScan,
+    mdiPageLayoutSidebarRight,
     mdiShieldKeyOutline,
     mdiSourcePull,
     mdiSourceRepository,
@@ -30,6 +31,7 @@
   import { absoluteTime, clockTime, countdown } from '#lib/format.ts';
   import { toolTitle } from '#lib/presentation.ts';
   import { SessionView } from '#lib/session.svelte.ts';
+  import { sessionSidebar } from '#lib/session-sidebar.svelte.ts';
   import { sessions } from '#lib/sessions.svelte.ts';
   import AddRepoModal from './AddRepoModal.svelte';
   import ChatHeader from './ChatHeader.svelte';
@@ -43,6 +45,7 @@
   import ProposalListModal from './ProposalListModal.svelte';
   import ProposalModal from './ProposalModal.svelte';
   import SessionComposer from './SessionComposer.svelte';
+  import SessionSidebar from './SessionSidebar.svelte';
   import TranscriptView from './TranscriptView.svelte';
   import WaitingSummary from './WaitingSummary.svelte';
 
@@ -139,8 +142,10 @@
     view.permissions.length > 0 || view.questions.length > 0 || openProposals.length > 0 || openHighlights.length > 0,
   );
   let width = $state(0);
-  // Room for the chat at its full width (max-w-3xl and its padding) with the panel beside it.
-  const sidePanel = $derived(width >= 1184);
+  // Room for the chat at its full width (max-w-3xl and its padding) with the sidebar beside it; otherwise it opens
+  // over the chat, and while it's folded away what waits on the user shows below the chat.
+  const docked = $derived(width >= 1184);
+  const sidebarOpen = $derived(sessionSidebar.choice ?? docked);
   // Below the chat on a narrower screen, the waiting panel folds to one line (#374). On a phone it starts folded
   // while a question or a permission request waits, so the chat stays readable; what the user chose holds until
   // nothing waits any more.
@@ -453,7 +458,7 @@
           onAnswer={(optionId) => view.answerPermission(request, optionId)}
         />
       {/each}
-      {#if sidePanel}
+      {#if sidebarOpen}
         {#each openProposals as proposal (proposal.id)}
           <ProposalCard
             {proposal}
@@ -503,6 +508,16 @@
         {#if session}
           <PhaseBadge phase={session.phase} commands={session.commands} commandLines={session.command_lines} waiting={waitingOnYou} unknown={showReconnecting} />
         {/if}
+        <IconButton
+          icon={mdiPageLayoutSidebarRight}
+          aria-label={sidebarOpen ? 'Hide details' : 'Show details'}
+          aria-expanded={sidebarOpen}
+          variant="ghost"
+          shape="round"
+          color="secondary"
+          indicator={!sidebarOpen && waiting ? 'warning' : undefined}
+          onclick={() => (sessionSidebar.choice = !sidebarOpen)}
+        />
         <IconButton
           icon={mdiSourcePull}
           aria-label="Proposals"
@@ -587,7 +602,7 @@
       </div>
     {/if}
 
-    <div class="flex min-h-0 grow" bind:clientWidth={width}>
+    <div class="relative flex min-h-0 grow" bind:clientWidth={width}>
       <div class="flex min-w-0 grow flex-col">
         <div class="relative min-h-0 grow">
           <div
@@ -657,7 +672,7 @@
           {/if}
         </div>
 
-        {#if waiting && !sidePanel}
+        {#if waiting && !sidebarOpen}
           <div
             class={['border-light-200 shrink-0 border-t px-3 py-2', !folded && 'max-h-[40dvh] overflow-y-auto sm:max-h-[55dvh]']}
             data-testid="waiting-panel"
@@ -702,14 +717,14 @@
           }}
         />
       </div>
-      {#if waiting && sidePanel}
-        <aside
-          class="border-light-200 immich-scrollbar flex w-96 shrink-0 flex-col gap-2 overflow-y-auto border-s p-3"
-          aria-label="Waiting on you"
-          data-testid="side-panel"
-        >
-          {@render waitingItems()}
-        </aside>
+      {#if sidebarOpen}
+        <SessionSidebar
+          waiting={waitingItems}
+          hasWaiting={waiting}
+          workDone={view.workDone}
+          {docked}
+          onClose={() => (sessionSidebar.choice = false)}
+        />
       {/if}
     </div>
   </div>

@@ -42,6 +42,7 @@ mod tls;
 mod users;
 mod vault;
 mod work;
+mod work_done;
 
 use std::net::SocketAddr;
 use std::ops::Deref;

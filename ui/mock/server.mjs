@@ -1956,6 +1956,7 @@ async function handleApi(req, res, url) {
       session.broadcast();
       return json(res, 200, session.data);
     }
+    if (parts.length === 3 && parts[2] === 'work-done' && method === 'GET') return json(res, 200, workDone(session.data.id));
     if (parts.length === 3 && parts[2] === 'highlights' && method === 'GET') {
       return json(res, 200, [...highlights.values()].filter((h) => h.session_id === session.data.id));
     }
@@ -2182,6 +2183,64 @@ async function handleApi(req, res, url) {
   return json(res, 404, { error: 'not found' });
 }
 
+/** What an update does, in a few words, as the runtime says it in a result. */
+function didOf(update) {
+  const parts = [];
+  if (update.comment) parts.push('commented');
+  if (update.close) parts.push('closed');
+  if (update.reopen) parts.push('reopened');
+  if (update.ready) parts.push('marked ready');
+  if (update.title) parts.push('retitled');
+  return parts.join(', ');
+}
+
+/** What the runtime last saw of pull requests, by `repo#number`: `{state, checks, failing}`. */
+const pullStates = new Map();
+
+/** The issues and pull requests a session acted on, from its executed proposals: as the runtime builds them. */
+function workDone(sessionId) {
+  const items = new Map();
+  const executed = [...proposals.values()]
+    .filter((p) => p.session_id === sessionId && p.status === 'executed' && p.result)
+    .sort((a, b) => String(a.decided_at ?? a.created_at).localeCompare(String(b.decided_at ?? b.created_at)));
+  for (const proposal of executed) {
+    const repo = String(proposal.payload.repo ?? '').toLowerCase();
+    const at = proposal.decided_at ?? proposal.created_at;
+    const note = (number, pullRequest, title, did) => {
+      const key = `${repo}#${number}`;
+      const item = items.get(key) ?? { repo, number, pullRequest: false, did: [] };
+      item.pullRequest ||= pullRequest;
+      if (title) item.title = title;
+      for (const what of did.split(', ').filter(Boolean)) if (!item.did.includes(what)) item.did.push(what);
+      item.at = at;
+      items.set(key, item);
+    };
+    if (proposal.kind === 'github.pr.create') note(proposal.result.number, true, proposal.payload.title, 'opened');
+    if (proposal.kind === 'github.stack.create') {
+      proposal.result.pull_requests.forEach((pull, i) => note(pull.number, true, proposal.payload.pull_requests[i]?.title, 'opened'));
+    }
+    if (proposal.kind === 'github.issue.create') for (const issue of proposal.result.issues) note(issue.number, false, issue.title, 'filed');
+    if (proposal.kind === 'github.issue.update' || proposal.kind === 'github.pr.update') {
+      for (const done of proposal.result.updated) {
+        const update = proposal.payload.updates.find((u) => u.number === done.number);
+        note(done.number, proposal.kind === 'github.pr.update', update?.title, done.did ?? '');
+      }
+    }
+  }
+  return [...items.values()]
+    .sort((a, b) => String(b.at).localeCompare(String(a.at)) || a.repo.localeCompare(b.repo) || a.number - b.number)
+    .map((item) => ({
+      repo: item.repo,
+      number: item.number,
+      kind: item.pullRequest ? 'pull_request' : 'issue',
+      ...(item.title ? { title: item.title } : {}),
+      url: `https://github.com/${item.repo}/${item.pullRequest ? 'pull' : 'issues'}/${item.number}`,
+      did: item.did,
+      at: item.at,
+      ...(item.pullRequest && pullStates.has(`${item.repo}#${item.number}`) ? { state: pullStates.get(`${item.repo}#${item.number}`) } : {}),
+    }));
+}
+
 /** Approves a proposal; like the runtime, it answers right away and the outcome follows as a proposal update. */
 function approve(proposal, body, decidedBy) {
   const session = sessions.get(proposal.session_id);
@@ -2211,14 +2270,14 @@ function approve(proposal, body, decidedBy) {
     ack = 'Great, the stack is open.';
   } else if (proposal.kind === 'github.issue.update') {
     if (Array.isArray(body.updates)) proposal.payload.updates = body.updates;
-    const updated = proposal.payload.updates.map((u) => ({ number: u.number }));
+    const updated = proposal.payload.updates.map((u) => ({ number: u.number, did: didOf(u) }));
     proposal.status = 'executed';
     proposal.result = { updated, failed: [], message: `Updated ${updated.map((u) => `#${u.number}`).join(', ')}.` };
     notice = `Your issue updates were approved and made: ${proposal.result.message}`;
     ack = 'Thanks, the tracker is tidy.';
   } else if (proposal.kind === 'github.pr.update') {
     if (Array.isArray(body.updates)) proposal.payload.updates = body.updates;
-    const updated = proposal.payload.updates.map((u) => ({ number: u.number }));
+    const updated = proposal.payload.updates.map((u) => ({ number: u.number, did: didOf(u) }));
     proposal.status = 'executed';
     proposal.result = { updated, failed: [], message: `Updated ${updated.map((u) => `#${u.number}`).join(', ')}.` };
     notice = `Your pull request updates were approved and made: ${proposal.result.message}`;
@@ -2616,6 +2675,15 @@ const server = http.createServer(async (req, res) => {
       for (const session of sessions.values()) {
         session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text }, messageId: randomUUID() });
       }
+      return json(res, 200, {});
+    }
+    if (url.pathname === '/_mock/pull' && req.method === 'POST') {
+      // What the runtime last saw of a pull request: ?repo=o/r&number=9&state=open&checks=failure&failing=check,lint
+      const { searchParams } = url;
+      const state = { state: searchParams.get('state') ?? 'open' };
+      if (searchParams.get('checks')) state.checks = searchParams.get('checks');
+      if (searchParams.get('failing')) state.failing = searchParams.get('failing').split(',');
+      pullStates.set(`${searchParams.get('repo').toLowerCase()}#${searchParams.get('number')}`, state);
       return json(res, 200, {});
     }
     if (url.pathname === '/_mock/update' && req.method === 'POST') {
