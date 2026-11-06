@@ -96,11 +96,26 @@
                   {session.volume_kept ? 'Let it go' : 'Keep volume'}
                 </Button>
               {:else if session.phase !== 'parked'}
-                <Button size="tiny" shape="round" variant="ghost" disabled={busy !== null} onclick={() => act(session.id, () => api.parkSession(session.id))}>
+                <Button
+                  size="tiny"
+                  shape="round"
+                  variant="ghost"
+                  disabled={busy !== null}
+                  aria-label="Park the session {session.title || 'New session'}"
+                  onclick={() => act(session.id, () => api.parkSession(session.id))}
+                >
                   Park
                 </Button>
               {/if}
-              <Button size="tiny" shape="round" variant="ghost" color="danger" disabled={busy !== null} onclick={() => remove(session)}>
+              <Button
+                size="tiny"
+                shape="round"
+                variant="ghost"
+                color="danger"
+                disabled={busy !== null}
+                aria-label="Delete the session {session.title || 'New session'}"
+                onclick={() => remove(session)}
+              >
                 Delete
               </Button>
             </div>

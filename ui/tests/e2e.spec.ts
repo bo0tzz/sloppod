@@ -4077,7 +4077,7 @@ test("a session's disk use shows in the list, its header and Settings, and stays
   const listed = storage.getByTestId('storage-session').filter({ hasText: 'Add backoff' });
   await expect(listed.getByTestId('storage-used')).toHaveText('700 MB');
   await expect(storage.getByTestId('storage-total')).toContainText('700 MB');
-  await listed.getByRole('button', { name: 'Park' }).click();
-  await expect(listed.getByRole('button', { name: 'Park' })).toHaveCount(0);
+  await listed.getByRole('button', { name: /^Park the session/ }).click();
+  await expect(listed.getByRole('button', { name: /^Park the session/ })).toHaveCount(0);
   await expect(listed.getByTestId('storage-used')).toHaveText('700 MB');
 });
