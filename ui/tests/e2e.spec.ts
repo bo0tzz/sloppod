@@ -1501,6 +1501,8 @@ test('sending a message scrolls the chat to it, and so does scrolling the sessio
     })
     .toBeGreaterThan(up);
   const down = await scrollTop();
+  // Back up through the list, however long it is, to its top; then the wheel goes on to the chat.
+  await page.mouse.wheel(0, -100_000);
   await expect
     .poll(async () => {
       await page.mouse.wheel(0, -200);
