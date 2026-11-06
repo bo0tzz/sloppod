@@ -70,7 +70,7 @@ class MockSession {
           proposals: [...proposals.values()].filter((p) => p.session_id === data.id && p.status === 'pending').length,
           questions: pending.filter((p) => p.method === 'elicitation/create').length,
           permissions: pending.filter((p) => p.method !== 'elicitation/create').length,
-          highlights: [...highlights.values()].filter((h) => h.session_id === data.id && !h.seen_at).length,
+          highlights: [...highlights.values()].filter((h) => h.session_id === data.id && !h.seen_at && !h.retracted_at).length,
         };
       },
     });
@@ -755,6 +755,51 @@ async function agentScript(session, turn, prompt) {
   // With `Highlight (codex):` the calls are reported as codex-acp does: its own title, the input wrapped with the server and
   // tool, and the result as `rawOutput` rather than content.
   // With `Highlight (retry):` a first call fails and is tried again; the result of the second says nothing of which highlight it made.
+  // With `Highlight (retract): <text> | <reason>` the agent highlights, then takes it back (`retract_highlight`).
+  if (/^highlight \(retract\):/i.test(prompt)) {
+    const [text, reason] = prompt.replace(/^highlight \(retract\):\s*/i, '').split('|').map((t) => t.trim());
+    const highlightId = randomUUID();
+    tool({ toolCallId: highlightId, title: 'mcp__sloppod__highlight', kind: 'other', status: 'pending', rawInput: { text } });
+    await step(1);
+    const highlight = createHighlight(session, text);
+    update(highlightId, {
+      status: 'completed',
+      content: [{ type: 'content', content: { type: 'text', text: `Highlighted (highlight ${highlight.id}). It stays in the user's list until they mark it seen; nothing waits on it.` } }],
+    });
+    const retractId = randomUUID();
+    tool({ toolCallId: retractId, title: 'mcp__sloppod__retract_highlight', kind: 'other', status: 'pending', rawInput: { id: highlight.id, reason } });
+    await step(1);
+    highlight.retracted_at = now();
+    highlight.retraction_reason = reason;
+    broadcastHighlight(highlight);
+    update(retractId, { status: 'completed', content: [{ type: 'content', content: { type: 'text', text: 'Retracted: it leaves the user\'s list.' } }] });
+    await say('Done.');
+    return;
+  }
+  // With `Withdraw the question: <reason>` the agent asks a question, then takes it back (`withdraw_question`): it closes
+  // without an answer, nothing is sent to the agent, and the chat says so.
+  if (/^withdraw the question:/i.test(prompt)) {
+    const reason = prompt.replace(/^withdraw the question:\s*/i, '').trim();
+    const [question] = QUESTIONS;
+    const askId = randomUUID();
+    tool({ toolCallId: askId, title: 'mcp__sloppod__ask_user', kind: 'other', status: 'pending', rawInput: { questions: [question] } });
+    void requestFromUser(session, {
+      method: 'elicitation/create',
+      params: { ...questionsToElicitation([question], session.data.id), _meta: { sloppod: { questionId: randomUUID() } } },
+      cancelled: { action: 'cancel' },
+      blocking: false,
+    });
+    update(askId, { status: 'completed' });
+    await step(2);
+    const pending = [...session.pending.values()].at(-1);
+    if (pending) resolvePending(session, pending, { action: 'cancel' });
+    const withdrawId = randomUUID();
+    tool({ toolCallId: withdrawId, title: 'mcp__sloppod__withdraw_question', kind: 'other', status: 'pending' });
+    session.emit({ sessionUpdate: 'notice', severity: 'info', title: `Withdrawn: ${reason}`, description: `The agent took back its question: ${question.question}` });
+    update(withdrawId, { status: 'completed' });
+    await say('Done.');
+    return;
+  }
   if (/^highlight \(retry\):/i.test(prompt)) {
     const text = prompt.replace(/^highlight \(retry\):\s*/i, '').trim();
     const failedId = randomUUID();

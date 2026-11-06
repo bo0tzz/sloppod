@@ -246,6 +246,8 @@ fn review_tools() -> Vec<Value> {
 }
 
 const HIGHLIGHT: &str = "highlight";
+const RETRACT_HIGHLIGHT: &str = "retract_highlight";
+const WITHDRAW_QUESTION: &str = "withdraw_question";
 
 /// Whether a session has `highlight`: only one the user talks to, so not a sub-session, whose report reaches its
 /// parent (ADR 27), nor a reviewer.
@@ -327,7 +329,9 @@ fn tools(state: &AppState, row: &db::SessionRow) -> Vec<Value> {
     // (ADR 27).
     if highlight_offered(&row.role()) {
         tools.push(highlight_tool());
+        tools.push(retract_highlight_tool());
     }
+    tools.push(withdraw_question_tool());
     tools.push(json!({
         "name": "request_review",
         "description": "After a review asked for changes to your proposal or to a branch you asked `request_code_review` for, ask for the next round once you've pushed fixes. The proposal is re-pinned to your branch's new head.",
@@ -354,13 +358,43 @@ const HIGHLIGHT_LIMIT: usize = 2000;
 fn highlight_tool() -> Value {
     json!({
         "name": HIGHLIGHT,
-        "description": "Put something in front of the user that they'd want to find again without reading the whole conversation, instead of writing it as an ordinary reply: the answer to what they asked, something they have to do that isn't a decision, or a serious finding they didn't ask about. It shows as a highlighted card in the chat and in the session's \"for you\" list, where each stays until they mark it seen, and the session counts as waiting on them meanwhile. Marking one seen starts no turn and you aren't told. Read out of context: say what it answers, lead with the conclusion, keep it to a few lines, link what it refers to. Highlight each thing once; if it changes, highlight the new state. Not for progress, plans, or what a proposal or a question already shows.",
+        "description": "Put something in front of the user that they'd want to find again without reading the whole conversation: the answer to what they asked, something they have to do that isn't a decision, or a serious finding they didn't ask about. It shows in the chat where you call it, as a highlighted card like a message of yours, and in the session's \"for you\" list, so don't also write its content in a reply: a reply around it adds only what isn't in it. where each stays until they mark it seen, and the session counts as waiting on them meanwhile. Marking one seen starts no turn and you aren't told. Read out of context: say what it answers, lead with the conclusion, keep it to a few lines, link what it refers to. Highlight each thing once; if it changes, highlight the new state. Not for progress, plans, or what a proposal or a question already shows.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "text": {"type": "string", "description": "What the user should see, in Markdown, a few lines"},
             },
             "required": ["text"],
+        },
+    })
+}
+
+fn retract_highlight_tool() -> Value {
+    json!({
+        "name": RETRACT_HIGHLIGHT,
+        "description": "Take back a highlight of yours that turned out wrong or no longer applies, saying why. It leaves the user's \"for you\" list and stops counting as waiting on them; its card stays in the chat, muted, with \"Retracted: <reason>\". Only while the user hasn't marked it seen: after that it's an error that says so (say what changed in a reply instead). If it changed, retract it and highlight the new state.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "The highlight's id, from `highlight`'s result"},
+                "reason": {"type": "string", "description": "Why it no longer applies, a line; the user sees it"},
+            },
+            "required": ["id", "reason"],
+        },
+    })
+}
+
+fn withdraw_question_tool() -> Value {
+    json!({
+        "name": WITHDRAW_QUESTION,
+        "description": "Take back a question you asked with `ask_user` that no longer applies, because the user answered it in the chat or you decided otherwise, saying why. The question closes for the user and stops counting as waiting; the chat says \"Withdrawn: <reason>\". Nothing is sent to you.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "The question's id, from `ask_user`'s result"},
+                "reason": {"type": "string", "description": "Why it no longer applies, a line; the user sees it"},
+            },
+            "required": ["id", "reason"],
         },
     })
 }
@@ -384,6 +418,8 @@ async fn call(state: &AppState, session: Uuid, params: &Value) -> Value {
         "request_review" => reviews::request(state, session, &arguments).await,
         "ask_user" => ask_user(state, session, &arguments).await,
         HIGHLIGHT => highlight(state, session, &arguments).await,
+        RETRACT_HIGHLIGHT => retract_highlight(state, session, &arguments).await,
+        WITHDRAW_QUESTION => withdraw_question(state, session, &arguments).await,
         LIST_GRANTS => list_grants_text(state, session).await,
         "get_proposal" => get_proposal(state, session, &arguments).await,
         "withdraw_proposal" => withdraw_proposal(state, session, &arguments).await,
@@ -426,14 +462,64 @@ async fn highlight(state: &AppState, session: Uuid, arguments: &Value) -> Result
 }
 
 async fn ask_user(state: &AppState, session: Uuid, arguments: &Value) -> Result<String, String> {
-    state
+    let id = state
         .hub
         .ask(session, arguments["questions"].clone())
         .await?;
-    Ok(
-        "Asked. The answer arrives later as a message; carry on with what doesn't depend on it."
-            .into(),
-    )
+    Ok(format!(
+        "Asked (question {id}). The answer arrives later as a message; carry on with what doesn't depend on it. If it no longer applies, `withdraw_question` takes it back."
+    ))
+}
+
+/// What the agent may give as the reason for taking something back, in characters.
+const REASON_LIMIT: usize = 500;
+
+fn reason(arguments: &Value) -> Result<&str, String> {
+    let reason = arguments["reason"]
+        .as_str()
+        .map(str::trim)
+        .unwrap_or_default();
+    if reason.is_empty() {
+        return Err("give the `reason` it no longer applies; the user sees it".into());
+    }
+    if reason.chars().count() > REASON_LIMIT {
+        return Err(format!("keep the reason under {REASON_LIMIT} characters"));
+    }
+    Ok(reason)
+}
+
+async fn withdraw_question(
+    state: &AppState,
+    session: Uuid,
+    arguments: &Value,
+) -> Result<String, String> {
+    let id = proposal_id(arguments).ok_or("give the question's id, as `ask_user` returned it")?;
+    state
+        .hub
+        .withdraw_question(session, id, reason(arguments)?)
+        .await?;
+    Ok("Withdrawn: the question is closed for the user, with your reason.".into())
+}
+
+async fn retract_highlight(
+    state: &AppState,
+    session: Uuid,
+    arguments: &Value,
+) -> Result<String, String> {
+    let id = proposal_id(arguments).ok_or("give the highlight's id, as `highlight` returned it")?;
+    let reason = reason(arguments)?;
+    match db::retract_highlight(&state.db, session, id, reason)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        db::Retraction::Retracted(row) => {
+            state.hub.broadcast_highlight(&row.to_api());
+            Ok("Retracted: it leaves the user's list, and stays in the chat, muted, with your reason. If it changed, highlight the new state.".into())
+        }
+        db::Retraction::Seen => Err("the user has already seen it, so it can't be taken back; say what changed in a reply, or highlight the new state".into()),
+        db::Retraction::AlreadyRetracted => Err("it was retracted already".into()),
+        db::Retraction::NotFound => Err("no such highlight of yours".into()),
+    }
 }
 
 async fn list_grants_text(state: &AppState, session: Uuid) -> Result<String, String> {
@@ -602,6 +688,8 @@ mod tests {
         assert!(!highlight_offered(&SessionRole::Review));
         assert!(!highlight_offered(&SessionRole::Utility));
         assert_eq!(highlight_tool()["name"], HIGHLIGHT);
+        assert_eq!(retract_highlight_tool()["name"], RETRACT_HIGHLIGHT);
+        assert_eq!(withdraw_question_tool()["name"], WITHDRAW_QUESTION);
     }
 
     #[test]

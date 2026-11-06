@@ -1619,6 +1619,8 @@ pub struct HighlightRow {
     pub text: String,
     pub created_at: DateTime<Utc>,
     pub seen_at: Option<DateTime<Utc>>,
+    pub retracted_at: Option<DateTime<Utc>>,
+    pub retraction_reason: Option<String>,
 }
 
 impl HighlightRow {
@@ -1629,11 +1631,14 @@ impl HighlightRow {
             text: self.text.clone(),
             created_at: self.created_at.to_rfc3339(),
             seen_at: self.seen_at.map(|at| at.to_rfc3339()),
+            retracted_at: self.retracted_at.map(|at| at.to_rfc3339()),
+            retraction_reason: self.retraction_reason.clone(),
         }
     }
 }
 
-const HIGHLIGHT_COLUMNS: &str = "id, session_id, text, created_at, seen_at";
+const HIGHLIGHT_COLUMNS: &str =
+    "id, session_id, text, created_at, seen_at, retracted_at, retraction_reason";
 
 /// Keeps what the agent highlighted for the user (#439).
 pub async fn insert_highlight(
@@ -1661,10 +1666,10 @@ pub async fn list_highlights(db: &PgPool, session: Uuid) -> sqlx::Result<Vec<Hig
     .await
 }
 
-/// How many of the session's highlights the user hasn't marked seen.
+/// How many of the session's highlights are open: neither marked seen by the user nor taken back by the agent.
 pub async fn open_highlights(db: &PgPool, session: Uuid) -> sqlx::Result<usize> {
     let count: i64 = sqlx::query_scalar(
-        "select count(*) from highlights where session_id = $1 and seen_at is null",
+        "select count(*) from highlights where session_id = $1 and seen_at is null and retracted_at is null",
     )
     .bind(session)
     .fetch_one(db)
@@ -1679,13 +1684,57 @@ pub async fn mark_highlight_seen(
     id: Uuid,
 ) -> sqlx::Result<Option<HighlightRow>> {
     sqlx::query_as(AssertSqlSafe(format!(
-        "update highlights set seen_at = coalesce(seen_at, now()) where id = $1 and session_id = $2 \
-         returning {HIGHLIGHT_COLUMNS}"
+        "update highlights set seen_at = case when retracted_at is null then coalesce(seen_at, now()) else seen_at end \
+         where id = $1 and session_id = $2 returning {HIGHLIGHT_COLUMNS}"
     )))
     .bind(id)
     .bind(session)
     .fetch_optional(db)
     .await
+}
+
+/// What came of the agent taking a highlight back.
+pub enum Retraction {
+    Retracted(HighlightRow),
+    /// The user marked it seen first.
+    Seen,
+    AlreadyRetracted,
+    /// No such highlight of the session's.
+    NotFound,
+}
+
+/// The agent takes one of the session's highlights back, with why, if the user hasn't marked it seen.
+pub async fn retract_highlight(
+    db: &PgPool,
+    session: Uuid,
+    id: Uuid,
+    reason: &str,
+) -> sqlx::Result<Retraction> {
+    let retracted: Option<HighlightRow> = sqlx::query_as(AssertSqlSafe(format!(
+        "update highlights set retracted_at = now(), retraction_reason = $3 \
+         where id = $1 and session_id = $2 and seen_at is null and retracted_at is null \
+         returning {HIGHLIGHT_COLUMNS}"
+    )))
+    .bind(id)
+    .bind(session)
+    .bind(reason)
+    .fetch_optional(db)
+    .await?;
+    if let Some(row) = retracted {
+        return Ok(Retraction::Retracted(row));
+    }
+    let row: Option<(bool,)> = sqlx::query_as(
+        "select retracted_at is not null from highlights where id = $1 and session_id = $2",
+    )
+    .bind(id)
+    .bind(session)
+    .fetch_optional(db)
+    .await?;
+    Ok(match row {
+        None => Retraction::NotFound,
+        Some((true,)) => Retraction::AlreadyRetracted,
+        Some((false,)) => Retraction::Seen,
+    })
 }
 
 /// A session's proposals that are still with their reviewer: in review, or waiting on the author's fixes.

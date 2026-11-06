@@ -3388,6 +3388,8 @@ async fn a_highlight_is_told_to_the_session_and_changes_what_it_waits_on() {
         text: "It's done".into(),
         created_at: START.into(),
         seen_at: None,
+        retracted_at: None,
+        retraction_reason: None,
     };
     h.hub.broadcast_highlight(&highlight);
     assert_eq!(changed.try_recv().unwrap(), h.id);
@@ -3398,4 +3400,80 @@ async fn a_highlight_is_told_to_the_session_and_changes_what_it_waits_on() {
         }
         _ => panic!("the highlight comes as a notification"),
     }
+}
+
+#[tokio::test]
+async fn a_question_the_agent_withdraws_closes_without_an_answer() {
+    let h = Harness::ready().await;
+    let mut events = h.hub.subscribe(h.id);
+    let questions = json!([{"question": "Which backoff?", "options": [{"label": "Exponential"}, {"label": "Fixed"}]}]);
+    let key = h.hub.ask(h.id, questions).await.unwrap();
+    let replay = h.hub.replay(h.id).await.unwrap();
+    assert_eq!(replay.permissions.len(), 1);
+    while events.try_recv().is_ok() {}
+
+    // Another question's id isn't this one's to withdraw; its own is.
+    assert!(
+        h.hub
+            .withdraw_question(h.id, Uuid::new_v4(), "no such")
+            .await
+            .is_err()
+    );
+    h.hub
+        .withdraw_question(h.id, key, "The user answered in the chat")
+        .await
+        .unwrap();
+    assert!(h.hub.replay(h.id).await.unwrap().permissions.is_empty());
+    let mut resolved = false;
+    let mut said = None;
+    while let Ok(event) = events.try_recv() {
+        match event {
+            UiEvent::PermissionResolved { .. } => resolved = true,
+            UiEvent::Notification { message, .. }
+                if message["params"]["update"]["sessionUpdate"] == "notice" =>
+            {
+                said = Some(message["params"]["update"].clone());
+            }
+            _ => {}
+        }
+    }
+    assert!(resolved, "the UIs are told it closed");
+    let said = said.expect("the chat says it was withdrawn");
+    assert_eq!(said["title"], "Withdrawn: The user answered in the chat");
+    assert!(
+        said["description"]
+            .as_str()
+            .unwrap()
+            .contains("Which backoff?")
+    );
+    // Gone for good: it can't be withdrawn again, and the agent was told nothing.
+    assert!(h.hub.withdraw_question(h.id, key, "again").await.is_err());
+}
+
+#[tokio::test]
+async fn a_withdrawal_the_database_cannot_keep_leaves_the_question_open_to_try_again() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let h = Harness::ready().await;
+    let questions = json!([{"question": "Which backoff?", "options": [{"label": "Exponential"}, {"label": "Fixed"}]}]);
+    let key = h.hub.ask(h.id, questions).await.unwrap();
+
+    h.store.fail_forgetting_questions.store(true, Relaxed);
+    assert!(
+        h.hub
+            .withdraw_question(h.id, key, "answered")
+            .await
+            .is_err()
+    );
+    // Still open for the user and still kept, so a restart would show it too.
+    assert_eq!(h.hub.replay(h.id).await.unwrap().permissions.len(), 1);
+    assert_eq!(h.store.questions.lock().unwrap().len(), 1);
+
+    // The database is back: the same withdrawal goes through, and nothing is left to restore.
+    h.store.fail_forgetting_questions.store(false, Relaxed);
+    h.hub
+        .withdraw_question(h.id, key, "answered")
+        .await
+        .unwrap();
+    assert!(h.hub.replay(h.id).await.unwrap().permissions.is_empty());
+    assert!(h.store.questions.lock().unwrap().is_empty());
 }

@@ -2324,3 +2324,65 @@ async fn highlights_stay_open_until_marked_seen(db: PgPool) {
     );
     assert_eq!(db::open_highlights(&db, s).await.unwrap(), 1);
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn an_agent_takes_back_a_highlight_the_user_has_not_seen(db: PgPool) {
+    let s = session(&db, "dev").await;
+    let other = session(&db, "dev").await;
+    let wrong = db::insert_highlight(&db, s, "Merge pull request 12")
+        .await
+        .unwrap();
+    let seen = db::insert_highlight(&db, s, "Re-run the job")
+        .await
+        .unwrap();
+    db::mark_highlight_seen(&db, s, seen.id).await.unwrap();
+    assert_eq!(db::open_highlights(&db, s).await.unwrap(), 1);
+
+    // Another session's highlight isn't this one's to retract.
+    assert!(matches!(
+        db::retract_highlight(&db, other, wrong.id, "no")
+            .await
+            .unwrap(),
+        db::Retraction::NotFound
+    ));
+    // The user saw this one: too late.
+    assert!(matches!(
+        db::retract_highlight(&db, s, seen.id, "wrong")
+            .await
+            .unwrap(),
+        db::Retraction::Seen
+    ));
+
+    let retracted = match db::retract_highlight(&db, s, wrong.id, "It was pull request 21")
+        .await
+        .unwrap()
+    {
+        db::Retraction::Retracted(row) => row,
+        _ => panic!("an open highlight can be retracted"),
+    };
+    assert!(retracted.retracted_at.is_some());
+    assert_eq!(
+        retracted.retraction_reason.as_deref(),
+        Some("It was pull request 21")
+    );
+    // It's no longer open, still listed with why, and retracting again says so.
+    assert_eq!(db::open_highlights(&db, s).await.unwrap(), 0);
+    let listed = db::list_highlights(&db, s).await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(
+        listed[0].retraction_reason.as_deref(),
+        Some("It was pull request 21")
+    );
+    assert!(matches!(
+        db::retract_highlight(&db, s, wrong.id, "again")
+            .await
+            .unwrap(),
+        db::Retraction::AlreadyRetracted
+    ));
+    // Seen after the fact doesn't reopen or mark it: it was taken back.
+    let after = db::mark_highlight_seen(&db, s, wrong.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(after.seen_at.is_none() && after.retracted_at.is_some());
+}

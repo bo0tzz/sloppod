@@ -68,7 +68,7 @@
   // agent, not here.
   // The runtime pushes the session when questions or permission requests change, but not when a proposal is decided,
   // so the proposals this view already follows give the count (#368).
-  const openHighlights = $derived(view.highlights.filter((highlight) => !highlight.seen_at));
+  const openHighlights = $derived(view.highlights.filter((highlight) => !highlight.seen_at && !highlight.retracted_at));
   const waitingOnYou = $derived(
     session?.waiting && view.proposalsLoaded
       ? { ...session.waiting, proposals: pendingProposals.length, highlights: openHighlights.length }

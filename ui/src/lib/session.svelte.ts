@@ -388,13 +388,13 @@ export class SessionView {
     sessions.upsert(session);
   }
 
-  /** Adds a highlight or updates it; once seen, a copy that says it's open (a slow fetch's) doesn't reopen it. */
+  /** Adds a highlight or updates it; once seen or retracted, a copy that says it's open (a slow fetch's) doesn't reopen it. */
   upsertHighlight(highlight: Highlight) {
     const index = this.highlights.findIndex((existing) => existing.id === highlight.id);
     if (index === -1) {
       this.highlights.push(highlight);
       this.highlights.sort((a, b) => a.created_at.localeCompare(b.created_at));
-    } else if (!this.highlights[index].seen_at) {
+    } else if (!this.highlights[index].seen_at && !this.highlights[index].retracted_at) {
       this.highlights[index] = highlight;
     }
   }
