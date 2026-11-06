@@ -20,6 +20,10 @@ pub trait SessionStore: Send + Sync {
     async fn open_highlights(&self, _id: Uuid) -> sqlx::Result<usize> {
         Ok(0)
     }
+    /// How far the owner has read the session (#48).
+    async fn read_seq(&self, _id: Uuid, _owner: &str) -> sqlx::Result<Option<i64>> {
+        Ok(None)
+    }
     async fn set_phase(&self, id: Uuid, phase: Phase) -> sqlx::Result<Option<SessionRow>>;
     async fn set_auto_title(&self, id: Uuid, title: &str) -> sqlx::Result<bool>;
     async fn set_session_model(&self, id: Uuid, model: &str) -> sqlx::Result<()>;
@@ -82,6 +86,10 @@ impl SessionStore for PgStore {
 
     async fn open_highlights(&self, id: Uuid) -> sqlx::Result<usize> {
         db::open_highlights(&self.0, id).await
+    }
+
+    async fn read_seq(&self, id: Uuid, owner: &str) -> sqlx::Result<Option<i64>> {
+        db::read_seq(&self.0, id, owner).await
     }
 
     async fn owner_zone(&self, owner: &str) -> sqlx::Result<chrono_tz::Tz> {

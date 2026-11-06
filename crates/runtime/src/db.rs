@@ -178,6 +178,7 @@ impl SessionRow {
                 _ => None,
             },
             volume_kept: self.volume_kept,
+            read_seq: None,
         }
     }
 
@@ -1726,6 +1727,30 @@ pub async fn pending_proposals(db: &PgPool, session: Uuid) -> sqlx::Result<usize
     .fetch_one(db)
     .await?;
     Ok(count as usize)
+}
+
+/// How far the user has read a session: the seq of the last event they scrolled past, if they've said (#48).
+pub async fn read_seq(db: &PgPool, session: Uuid, owner: &str) -> sqlx::Result<Option<i64>> {
+    sqlx::query_scalar("select seq from session_reads where session_id = $1 and owner = $2")
+        .bind(session)
+        .bind(owner)
+        .fetch_optional(db)
+        .await
+}
+
+/// Moves the user's read position in a session forward to `seq`: never back, whatever order their UIs report in.
+/// Returns where it is now.
+pub async fn set_read_seq(db: &PgPool, session: Uuid, owner: &str, seq: i64) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "insert into session_reads (session_id, owner, seq) values ($1, $2, $3) \
+         on conflict (session_id, owner) do update \
+         set seq = greatest(session_reads.seq, excluded.seq), updated_at = now() returning seq",
+    )
+    .bind(session)
+    .bind(owner)
+    .bind(seq)
+    .fetch_one(db)
+    .await
 }
 
 #[derive(sqlx::FromRow)]

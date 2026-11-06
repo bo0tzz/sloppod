@@ -190,11 +190,17 @@
   onMount(() => {
     loadAutoApprovals().catch(() => {});
     view.start();
-    return () => view.stop();
+    return () => {
+      clearTimeout(readTimer);
+      reportRead();
+      view.stop();
+    };
   });
 
   function onScroll() {
-    if (!scroller) return;
+    if (!scroller || !positioned) return;
+    scheduleRead();
+    if (holdBar) return;
     if (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80) {
       atBottom = true;
     } else if (pointerHeld || performance.now() - lastUserScroll < 1000) {
@@ -209,7 +215,10 @@
   let pointerHeld = false;
   $effect(() => {
     if (!scroller) return;
-    const scrolling = () => (lastUserScroll = performance.now());
+    const scrolling = () => {
+      lastUserScroll = performance.now();
+      holdBar = false;
+    };
     const press = () => (pointerHeld = true);
     const release = () => (pointerHeld = false);
     const events = ['wheel', 'touchmove', 'keydown', 'pointerdown'] as const;
@@ -229,6 +238,93 @@
     scroller?.scrollTo({ top: scroller.scrollHeight, behavior });
   }
 
+  function jumpToLatest() {
+    holdBar = false;
+    atBottom = true;
+    scrollToBottom('smooth');
+  }
+
+  /** What the reader has scrolled past, and where the "Unread" bar goes (#48). */
+  const CONTEXT_ABOVE_UNREAD = 96;
+  /** Set once the view has started where it's going to, at the bar or the bottom: until then nothing counts as read. */
+  let positioned = $state(false);
+  /** The read position the bar is drawn from. It follows reading while the view is at the bottom, and holds still while scrolled up, so the bar stays put as the reader passes it. */
+  let unreadAfter = $state<number | null>(null);
+  /** The bar stays where the view opened at it until the reader moves, even if the view ends up at the bottom. */
+  let holdBar = $state(false);
+
+  $effect(() => {
+    if (positioned && atBottom && !holdBar) unreadAfter = view.readSeq || null;
+  });
+
+  const rowElements = () => (content ? [...content.querySelectorAll<HTMLElement>('[data-seq]')] : []);
+
+  /**
+   * Reports what's been scrolled past as read: the last event of the rows fully above the bottom of the view, but never
+   * beyond the first event of the row below them. An update to a row that is already read (a plan, a tool call) comes
+   * later in the log than rows after it that haven't been seen.
+   */
+  function reportRead() {
+    if (!positioned || !scroller) return;
+    const bottom = scroller.getBoundingClientRect().bottom + 1;
+    let seq = 0;
+    let below = Infinity;
+    for (const row of rowElements()) {
+      if (row.getBoundingClientRect().bottom > bottom) {
+        below = Number(row.dataset.firstSeq);
+        break;
+      }
+      seq = Math.max(seq, Number(row.dataset.seq));
+    }
+    seq = Math.min(seq, below - 1);
+    if (seq > 0) view.markRead(seq);
+  }
+
+  /**
+   * Measures once the view has settled for a moment: rows off screen are laid out at a guess until they come near, so
+   * what's measured while scrolling or resizing can show a tall row as short and fully in view.
+   */
+  let readTimer: ReturnType<typeof setTimeout> | undefined;
+  function scheduleRead() {
+    clearTimeout(readTimer);
+    readTimer = setTimeout(reportRead, 200);
+  }
+
+  // An item changing in place, a message getting another word on its line, moves no scroll or size.
+  $effect(() => {
+    if (view.transcript.seq === 0) return;
+    void tick().then(scheduleRead);
+  });
+
+  /** On opening, the view starts at the "Unread" bar with a little context above it, or at the bottom with nothing unread. */
+  $effect(() => {
+    if (positioned || !view.loaded || !view.session || !scroller) return;
+    const read = view.session.read_seq;
+    positioned = true;
+    unreadAfter = read ?? null;
+    if (read === undefined || !view.transcript.items.some((item) => item.addedSeq > read)) {
+      unreadAfter = view.readSeq || null;
+      scrollToBottom();
+      void tick().then(() => scrollToBottom());
+      return;
+    }
+    atBottom = false;
+    holdBar = true;
+    void tick().then(() => {
+      scrollToBar();
+      scheduleRead();
+    });
+  });
+
+  /** Puts the bar near the top of the view, with some context above it. */
+  function scrollToBar() {
+    const bar = content?.querySelector<HTMLElement>('[data-unread-divider]');
+    if (!bar || !scroller) return;
+    scroller.scrollTo({
+      top: bar.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop - CONTEXT_ABOVE_UNREAD,
+    });
+  }
+
   $effect(() => {
     if (!scroller) return;
     const scrolled = () => (userScrolled = true);
@@ -241,7 +337,11 @@
   $effect(() => {
     if (!content || !scroller) return;
     const observer = new ResizeObserver(() => {
-      if (atBottom) scrollToBottom();
+      if (!positioned) return;
+      // Rows off screen are laid out at a guess until they come near, so the bar's place keeps moving as they do.
+      if (holdBar) scrollToBar();
+      else if (atBottom) scrollToBottom();
+      scheduleRead();
     });
     observer.observe(content);
     observer.observe(scroller);
@@ -546,6 +646,7 @@
                   onSeen={(highlight) => view.markHighlightSeen(highlight)}
                   onResume={view.unsent.length > 0 ? undefined : resume}
                   awaiting={new Set(view.permissions.map((request) => request.toolCall.toolCallId))}
+                  unreadAfter={atBottom && !holdBar ? null : unreadAfter}
                 />
                 {#if activity}
                   <div class="text-muted flex items-center gap-2 py-1 text-sm" data-testid="activity">
@@ -565,7 +666,7 @@
                 color="secondary"
                 size="small"
                 class="shadow-md"
-                onclick={() => scrollToBottom('smooth')}
+                onclick={jumpToLatest}
               />
             </div>
           {/if}
@@ -605,7 +706,16 @@
           </div>
         {/if}
 
-        <SessionComposer {view} />
+        <SessionComposer
+          {view}
+          onSend={() => {
+            lastUserScroll = -Infinity;
+            pointerHeld = false;
+            holdBar = false;
+            atBottom = true;
+            scrollToBottom();
+          }}
+        />
       </div>
       {#if waiting && sidePanel}
         <aside
