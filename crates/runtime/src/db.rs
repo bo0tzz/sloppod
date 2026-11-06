@@ -360,9 +360,11 @@ pub async fn claim_purges(db: &PgPool, age: chrono::Duration) -> sqlx::Result<Ve
     .await
 }
 
-/// Records that a purge removed everything of the session.
+/// Records that a purge removed everything of the session, its volume's disk use with it, in one update (#455).
 pub async fn finish_purge(db: &PgPool, id: Uuid) -> sqlx::Result<()> {
-    sqlx::query("update sessions set purged_at = now() where id = $1")
+    sqlx::query(
+        "update sessions set purged_at = now(), disk_used = null, disk_size = null, disk_seen_at = null where id = $1",
+    )
         .bind(id)
         .execute(db)
         .await
@@ -640,17 +642,6 @@ pub async fn set_volume_kept(db: &PgPool, id: Uuid, kept: bool) -> sqlx::Result<
     .execute(db)
     .await?;
     Ok(result.rows_affected() > 0)
-}
-
-/// Forgets a session's disk use, once its volume is gone.
-pub async fn clear_disk(db: &PgPool, id: Uuid) -> sqlx::Result<()> {
-    sqlx::query(
-        "update sessions set disk_used = null, disk_size = null, disk_seen_at = null where id = $1",
-    )
-    .bind(id)
-    .execute(db)
-    .await
-    .map(|_| ())
 }
 
 /// Of `ids`, the sessions that exist and aren't purged: what may still have objects in the cluster.

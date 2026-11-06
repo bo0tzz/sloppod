@@ -94,9 +94,8 @@ pub async fn purge_stopped(state: &AppState) {
         // A failure leaves it claimed, so the next sweep tries again at once.
         let purged = async {
             lifecycle::remove_session(state, &session).await?;
+            // Its disk use goes with it, in the same update: nothing of it counts towards what sessions use.
             db::finish_purge(&state.db, session.id).await?;
-            // Its volume is gone: nothing of it counts towards what sessions use.
-            db::clear_disk(&state.db, session.id).await?;
             anyhow::Ok(())
         }
         .await;

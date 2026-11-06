@@ -2610,10 +2610,9 @@ async fn a_claimed_volume_removal_cant_be_kept_and_is_retried_at_once(db: PgPool
         1
     );
 
-    // Removed: its disk use is forgotten, so it no longer counts in Settings' storage.
+    // Removed: its disk use is forgotten in the same update that records it, so it no longer counts in Settings' storage.
     db::set_disk(&db, id, 1, 2).await.unwrap();
     db::finish_purge(&db, id).await.unwrap();
-    db::clear_disk(&db, id).await.unwrap();
     assert!(
         db::get_session(&db, id)
             .await
