@@ -82,14 +82,19 @@ pub fn work_done(proposals: &[ProposalRow], watches: &[(String, i64, Value)]) ->
                     let Some(number) = done["number"].as_u64() else {
                         continue;
                     };
-                    // The update that was made, by its place in the payload; a result from before it said so is
-                    // matched by number.
-                    let made = match done["index"].as_u64() {
-                        Some(index) => updates.and_then(|u| u.get(index as usize)),
-                        None => updates
+                    // The update that was made, by its place in the payload. A result from before it said so can be
+                    // matched by number only when one update is for the item: with more, which of them went through
+                    // isn't known, and no title is better than one that was never applied.
+                    let of_item = || {
+                        updates
                             .into_iter()
                             .flatten()
-                            .find(|u| u["number"].as_u64() == Some(number)),
+                            .filter(|u| u["number"].as_u64() == Some(number))
+                    };
+                    let made = match done["index"].as_u64() {
+                        Some(index) => updates.and_then(|u| u.get(index as usize)),
+                        None if of_item().count() == 1 => of_item().next(),
+                        None => None,
                     };
                     let title = made.and_then(|u| u["title"].as_str());
                     note(
@@ -288,6 +293,28 @@ mod tests {
             .map(|w| (w.number, w.title.as_deref()))
             .collect();
         assert_eq!(titles, [(4, None), (9, Some("Last"))]);
+    }
+
+    #[test]
+    fn a_result_without_places_gives_a_title_only_when_one_update_was_for_the_item() {
+        let payload = json!({"repo": "o/r", "updates": [
+            {"number": 9, "title": "First"},
+            {"number": 9, "title": "Last"},
+            {"number": 4, "title": "Never applied"},
+            {"number": 4, "comment": "Applied"},
+            {"number": 2, "title": "Only"},
+        ]});
+        let result = json!({"updated": [
+            {"number": 9, "did": "retitled"},
+            {"number": 4, "did": "commented"},
+            {"number": 2, "did": "retitled"},
+        ], "failed": []});
+        let done = work_done(&[proposal("github.issue.update", 1, payload, result)], &[]);
+        let titles: Vec<_> = done
+            .iter()
+            .map(|w| (w.number, w.title.as_deref()))
+            .collect();
+        assert_eq!(titles, [(2, Some("Only")), (4, None), (9, None)]);
     }
 
     #[test]
