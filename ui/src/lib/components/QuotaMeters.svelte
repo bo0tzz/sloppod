@@ -2,12 +2,19 @@
   import type { Quota, QuotaWindow } from '#lib/api.ts';
   import { absoluteTime, timeAgo } from '#lib/format.ts';
   import { quotas } from '#lib/quotas.svelte.ts';
+  import { spending } from '#lib/spend.svelte.ts';
   import { onMount } from 'svelte';
 
   /** On a page of its own, as a box in the page's column; by default it closes the sidebar. */
   let { framed = false }: { framed?: boolean } = $props();
 
-  onMount(() => quotas.subscribe());
+  onMount(() => {
+    const unsubscribe = [quotas.subscribe(), spending.subscribe()];
+    return () => unsubscribe.forEach((stop) => stop());
+  });
+  const dollars = (amount: number) => `$${amount.toFixed(amount < 1 ? 3 : 2)}`;
+  // The sessions and shared keys that spent anything, most recently read first; a few, in the sidebar.
+  const spent = $derived(spending.spend.keys.filter((key) => key.spend > 0).slice(0, 5));
 
   const providers: Record<string, string> = { claude: 'Claude', chatgpt: 'ChatGPT' };
   const windows: Record<string, string> = {
@@ -47,10 +54,10 @@
   const text = { danger: 'text-danger', warning: 'text-warning-700', normal: 'text-muted' };
 </script>
 
-{#if quotas.list.length > 0}
+{#if quotas.list.length > 0 || spent.length > 0}
   <ul
     class="border-light-200 flex shrink-0 flex-col gap-3 {framed ? 'rounded-xl border p-3' : 'border-t px-4 py-2'}"
-    aria-label="Usage limits"
+    aria-label="Usage limits and spend"
   >
     {#each quotas.list as quota (quota.credential_id)}
       <li class="flex flex-col gap-1 text-xs" data-testid="quota" data-limited={quota.limited}>
@@ -85,5 +92,22 @@
         {/each}
       </li>
     {/each}
+    {#if spent.length > 0}
+      <li class="flex flex-col gap-1 text-xs" data-testid="spend">
+        <div class="flex items-baseline justify-between gap-2">
+          <span class="min-w-0 truncate font-medium">Model endpoints</span>
+          <span class="shrink-0" data-testid="spend-total">{dollars(spending.spend.total)} spent</span>
+        </div>
+        {#each spent as key (key.key_id)}
+          {@const over = key.max_budget !== null && key.spend >= key.max_budget}
+          <div class="flex items-baseline justify-between gap-2" data-testid="spend-key" title="As of {absoluteTime(key.observed_at)}">
+            <span class="text-muted min-w-0 truncate">{key.name}</span>
+            <span class={over ? 'text-danger shrink-0' : 'text-muted shrink-0'}>
+              {dollars(key.spend)}{key.max_budget !== null ? ` of ${dollars(key.max_budget)}` : ''}
+            </span>
+          </div>
+        {/each}
+      </li>
+    {/if}
   </ul>
 {/if}

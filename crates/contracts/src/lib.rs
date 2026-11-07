@@ -444,6 +444,17 @@ pub struct ModelTarget {
     /// The Messages API's base URL.
     pub base_url: String,
     pub key: String,
+    /// Whose spend the key's is, for the spend the runtime shows: the session's alone (`None`), or something several
+    /// sessions share, such as an endpoint credential's one key.
+    #[serde(default)]
+    pub shared: Option<SharedKey>,
+}
+
+/// A key several sessions share: a stable id, and how it's shown.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SharedKey {
+    pub id: String,
+    pub name: String,
 }
 
 /// Leaves the key out, so logging one can't leak it.

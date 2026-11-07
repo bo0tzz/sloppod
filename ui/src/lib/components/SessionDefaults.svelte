@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Alert, Button, Field, Heading, LoadingSpinner, Select, Text, toastManager } from '@immich/ui';
+  import { Alert, Button, Field, Heading, Input, LoadingSpinner, Select, Text, toastManager } from '@immich/ui';
   import { onMount } from 'svelte';
   import { api, type ReviewPolicy, type Settings } from '#lib/api.ts';
   import ModelField from './ModelField.svelte';
@@ -10,11 +10,15 @@
   let model = $state('');
   let subSessionModel = $state('');
   let review = $state<ReviewPolicy>('off');
+  // Dollars, as typed; empty for no limit.
+  let budget = $state('');
+  const budgetValue = $derived(budget.trim() === '' ? null : Number(budget));
 
   const changed = $derived(
     model.trim() !== (settings?.model ?? '') ||
       subSessionModel.trim() !== (settings?.sub_session_model ?? '') ||
-      review !== (settings?.review ?? 'off'),
+      review !== (settings?.review ?? 'off') ||
+      budgetValue !== (settings?.session_budget ?? null),
   );
   const reviewOptions = [
     { value: 'off', label: 'Only when the agent asks' },
@@ -26,6 +30,7 @@
     model = loaded.model ?? '';
     subSessionModel = loaded.sub_session_model ?? '';
     review = loaded.review;
+    budget = loaded.session_budget === null ? '' : String(loaded.session_budget);
   }
 
   onMount(async () => {
@@ -45,6 +50,7 @@
           model: model.trim() || null,
           sub_session_model: subSessionModel.trim() || null,
           review,
+          session_budget: budgetValue,
         }),
       );
       toastManager.success('Saved your defaults');
@@ -81,6 +87,14 @@
           choices={[{ value: 'parent', label: 'The same as their parent' }]}
           testid="sub-session-model"
         />
+      </div>
+      <div class="min-w-48 grow">
+        <Field
+          label="Budget per session"
+          description="The most a session on a LiteLLM operator model may spend, in dollars; LiteLLM refuses it after that. Empty for no limit."
+        >
+          <Input bind:value={budget} inputmode="decimal" placeholder="No limit" autocomplete="off" data-testid="session-budget" />
+        </Field>
       </div>
       <div class="min-w-48 grow">
         <Field label="Review by Codex" description="Another model reviews proposals before you see them; needs a ChatGPT login.">

@@ -112,9 +112,7 @@ pub async fn start_session(
     let mut grants = new.grants.to_vec();
     let endpoint = match crate::endpoint::EndpointModel::parse(new.model.unwrap_or_default()) {
         Some(model) => Some(
-            state
-                .providers
-                .grant(new.owner, &model)
+            crate::endpoint::session_grant(state, new.owner, &model)
                 .await?
                 .map_err(|why| anyhow::anyhow!(why))?,
         ),

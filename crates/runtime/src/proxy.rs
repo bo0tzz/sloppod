@@ -127,6 +127,27 @@ impl Reach {
         }
     }
 
+    /// The runtime's own GET of a JSON document at `url` with `key` as a bearer token, under the same rule as
+    /// sessions' requests: never the runtime itself or a local address. Given up on after 10 seconds.
+    pub async fn get_json(&self, url: &str, key: &str) -> anyhow::Result<serde_json::Value> {
+        if let Some(Ok(ip)) = host_ip(url)
+            && !self.local
+            && !reachable(&self.own, ip)
+        {
+            anyhow::bail!("the server can't be the runtime itself or a local address");
+        }
+        Ok(self
+            .http
+            .get(url)
+            .bearer_auth(key)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
     /// Sends a session's request on to `url`, as [`forward`] does, unless `url` is somewhere it can't go.
     pub async fn forward(&self, request: Forward<'_>) -> anyhow::Result<Response> {
         // An address in the URL is connected to without the resolver.

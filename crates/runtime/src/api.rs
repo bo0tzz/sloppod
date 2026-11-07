@@ -60,6 +60,7 @@ pub fn routes() -> Router<AppState> {
         .route("/capabilities/{id}", delete(delete_definition))
         .route("/credentials/{id}/default", post(default_credential))
         .route("/quotas", get(list_quotas))
+        .route("/spend", get(get_spend))
         .route(
             "/standing-approvals",
             get(list_standing_approvals).post(create_standing_approval),
@@ -160,8 +161,9 @@ async fn settings(state: &AppState, user: &str) -> ApiResult<serde_json::Value> 
     let timezone = db::user_timezone(&state.db, user).await?;
     let sub_session_model = db::user_sub_session_model(&state.db, user).await?;
     let instructions = db::user_instructions(&state.db, user).await?;
+    let session_budget = db::user_session_budget(&state.db, user).await?;
     Ok(
-        json!({"model": model, "sub_session_model": sub_session_model, "models": models, "review": review, "timezone": timezone, "instructions": instructions}),
+        json!({"model": model, "sub_session_model": sub_session_model, "models": models, "review": review, "timezone": timezone, "instructions": instructions, "session_budget": session_budget}),
     )
 }
 
@@ -200,6 +202,9 @@ struct SettingsUpdate {
     timezone: Option<String>,
     #[serde(default, deserialize_with = "present")]
     instructions: Option<Option<String>>,
+    /// The most a session on an endpoint's model may spend, in dollars (#461); `null` for no limit.
+    #[serde(default, deserialize_with = "present")]
+    session_budget: Option<Option<f64>>,
 }
 
 async fn put_settings(
@@ -209,6 +214,13 @@ async fn put_settings(
 ) -> ApiResult<impl IntoResponse> {
     // Checked before anything is written, so a bad field doesn't leave the others half applied.
     let review = update.review.as_deref().map(review_policy).transpose()?;
+    if let Some(Some(budget)) = update.session_budget
+        && !(budget.is_finite() && budget > 0.0)
+    {
+        return Err(bad_request(
+            "session_budget is a number of dollars above 0, or null",
+        ));
+    }
     let timezone = update
         .timezone
         .as_deref()
@@ -238,6 +250,9 @@ async fn put_settings(
     }
     if let Some(review) = review {
         db::set_user_review(&state.db, &user, review).await?;
+    }
+    if let Some(budget) = update.session_budget {
+        db::set_user_session_budget(&state.db, &user, budget).await?;
     }
     if let Some(timezone) = timezone {
         db::set_user_timezone(&state.db, &user, timezone.name()).await?;
@@ -1144,6 +1159,14 @@ async fn list_quotas(
     Ok(Json(
         quota::list(&state.db, &user, chrono::Utc::now()).await?,
     ))
+}
+
+/// What the user's sessions on endpoint models have spent (#461).
+async fn get_spend(
+    State(state): State<AppState>,
+    User(user): User,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(crate::spend::list(&state.db, &user).await?))
 }
 
 async fn list_standing_approvals(

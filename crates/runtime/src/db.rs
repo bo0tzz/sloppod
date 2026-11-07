@@ -1673,6 +1673,32 @@ pub async fn set_user_sub_session_model(
     .map(|_| ())
 }
 
+/// The most a session on an endpoint's model may spend, in dollars, where the endpoint keeps a budget per key (#461).
+pub async fn user_session_budget(db: &PgPool, owner: &str) -> sqlx::Result<Option<f64>> {
+    let row: Option<(Option<f64>,)> =
+        sqlx::query_as("select session_budget from user_settings where owner = $1")
+            .bind(owner)
+            .fetch_optional(db)
+            .await?;
+    Ok(row.and_then(|(budget,)| budget))
+}
+
+pub async fn set_user_session_budget(
+    db: &PgPool,
+    owner: &str,
+    budget: Option<f64>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "insert into user_settings (owner, session_budget) values ($1, $2) \
+         on conflict (owner) do update set session_budget = excluded.session_budget, updated_at = now()",
+    )
+    .bind(owner)
+    .bind(budget)
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
 /// The agent's state from the owner's most recently active session, for the models it offered.
 pub async fn latest_agent_state(db: &PgPool, owner: &str) -> sqlx::Result<Option<Value>> {
     let row: Option<(Option<Value>,)> = sqlx::query_as(

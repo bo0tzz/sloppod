@@ -380,6 +380,24 @@ export type Quota = {
   observed_at: string;
 };
 
+/** What sessions on endpoint models have spent, as the endpoints last said (#461). */
+export type Spend = {
+  /** In dollars, over every key the user's sessions used. */
+  total: number;
+  keys: SpentKey[];
+};
+
+/** One key's spend: a session's own, or one several share (an endpoint credential's). */
+export type SpentKey = {
+  key_id: string;
+  session_id: string | null;
+  /** The session's title, or the shared key's name. */
+  name: string;
+  spend: number;
+  max_budget: number | null;
+  observed_at: string;
+};
+
 export type QuotaStatus = 'allowed' | 'warning' | 'rejected';
 
 export type QuotaWindow = {
@@ -403,6 +421,9 @@ export type Settings = {
   /** The user's own instructions for all their sessions, like a user-level CLAUDE.md; a change reaches a running
    * session at its agent's next start. */
   instructions: string | null;
+  /** The most a session on an endpoint's model may spend, in dollars, where the endpoint keeps a budget per key (a
+   * LiteLLM operator proxy); `null` for no limit. */
+  session_budget: number | null;
 };
 
 /** Whether proposals are reviewed by another model before a human sees them. */
@@ -499,6 +520,7 @@ export const api = {
   updateSettings: (body: {
     model?: string | null;
     sub_session_model?: string | null;
+    session_budget?: number | null;
     review?: ReviewPolicy;
     timezone?: string;
     instructions?: string | null;
@@ -508,6 +530,7 @@ export const api = {
     call<Session>('PUT', `/sessions/${encodeURIComponent(id)}/review`, { review }),
   listCredentials: () => call<Credential[]>('GET', '/credentials'),
   listQuotas: () => call<Quota[]>('GET', '/quotas'),
+  getSpend: () => call<Spend>('GET', '/spend'),
   listStandingApprovals: () => call<StandingApproval[]>('GET', '/standing-approvals'),
   createStandingApproval: (approval: NewStandingApproval) =>
     call<StandingApproval>('POST', '/standing-approvals', approval),

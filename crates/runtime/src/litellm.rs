@@ -170,9 +170,15 @@ const KEY_LABEL: &str = "sloppod.dev/endpoint-key";
 
 /// The `LiteLLMVirtualKey` a session on `model` of the proxy at `namespace/proxy` gets: limited to that model, named
 /// for the session and its owner, its key in a Secret of its own.
-pub fn virtual_key(session: &SessionContext, namespace: &str, proxy: &str, model: &str) -> Value {
+pub fn virtual_key(
+    session: &SessionContext,
+    namespace: &str,
+    proxy: &str,
+    model: &str,
+    budget: Option<f64>,
+) -> Value {
     let at = location(namespace, proxy);
-    json!({
+    let mut key = json!({
         "apiVersion": format!("{GROUP}/{VERSION}"),
         "kind": "LiteLLMVirtualKey",
         "metadata": {
@@ -191,7 +197,12 @@ pub fn virtual_key(session: &SessionContext, namespace: &str, proxy: &str, model
             "keyAlias": key_name(&session.session_id, &at),
             "metadata": {"sloppod_session": session.session_id, "sloppod_owner": session.owner},
         },
-    })
+    });
+    // The owner's budget per session, which LiteLLM enforces on the key.
+    if let Some(budget) = budget {
+        key["spec"]["maxBudget"] = json!(budget.to_string());
+    }
+    key
 }
 
 /// What the runtime does with sessions' virtual keys in the cluster.
@@ -426,7 +437,13 @@ impl ModelProvider for LiteLlm {
             ));
         };
         self.keys
-            .apply(&virtual_key(session, namespace, proxy, model))
+            .apply(&virtual_key(
+                session,
+                namespace,
+                proxy,
+                model,
+                grant.params["max_budget"].as_f64(),
+            ))
             .await
             .map_err(contract_error)
     }
@@ -439,7 +456,11 @@ impl ModelProvider for LiteLlm {
         let name = key_name(&session.session_id, at);
         let cached = self.minted.lock().unwrap().get(&name).cloned();
         if let Some(key) = cached {
-            return Ok(Some(ModelTarget { base_url, key }));
+            return Ok(Some(ModelTarget {
+                base_url,
+                key,
+                shared: None,
+            }));
         }
         // The operator mints the key a moment after the virtual key is made; a session's first request may beat it.
         let secret = secret_name(&session.session_id, at);
@@ -447,7 +468,11 @@ impl ModelProvider for LiteLlm {
         loop {
             if let Some(key) = self.keys.secret(&secret).await.map_err(contract_error)? {
                 self.minted.lock().unwrap().insert(name, key.clone());
-                return Ok(Some(ModelTarget { base_url, key }));
+                return Ok(Some(ModelTarget {
+                    base_url,
+                    key,
+                    shared: None,
+                }));
             }
             if tokio::time::Instant::now() >= deadline {
                 return Ok(None);

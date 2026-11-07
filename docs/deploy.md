@@ -143,7 +143,7 @@ spec:
     supportsFunctionCalling: true
 ```
 
-Sessions reach the proxy's Service (`main.ai.svc.cluster.local:4000` here) through the runtime, so the runtime pod needs to reach it; a session's own egress doesn't change. A model is offered as soon as the operator would bind it to a proxy, and isn't any more once it wouldn't.
+Sessions reach the proxy's Service (`main.ai.svc.cluster.local:4000` here) through the runtime, so the runtime pod needs to reach it; a session's own egress doesn't change. A model is offered as soon as the operator would bind it to a proxy, and isn't any more once it wouldn't. Each session's spend, from its key's `/key/info`, shows next to the usage meters with the user's total, and a budget per session set in Settings (Defaults for new sessions) is set as each new key's `maxBudget`, which LiteLLM enforces.
 
 ## What a session keeps
 

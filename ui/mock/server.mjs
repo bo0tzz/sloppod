@@ -37,7 +37,7 @@ const MODELS = [
   { value: 'haiku', name: 'Haiku' },
 ];
 /** The user's defaults for new sessions. `models` fills in once a session has offered them. */
-const settings = { model: null, sub_session_model: null, models: [], review: 'off', timezone: null, instructions: null };
+const settings = { model: null, sub_session_model: null, models: [], review: 'off', timezone: null, instructions: null, session_budget: null };
 const CANCELLED = Symbol('cancelled');
 
 /** @type {Map<string, MockSession>} */
@@ -1885,6 +1885,7 @@ async function handleApi(req, res, url) {
   if (parts[0] === 'capabilities') return handleCapabilities(req, res, parts);
   if (parts[0] === 'work') return handleWork(req, res, parts, { json, readBody, user: req.headers['x-forwarded-user'] ?? 'bo0tzz' });
   if (parts[0] === 'quotas' && parts.length === 1 && method === 'GET') return json(res, 200, quotas);
+  if (parts[0] === 'spend' && parts.length === 1 && method === 'GET') return json(res, 200, spend);
   if (parts[0] === 'standing-approvals') return handleStandingApprovals(req, res, parts);
 
   if (parts[0] === 'storage' && parts.length === 1 && method === 'GET') {
@@ -1911,6 +1912,13 @@ async function handleApi(req, res, url) {
           return json(res, 400, { error: 'sub_session_model must be a string or null' });
         }
         settings.sub_session_model = body.sub_session_model || null;
+      }
+      if ('session_budget' in body) {
+        const budget = body.session_budget;
+        if (budget !== null && !(typeof budget === 'number' && Number.isFinite(budget) && budget > 0)) {
+          return json(res, 400, { error: 'session_budget is a number of dollars above 0, or null' });
+        }
+        settings.session_budget = budget;
       }
       if ('instructions' in body) {
         if (body.instructions !== null && typeof body.instructions !== 'string') {
@@ -2669,11 +2677,19 @@ let dropNextPrompt = null;
 let dropNextRemove = false;
 /** Set by `/_mock/fail-next-prompt`: refuse the next prompt that isn't dropped, without taking it. */
 let failNextPrompt = false;
+/** What the user's sessions on endpoint models have spent (`GET /spend`, #461); set by `/_mock/spend`. */
+let spend = { total: 0, keys: [] };
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   try {
     if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
+    if (url.pathname === '/_mock/spend' && req.method === 'POST') {
+      spend = await readBody(req);
+      // As the runtime tells the owner's connections that their spend changed, for them to read it again.
+      for (const conn of connections) conn.notify('_sloppod/spend', {});
+      return json(res, 200, {});
+    }
     if (url.pathname === '/_mock/quotas' && req.method === 'POST') {
       const before = quotas;
       quotas = await readBody(req);

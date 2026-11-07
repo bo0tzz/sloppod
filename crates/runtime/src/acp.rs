@@ -389,6 +389,18 @@ async fn run(state: AppState, user: String, agent: String, socket: WebSocket) {
             .await
         })
     };
+    // The owner's spend on endpoint models, likewise (#461).
+    let spend = {
+        let conn = conn.clone();
+        let changes = conn.state.spending.subscribe();
+        tokio::spawn(async move {
+            let out = conn.out.clone();
+            crate::spend::forward(&conn.user, changes, out, || {
+                conn.drop_connection.notify_one()
+            })
+            .await
+        })
+    };
     // The owner's sessions as they change, whichever one the connection shows, or none: the session list follows them.
     let sessions = {
         let conn = conn.clone();
@@ -443,6 +455,7 @@ async fn run(state: AppState, user: String, agent: String, socket: WebSocket) {
         task.abort();
     }
     quotas.abort();
+    spend.abort();
     sessions.abort();
     writer.abort();
     tracing::info!(connection = %conn.id, "UI disconnected");

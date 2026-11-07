@@ -400,6 +400,28 @@ pub mod api {
         pub status: QuotaStatus,
     }
 
+    /// What sessions on endpoint models have spent, as the endpoints last said (#461): every key's, and their sum.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct Spend {
+        /// In dollars, over every key the user's sessions used.
+        pub total: f64,
+        pub keys: Vec<SpentKey>,
+    }
+
+    /// One key's spend: a session's own (`session_id`), or a key several sessions share, such as an endpoint
+    /// credential's (`name`).
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct SpentKey {
+        pub key_id: String,
+        pub session_id: Option<Uuid>,
+        /// The session's title, or the shared key's name.
+        pub name: String,
+        pub spend: f64,
+        /// The most the key may spend, where the endpoint keeps a budget for it.
+        pub max_budget: Option<f64>,
+        pub observed_at: String,
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
     pub enum QuotaStatus {
