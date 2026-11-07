@@ -1460,6 +1460,22 @@ pub async fn add_grant(db: &PgPool, session: Uuid, grant: &Grant) -> sqlx::Resul
     insert_grant(db, session, grant, None).await.map(|_| ())
 }
 
+/// Every endpoint grant still held, by session id: of sessions that haven't stopped or been purged (#461). What a
+/// model provider made for any other is swept.
+pub async fn endpoint_grants_held(db: &PgPool) -> sqlx::Result<Vec<(String, Grant)>> {
+    let rows: Vec<(Uuid, String, Value)> = sqlx::query_as(
+        "select g.session_id, g.capability, g.params from session_grants g join sessions s on s.id = g.session_id \
+         where g.capability = $1 and s.phase <> 'stopped' and s.purged_at is null",
+    )
+    .bind(sloppod_contracts::capability::ENDPOINT)
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(session, capability, params)| (session.to_string(), Grant::new(&capability, params)))
+        .collect())
+}
+
 /// Moves a session onto `model`, with its endpoint grant following it (#461): the endpoint grant `endpoint` replaces
 /// any it had, or none is left. In one transaction, so the session is never on one model with another's grant.
 pub async fn set_model_and_endpoint(

@@ -354,6 +354,7 @@ async fn main() -> anyhow::Result<()> {
                 lifecycle::purge_deleted(&state).await;
                 storage::purge_stopped(&state).await;
                 storage::sweep_leftovers(&state).await;
+                lifecycle::sweep_endpoint_keys(&state).await;
             }
         });
     }

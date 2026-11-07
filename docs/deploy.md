@@ -85,7 +85,7 @@ Sessions can run Claude Code on models of any Anthropic-compatible endpoint ([#4
 
 ### With the LiteLLM operator
 
-With the [LiteLLM operator](https://github.com/home-operations/litellm-operator) installed, its proxies and models are found by themselves: list the namespaces they're in under `litellm.namespaces`, and every user is offered each proxy's models. A session on one gets a `LiteLLMVirtualKey` of its own in sloppod's namespace, limited to its model, and the key goes when the session stops or is purged. The chart then grants the runtime `get`, `list` and `watch` on `litellmproxies` and `litellmmodels` in those namespaces, and in its own namespace `get`, `create`, `patch` and `delete` on `litellmvirtualkeys` and `get` on Secrets, where the operator writes the keys it mints.
+With the [LiteLLM operator](https://github.com/home-operations/litellm-operator) installed, its proxies and models are found by themselves: list the namespaces they're in under `litellm.namespaces`, and every user is offered each proxy's models. A session on one gets a `LiteLLMVirtualKey` of its own in sloppod's namespace, limited to its model, and the key goes when the session stops or is purged. The chart then grants the runtime `get`, `list` and `watch` on `litellmproxies` and `litellmmodels` in those namespaces, and in its own namespace `get`, `list`, `create`, `patch` and `delete` on `litellmvirtualkeys` (an hourly sweep lists them to delete any no session holds) and `get` on Secrets, where the operator writes the keys it mints.
 
 ```yaml
 # The HelmRelease's values:

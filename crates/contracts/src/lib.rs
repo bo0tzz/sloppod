@@ -485,6 +485,11 @@ pub trait ModelProvider: Send + Sync {
     async fn release(&self, _session_id: &str, _grant: &Grant) -> Result<()> {
         Ok(())
     }
+    /// Removes what it made for sessions that no longer hold it: `keep` is every session's endpoint grant that's still
+    /// held, by session id. A backstop for releases that failed.
+    async fn sweep(&self, _keep: &[(String, Grant)]) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// What a placement backend needs to run one session pod.

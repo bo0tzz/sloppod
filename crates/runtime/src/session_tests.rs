@@ -3673,3 +3673,39 @@ async fn a_session_moves_to_another_provider_only_when_quiet_and_never_half_way(
     let _turn = h.prompt("Still here");
     assert_eq!(prompt_text(&h.next().await), ["Still here"]);
 }
+
+#[tokio::test]
+async fn a_move_whose_change_fails_is_put_back_idle_or_parked() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let fail_change = |h: &Harness, reverted: Arc<AtomicUsize>| {
+        let hub = h.hub.clone();
+        let id = h.id;
+        async move {
+            hub.switch_provider(
+                id,
+                || async { anyhow::bail!("the key couldn't be made") },
+                || async { panic!("a pod was replaced after its change failed") },
+                || async move {
+                    reverted.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+        }
+    };
+    // Idle: put back, and the old agent carries on.
+    let mut h = Harness::ready().await;
+    let reverted = Arc::new(AtomicUsize::new(0));
+    assert!(fail_change(&h, reverted.clone()).await.is_err());
+    assert_eq!(reverted.load(Ordering::SeqCst), 1);
+    let _turn = h.prompt("Still here");
+    assert_eq!(prompt_text(&h.next().await), ["Still here"]);
+
+    // Parked: put back too, and it stays parked.
+    let h = Harness::ready().await;
+    h.hub.park(h.id, || async { Ok(()) }).await.unwrap();
+    let reverted = Arc::new(AtomicUsize::new(0));
+    assert!(fail_change(&h, reverted.clone()).await.is_err());
+    assert_eq!(reverted.load(Ordering::SeqCst), 1);
+    assert_eq!(h.phase().await, "parked");
+}

@@ -178,8 +178,10 @@ impl Providers {
         Ok(())
     }
 
-    /// Removes what provisioning made for these grants of a session's.
-    pub async fn release(&self, session_id: &str, grants: &[Grant]) {
+    /// Removes what provisioning made for these grants of a session's. Every grant is tried; the first failure is
+    /// returned, so a purge tries again, and the sweep is the backstop for the rest.
+    pub async fn release(&self, session_id: &str, grants: &[Grant]) -> anyhow::Result<()> {
+        let mut failed = None;
         for grant in grants
             .iter()
             .filter(|g| g.capability == capability::ENDPOINT)
@@ -188,6 +190,18 @@ impl Providers {
                 && let Err(e) = provider.release(session_id, grant).await
             {
                 tracing::warn!(session = session_id, error = %e.0, "releasing a session's endpoint key");
+                failed.get_or_insert(anyhow::anyhow!(e.0));
+            }
+        }
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// Has every provider remove what it made for sessions that don't hold it any more (`keep`: each endpoint grant
+    /// still held, by session id).
+    pub async fn sweep(&self, keep: &[(String, Grant)]) {
+        for provider in &self.0 {
+            if let Err(e) = provider.sweep(keep).await {
+                tracing::warn!(provider = %provider.manifest().name, error = %e.0, "sweeping endpoint keys no session holds");
             }
         }
     }
@@ -590,6 +604,38 @@ pub async fn own_provider_ready(
     })
 }
 
+/// Whether two endpoint grants are on the same endpoint, so what one provisioned is the other's too.
+fn same_endpoint(a: Option<&Grant>, b: Option<&Grant>) -> bool {
+    match (
+        a.and_then(Providers::location),
+        b.and_then(Providers::location),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Puts back what provisioning a switch from `old` to `new` changed, once its record is back: the old grant's key as
+/// it was (a key on the same endpoint now limited to the new model, say), and the new grant's own, if it made one.
+pub async fn undo_provisioning(
+    providers: &Providers,
+    old_context: &SessionContext,
+    old: Option<&Grant>,
+    new: Option<&Grant>,
+) -> anyhow::Result<()> {
+    if old.is_some() {
+        providers.provision(old_context).await?;
+    }
+    if let Some(new) = new
+        && !same_endpoint(old, Some(new))
+    {
+        providers
+            .release(&old_context.session_id, std::slice::from_ref(new))
+            .await?;
+    }
+    Ok(())
+}
+
 /// A change of a session's model that involves an endpoint's (#461), to one or from one: unlike a change between the
 /// agent's own models, the agent can't make it itself, since it's another provider (ADR 20). The model and the
 /// endpoint grant change together, and the agent starts again on a new pod, resuming its conversation. `None` when
@@ -643,7 +689,9 @@ pub async fn switch(
         .find(|g| g.capability == capability::ENDPOINT);
     let old_model = row.model.clone().unwrap_or_default();
     let id = session.to_string();
-    // The session as it'll be, for provisioning its new grant (a key minted for it, say) before its agent starts.
+    // The session as it'll be, for provisioning its new grant (a key minted for it, say) before its agent starts, and
+    // as it was, for putting it back.
+    let old_context = row.context();
     let mut moved_context = row.context();
     follow_model(&mut moved_context.grants, new_grant.clone());
     let moved = state
@@ -662,20 +710,28 @@ pub async fn switch(
             || async {
                 db::set_model_and_endpoint(&state.db, session, &old_model, old_grant.as_ref())
                     .await?;
-                Ok(())
+                undo_provisioning(
+                    &state.providers,
+                    &old_context,
+                    old_grant.as_ref(),
+                    new_grant.as_ref(),
+                )
+                .await
             },
         )
         .await;
     match moved {
         Ok(true) => {
-            // What the old grant had made is no longer needed, unless the new one is on the same endpoint.
+            // What the old grant had made is no longer needed, unless the new one is on the same endpoint. A release
+            // that fails is left to the sweep.
             if let Some(old) = &old_grant
-                && old.param("location") != new_grant.as_ref().and_then(|g| g.param("location"))
-            {
-                state
+                && !same_endpoint(Some(old), new_grant.as_ref())
+                && let Err(e) = state
                     .providers
                     .release(&id, std::slice::from_ref(old))
-                    .await;
+                    .await
+            {
+                tracing::warn!(%session, error = %format!("{e:#}"), "releasing a session's old endpoint key; the sweep tries again");
             }
             state.hub.broadcast_session(session).await;
             Some(Ok(json!({})))

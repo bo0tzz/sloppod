@@ -2814,7 +2814,7 @@ impl Hub {
     /// Moves a session onto another provider's model (#461), under its transition lock and only while nothing is in
     /// flight: parked, when `change` records it and the session starts on it when woken; or idle, with no turn,
     /// queue, open request or running command, when `change` records it and `replace` starts the agent again on a
-    /// new pod. If the pod can't be replaced, `revert` puts the record back and the old agent carries on, so the
+    /// new pod. If either fails, `revert` puts back whatever was changed and the old agent carries on, so the
     /// agent never runs against routing that isn't its own. Says whether it moved; `false` when the session isn't
     /// quiet, and nothing was changed.
     pub async fn switch_provider<C, CF, R, RF, V, VF>(
@@ -2835,34 +2835,34 @@ impl Hub {
         let live = self.live(id);
         let _transition = live.transition.lock().await;
         let phase = self.store.get_session(id).await?.map(|row| row.phase());
-        match phase {
-            Some(Phase::Parked) => {
-                change().await?;
-                return Ok(true);
+        let quiet = match phase {
+            Some(Phase::Parked) => None,
+            Some(Phase::Idle) => {
+                let mut state = live.state.lock().await;
+                let busy = state.turn_running
+                    || !state.queue.is_empty()
+                    || !state.permissions.is_empty()
+                    || live.running_commands().is_some_and(|running| running > 0);
+                if busy || state.agent_session_id.is_none() {
+                    return Ok(false);
+                }
+                Some((state.agent.clone(), state.agent_session_id.take()))
             }
-            Some(Phase::Idle) => {}
             _ => return Ok(false),
-        }
-        let (agent, agent_session_id) = {
-            let mut state = live.state.lock().await;
-            let busy = state.turn_running
-                || !state.queue.is_empty()
-                || !state.permissions.is_empty()
-                || live.running_commands().is_some_and(|running| running > 0);
-            if busy || state.agent_session_id.is_none() {
-                return Ok(false);
-            }
-            (state.agent.clone(), state.agent_session_id.take())
         };
-        if let Err(e) = change().await {
-            self.unpark(id, agent, agent_session_id).await;
-            return Err(e);
-        }
-        if let Err(e) = replace().await {
+        // A parked session only needs the record; an idle one, a new pod too.
+        let moved = match change().await {
+            Ok(()) if quiet.is_some() => replace().await,
+            done => done,
+        };
+        if let Err(e) = moved {
+            // Whatever part of the change was made is put back, a parked session's too.
             if let Err(undo) = revert().await {
-                tracing::error!(session = %id, error = %undo, "putting back a session's model after its pod wasn't replaced");
+                tracing::error!(session = %id, error = %undo, "putting back a session's model after its move failed");
             }
-            self.unpark(id, agent, agent_session_id).await;
+            if let Some((agent, agent_session_id)) = quiet {
+                self.unpark(id, agent, agent_session_id).await;
+            }
             return Err(e);
         }
         Ok(true)

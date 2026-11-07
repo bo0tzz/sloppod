@@ -72,7 +72,7 @@ rules:
   # Each session on a LiteLLM model gets a virtual key, which the operator mints into a Secret named after it (#461).
   - apiGroups: [litellm.home-operations.com]
     resources: [litellmvirtualkeys]
-    verbs: [get, create, patch, delete]
+    verbs: [get, list, create, patch, delete]
   - apiGroups: [""]
     resources: [secrets]
     verbs: [get]

@@ -489,6 +489,20 @@ pub async fn remove_session(state: &AppState, session: &db::SessionRow) -> anyho
     remove_keys(state, session).await
 }
 
+/// Removes what model providers made for sessions that don't hold it any more (#461): a virtual key whose release
+/// failed, or whose session was purged while the runtime was down. A session keeps its endpoint key until it stops or
+/// is purged, parked or deleted-and-restorable too.
+pub async fn sweep_endpoint_keys(state: &AppState) {
+    let held = match db::endpoint_grants_held(&state.db).await {
+        Ok(held) => held,
+        Err(e) => {
+            tracing::warn!(error = %e, "listing the endpoint grants sessions hold");
+            return;
+        }
+    };
+    state.providers.sweep(&held).await;
+}
+
 /// Deletes the keys a session's pod uses: its memini key, its own key (#455), and its endpoint's key (#461). Placing
 /// the session mints them again.
 pub async fn remove_keys(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
@@ -504,7 +518,7 @@ pub async fn remove_keys(state: &AppState, session: &db::SessionRow) -> anyhow::
     state
         .providers
         .release(&id.to_string(), &session.grants())
-        .await;
+        .await?;
     state
         .credentials
         .delete_session_secret(id, SESSION_KEY)
