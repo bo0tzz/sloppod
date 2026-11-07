@@ -189,6 +189,9 @@ const OUTWARD: &str = "\n# Acting outside the pod\n\
     rather than `gh stack submit`. To file issues, call `propose_issues`; to comment on, edit or close existing \
     ones, `propose_issue_updates`, and open pull requests, `propose_pull_request_updates` (also to mark a draft \
     ready). Direct writes to GitHub (gh pr create, gh issue create, comments, API POSTs) are refused.\n\
+    - A pull request or stack proposed onto another branch follows it when that branch's pull request merges, \
+    while it waits: sloppod moves it onto the branch that one merged into (merging that into your branch if it was \
+    squashed) and tells you what moved. Don't withdraw and propose it again for that.\n\
     - For write access to another repository, call `request_repository`.\n";
 
 /// ADR 4's instructions: the user isn't watching, and nothing waits on them.
@@ -599,6 +602,8 @@ mod tests {
             assert!(work.contains(part), "work: {part}");
         }
         assert!(work.contains("they aren't the user's approval of anything else"));
+        // A proposal on a branch that merges follows it by itself (#141): nothing to withdraw.
+        assert!(work.contains("follows it when that branch's pull request merges"));
         assert!(work.contains("act on that answer as the user's decision"));
         assert!(!work.contains("# You're a sub-session"));
         assert!(

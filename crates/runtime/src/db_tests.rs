@@ -1,9 +1,11 @@
 //! Tests of the queries against a real Postgres; `mise run check` provides one through `DATABASE_URL`.
 
 use chrono::{DateTime, Duration, Utc};
-use serde_json::json;
+use serde_json::{Value, json};
 use sloppod_protocol::api::{Phase, ProposalStatus, ReviewPolicy, SessionKind};
 use sqlx::PgPool;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 
 use crate::db::{self, NewSessionRow};
@@ -2666,5 +2668,114 @@ async fn a_claimed_volume_removal_cant_be_kept_and_is_retried_at_once(db: PgPool
             .unwrap()
             .iter()
             .all(|row| row.id != kept)
+    );
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_proposal_is_followed_only_while_undecided_and_a_withdrawal_waits_for_it(db: PgPool) {
+    let s = session(&db, "dev").await;
+    let pending = |db: PgPool| async move {
+        db::insert_proposal(
+            &db,
+            s,
+            "github.pr.create",
+            ProposalStatus::Pending,
+            &json!({"base": "old"}),
+        )
+        .await
+        .unwrap()
+        .id
+    };
+    let follow_to = |base: &'static str, ran: Arc<AtomicBool>| {
+        move |_row: db::ProposalRow| async move {
+            ran.store(true, Ordering::SeqCst);
+            Ok(Some((ProposalStatus::Pending, json!({"base": base}), ())))
+        }
+    };
+
+    // Withdrawn before the follow: its work, which would write to GitHub, doesn't run, and nothing changes.
+    let withdrawn = pending(db.clone()).await;
+    db::withdraw_proposal(&db, withdrawn, s, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let ran = Arc::new(AtomicBool::new(false));
+    let followed = db::follow_while_undecided(&db, withdrawn, follow_to("main", ran.clone()))
+        .await
+        .unwrap();
+    assert!(followed.is_none());
+    assert!(!ran.load(Ordering::SeqCst));
+    let kept = db::get_proposal(&db, withdrawn).await.unwrap().unwrap();
+    assert_eq!(
+        (kept.status, kept.payload),
+        (ProposalStatus::Withdrawn, json!({"base": "old"}))
+    );
+
+    // Undecided, it's followed.
+    let id = pending(db.clone()).await;
+    let ran = Arc::new(AtomicBool::new(false));
+    let (row, was, ()) = db::follow_while_undecided(&db, id, follow_to("main", ran.clone()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ran.load(Ordering::SeqCst));
+    assert_eq!(
+        (was, row.status, row.payload),
+        (
+            ProposalStatus::Pending,
+            ProposalStatus::Pending,
+            json!({"base": "main"})
+        )
+    );
+
+    // A withdrawal that comes while it's being followed waits until that's done, then goes through.
+    let (started, mut start) = tokio::sync::mpsc::channel::<()>(1);
+    let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+    let following = tokio::spawn({
+        let db = db.clone();
+        async move {
+            db::follow_while_undecided(&db, id, move |_row| async move {
+                started.send(()).await.unwrap();
+                finished.await.unwrap();
+                Ok(Some((
+                    ProposalStatus::Pending,
+                    json!({"base": "trunk"}),
+                    (),
+                )))
+            })
+            .await
+        }
+    });
+    start.recv().await.unwrap();
+    let withdrawing = tokio::spawn({
+        let db = db.clone();
+        async move { db::withdraw_proposal(&db, id, s, Some("not needed")).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !withdrawing.is_finished(),
+        "the withdrawal waits for the follow"
+    );
+    finish.send(()).unwrap();
+    following.await.unwrap().unwrap().unwrap();
+    let withdrawn = withdrawing.await.unwrap().unwrap().unwrap();
+    assert_eq!(
+        (withdrawn.status, withdrawn.payload),
+        (ProposalStatus::Withdrawn, json!({"base": "trunk"}))
+    );
+
+    // Work that finds nothing moved changes nothing, and lets go of the proposal.
+    let other = pending(db.clone()).await;
+    let nothing = db::follow_while_undecided(&db, other, |_row| async {
+        Ok(None::<(ProposalStatus, Value, ())>)
+    })
+    .await
+    .unwrap();
+    assert!(nothing.is_none());
+    assert!(
+        db::withdraw_proposal(&db, other, s, None)
+            .await
+            .unwrap()
+            .is_some()
     );
 }
