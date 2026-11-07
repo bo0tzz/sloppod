@@ -1480,6 +1480,56 @@ test('a read position that failed to save is sent again', async ({ page }) => {
   expect(attempts).toBeGreaterThan(1);
 });
 
+test('the end of the chat stays in view as the message box grows and shrinks', async ({ page }) => {
+  await page.setViewportSize({ width: 1000, height: 500 });
+  await createSession(page, 'Give me a long answer in sloppod');
+  const end = page.getByText('The end.');
+  await expect(end).toBeInViewport({ ratio: 1, timeout: 20_000 });
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+
+  // Following the bottom, the view stays there as the box takes more room, and as it gives it back.
+  await box.click();
+  for (const line of ['one', 'two', 'three', 'four']) {
+    await box.pressSequentially(line);
+    await page.keyboard.press('Shift+Enter');
+  }
+  await expect(end).toBeInViewport({ ratio: 1 });
+  await box.fill('one\ntwo\nthree\nfour\nfive\nsix');
+  await expect(end).toBeInViewport({ ratio: 1 });
+  await box.fill('');
+  await expect(end).toBeInViewport({ ratio: 1 });
+
+  // Scrolled up, what the reader was looking at stays where it is.
+  const scroller = page.getByTestId('transcript-scroller');
+  await end.hover();
+  await page.mouse.wheel(0, -300);
+  await expect(end).not.toBeInViewport();
+  const top = () => scroller.evaluate((element) => element.scrollTop);
+  const kept = await top();
+  await box.fill('one\ntwo\nthree\nfour');
+  await expect.poll(top).toBe(kept);
+});
+
+test('opened at the unread bar, the end of the chat stays in view as the message box grows', async ({ page }) => {
+  await page.setViewportSize({ width: 1000, height: 500 });
+  const id = await createSession(page, 'Give me a long answer in sloppod');
+  await expect(page.getByText('The end.')).toBeInViewport({ timeout: 20_000 });
+  const read = await readPosition(page, id);
+  await page.getByText('The end.').hover();
+  await page.mouse.wheel(0, -2000);
+  await expect(page.getByText('The end.')).not.toBeInViewport();
+  await page.request.post('/_mock/say?text=Just%20one%20line.');
+  await expect(page.getByTestId('unread-divider')).toHaveCount(1);
+  expect(await readPosition(page, id)).toBe(read);
+
+  await page.reload();
+  const last = page.getByText('Just one line.');
+  await expect(page.getByTestId('unread-divider')).toBeInViewport();
+  await expect(last).toBeInViewport({ ratio: 1 });
+  await page.getByRole('textbox', { name: 'Prompt' }).fill('one\ntwo\nthree\nfour');
+  await expect(last).toBeInViewport({ ratio: 1 });
+});
+
 test('sending a message scrolls the chat to it, and so does scrolling the session list past its end', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 500 });
   await createSession(page, 'Give me a long answer in sloppod');
