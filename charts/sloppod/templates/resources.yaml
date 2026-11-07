@@ -68,6 +68,15 @@ rules:
     resources: [secrets]
     resourceNames: [{{ include "sloppod.caSecret" . }}]
     verbs: [get]
+  {{- if .Values.litellm.namespaces }}
+  # Each session on a LiteLLM model gets a virtual key, which the operator mints into a Secret named after it (#461).
+  - apiGroups: [litellm.home-operations.com]
+    resources: [litellmvirtualkeys]
+    verbs: [get, list, create, patch, delete]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -99,3 +108,34 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "sloppod.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
+{{- range .Values.litellm.namespaces }}
+---
+# The LiteLLM operator's proxies and models here are offered to sessions (#461).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "sloppod.fullname" $ }}-litellm
+  namespace: {{ . }}
+  labels:
+    {{- include "sloppod.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: [litellm.home-operations.com]
+    resources: [litellmproxies, litellmmodels]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "sloppod.fullname" $ }}-litellm
+  namespace: {{ . }}
+  labels:
+    {{- include "sloppod.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "sloppod.fullname" $ }}-litellm
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "sloppod.serviceAccountName" $ }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}

@@ -102,6 +102,11 @@ pub struct Config {
     #[arg(long, env = "SLOPPOD_ALLOWED_ORIGINS", value_delimiter = ',')]
     pub allowed_origins: Vec<String>,
 
+    /// Namespaces whose LiteLLM operator proxies and models sessions are offered (#461); none leaves the operator
+    /// alone. Each session on one of their models gets a `LiteLLMVirtualKey` of its own, in `namespace`.
+    #[arg(long, env = "SLOPPOD_LITELLM_NAMESPACES", value_delimiter = ',')]
+    pub litellm_namespaces: Vec<String>,
+
     /// User for requests without the header; unset, such requests are refused.
     #[arg(long, env = "SLOPPOD_DEFAULT_USER")]
     pub default_user: Option<String>,

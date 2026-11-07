@@ -347,11 +347,12 @@ async fn tools(state: &AppState, row: &db::SessionRow) -> Vec<Value> {
     }));
     if kind == SessionKind::Work {
         // The user's endpoint models a child can run on (#461), by the names `spawn_session` takes.
-        let models: Vec<String> = crate::endpoint::offered(&state.credentials, &row.owner)
+        let models: Vec<String> = state
+            .providers
+            .offered(&row.owner)
             .await
-            .unwrap_or_default()
             .into_iter()
-            .filter_map(|m| m["name"].as_str().map(str::to_owned))
+            .map(|m| m.name)
             .collect();
         tools.extend(subsessions::tools(&models));
     }

@@ -105,6 +105,10 @@ spec:
             - name: SLOPPOD_ALLOWED_ORIGINS
               value: {{ join "," . | quote }}
             {{- end }}
+            {{- with .Values.litellm.namespaces }}
+            - name: SLOPPOD_LITELLM_NAMESPACES
+              value: {{ join "," . | quote }}
+            {{- end }}
             {{- with .Values.memory.namespacePrefix }}
             - name: SLOPPOD_MEMINI_NAMESPACE_PREFIX
               value: {{ . | quote }}

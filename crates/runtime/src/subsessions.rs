@@ -149,7 +149,7 @@ pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<
     // An endpoint's model, named by its id or its name, gets the child the endpoint grant it needs, whether or not
     // this session holds one (ADR 27, 2026-11-07).
     let model = crate::endpoint::chosen(
-        &state.credentials,
+        &state.providers,
         &parent.owner,
         adapter.as_ref(),
         model.as_deref(),

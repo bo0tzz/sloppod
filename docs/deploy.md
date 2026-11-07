@@ -83,6 +83,68 @@ Sessions can run Claude Code on models of any Anthropic-compatible endpoint ([#4
 
 **A runtime restart during a turn on an endpoint model.** Model answers stream through the runtime, so stopping it would cut them. On `SIGTERM` the runtime stops taking new model requests (they get `503` with `retry-after`) and waits up to 60 seconds for answers in flight to finish before exiting; the chart sets `terminationGracePeriodSeconds: 75` to leave room for it. An answer still streaming after that is cut. Claude Code tries a cut answer again at once, and a refused or unreachable request again with backoff for about three minutes (checked against Claude Code 2.1.310), so a turn carries on once the next runtime is up: what it loses is the tokens spent on the cut answer, which the endpoint bills again. With the chart's `Recreate` strategy the next runtime starts only after this one exits, so a deploy takes up to a minute longer while answers finish. Sessions on Claude or Codex aren't affected: they reach their providers through the egress listener, not the runtime.
 
+### With the LiteLLM operator
+
+With the [LiteLLM operator](https://github.com/home-operations/litellm-operator) installed, its proxies and models are found by themselves: list the namespaces they're in under `litellm.namespaces`, and every user is offered each proxy's models. A session on one gets a `LiteLLMVirtualKey` of its own in sloppod's namespace, limited to its model, and the key goes when the session stops or is purged. The chart then grants the runtime `get`, `list` and `watch` on `litellmproxies` and `litellmmodels` in those namespaces, and in its own namespace `get`, `list`, `create`, `patch` and `delete` on `litellmvirtualkeys` (an hourly sweep lists them to delete any no session holds) and `get` on Secrets, where the operator writes the keys it mints.
+
+```yaml
+# The HelmRelease's values:
+litellm:
+  namespaces: [ai]
+---
+apiVersion: litellm.home-operations.com/v1alpha1
+kind: LiteLLMProxy
+metadata:
+  name: main
+  namespace: ai
+spec:
+  # Virtual keys are minted through the proxy's admin API, with its database.
+  apiAccess:
+    masterKeyRef:
+      name: litellm-secrets
+      key: LITELLM_MASTER_KEY
+  generalSettings:
+    database_url: os.environ/DATABASE_URL
+  envFrom:
+    - secretRef:
+        name: litellm-secrets
+---
+# A hosted model, through its provider's API.
+apiVersion: litellm.home-operations.com/v1alpha1
+kind: LiteLLMModel
+metadata:
+  name: glm-5-2
+  namespace: ai
+spec:
+  modelName: glm-5.2
+  params:
+    model: openai/glm-5.2
+    apiBase: https://api.z.ai/api/coding/paas/v4
+    apiKeyRef:
+      name: litellm-secrets
+      key: ZAI_API_KEY
+  info:
+    maxInputTokens: 200000
+    supportsFunctionCalling: true
+---
+# A model served in the cluster, e.g. by vLLM.
+apiVersion: litellm.home-operations.com/v1alpha1
+kind: LiteLLMModel
+metadata:
+  name: qwen3-coder
+  namespace: ai
+spec:
+  modelName: qwen3-coder
+  params:
+    model: hosted_vllm/Qwen/Qwen3-Coder-30B-A3B-Instruct
+    apiBase: http://vllm.ai.svc.cluster.local:8000/v1
+  info:
+    maxInputTokens: 131072
+    supportsFunctionCalling: true
+```
+
+Sessions reach the proxy's Service (`main.ai.svc.cluster.local:4000` here) through the runtime, so the runtime pod needs to reach it; a session's own egress doesn't change. A model is offered as soon as the operator would bind it to a proxy, and isn't any more once it wouldn't.
+
 ## What a session keeps
 
 What each session holds in the cluster, by its phase ([ADR 25](adr/0025-session-lifecycle.md), #455):
