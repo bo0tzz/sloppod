@@ -2779,3 +2779,74 @@ async fn a_proposal_is_followed_only_while_undecided_and_a_withdrawal_waits_for_
             .is_some()
     );
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_proposal_with_changes_requested_is_followed_for_its_next_round_only_while_it_has_them(
+    db: PgPool,
+) {
+    let s = session(&db, "dev").await;
+    let asked = |db: PgPool| async move {
+        db::insert_proposal(
+            &db,
+            s,
+            "github.pr.create",
+            ProposalStatus::ChangesRequested,
+            &json!({"base": "old"}),
+        )
+        .await
+        .unwrap()
+        .id
+    };
+    // As request_review does: the next round, under the lock, only if changes are still requested.
+    let next_round = |ran: Arc<AtomicBool>| {
+        move |row: db::ProposalRow| async move {
+            if row.status != ProposalStatus::ChangesRequested {
+                return Ok(None);
+            }
+            ran.store(true, Ordering::SeqCst);
+            Ok(Some((
+                ProposalStatus::InReview,
+                json!({"base": "main"}),
+                (),
+            )))
+        }
+    };
+    // Withdrawn before the author asked for the next round: not followed, not sent to review.
+    let withdrawn = asked(db.clone()).await;
+    db::withdraw_proposal(&db, withdrawn, s, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let ran = Arc::new(AtomicBool::new(false));
+    assert!(
+        db::follow_while_undecided(&db, withdrawn, next_round(ran.clone()))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!ran.load(Ordering::SeqCst));
+    assert_eq!(
+        db::get_proposal(&db, withdrawn)
+            .await
+            .unwrap()
+            .unwrap()
+            .payload,
+        json!({"base": "old"})
+    );
+
+    let id = asked(db.clone()).await;
+    let ran = Arc::new(AtomicBool::new(false));
+    let (row, was, ()) = db::follow_while_undecided(&db, id, next_round(ran.clone()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ran.load(Ordering::SeqCst));
+    assert_eq!(
+        (was, row.status, row.payload),
+        (
+            ProposalStatus::ChangesRequested,
+            ProposalStatus::InReview,
+            json!({"base": "main"})
+        )
+    );
+}

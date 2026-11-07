@@ -956,47 +956,53 @@ pub async fn request(state: &AppState, session: Uuid, arguments: &Value) -> Resu
         .await
         .map_err(|e| e.to_string())?
         .ok_or("unknown session")?;
-    // Only what a human could edit when approving, so the update can't change what's being reviewed.
-    let edited = kind
-        .edit(&proposal.payload, &arguments["update"])
+    // Only what a human could edit when approving, so the update can't change what's being reviewed. Checked here
+    // for a quick answer, and applied again under the lock below.
+    kind.edit(&proposal.payload, &arguments["update"])
         .map_err(|e| format!("`update`: {}", e.0))?;
-    // A base that merged meanwhile is followed first (#141), and the reviewer told.
-    let context = author.context();
-    let (payload, moved) = match crate::proposals::followed(kind.as_ref(), &context, &edited)
-        .await
-        .map_err(|e| e.0)?
-    {
-        Some((payload, followed)) => (payload, Some(followed.note)),
-        None => (
-            crate::proposals::prepared(kind.as_ref(), &context, edited)
-                .await
-                .map_err(|e| e.0)?,
-            None,
-        ),
-    };
-    let subject = kind
-        .review_subject(&payload)
-        .ok_or("this proposal can't be reviewed")?;
     let replies = arguments["replies"]
         .as_str()
         .map(str::trim)
         .filter(|r| !r.is_empty());
-    if replies.is_none() && payload == proposal.payload {
-        return Err(
-            "nothing new: push your fixes or update the proposal first, or reply to the findings you think don't apply"
-                .into(),
-        );
-    }
-    let row = db::move_proposal(
-        &state.db,
-        id,
-        ProposalStatus::ChangesRequested,
-        ProposalStatus::InReview,
-        Some(&payload),
-    )
+    let context = author.context();
+    let kind_ref = kind.as_ref();
+    // Under the proposal's lock, and only while it still has changes requested: following a base that merged meanwhile
+    // (#141) can write to GitHub (a merge commit on its branch), which a proposal withdrawn meanwhile mustn't get.
+    let locked = db::follow_while_undecided(&state.db, id, |current| async move {
+        if current.status != ProposalStatus::ChangesRequested {
+            return Ok(None);
+        }
+        let edited = kind_ref
+            .edit(&current.payload, &arguments["update"])
+            .map_err(|e| anyhow::anyhow!("`update`: {}", e.0))?;
+        // A base that merged meanwhile is followed first, and the reviewer told.
+        let (payload, moved) = match crate::proposals::followed(kind_ref, &context, &edited)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.0))?
+        {
+            Some((payload, followed)) => (payload, Some(followed.note)),
+            None => (
+                crate::proposals::prepared(kind_ref, &context, edited)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.0))?,
+                None,
+            ),
+        };
+        let subject = kind_ref
+            .review_subject(&payload)
+            .ok_or_else(|| anyhow::anyhow!("this proposal can't be reviewed"))?;
+        if replies.is_none() && payload == current.payload {
+            anyhow::bail!(
+                "nothing new: push your fixes or update the proposal first, or reply to the findings you think don't apply"
+            );
+        }
+        Ok(Some((ProposalStatus::InReview, payload, (subject, moved))))
+    })
     .await
-    .map_err(|e| e.to_string())?
-    .ok_or("the proposal changed meanwhile")?;
+    .map_err(|e| e.to_string())?;
+    let Some((row, _, (subject, moved))) = locked else {
+        return Err("the proposal changed meanwhile".into());
+    };
     state.hub.broadcast_proposal(&row.to_api());
     start(state, &row, &subject, replies, None, moved.as_deref())
         .await
