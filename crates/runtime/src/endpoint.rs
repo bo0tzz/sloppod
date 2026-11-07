@@ -386,6 +386,36 @@ pub async fn chosen(
     })
 }
 
+/// Whether a session can move onto its agent's own provider (`model` being one of its models): it holds the agent's
+/// inference grant, and an account that grant names is still there, as the authorizer would pick it (ADR 29). A
+/// default the grant doesn't name doesn't count.
+pub async fn own_provider_ready(
+    credentials: &Credentials,
+    session: &SessionContext,
+    agent: &dyn sloppod_contracts::AgentAdapter,
+    model: &str,
+) -> sqlx::Result<Result<(), String>> {
+    let needed = agent.credential();
+    let inference = agent.inference_capability();
+    if !session.grants.iter().any(|g| g.capability == inference) {
+        return Ok(Err(format!(
+            "{model} needs the {inference} grant, which this session doesn't hold; choose another of your \
+             endpoints' models"
+        )));
+    }
+    Ok(match credentials.account(session, &needed.kind).await? {
+        Account::Found(_) => Ok(()),
+        Account::Gone => Err(format!(
+            "the accounts this session's {inference} grant names are gone; give it another in the grants list \
+             first, or choose another of your endpoints' models"
+        )),
+        Account::None => Err(format!(
+            "{model} needs {}; add one in Settings, or choose another of your endpoints' models",
+            needed.name
+        )),
+    })
+}
+
 /// A change of a session's model that involves an endpoint's (#461), to one or from one: unlike a change between the
 /// agent's own models, the agent can't make it itself, since it's another provider (ADR 20). The model and the
 /// endpoint grant change together, and the agent starts again on a new pod, resuming its conversation. `None` when
@@ -423,26 +453,13 @@ pub async fn switch(
     if was.is_none() && to.is_none() {
         return None;
     }
-    // Off an endpoint, onto the agent's own provider: the session needs its account and grant for that.
+    // Off an endpoint, onto the agent's own provider: the session needs a usable account there, by its own grant.
     if to.is_none() {
-        let needed = adapter.credential();
-        let has_account = match state
-            .credentials
-            .has_default(&row.owner, &needed.kind)
-            .await
+        match own_provider_ready(&state.credentials, &row.context(), adapter.as_ref(), &model).await
         {
-            Ok(has) => has,
+            Ok(Ok(())) => {}
+            Ok(Err(why)) => return Some(Err(RpcError::new(-32602, why))),
             Err(e) => return Some(Err(RpcError::new(-32603, e.to_string()))),
-        };
-        let inference = adapter.inference_capability();
-        if !has_account || !row.grants().iter().any(|g| g.capability == inference) {
-            return Some(Err(RpcError::new(
-                -32602,
-                format!(
-                    "{model} needs {} and the {inference} grant; add the account in Settings, or choose another of your endpoints' models",
-                    needed.name
-                ),
-            )));
         }
     }
     let mut grants = Vec::new();
@@ -844,6 +861,53 @@ mod tests {
                 .await
                 .unwrap(),
             Ok(Some("opus".into()))
+        );
+    }
+
+    #[sqlx::test]
+    async fn moving_back_to_claude_needs_an_account_the_session_s_grant_names(db: sqlx::PgPool) {
+        let (credentials, _) = credentials_with(db, "http://litellm:4000").await;
+        let claude = |name: &str| NewCredential {
+            kind: crate::credentials::CLAUDE.into(),
+            name: name.into(),
+            config: Default::default(),
+            secret: format!("sk-{name}"),
+        };
+        let first = credentials
+            .create("dev", claude("first"))
+            .await
+            .unwrap()
+            .unwrap();
+        let on = |grants: Vec<Grant>| session(grants);
+        let named = on(vec![Grant::new(
+            capability::MODEL,
+            json!({"credentials": [first.id.to_string()]}),
+        )]);
+        let agent = crate::adapter::ClaudeCode;
+        assert_eq!(
+            own_provider_ready(&credentials, &named, &agent, "opus")
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        // Its account deleted and another made the default: the grant still names only the one that's gone.
+        credentials.delete("dev", first.id).await.unwrap();
+        credentials
+            .create("dev", claude("second"))
+            .await
+            .unwrap()
+            .unwrap();
+        let refused = own_provider_ready(&credentials, &named, &agent, "opus")
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(refused.contains("are gone"), "{refused}");
+        // Without the model grant at all, neither.
+        assert!(
+            own_provider_ready(&credentials, &on(vec![]), &agent, "opus")
+                .await
+                .unwrap()
+                .is_err()
         );
     }
 }
