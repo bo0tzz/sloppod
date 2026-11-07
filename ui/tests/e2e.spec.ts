@@ -1321,11 +1321,15 @@ test('marks where the reader left off, and opens there, on this device or anothe
 
   // Reading to the end takes the bar away, and moves the position on for both.
   await page.getByText('Unread first.').hover();
-  // A wheel event scrolls a page at most in some browsers (Firefox), so it takes as many as it takes to reach the end.
+  // A wheel event scrolls a page at most in some browsers (Firefox), so it takes as many as it takes to reach the very
+  // end: the bar goes within a few lines of it, but the last message is only read once it's all in view.
+  const scroller = page.getByTestId('transcript-scroller');
   await expect(async () => {
     await page.mouse.wheel(0, 5000);
-    await expect(divider).toHaveCount(0, { timeout: 1000 });
+    const gap = await scroller.evaluate((element) => element.scrollHeight - element.scrollTop - element.clientHeight);
+    expect(gap).toBeLessThan(2);
   }).toPass();
+  await expect(divider).toHaveCount(0);
   const moved = await readPosition(page, id, read);
   await phone.reload();
   await expect(phone.getByText('line 11', { exact: true }).last()).toBeInViewport();
