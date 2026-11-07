@@ -10,6 +10,7 @@ mod db;
 mod db_tests;
 mod debug_bundle;
 mod definitions;
+mod endpoint;
 mod enforcer;
 mod github;
 mod grants;
@@ -66,7 +67,9 @@ use crate::config::Config;
 use crate::credentials::Credentials;
 use crate::enforcer::Cilium;
 use crate::pods::PodIndex;
-use crate::policies::{CodexPolicy, GitHubPolicy, MeminiPolicy, ModelPolicy, Policies};
+use crate::policies::{
+    CodexPolicy, EndpointPolicy, GitHubPolicy, MeminiPolicy, ModelPolicy, Policies,
+};
 use crate::proposals::ProposalKinds;
 use crate::session::Hub;
 
@@ -80,12 +83,18 @@ pub struct Inner {
     pub policies: Policies,
     /// Decides session requests to memini, which reach it through the runtime rather than the egress listener.
     pub memory: Arc<MeminiPolicy>,
+    /// Decides session requests to the endpoint their model is on (#461), which reach it through the runtime.
+    pub endpoint: Arc<EndpointPolicy>,
     pub proposals: ProposalKinds,
     pub placement: Arc<dyn PlacementBackend>,
     pub enforcer: Arc<dyn Enforcer>,
     pub cilium: Arc<Cilium>,
     /// Where requests to owners' MCP servers may go: not back to the runtime.
     pub reach: proxy::Reach,
+    /// The same, for model endpoints: no total timeout, only an idle one, since answers stream for minutes.
+    pub inference_reach: proxy::Reach,
+    /// Model answers streaming through the runtime, which a stopping runtime lets finish.
+    pub inference_streams: Arc<endpoint::Streams>,
     pub ca: tls::Ca,
     pub authz_addr: SocketAddr,
     pub agents: adapter::Agents,
@@ -237,6 +246,11 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
+    // The runtime's own addresses, which servers an owner names can't point back at.
+    let own: Vec<std::net::IpAddr> = [Some(authz_addr.ip()), config.pod_ip]
+        .into_iter()
+        .flatten()
+        .collect();
     let state = AppState(Arc::new(Inner {
         hub: Arc::new(Hub::new(Arc::new(store::PgStore(db.clone())))),
         config: config.clone(),
@@ -244,6 +258,7 @@ async fn main() -> anyhow::Result<()> {
         kube,
         pods,
         memory: Arc::new(MeminiPolicy::new(credentials.clone())),
+        endpoint: Arc::new(EndpointPolicy::new(credentials.clone())),
         credentials,
         policies,
         proposals,
@@ -251,12 +266,9 @@ async fn main() -> anyhow::Result<()> {
         enforcer: cilium.clone(),
         cilium,
         ca,
-        reach: proxy::Reach::new(
-            [Some(authz_addr.ip()), config.pod_ip]
-                .into_iter()
-                .flatten()
-                .collect(),
-        ),
+        reach: proxy::Reach::new(own.clone()),
+        inference_reach: proxy::Reach::with_idle(own, endpoint::IDLE),
+        inference_streams: Default::default(),
         authz_addr,
         agents,
         instructions,
@@ -399,6 +411,10 @@ async fn main() -> anyhow::Result<()> {
             get(link::transcript),
         )
         .route("/mcp", post(mcp::handler).get(mcp::stream))
+        .route(
+            &format!("{}/{{*path}}", endpoint::PREFIX),
+            any(endpoint::proxy),
+        )
         .route(memory::PREFIX, any(memory::proxy))
         .route(&format!("{}/{{*path}}", memory::PREFIX), any(memory::proxy))
         .route(
@@ -410,7 +426,7 @@ async fn main() -> anyhow::Result<()> {
             any(definitions::proxy),
         )
         .route("/healthz", get(|| async { "ok" }))
-        .with_state(state);
+        .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let sessions_listener = tokio::net::TcpListener::bind(config.sessions_listen).await?;
     tracing::info!(
@@ -431,8 +447,38 @@ async fn main() -> anyhow::Result<()> {
         result = http => result?,
         result = sessions => result?,
         result = authz => result??,
+        () = stopping(&state) => {}
     }
     Ok(())
+}
+
+/// Waits for the runtime to be told to stop, then lets model answers in flight finish (#461): a deploy would otherwise
+/// cut every one of them. The agents try a cut answer again, but that costs the tokens already spent on it. New ones
+/// are refused meanwhile, and the agents try those again against the next runtime.
+async fn stopping(state: &AppState) {
+    let mut terminate = match tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::terminate(),
+    ) {
+        Ok(signal) => signal,
+        Err(e) => {
+            tracing::warn!(error = %e, "listening for SIGTERM; a stop won't wait for model answers");
+            std::future::pending::<()>().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = terminate.recv() => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
+    let open = state.inference_streams.open();
+    tracing::info!(open, "stopping; letting model answers in flight finish");
+    let left = state.inference_streams.drain(endpoint::DRAIN).await;
+    if left > 0 {
+        tracing::warn!(
+            left,
+            "stopping with model answers still in flight; their agents try them again"
+        );
+    }
 }
 
 /// Brings session pods and policies back in line with the database after a restart.

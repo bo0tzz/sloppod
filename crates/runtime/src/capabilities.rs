@@ -5,7 +5,7 @@
 
 use sloppod_contracts::{Grant, SessionContext, capability};
 
-use crate::credentials::{CHATGPT, CLAUDE};
+use crate::credentials::{CHATGPT, CLAUDE, ENDPOINT};
 
 /// Where a capability stands in a new session's starting set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +59,8 @@ pub enum Provider {
     Anthropic,
     /// Codex's backend, on one of the owner's ChatGPT logins.
     ChatGpt,
+    /// An Anthropic-compatible endpoint of the owner's (#461), reached through the runtime.
+    Endpoint,
 }
 
 impl Provider {
@@ -67,6 +69,7 @@ impl Provider {
         match self {
             Provider::Anthropic => CLAUDE,
             Provider::ChatGpt => CHATGPT,
+            Provider::Endpoint => ENDPOINT,
         }
     }
 }
@@ -112,6 +115,16 @@ pub const BUILTINS: &[Builtin] = &[
         always_inherited: true,
         needs: Some(CHATGPT),
         parts: &[Part::Model(Provider::ChatGpt)],
+    },
+    Builtin {
+        name: capability::ENDPOINT,
+        // It follows the session's model: chosen with it, never granted on its own (#461).
+        grantable: false,
+        start: Start::Not,
+        // Not copied to a child as such: a child's endpoint grant follows its own model (ADR 27, 2026-11-07).
+        always_inherited: false,
+        needs: None,
+        parts: &[Part::Model(Provider::Endpoint)],
     },
     Builtin {
         name: capability::REPO,

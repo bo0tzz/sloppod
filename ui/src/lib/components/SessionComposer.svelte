@@ -2,6 +2,7 @@
   import { Button, IconButton, Select, toastManager } from '@immich/ui';
   import { mdiClose, mdiImagePlus, mdiPencilOutline, mdiSend, mdiSteering, mdiStop } from '@mdi/js';
   import { configSelectOptions } from '#lib/presentation.ts';
+  import { api } from '#lib/api.ts';
   import { ConnectionClosedError } from '#lib/acp/connection.ts';
   import { queuedText, type QueuedMessage, type SessionView } from '#lib/session.svelte.ts';
   import { loadDraft, saveDraft, type Outgoing } from '#lib/drafts.ts';
@@ -47,7 +48,23 @@
   const canSend = $derived(!blockedReason && attaching === 0 && (text.trim().length > 0 || images.length > 0));
 
   const model = $derived(phase === 'stopped' ? undefined : view.model);
-  const modelOptions = $derived(model?.type === 'select' ? configSelectOptions(model.options) : []);
+  // The user's endpoints' models (#461), offered next to the agent's own; Claude Code runs on them.
+  let endpointModels = $state<{ value: string; label: string }[]>([]);
+  $effect(() => {
+    if (view.session?.agent !== 'claude-code') return;
+    api.getSettings().then(
+      (settings) =>
+        (endpointModels = settings.models
+          .filter((entry) => entry.value.startsWith('endpoint:'))
+          .map((entry) => ({ value: entry.value, label: entry.name }))),
+      () => {},
+    );
+  });
+  const modelOptions = $derived(model?.type === 'select' ? [...configSelectOptions(model.options), ...endpointModels] : []);
+  // On an endpoint's model, the agent's own picker doesn't know it: the session says which it is.
+  const modelValue = $derived(
+    view.session?.model?.startsWith('endpoint:') ? view.session.model : model?.type === 'select' ? model.currentValue : undefined,
+  );
 
   const unusualStops: Record<string, string> = {
     max_tokens: 'The agent hit its token limit.',
@@ -189,7 +206,7 @@
   }
 
   async function setModel(value: string) {
-    if (model?.type !== 'select' || value === model.currentValue) return;
+    if (model?.type !== 'select' || value === modelValue) return;
     try {
       await view.setConfigOption('model', value);
     } catch (error) {
@@ -313,7 +330,7 @@
     {/if}
     {#if model?.type === 'select' && modelOptions.length > 0}
       <div class="w-40 shrink-0 sm:w-48" data-testid="model-select">
-        <Select size="tiny" options={modelOptions} value={model.currentValue} onChange={setModel} title={model.name} />
+        <Select size="tiny" options={modelOptions} value={modelValue} onChange={setModel} title={model.name} />
       </div>
     {/if}
   {/snippet}

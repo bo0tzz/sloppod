@@ -41,6 +41,13 @@ pub async fn accounts_given(
             grant.capability
         )));
     };
+    // Its endpoint is the model's: another one is another model, which the session moves onto as a whole (#461).
+    if grant.capability == sloppod_contracts::capability::ENDPOINT {
+        return Ok(Err(
+            "an endpoint grant follows the session's model; choose another model in the session's model selector instead"
+                .into(),
+        ));
+    }
     if ids.is_empty() {
         return Ok(Err("a model grant names at least one account".into()));
     }
@@ -67,6 +74,7 @@ pub fn describe(grant: &Grant) -> String {
                        others)."
             .into(),
         capability::CODEX => "Codex's API on chatgpt.com, with the first of the owner's ChatGPT logins this grant names.".into(),
+        capability::ENDPOINT => "The inference API of the owner's model endpoint this grant names, which the session's model is on, through the runtime with its key; it follows the model.".into(),
         capability::DOCS => "Library documentation, searched by library and topic, through Context7's MCP server (the `docs` \
                    tools)."
             .into(),

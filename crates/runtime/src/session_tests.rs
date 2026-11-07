@@ -3610,3 +3610,66 @@ async fn a_release_while_parked_and_a_wake_dont_interleave() {
     let ran = h.hub.while_parked(h.id, || async { Ok(()) }).await.unwrap();
     assert_eq!(ran, None);
 }
+
+#[tokio::test]
+async fn a_session_moves_to_another_provider_only_when_quiet_and_never_half_way() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let counted = || Arc::new(AtomicUsize::new(0));
+    let (changed, replaced, reverted) = (counted(), counted(), counted());
+    let switch = |h: &Harness, fail: bool| {
+        let (changed, replaced, reverted) = (changed.clone(), replaced.clone(), reverted.clone());
+        let hub = h.hub.clone();
+        let id = h.id;
+        async move {
+            hub.switch_provider(
+                id,
+                || async move {
+                    changed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                || async move {
+                    replaced.fetch_add(1, Ordering::SeqCst);
+                    if fail {
+                        anyhow::bail!("the pod wasn't replaced")
+                    } else {
+                        Ok(())
+                    }
+                },
+                || async move {
+                    reverted.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+        }
+    };
+
+    // Busy: in a turn, or with commands running: nothing is changed.
+    let mut h = Harness::ready().await;
+    let _turn = h.prompt("Busy");
+    h.next().await;
+    assert!(!switch(&h, false).await.unwrap());
+    let h = Harness::ready().await;
+    h.hub.set_commands(h.id, &h.agent, 1, Vec::new()).await;
+    assert!(!switch(&h, false).await.unwrap());
+    assert_eq!(changed.load(Ordering::SeqCst), 0);
+
+    // Quiet: recorded, and the agent starts again.
+    let h = Harness::ready().await;
+    assert!(switch(&h, false).await.unwrap());
+    assert_eq!(
+        (
+            changed.load(Ordering::SeqCst),
+            replaced.load(Ordering::SeqCst)
+        ),
+        (1, 1)
+    );
+
+    // The pod not replaced: the record is put back, and the old agent carries on.
+    let mut h = Harness::ready().await;
+    assert!(switch(&h, true).await.is_err());
+    assert_eq!(reverted.load(Ordering::SeqCst), 1);
+    assert_eq!(h.phase().await, "idle");
+    let _turn = h.prompt("Still here");
+    assert_eq!(prompt_text(&h.next().await), ["Still here"]);
+}

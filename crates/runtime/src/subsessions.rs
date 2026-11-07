@@ -134,19 +134,6 @@ pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<
         .agents
         .get(agent)
         .ok_or_else(|| format!("there's no agent called {agent}"))?;
-    let needed = adapter.credential();
-    let has_credential = state
-        .credentials
-        .has_default(&parent.owner, &needed.kind)
-        .await
-        .map_err(|e| e.to_string())?;
-    let inference = adapter.inference_capability();
-    if !has_credential || !grants.iter().any(|g| g.capability == inference) {
-        return Err(format!(
-            "{agent} needs {} and the {inference} grant, which you can't give it",
-            needed.name
-        ));
-    }
     let setting = db::user_sub_session_model(&state.db, &parent.owner)
         .await
         .map_err(|e| e.to_string())?;
@@ -159,6 +146,31 @@ pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<
         adapter.sub_session_model(),
         parent.model.as_deref(),
     );
+    // An endpoint's model, named by its id or its name, gets the child the endpoint grant it needs, whether or not
+    // this session holds one (ADR 27, 2026-11-07).
+    let model = crate::endpoint::chosen(
+        &state.credentials,
+        &parent.owner,
+        adapter.as_ref(),
+        model.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())??;
+    let on_endpoint =
+        crate::endpoint::EndpointModel::parse(model.as_deref().unwrap_or_default()).is_some();
+    let needed = adapter.credential();
+    let has_credential = state
+        .credentials
+        .has_default(&parent.owner, &needed.kind)
+        .await
+        .map_err(|e| e.to_string())?;
+    let inference = adapter.inference_capability();
+    if !on_endpoint && (!has_credential || !grants.iter().any(|g| g.capability == inference)) {
+        return Err(format!(
+            "{agent} needs {} and the {inference} grant, which you can't give it",
+            needed.name
+        ));
+    }
     let title = arguments["title"]
         .as_str()
         .map(str::to_owned)
@@ -400,7 +412,11 @@ pub async fn park_finished(state: &AppState) {
     }
 }
 
-pub fn tools() -> Vec<Value> {
+pub fn tools(endpoint_models: &[String]) -> Vec<Value> {
+    let model = match endpoint_models {
+        [] => "defaults to the user's setting for sub-sessions, by default a cheaper model than yours where the agent has one (Sonnet for claude-code); name a model to give a hard task a bigger one".to_owned(),
+        models => format!("defaults to the user's setting for sub-sessions, by default a cheaper model than yours where the agent has one (Sonnet for claude-code); name a model to give a hard task a bigger one. The user's own endpoints serve these, for claude-code: {} (name one by the model before the parentheses)", models.join(", ")),
+    };
     vec![
         json!({
             "name": "spawn_session",
@@ -413,7 +429,7 @@ pub fn tools() -> Vec<Value> {
                     "repo": {"type": "string", "description": "owner/name, one you have; defaults to yours"},
                     "grants": {"type": "array", "items": {"type": "string"}, "description": "The capabilities to give it, of yours (e.g. [\"github\", \"repo\", \"docs\"]); defaults to all of yours. Model access always stays"},
                     "agent": {"type": "string", "description": "claude-code or codex; defaults to yours"},
-                    "model": {"type": "string", "description": "defaults to the user's setting for sub-sessions, by default a cheaper model than yours where the agent has one (Sonnet for claude-code); name a model to give a hard task a bigger one"},
+                    "model": {"type": "string", "description": model},
                 },
                 "required": ["task"],
             },

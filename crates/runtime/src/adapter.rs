@@ -349,6 +349,10 @@ impl AgentAdapter for ClaudeCode {
         Some("sonnet".into())
     }
 
+    fn takes_endpoints(&self) -> bool {
+        true
+    }
+
     fn launch(&self, context: &AgentContext) -> AgentLaunch {
         let session_id = &context.session.session_id;
         let config_dir = format!("{}/.claude", context.workdir);
@@ -373,8 +377,26 @@ impl AgentAdapter for ClaudeCode {
             ),
             ("DISABLE_AUTOUPDATER".to_owned(), "1".to_owned()),
         ];
-        if let Some(model) = &context.model {
-            env.push(("ANTHROPIC_MODEL".to_owned(), model.clone()));
+        match (&context.inference, &context.model) {
+            // An endpoint's model (#461): every request goes to the endpoint through the runtime, which swaps the
+            // placeholder for the endpoint's key. The models Claude Code picks for itself (the small one for
+            // background calls, subagents' aliases) are the endpoint's too, or it would ask the endpoint for Claude's.
+            (Some(inference), _) => {
+                env.retain(|(name, _)| name != "CLAUDE_CODE_OAUTH_TOKEN");
+                env.push(("ANTHROPIC_BASE_URL".to_owned(), inference.base_url.clone()));
+                env.push(("ANTHROPIC_AUTH_TOKEN".to_owned(), PLACEHOLDER.to_owned()));
+                for name in [
+                    "ANTHROPIC_MODEL",
+                    "ANTHROPIC_SMALL_FAST_MODEL",
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                ] {
+                    env.push((name.to_owned(), inference.model.clone()));
+                }
+            }
+            (None, Some(model)) => env.push(("ANTHROPIC_MODEL".to_owned(), model.clone())),
+            (None, None) => {}
         }
         let mut plugins = Vec::new();
         if let Some(memory) = &context.memory {
@@ -558,6 +580,7 @@ mod tests {
             endpoints: "http://runtime".into(),
             instructions: Some("Be brief.".into()),
             model: Some("claude-haiku".into()),
+            inference: None,
             memory: None,
             work: None,
         }
@@ -797,6 +820,38 @@ mod tests {
             launch
                 .env
                 .contains(&("CODEX_HOME".into(), "/workspace/.codex".into()))
+        );
+    }
+
+    #[test]
+    fn claude_code_on_an_endpoint_model_asks_the_runtime_with_a_placeholder() {
+        let mut on_endpoint = context();
+        on_endpoint.model =
+            Some("endpoint:0195f3a2-0000-7000-8000-000000000000:qwen3-coder".into());
+        on_endpoint.inference = Some(sloppod_contracts::InferenceContext {
+            base_url: "http://127.0.0.1:7071/inference".into(),
+            model: "qwen3-coder".into(),
+        });
+        let env: HashMap<String, String> =
+            ClaudeCode.launch(&on_endpoint).env.into_iter().collect();
+        assert_eq!(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:7071/inference");
+        assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], PLACEHOLDER);
+        assert!(!env.contains_key("CLAUDE_CODE_OAUTH_TOKEN"));
+        // Its own background calls and subagents' aliases go to the endpoint's model, not Claude's.
+        for name in [
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_SMALL_FAST_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        ] {
+            assert_eq!(env[name], "qwen3-coder", "{name}");
+        }
+        // On Claude, it's Claude's API, with its placeholder token.
+        let env: HashMap<String, String> = ClaudeCode.launch(&context()).env.into_iter().collect();
+        assert_eq!(env["ANTHROPIC_MODEL"], "claude-haiku");
+        assert!(
+            env.contains_key("CLAUDE_CODE_OAUTH_TOKEN") && !env.contains_key("ANTHROPIC_BASE_URL")
         );
     }
 }

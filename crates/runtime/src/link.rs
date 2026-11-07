@@ -19,7 +19,7 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, PostParams};
 use serde_json::{Value, json};
 use sloppod_contracts::capability;
-use sloppod_contracts::{AgentContext, MemoryContext};
+use sloppod_contracts::{AgentContext, InferenceContext, MemoryContext};
 use sloppod_protocol::api::SessionKind;
 use sloppod_protocol::link::{
     AgentReady, FromSupervisor, Launch, Repo, RunningAgent, ToSupervisor, TranscriptFile,
@@ -536,6 +536,13 @@ pub async fn agent_context(
             SessionKind::Utility => None,
         },
         model: session.model.clone(),
+        inference: crate::endpoint::EndpointModel::parse(
+            session.model.as_deref().unwrap_or_default(),
+        )
+        .map(|model| InferenceContext {
+            base_url: format!("{endpoints}{}", crate::endpoint::PREFIX),
+            model: model.model,
+        }),
         work,
         memory,
     }

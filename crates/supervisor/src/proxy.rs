@@ -1,6 +1,6 @@
-//! Serves the runtime's session endpoints (MCP, memory) to the agent on localhost, attaching the pod's ServiceAccount
-//! token to every request, so the runtime knows which session is calling from the pod's own identity (#196) rather
-//! than from its IP.
+//! Serves the runtime's session endpoints (MCP, memory, an endpoint model's inference) to the agent on localhost,
+//! attaching the pod's ServiceAccount token to every request, so the runtime knows which session is calling from the
+//! pod's own identity (#196) rather than from its IP.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -43,6 +43,7 @@ pub async fn serve(
         .route("/memini", any(forward))
         .route("/memini/{*rest}", any(forward))
         .route("/servers/{*rest}", any(forward))
+        .route("/inference/{*rest}", any(forward))
         .with_state(proxy);
     axum::serve(listener, app).await?;
     Ok(())

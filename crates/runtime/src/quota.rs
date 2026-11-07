@@ -577,6 +577,13 @@ pub async fn seen(
         return;
     };
     let session = match db::get_session(&state.db, session).await {
+        // On an endpoint's model, what Claude Code reports isn't about a Claude account (#461).
+        Ok(Some(row))
+            if crate::endpoint::EndpointModel::parse(row.model.as_deref().unwrap_or_default())
+                .is_some() =>
+        {
+            return;
+        }
         Ok(Some(row)) => row.context(),
         Ok(None) => return,
         Err(e) => {

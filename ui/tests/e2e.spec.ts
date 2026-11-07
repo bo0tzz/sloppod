@@ -1156,6 +1156,47 @@ test('saves the default model for new sessions', async ({ page }) => {
   await expect(defaults.getByRole('combobox', { name: 'Model' })).toContainText('Agent default');
 });
 
+test("an endpoint added in settings offers its models wherever a model is chosen", async ({ page }) => {
+  await page.goto('/settings');
+  const endpoints = page.getByTestId('credentials-endpoint');
+  await endpoints.getByRole('button', { name: 'Add endpoint' }).click();
+  await endpoints.getByLabel('Name', { exact: true }).fill('litellm');
+  await endpoints.getByLabel('Base URL').fill('http://litellm.ai.svc.cluster.local:4000/');
+  await endpoints.getByLabel('Models').fill('qwen3-coder, glm-5');
+  await endpoints.getByLabel('Key', { exact: true }).fill('sk-litellm');
+  await endpoints.getByRole('button', { name: 'Save' }).click();
+  await expect(endpoints.getByTestId('credential')).toContainText('litellm');
+  try {
+    // The default model and the one sub-sessions run on can be one of its models.
+    const defaults = page.getByTestId('session-defaults');
+    await page.reload();
+    await defaults.getByRole('combobox', { name: 'Model', exact: true }).click();
+    await expect(page.getByRole('option', { name: 'glm-5 (litellm)' })).toBeVisible();
+    await page.keyboard.press('Escape');
+    await defaults.getByRole('combobox', { name: 'Sub-sessions' }).click();
+    await expect(page.getByRole('option', { name: 'qwen3-coder (litellm)' })).toBeVisible();
+    await page.keyboard.press('Escape');
+
+    // A running session can be moved onto one, and back.
+    const sent: string[] = [];
+    page.on('websocket', (socket) => socket.on('framesent', ({ payload }) => sent.push(String(payload))));
+    await createSession(page, 'Try another model in sloppod');
+    const select = page.getByTestId('model-select');
+    await select.getByRole('combobox').click();
+    await page.getByRole('option', { name: 'qwen3-coder (litellm)' }).click();
+    await expect(select).toContainText('qwen3-coder (litellm)');
+    expect(sent.some((frame) => frame.includes('"session/set_config_option"') && frame.includes('endpoint:'))).toBe(true);
+    await page.reload();
+    await expect(page.getByTestId('model-select')).toContainText('qwen3-coder (litellm)');
+    await page.getByTestId('model-select').getByRole('combobox').click();
+    await page.getByRole('option', { name: 'Opus' }).click();
+    await expect(page.getByTestId('model-select')).toContainText('Opus');
+  } finally {
+    const listed: { id: string; kind: string }[] = await (await page.request.get('/api/v1/credentials')).json();
+    for (const { id } of listed.filter((c) => c.kind === 'endpoint')) await page.request.delete(`/api/v1/credentials/${id}`);
+  }
+});
+
 test('saves a model id the agent does not list', async ({ page }) => {
   const defaults = page.getByTestId('session-defaults');
   await page.goto('/settings');

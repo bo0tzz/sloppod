@@ -229,6 +229,8 @@ pub mod capability {
     pub const REPO: &str = "repo";
     /// One of the owner's work graphs (ADR 30): `{graph, name, level}`, level `read`, `track` or `plan`.
     pub const WORK: &str = "work";
+    /// An Anthropic-compatible endpoint a session's model is on (#461): `{credentials}`, the endpoint credential.
+    pub const ENDPOINT: &str = "endpoint";
 }
 
 /// Whether two names are the same GitHub repository: GitHub's names are case-insensitive. Every comparison of
@@ -553,10 +555,22 @@ pub struct AgentContext {
     pub endpoints: String,
     pub instructions: Option<String>,
     pub model: Option<String>,
+    /// Where the agent's model is served when it's an endpoint's rather than its own provider's (#461).
+    #[serde(default)]
+    pub inference: Option<InferenceContext>,
     pub memory: Option<MemoryContext>,
     /// What the session is told about the work graph it's granted and the items it's linked to (ADR 30).
     #[serde(default)]
     pub work: Option<String>,
+}
+
+/// An Anthropic-compatible endpoint the agent's model is on, reached through the runtime, which attaches its key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceContext {
+    /// The Messages API's base URL, under the runtime's endpoints.
+    pub base_url: String,
+    /// The model's name at the endpoint.
+    pub model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -595,6 +609,10 @@ pub trait AgentAdapter: Send + Sync {
     /// default, if it offers one (#283). `None` leaves them on their parent's model.
     fn sub_session_model(&self) -> Option<String> {
         None
+    }
+    /// Whether it can run on an Anthropic-compatible endpoint's model (#461), given an [`InferenceContext`].
+    fn takes_endpoints(&self) -> bool {
+        false
     }
     fn launch(&self, context: &AgentContext) -> AgentLaunch;
 }

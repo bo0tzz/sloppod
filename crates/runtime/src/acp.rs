@@ -228,7 +228,17 @@ impl Conn {
             ("_sloppod/steer_queued", Some(session)) => hub.steer_queued(session, params).await,
             ("_sloppod/remove_queued", Some(session)) => hub.remove_queued(session, params).await,
             ("session/set_config_option", Some(session)) => {
-                hub.set_config_option(session, params).await
+                // To or from an endpoint's model, the runtime moves the session itself (#461).
+                let endpoint = match (params["configId"].as_str(), params["value"].as_str()) {
+                    (Some("model"), Some(value)) => {
+                        crate::endpoint::switch(&self.state, session, value).await
+                    }
+                    _ => None,
+                };
+                match endpoint {
+                    Some(result) => result,
+                    None => hub.set_config_option(session, params).await,
+                }
             }
             (_, None) if method.starts_with("session/") || method.starts_with("_session/") => {
                 Err(RpcError::new(-32602, "missing or invalid sessionId"))
