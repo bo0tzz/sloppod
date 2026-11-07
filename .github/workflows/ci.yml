@@ -102,9 +102,27 @@ jobs:
       - run: npx vite build
       - run: npx playwright test --project=e2e --shard=${{ matrix.shard }}/3
 
+  # The scrolling tests again in Firefox, which the chat is read in: its scroll and resize timing differ from Chromium's.
+  e2e-firefox:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.ui != 'false' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: jdx/mise-action@82a612c5ab8bcda7cc5db6b7e81a8e7584c3dc6e # v5.2.3
+        with:
+          install_args: node
+      - run: npm ci
+      - run: npx playwright install --with-deps firefox
+      - run: npx vite build
+      - run: npx playwright test --project=firefox
+
   # The one check to require for the UI: it keeps the name `ui`, and passes when the jobs above were skipped.
   ui:
-    needs: [changes, ui-check, e2e]
+    needs: [changes, ui-check, e2e, e2e-firefox]
     if: always()
     runs-on: ubuntu-latest
     steps:
