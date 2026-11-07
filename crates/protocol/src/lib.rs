@@ -234,6 +234,24 @@ pub mod api {
         pub read_seq: Option<i64>,
     }
 
+    /// What the cluster holds for sloppod's sessions, as Settings → Storage shows it (`GET /storage`).
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct Storage {
+        pub volumes: Vec<StoredVolume>,
+    }
+
+    /// A session's workspace volume in the cluster.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct StoredVolume {
+        /// Its name in the cluster, e.g. `workdir-sloppod-<session id>`.
+        pub name: String,
+        /// Its size in bytes, as the cluster has it.
+        pub capacity: Option<u64>,
+        /// The session it's for, of any kind, deleted ones included; absent when the database doesn't know it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub session: Option<Session>,
+    }
+
     /// A session's workspace volume: bytes used and its size, and when its supervisor said so.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct Disk {

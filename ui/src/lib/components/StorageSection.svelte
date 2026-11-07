@@ -2,25 +2,32 @@
   import { Alert, Button, Heading, LoadingSpinner, Text, modalManager } from '@immich/ui';
   import { mdiTrashCanOutline } from '@mdi/js';
   import { onMount } from 'svelte';
-  import { api, type Session } from '#lib/api.ts';
+  import { api, type Session, type StoredVolume } from '#lib/api.ts';
   import { bytes } from '#lib/format.ts';
   import { sessions } from '#lib/sessions.svelte.ts';
   import PhaseBadge from './PhaseBadge.svelte';
 
-  /** Sessions with a workspace volume, deleted ones included until they're purged, largest first (#455). */
-  let listed = $state<Session[] | null>(null);
+  /**
+   * Every volume the cluster holds for the user's sessions, of any kind and deleted ones included, and those whose
+   * session nobody knows (#455): the most used first, then those never measured.
+   */
+  let volumes = $state<StoredVolume[] | null>(null);
   let loadError = $state<string | null>(null);
   let actionError = $state<string | null>(null);
   let busy = $state<string | null>(null);
 
   const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
-  const used = (session: Session) => session.disk?.used ?? 0;
-  const total = $derived((listed ?? []).reduce((sum, session) => sum + used(session), 0));
+  const used = (volume: StoredVolume) => volume.session?.disk?.used;
+  const known = $derived((volumes ?? []).filter((volume) => volume.session));
+  const unknown = $derived((volumes ?? []).filter((volume) => !volume.session));
+  const measured = $derived(known.filter((volume) => used(volume) !== undefined));
+  const total = $derived(measured.reduce((sum, volume) => sum + (used(volume) ?? 0), 0));
+  const unmeasured = $derived((volumes ?? []).length - measured.length);
 
   async function refresh() {
     try {
-      const [live, deleted] = await Promise.all([api.listSessions(), api.listDeletedSessions()]);
-      listed = [...live, ...deleted].filter((session) => session.disk).sort((a, b) => used(b) - used(a));
+      const storage = await api.getStorage();
+      volumes = storage.volumes.sort((a, b) => (used(b) ?? -1) - (used(a) ?? -1));
       loadError = null;
     } catch (e) {
       loadError = errorText(e);
@@ -54,6 +61,8 @@
     });
     if (confirmed) await act(session.id, () => api.deleteSession(session.id));
   }
+
+  const count = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 </script>
 
 <section class="flex flex-col gap-3" data-testid="storage" aria-labelledby="storage-title">
@@ -61,68 +70,97 @@
     <Heading tag="h2" size="tiny" id="storage-title">Storage</Heading>
     <Text color="muted" size="small">
       Each session keeps its files on a volume of its own while it's parked. A stopped session's volume goes a week after
-      it stopped, unless you keep it; a deleted one's when it can't be restored any more.
+      it stopped, unless you keep it; a deleted one's when it can't be restored any more. A session says how much it uses
+      while it runs, and once more as it parks.
     </Text>
   </div>
 
   {#if loadError}
     <Alert color="danger" size="small" title="Couldn't load the sessions' storage">{loadError}</Alert>
-  {:else if listed === null}
+  {:else if volumes === null}
     <div class="flex py-4"><LoadingSpinner /></div>
-  {:else if listed.length === 0}
-    <Text color="muted" size="small">No session has said how much it uses yet.</Text>
+  {:else if volumes.length === 0}
+    <Text color="muted" size="small">No volumes.</Text>
   {:else}
-    <Text size="small" data-testid="storage-total">{bytes(total)} used by {listed.length} {listed.length === 1 ? 'session' : 'sessions'}</Text>
-    <ul class="border-light-200 divide-light-200 divide-y rounded-xl border text-sm">
-      {#each listed as session (session.id)}
-        <li class="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2" data-testid="storage-session" data-session={session.id}>
-          <a href="/sessions/{session.id}" class="min-w-0 grow truncate font-medium hover:underline">{session.title || 'New session'}</a>
-          {#if session.deleted_at}
-            <Text color="muted" size="small">deleted</Text>
-          {:else}
-            <PhaseBadge phase={session.phase} />
-          {/if}
-          <span class="text-muted w-16 shrink-0 text-end" title="of {bytes(session.disk?.size ?? 0)}" data-testid="storage-used">{bytes(used(session))}</span>
-          {#if !session.deleted_at}
-            <div class="flex shrink-0 gap-1">
-              {#if session.phase === 'stopped'}
-                <Button
-                  size="tiny"
-                  shape="round"
-                  variant="ghost"
-                  disabled={busy !== null}
-                  onclick={() => act(session.id, () => api.setVolumeKept(session.id, !session.volume_kept))}
-                >
-                  {session.volume_kept ? 'Let it go' : 'Keep volume'}
-                </Button>
-              {:else if session.phase !== 'parked'}
-                <Button
-                  size="tiny"
-                  shape="round"
-                  variant="ghost"
-                  disabled={busy !== null}
-                  aria-label="Park the session {session.title || 'New session'}"
-                  onclick={() => act(session.id, () => api.parkSession(session.id))}
-                >
-                  Park
-                </Button>
+    <Text size="small" data-testid="storage-total">
+      {count(volumes.length, 'volume', 'volumes')}, {bytes(total)} used{#if unmeasured > 0}; {unmeasured} not measured{/if}
+    </Text>
+    {#if known.length > 0}
+      <ul class="border-light-200 divide-light-200 divide-y rounded-xl border text-sm">
+        {#each known as volume (volume.name)}
+          {@const session = volume.session!}
+          <li class="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2" data-testid="storage-session" data-session={session.id}>
+            <a href="/sessions/{session.id}" class="min-w-0 grow truncate font-medium hover:underline">{session.title || 'New session'}</a>
+            {#if session.kind === 'review'}
+              <Text color="muted" size="small" data-testid="storage-reviewer">reviewer</Text>
+            {/if}
+            {#if session.deleted_at}
+              <Text color="muted" size="small">deleted</Text>
+            {:else}
+              <PhaseBadge phase={session.phase} />
+            {/if}
+            <span class="text-muted w-24 shrink-0 text-end" data-testid="storage-used">
+              {#if session.disk}
+                <span title="of {bytes(session.disk.size)}">{bytes(session.disk.used)}</span>
+              {:else}
+                not measured
               {/if}
-              <Button
-                size="tiny"
-                shape="round"
-                variant="ghost"
-                color="danger"
-                disabled={busy !== null}
-                aria-label="Delete the session {session.title || 'New session'}"
-                onclick={() => remove(session)}
-              >
-                Delete
-              </Button>
-            </div>
-          {/if}
-        </li>
-      {/each}
-    </ul>
+            </span>
+            {#if !session.deleted_at && session.kind === 'work'}
+              <div class="flex shrink-0 gap-1">
+                {#if session.phase === 'stopped'}
+                  <Button
+                    size="tiny"
+                    shape="round"
+                    variant="ghost"
+                    disabled={busy !== null}
+                    onclick={() => act(session.id, () => api.setVolumeKept(session.id, !session.volume_kept))}
+                  >
+                    {session.volume_kept ? 'Let it go' : 'Keep volume'}
+                  </Button>
+                {:else if session.phase !== 'parked'}
+                  <Button
+                    size="tiny"
+                    shape="round"
+                    variant="ghost"
+                    disabled={busy !== null}
+                    aria-label="Park the session {session.title || 'New session'}"
+                    onclick={() => act(session.id, () => api.parkSession(session.id))}
+                  >
+                    Park
+                  </Button>
+                {/if}
+                <Button
+                  size="tiny"
+                  shape="round"
+                  variant="ghost"
+                  color="danger"
+                  disabled={busy !== null}
+                  aria-label="Delete the session {session.title || 'New session'}"
+                  onclick={() => remove(session)}
+                >
+                  Delete
+                </Button>
+              </div>
+            {/if}
+          </li>
+        {/each}
+      </ul>
+    {/if}
+    {#if unknown.length > 0}
+      <div class="flex flex-col gap-2" data-testid="storage-unknown">
+        <Text size="small" fontWeight="semi-bold">{count(unknown.length, 'volume', 'volumes')} of no known session</Text>
+        <Text color="muted" size="small">
+          Left alone: sloppod doesn't remove what its database doesn't know, in case that's the database's mistake. See
+          docs/deploy.md for removing them by hand.
+        </Text>
+        <ul class="border-light-200 divide-light-200 divide-y rounded-xl border text-sm">
+          {#each unknown as volume (volume.name)}
+            <li class="px-3 py-2 font-mono text-xs break-all" data-testid="storage-unknown-volume">{volume.name}</li>
+          {/each}
+        </ul>
+      </div>
+    {/if}
   {/if}
   {#if actionError}
     <Alert color="danger" size="small">{actionError}</Alert>
