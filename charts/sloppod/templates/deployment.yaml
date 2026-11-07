@@ -105,10 +105,9 @@ spec:
             - name: SLOPPOD_ALLOWED_ORIGINS
               value: {{ join "," . | quote }}
             {{- end }}
-            {{- with .Values.litellm.namespaces }}
+            # Always set: empty turns the watch off, where unset would mean the runtime's own namespace.
             - name: SLOPPOD_LITELLM_NAMESPACES
-              value: {{ join "," . | quote }}
-            {{- end }}
+              value: {{ join "," (include "sloppod.litellmNamespaces" . | fromJsonArray) | quote }}
             {{- with .Values.memory.namespacePrefix }}
             - name: SLOPPOD_MEMINI_NAMESPACE_PREFIX
               value: {{ . | quote }}

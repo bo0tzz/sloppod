@@ -304,13 +304,59 @@ pub struct Catalog {
     models: Vec<Store<DynamicObject>>,
 }
 
+/// How long a watch whose resources aren't there waits before looking again: the operator may be installed later.
+const LOOK_AGAIN: Duration = Duration::from_secs(600);
+
+/// What listing a kind of resource says about watching it.
+#[derive(Debug, PartialEq)]
+enum Found {
+    /// It's there: watch it.
+    Yes,
+    /// Not installed (404) or not allowed (403): look again later, quietly.
+    Absent(&'static str),
+    /// Something else went wrong; the watch's own retries cover it.
+    Error,
+}
+
+fn found(listed: &kube::Result<kube::core::ObjectList<DynamicObject>>) -> Found {
+    match listed {
+        Ok(_) => Found::Yes,
+        Err(kube::Error::Api(e)) if e.code == 404 => {
+            Found::Absent("LiteLLM operator CRDs not found; no LiteLLM models")
+        }
+        Err(kube::Error::Api(e)) if e.code == 403 => {
+            Found::Absent("not allowed to read the LiteLLM operator's resources; no LiteLLM models")
+        }
+        Err(_) => Found::Error,
+    }
+}
+
+/// Watches one kind of the operator's resources in one namespace. Where the operator isn't installed (or the runtime
+/// may not read its resources there), it says so once, at info, and looks again every 10 minutes, quietly, so the
+/// operator can be installed later without a restart.
 fn watch(api: Api<DynamicObject>, kind: &ApiResource, what: &'static str) -> Store<DynamicObject> {
     let writer = reflector::store::Writer::new(kind.clone());
     let store = writer.as_reader();
-    let stream = reflector::reflector(writer, watcher(api, watcher::Config::default()))
-        .default_backoff()
-        .applied_objects();
     tokio::spawn(async move {
+        let mut told = false;
+        loop {
+            match found(&api.list(&kube::api::ListParams::default().limit(1)).await) {
+                Found::Yes | Found::Error => break,
+                Found::Absent(why) => {
+                    if !told {
+                        tracing::info!(what, "{why}");
+                        told = true;
+                    }
+                    tokio::time::sleep(LOOK_AGAIN).await;
+                }
+            }
+        }
+        if told {
+            tracing::info!(what, "LiteLLM operator resources found; watching them");
+        }
+        let stream = reflector::reflector(writer, watcher(api, watcher::Config::default()))
+            .default_backoff()
+            .applied_objects();
         futures::pin_mut!(stream);
         while let Some(event) = stream.next().await {
             if let Err(e) = event {
@@ -956,5 +1002,24 @@ mod tests {
             .key_id;
         assert!(first.starts_with(&format!("litellm:{name}:")));
         assert_ne!(first, second, "each key's spend is its own");
+    }
+
+    #[test]
+    fn a_missing_operator_is_looked_for_again_quietly() {
+        let api_error = |code: u16| {
+            Err(kube::Error::Api(
+                kube::core::Status::failure("nope", "NotFound")
+                    .with_code(code)
+                    .boxed(),
+            ))
+        };
+        assert!(
+            matches!(found(&api_error(404)), Found::Absent(why) if why.contains("CRDs not found"))
+        );
+        assert!(matches!(found(&api_error(403)), Found::Absent(_)));
+        assert_eq!(found(&api_error(500)), Found::Error);
+        let listed: kube::core::ObjectList<DynamicObject> =
+            serde_json::from_value(json!({"metadata": {}, "items": []})).unwrap();
+        assert_eq!(found(&Ok(listed)), Found::Yes);
     }
 }

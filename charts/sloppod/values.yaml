@@ -79,7 +79,8 @@ networkPolicy:
 
 # The LiteLLM operator (home-operations/litellm-operator, #461): sessions are offered the models of the LiteLLMProxy
 # resources in these namespaces, and each session on one gets a LiteLLMVirtualKey of its own in the release's
-# namespace. Empty leaves the operator alone. Granting it lets the runtime read every Secret in its own namespace,
-# where the operator writes the keys it mints.
+# namespace. Left unset, it's the release's own namespace; `[]` leaves the operator alone. Where the operator isn't
+# installed, the runtime says so once and looks again every 10 minutes. Watching lets the runtime read every Secret in
+# its own namespace, where the operator writes the keys it mints.
 litellm:
-  namespaces: []
+  namespaces: ~

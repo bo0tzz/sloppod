@@ -177,9 +177,10 @@ async fn main() -> anyhow::Result<()> {
 
     let mut providers = endpoint::Providers::default();
     providers.register(Arc::new(endpoint::OwnEndpoints::new(credentials.clone())));
-    if !config.litellm_namespaces.is_empty() {
+    let litellm_namespaces = config.litellm_namespaces();
+    if !litellm_namespaces.is_empty() {
         providers.register(Arc::new(litellm::LiteLlm::new(
-            litellm::Catalog::watch(&kube, &config.litellm_namespaces),
+            litellm::Catalog::watch(&kube, &litellm_namespaces),
             Arc::new(litellm::ClusterKeys::new(&kube, &config.namespace)),
             &config.cluster_domain,
         )));
