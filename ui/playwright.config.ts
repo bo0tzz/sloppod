@@ -28,6 +28,14 @@ export default defineConfig({
   },
   projects: [
     { name: 'e2e', testMatch: 'e2e.spec.ts', use: { ...devices['Desktop Chrome'] } },
+    // The scrolling tests again in Firefox, whose scroll and resize timing differ from Chromium's (the browser the
+    // user reads the chat in); only the tests tagged `@scroll`. Needs the browser's system libraries, so it runs in CI.
+    {
+      name: 'firefox',
+      testMatch: 'e2e.spec.ts',
+      grep: /@scroll/,
+      use: { ...devices['Desktop Firefox'], launchOptions: {} },
+    },
     { name: 'screenshots', testMatch: 'screenshots.spec.ts' },
   ],
 });

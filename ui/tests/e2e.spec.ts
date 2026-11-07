@@ -1224,7 +1224,7 @@ test('queues messages while the agent starts', async ({ page }) => {
   await expect(page.getByTestId('composer-hint')).toBeHidden();
 });
 
-test('follows new output while the reader is at the bottom, across a reconnect', async ({ page }) => {
+test('follows new output while the reader is at the bottom, across a reconnect', { tag: '@scroll' }, async ({ page }) => {
   await page.setViewportSize({ width: 1000, height: 500 });
   await createSession(page, 'Give me a long answer in sloppod');
   const end = page.getByText('The end.');
@@ -1282,7 +1282,7 @@ async function readPosition(page: Page, id: string, above = 0) {
 
 const LONG_SAY = Array.from({ length: 12 }, (_, line) => `line ${line}`).join('%0A%0A');
 
-test('marks where the reader left off, and opens there, on this device or another', async ({ page, context }) => {
+test('marks where the reader left off, and opens there, on this device or another', { tag: '@scroll' }, async ({ page, context }) => {
   await page.setViewportSize({ width: 1000, height: 500 });
   const id = await createSession(page, 'Give me a long answer in sloppod');
   await expect(page.getByText('The end.')).toBeInViewport({ timeout: 20_000 });
@@ -1336,7 +1336,7 @@ const plan = (status: string) => ({
   entries: [{ content: 'Check the unread marker', priority: 'medium', status }],
 });
 
-test('an update to a row already read does not mark the rows after it read', async ({ page }) => {
+test('an update to a row already read does not mark the rows after it read', { tag: '@scroll' }, async ({ page }) => {
   await page.setViewportSize({ width: 1000, height: 500 });
   const id = await createSession(page, 'Give me a long answer in sloppod');
   await expect(page.getByText('The end.')).toBeInViewport({ timeout: 20_000 });
@@ -1378,7 +1378,7 @@ const readCall = (toolCallId: string) => ({
   status: 'completed',
 });
 
-test('more of a message that was read is unread', async ({ page }) => {
+test('more of a message that was read is unread', { tag: '@scroll' }, async ({ page }) => {
   await page.setViewportSize({ width: 1000, height: 500 });
   const id = await createSession(page, 'Give me a long answer in sloppod');
   await expect(page.getByText('The end.')).toBeInViewport({ timeout: 20_000 });
@@ -1399,7 +1399,7 @@ test('more of a message that was read is unread', async ({ page }) => {
   await expect(page.getByText('The start of it. And the rest.')).toBeInViewport();
 });
 
-test('a tool call added to a run that was read is unread', async ({ page }) => {
+test('a tool call added to a run that was read is unread', { tag: '@scroll' }, async ({ page }) => {
   await page.setViewportSize({ width: 1000, height: 500 });
   const id = await createSession(page, 'Give me a long answer in sloppod');
   await expect(page.getByText('The end.')).toBeInViewport({ timeout: 20_000 });
@@ -1420,7 +1420,7 @@ test('a tool call added to a run that was read is unread', async ({ page }) => {
   await expect(page.getByTestId('tool-fold')).toBeInViewport();
 });
 
-test('reads what an item grew by in place, at the bottom', async ({ page }) => {
+test('reads what an item grew by in place, at the bottom', { tag: '@scroll' }, async ({ page }) => {
   await page.setViewportSize({ width: 1000, height: 500 });
   const id = await createSession(page, 'Give me a long answer in sloppod');
   await expect(page.getByText('The end.')).toBeInViewport({ timeout: 20_000 });
@@ -1444,7 +1444,7 @@ test('reads what an item grew by in place, at the bottom', async ({ page }) => {
   await expect(page.getByTestId('unread-divider')).toHaveCount(0);
 });
 
-test('jumping to the latest message from the unread bar goes on following the bottom', async ({ page }) => {
+test('jumping to the latest message from the unread bar goes on following the bottom', { tag: '@scroll' }, async ({ page }) => {
   await page.setViewportSize({ width: 1000, height: 500 });
   const id = await createSession(page, 'Give me a long answer in sloppod');
   await expect(page.getByText('The end.')).toBeInViewport({ timeout: 20_000 });
@@ -1480,7 +1480,7 @@ test('a read position that failed to save is sent again', async ({ page }) => {
   expect(attempts).toBeGreaterThan(1);
 });
 
-test('the end of the chat stays in view as the message box grows and shrinks', async ({ page }) => {
+test('the end of the chat stays in view as the message box grows and shrinks', { tag: '@scroll' }, async ({ page }) => {
   await page.setViewportSize({ width: 1000, height: 500 });
   await createSession(page, 'Give me a long answer in sloppod');
   const end = page.getByText('The end.');
@@ -1510,7 +1510,29 @@ test('the end of the chat stays in view as the message box grows and shrinks', a
   await expect.poll(top).toBe(kept);
 });
 
-test('opened at the unread bar, the end of the chat stays in view as the message box grows', async ({ page }) => {
+test('a scroll event that comes with the message box growing does not stop the view following the bottom', { tag: '@scroll' }, async ({ page }) => {
+  await page.setViewportSize({ width: 1000, height: 500 });
+  await createSession(page, 'Give me a long answer in sloppod');
+  const end = page.getByText('The end.');
+  await expect(end).toBeInViewport({ ratio: 1, timeout: 20_000 });
+  // The reader has just wheeled at the bottom, so their scrolling counts as recent, and the browser reports a scroll as
+  // the box grows, before the view has been put back, as Firefox does.
+  await page.evaluate(() => {
+    const box = document.querySelector('textarea')!;
+    const scroller = document.querySelector('[data-testid="transcript-scroller"]')!;
+    scroller.dispatchEvent(new WheelEvent('wheel', { deltaY: 100 }));
+    // The box taking more room, at once, so the view is shorter by the time the scroll is reported.
+    box.style.minHeight = '190px';
+    void scroller.clientHeight;
+    scroller.dispatchEvent(new Event('scroll'));
+  });
+  await expect(end).toBeInViewport({ ratio: 1 });
+  // Still following: new output scrolls into view.
+  await page.request.post('/_mock/say?text=More%20output.');
+  await expect(page.getByText('More output.')).toBeInViewport({ ratio: 1 });
+});
+
+test('opened at the unread bar, the end of the chat stays in view as the message box grows', { tag: '@scroll' }, async ({ page }) => {
   await page.setViewportSize({ width: 1000, height: 500 });
   const id = await createSession(page, 'Give me a long answer in sloppod');
   await expect(page.getByText('The end.')).toBeInViewport({ timeout: 20_000 });
@@ -1530,7 +1552,7 @@ test('opened at the unread bar, the end of the chat stays in view as the message
   await expect(last).toBeInViewport({ ratio: 1 });
 });
 
-test('sending a message scrolls the chat to it, and so does scrolling the session list past its end', async ({ page }) => {
+test('sending a message scrolls the chat to it, and so does scrolling the session list past its end', { tag: '@scroll' }, async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 500 });
   await createSession(page, 'Give me a long answer in sloppod');
   const end = page.getByText('The end.');
