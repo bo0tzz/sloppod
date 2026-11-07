@@ -309,7 +309,7 @@
   let holdBar = $state(false);
 
   $effect(() => {
-    if (positioned && atBottom && !holdBar && reading) unreadAfter = view.readSeq || null;
+    if (positioned && atBottom && !holdBar && reading) unreadAfter = view.readSeq;
   });
 
   const rowElements = () => (content ? [...content.querySelectorAll<HTMLElement>('[data-seq]')] : []);
@@ -356,9 +356,10 @@
     if (positioned || !view.loaded || !view.session || !scroller) return;
     const read = view.session.read_seq;
     positioned = true;
-    unreadAfter = read ?? null;
+    unreadAfter = read ?? 0;
     if (read === undefined || !view.transcript.items.some((item) => item.addedSeq > read)) {
-      unreadAfter = view.readSeq || null;
+      // Nothing read yet is a baseline of 0, so what comes in before the first report is unread if nobody is looking.
+      unreadAfter = view.readSeq;
       scrollToBottom();
       void tick().then(() => scrollToBottom());
       return;

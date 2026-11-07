@@ -1653,6 +1653,32 @@ for (const how of ['hidden', 'unfocused'] as const) {
   });
 }
 
+test('a session nobody has read yet, opened where nobody is looking, shows what came in as unread', { tag: '@scroll' }, async ({ page }) => {
+  await page.setViewportSize({ width: 1000, height: 500 });
+  const response = await page.request.post('/api/v1/sessions', { data: { prompt: 'Give me a long answer in sloppod' } });
+  const { id } = await response.json();
+  expect((await (await page.request.get(`/api/v1/sessions/${id}`)).json()).read_seq).toBeUndefined();
+  // Opened in a background tab, before the first read report.
+  await page.addInitScript(() => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+  });
+  await page.goto(`/sessions/${id}`);
+  await expect(page.getByText('The end.')).toBeAttached({ timeout: 20_000 });
+  const divider = page.getByTestId('unread-divider');
+  await expect(divider).toHaveCount(1);
+  await page.waitForTimeout(2500);
+  expect((await (await page.request.get(`/api/v1/sessions/${id}`)).json()).read_seq).toBeUndefined();
+
+  await page.request.post('/_mock/say?text=Still%20unread.');
+  await expect(page.getByText('Still unread.')).toBeAttached();
+  await expect(divider).toHaveCount(1);
+
+  // Looked at, it's read.
+  await comeBack(page, 'hidden');
+  await expect(divider).toHaveCount(0);
+  await readPosition(page, id);
+});
+
 test('sending a message scrolls the chat to it, and so does scrolling the session list past its end', { tag: '@scroll' }, async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 500 });
   await createSession(page, 'Give me a long answer in sloppod');
