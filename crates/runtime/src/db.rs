@@ -1936,6 +1936,47 @@ pub async fn proposals_in_review(db: &PgPool, session: Uuid) -> sqlx::Result<Vec
     .await
 }
 
+/// Follows an undecided proposal (#141) under its row's lock: `work` runs only while it's still `pending` or
+/// `changes_requested`, and may write to GitHub (merging a new base into its head); what it returns, the status and
+/// payload to move to, is applied in the same transaction. A withdrawal or a decision meanwhile waits for the lock, so a
+/// proposal is never withdrawn between the check and the write, and one withdrawn first is left as it is. `work`
+/// returning `None` changes nothing. A restart ends the transaction, and with it the lock: nothing is left claimed.
+pub async fn follow_while_undecided<T, F, Fut>(
+    db: &PgPool,
+    id: Uuid,
+    work: F,
+) -> anyhow::Result<Option<(ProposalRow, ProposalStatus, T)>>
+where
+    F: FnOnce(ProposalRow) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Option<(ProposalStatus, Value, T)>>>,
+{
+    let mut tx = db.begin().await?;
+    let row: Option<ProposalRow> = sqlx::query_as(AssertSqlSafe(format!(
+        "select {PROPOSAL_COLUMNS} from proposals where id = $1 and status in ('pending', 'changes_requested') \
+         for update"
+    )))
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let was = row.status;
+    let Some((to, payload, done)) = work(row).await? else {
+        return Ok(None);
+    };
+    let moved: ProposalRow = sqlx::query_as(AssertSqlSafe(format!(
+        "update proposals set status = $2, payload = $3 where id = $1 returning {PROPOSAL_COLUMNS}"
+    )))
+    .bind(id)
+    .bind(to.as_str())
+    .bind(&payload)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some((moved, was, done)))
+}
+
 /// Proposals out of review and waiting on a decision or on their author, of sessions that aren't deleted: what may
 /// have to follow what moved under it (#141).
 pub async fn undecided_proposals(db: &PgPool) -> sqlx::Result<Vec<ProposalRow>> {

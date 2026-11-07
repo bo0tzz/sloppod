@@ -280,35 +280,42 @@ pub(crate) async fn follow(state: &AppState, proposal: &db::ProposalRow) -> anyh
     let Some(session) = db::get_session(&state.db, proposal.session_id).await? else {
         return Ok(());
     };
-    let Some((payload, followed)) = followed(kind.as_ref(), &session.context(), &proposal.payload)
-        .await
-        .map_err(|e| anyhow::anyhow!(e.0))?
-    else {
-        return Ok(());
-    };
-    let subject = kind.review_subject(&payload);
-    let reviewed = !db::reviews(&state.db, proposal.id).await?.is_empty();
-    let again = subject.is_some()
-        && reviewed_again(proposal.status, followed.same_change, reviewed)
-        && reviews::available(state, &session.owner).await?;
-    let to = if again {
-        ProposalStatus::InReview
-    } else {
-        proposal.status
-    };
-    let Some(row) =
-        db::move_proposal(&state.db, proposal.id, proposal.status, to, Some(&payload)).await?
-    else {
-        // Decided or sent to another round meanwhile.
+    // Under the proposal's lock, and only while it's undecided: following can write to GitHub (a merge commit on its
+    // branch), which a proposal withdrawn meanwhile mustn't get.
+    let context = session.context();
+    let kind_ref = kind.as_ref();
+    let followed_up = db::follow_while_undecided(&state.db, proposal.id, |current| async move {
+        let Some((payload, followed)) = followed(kind_ref, &context, &current.payload)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.0))?
+        else {
+            return Ok(None);
+        };
+        let subject = kind_ref.review_subject(&payload);
+        let reviewed = !db::reviews(&state.db, current.id).await?.is_empty();
+        let again = subject.is_some()
+            && reviewed_again(current.status, followed.same_change, reviewed)
+            && reviews::available(state, &session.owner).await?;
+        let to = if again {
+            ProposalStatus::InReview
+        } else {
+            current.status
+        };
+        Ok(Some((to, payload, (followed, subject.filter(|_| again)))))
+    })
+    .await?;
+    let Some((row, was, (followed, again))) = followed_up else {
+        // Decided, withdrawn or sent to another round meanwhile, or nothing moved.
         return Ok(());
     };
     state.hub.broadcast_proposal(&row.to_api());
-    let next = if again {
-        " Its change isn't the one that was reviewed any more, so it's being reviewed again; you'll be told how that goes."
-    } else if proposal.status == ProposalStatus::ChangesRequested {
+    // Read later, maybe after the session withdrew it: it says what happened, not what the proposal is now.
+    let next = if again.is_some() {
+        " Its change isn't the one that was reviewed any more, so it went back to review; you'll be told how that goes."
+    } else if was == ProposalStatus::ChangesRequested {
         " Your next `request_review` reviews it as it is now."
     } else {
-        " It's still waiting for the user."
+        " Unless you've withdrawn it since, it waits for the user as before: there's nothing to propose again."
     };
     state
         .hub
@@ -316,13 +323,13 @@ pub(crate) async fn follow(state: &AppState, proposal: &db::ProposalRow) -> anyh
             proposal.session_id,
             format!(
                 "sloppod: your proposal {} ({}) moved: {}.{next}",
-                proposal.id,
-                kind.summary(&payload),
+                row.id,
+                kind.summary(&row.payload),
                 followed.note
             ),
         )
         .await;
-    if let Some(subject) = subject.filter(|_| again)
+    if let Some(subject) = again
         && let Err(e) = reviews::review_again(state, &row, &subject, &followed.note).await
     {
         tracing::warn!(proposal = %row.id, error = %e, "starting a review after the proposal moved");

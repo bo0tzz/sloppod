@@ -45,8 +45,9 @@ impl ProposalKind for PullRequest {
                           (`<session branch>-<name>`) so several pull requests can be open at once. Push your \
                           commits first, and don't push more to the branch before it's approved: new commits \
                           make the approved proposal fail to open, and you'd propose it again. A human reviews \
-                          the title, body and diff; once approved, sloppod opens the PR. Returns the proposal's \
-                          id; check it with get_proposal."
+                          the title, body and diff; once approved, sloppod opens the PR. If `base` is another \
+                          branch whose pull request merges meanwhile, this one follows it by itself, and you're \
+                          told: don't withdraw it for that. Returns the proposal's id; check it with get_proposal."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -331,8 +332,10 @@ impl ProposalKind for Stack {
                           Push every branch first, and don't push more to any of them before it's approved: new \
                           commits make the approved proposal fail to open, and you'd propose it again. They come \
                           from your session branch or branches named after it. A human reviews them together; \
-                          once approved, sloppod opens them and links them as a stack on GitHub. Returns the \
-                          proposal's id; check it with get_proposal."
+                          once approved, sloppod opens them and links them as a stack on GitHub. If `base` is \
+                          another branch whose pull request merges meanwhile, the stack follows it by itself, and \
+                          you're told: don't withdraw it for that. Returns the proposal's id; check it with \
+                          get_proposal."
                 .into(),
             input_schema: json!({
                 "type": "object",
