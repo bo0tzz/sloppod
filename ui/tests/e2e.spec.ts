@@ -1601,6 +1601,58 @@ test('opened at the unread bar, the end of the chat stays in view as the message
   await expect(last).toBeInViewport({ ratio: 1 });
 });
 
+/** Makes the page look as if the reader isn't there: in a background tab, or in a window that isn't the focused one. */
+async function leave(page: Page, how: 'hidden' | 'unfocused') {
+  await page.evaluate((how) => {
+    if (how === 'hidden') {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+      document.dispatchEvent(new Event('visibilitychange'));
+    } else {
+      document.hasFocus = () => false;
+      window.dispatchEvent(new Event('blur'));
+    }
+  }, how);
+}
+
+async function comeBack(page: Page, how: 'hidden' | 'unfocused') {
+  await page.evaluate((how) => {
+    if (how === 'hidden') {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' });
+      document.dispatchEvent(new Event('visibilitychange'));
+    } else {
+      document.hasFocus = () => true;
+      window.dispatchEvent(new Event('focus'));
+    }
+  }, how);
+}
+
+for (const how of ['hidden', 'unfocused'] as const) {
+  test(`a page that is ${how} follows the output but doesn't read it, and marks it read once the reader is back`, { tag: '@scroll' }, async ({ page }) => {
+    await page.setViewportSize({ width: 1000, height: 500 });
+    const id = await createSession(page, 'Give me a long answer in sloppod');
+    await expect(page.getByText('The end.')).toBeInViewport({ timeout: 20_000 });
+    const read = await readPosition(page, id);
+    const divider = page.getByTestId('unread-divider');
+    await expect(divider).toHaveCount(0);
+
+    // Output comes in while nobody is looking: the view follows it, and nothing is read.
+    await leave(page, how);
+    await page.request.post('/_mock/say?text=While%20you%20were%20away.');
+    await expect(page.getByText('While you were away.')).toBeInViewport({ ratio: 1 });
+    await expect(divider).toHaveCount(1);
+    await page.waitForTimeout(2500);
+    expect((await (await page.request.get(`/api/v1/sessions/${id}`)).json()).read_seq).toBe(read);
+
+    // Back, the latest is there with the bar above what came in meanwhile, for a moment...
+    await comeBack(page, how);
+    await expect(page.getByText('While you were away.')).toBeInViewport({ ratio: 1 });
+    await expect(divider).toHaveCount(1);
+    // ...and read once the reader has been there for a bit, which the other devices hear of.
+    await expect(divider).toHaveCount(0);
+    await readPosition(page, id, read);
+  });
+}
+
 test('sending a message scrolls the chat to it, and so does scrolling the session list past its end', { tag: '@scroll' }, async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 500 });
   await createSession(page, 'Give me a long answer in sloppod');
