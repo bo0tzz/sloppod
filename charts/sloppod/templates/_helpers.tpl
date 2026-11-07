@@ -30,3 +30,15 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
 {{- define "sloppod.caSecret" -}}
 {{ include "sloppod.fullname" . }}-egress-ca
 {{- end -}}
+
+{{/*
+The namespaces the runtime watches for the LiteLLM operator's resources (#461): litellm.namespaces, or the release's
+own when it's unset. An empty list turns it off.
+*/}}
+{{- define "sloppod.litellmNamespaces" -}}
+{{- if kindIs "invalid" .Values.litellm.namespaces -}}
+{{- list .Release.Namespace | toJson -}}
+{{- else -}}
+{{- .Values.litellm.namespaces | toJson -}}
+{{- end -}}
+{{- end }}

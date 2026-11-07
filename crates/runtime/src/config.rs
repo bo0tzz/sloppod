@@ -102,10 +102,11 @@ pub struct Config {
     #[arg(long, env = "SLOPPOD_ALLOWED_ORIGINS", value_delimiter = ',')]
     pub allowed_origins: Vec<String>,
 
-    /// Namespaces whose LiteLLM operator proxies and models sessions are offered (#461); none leaves the operator
-    /// alone. Each session on one of their models gets a `LiteLLMVirtualKey` of its own, in `namespace`.
-    #[arg(long, env = "SLOPPOD_LITELLM_NAMESPACES", value_delimiter = ',')]
-    pub litellm_namespaces: Vec<String>,
+    /// Namespaces whose LiteLLM operator proxies and models sessions are offered (#461), separated by commas: unset,
+    /// the runtime's own (`namespace`); empty, none, which leaves the operator alone. Each session on one of their
+    /// models gets a `LiteLLMVirtualKey` of its own, in `namespace`.
+    #[arg(long, env = "SLOPPOD_LITELLM_NAMESPACES")]
+    pub litellm_namespaces: Option<String>,
 
     /// User for requests without the header; unset, such requests are refused.
     #[arg(long, env = "SLOPPOD_DEFAULT_USER")]
@@ -160,5 +161,39 @@ impl Config {
             .filter_map(|kv| kv.split_once('='))
             .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
             .collect()
+    }
+
+    /// The namespaces LiteLLM operator resources are watched in: as given, or the runtime's own when nothing is.
+    pub fn litellm_namespaces(&self) -> Vec<String> {
+        litellm_namespaces(self.litellm_namespaces.as_deref(), &self.namespace)
+    }
+}
+
+fn litellm_namespaces(given: Option<&str>, own: &str) -> Vec<String> {
+    match given {
+        None => vec![own.to_owned()],
+        Some(list) => list
+            .split(',')
+            .map(str::trim)
+            .filter(|ns| !ns.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn litellm_is_watched_in_the_runtime_s_namespace_unless_told_otherwise() {
+        use super::litellm_namespaces;
+        assert_eq!(litellm_namespaces(None, "sloppod"), ["sloppod"]);
+        assert_eq!(
+            litellm_namespaces(Some("ai, models"), "sloppod"),
+            ["ai", "models"]
+        );
+        assert!(
+            litellm_namespaces(Some(""), "sloppod").is_empty(),
+            "empty turns it off"
+        );
     }
 }
