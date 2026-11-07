@@ -108,6 +108,12 @@ pub async fn start_session(
     id: Uuid,
     new: NewSession<'_>,
 ) -> anyhow::Result<db::SessionRow> {
+    // The endpoint grant follows the model (#461): `new.model` was checked by `endpoint::chosen`.
+    let mut grants = new.grants.to_vec();
+    crate::endpoint::follow_model(
+        &mut grants,
+        crate::endpoint::EndpointModel::parse(new.model.unwrap_or_default()).as_ref(),
+    );
     db::insert_session(
         &state.db,
         db::NewSessionRow {
@@ -121,7 +127,7 @@ pub async fn start_session(
             review: new.review,
             model: new.model,
             repo: new.repo,
-            grants: new.grants,
+            grants: &grants,
         },
     )
     .await?;

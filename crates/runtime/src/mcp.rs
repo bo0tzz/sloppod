@@ -40,7 +40,7 @@ pub async fn handler(
         "ping" => Ok(json!({})),
         "tools/list" => match session_kind(&state, session).await {
             Ok(row) => {
-                let tools = tools(&state, &row);
+                let tools = tools(&state, &row).await;
                 state.tool_streams.listed(session, &tools);
                 Ok(json!({"tools": tools}))
             }
@@ -145,7 +145,7 @@ pub async fn tools_changed(state: &AppState, session: Uuid) {
 /// The tools the session has now; none if it can't act.
 async fn current_tools(state: &AppState, session: Uuid) -> Vec<Value> {
     match session_kind(state, session).await {
-        Ok(row) => tools(state, &row),
+        Ok(row) => tools(state, &row).await,
         Err(_) => Vec::new(),
     }
 }
@@ -255,7 +255,7 @@ fn highlight_offered(role: &SessionRole) -> bool {
     matches!(role, SessionRole::Work)
 }
 
-fn tools(state: &AppState, row: &db::SessionRow) -> Vec<Value> {
+async fn tools(state: &AppState, row: &db::SessionRow) -> Vec<Value> {
     let kind = row.kind;
     let context = row.context();
     match kind {
@@ -346,7 +346,14 @@ fn tools(state: &AppState, row: &db::SessionRow) -> Vec<Value> {
         },
     }));
     if kind == SessionKind::Work {
-        tools.extend(subsessions::tools());
+        // The user's endpoint models a child can run on (#461), by the names `spawn_session` takes.
+        let models: Vec<String> = crate::endpoint::offered(&state.credentials, &row.owner)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|m| m["name"].as_str().map(str::to_owned))
+            .collect();
+        tools.extend(subsessions::tools(&models));
     }
     tools.extend(work::agent::tools(&context));
     tools
@@ -410,7 +417,7 @@ async fn call(state: &AppState, session: Uuid, params: &Value) -> Value {
         Ok(row) => row,
         Err(e) => return text(e, true),
     };
-    if !tools(state, &row).iter().any(|t| t["name"] == name) {
+    if !tools(state, &row).await.iter().any(|t| t["name"] == name) {
         return text(format!("{name} isn't one of this session's tools"), true);
     }
     let result = match name {

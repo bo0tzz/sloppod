@@ -2477,6 +2477,11 @@ impl Hub {
             (TurnEnd::Limited, Some(limit_hit)) => limit_hit(id).await,
             _ => limits::Next::Wait(None),
         };
+        // A limit the runtime doesn't know of, an endpoint's (#461), is an ordinary failure, its error as it came.
+        let end = match (end, &next) {
+            (TurnEnd::Limited, limits::Next::Failed(error)) => TurnEnd::Failed(error.clone()),
+            (end, _) => end,
+        };
         let limited = {
             let live = self.live(id);
             let mut state = live.state.lock().await;
@@ -2496,6 +2501,7 @@ impl Hub {
                         state.limit_notice = None;
                         Some(limits::wait_until(reset, now))
                     }
+                    limits::Next::Failed(_) => state.limited_until,
                 },
                 TurnEnd::Ended | TurnEnd::Cancelled => None,
                 TurnEnd::Failed(_) => state.limited_until,

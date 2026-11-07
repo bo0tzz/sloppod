@@ -26,6 +26,8 @@ pub static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
 pub struct Reach {
     own: Arc<[IpAddr]>,
     http: reqwest::Client,
+    /// Local addresses are reachable too: only for tests.
+    local: bool,
 }
 
 /// Whether a connection to `ip` may be made for a session.
@@ -62,16 +64,49 @@ impl reqwest::dns::Resolve for Resolver {
 impl Reach {
     /// `own` is the runtime's addresses: its pod's and its Service's.
     pub fn new(own: Vec<IpAddr>) -> Self {
+        Self::build(own, None)
+    }
+
+    /// The same, giving up on an answer that goes quiet for `idle`, however long it takes in all: for model answers,
+    /// which stream for minutes (#461).
+    pub fn with_idle(own: Vec<IpAddr>, idle: Duration) -> Self {
+        Self::build(own, Some(idle))
+    }
+
+    fn build(own: Vec<IpAddr>, idle: Option<Duration>) -> Self {
         let own: Arc<[IpAddr]> = own.into();
-        let http = reqwest::Client::builder()
+        let mut http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             // Through a proxy, the address checked wouldn't be the one the request goes to.
             .no_proxy()
-            .dns_resolver(Arc::new(Resolver(own.clone())))
+            .dns_resolver(Arc::new(Resolver(own.clone())));
+        if let Some(idle) = idle {
+            http = http.read_timeout(idle);
+        }
+        let http = http.build().expect("building the servers' proxy client");
+        Self {
+            own,
+            http,
+            local: false,
+        }
+    }
+
+    /// One that also reaches local addresses, for tests' servers on loopback.
+    #[cfg(test)]
+    pub fn local(idle: Duration) -> Self {
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(idle)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .build()
-            .expect("building the servers' proxy client");
-        Self { own, http }
+            .expect("building a test client");
+        Self {
+            own: Arc::from([]),
+            http,
+            local: true,
+        }
     }
 
     /// Why a session's request can't be sent to `url`, if it can't. Names are resolved now, as well as again on
@@ -96,6 +131,7 @@ impl Reach {
     pub async fn forward(&self, request: Forward<'_>) -> anyhow::Result<Response> {
         // An address in the URL is connected to without the resolver.
         if let Some(Ok(ip)) = host_ip(request.url)
+            && !self.local
             && !reachable(&self.own, ip)
         {
             anyhow::bail!("the server can't be the runtime itself or a local address");

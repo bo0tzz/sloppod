@@ -24,7 +24,7 @@ impl ModelPolicy {
     }
 }
 
-fn is_inference(request: &HttpRequest) -> bool {
+pub(crate) fn is_inference(request: &HttpRequest) -> bool {
     request.method == "POST" && INFERENCE.contains(&request.path_only())
 }
 

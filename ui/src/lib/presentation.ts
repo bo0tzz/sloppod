@@ -334,6 +334,25 @@ export const credentialKinds: CredentialKindSpec[] = [
       placeholder: 'Paste auth.json here',
     },
   },
+  {
+    kind: 'endpoint',
+    title: 'Model endpoints',
+    noun: 'endpoint',
+    description:
+      "Anthropic-compatible endpoints, such as a LiteLLM proxy: their models are offered wherever you choose a model, for Claude Code sessions. Sessions reach them through sloppod, which adds the key, so an address inside the cluster works.",
+    empty: 'No endpoint yet.',
+    fields: [
+      { key: 'url', label: 'Base URL', type: 'url', placeholder: 'http://litellm.ai.svc.cluster.local:4000' },
+      {
+        key: 'models',
+        label: 'Models',
+        placeholder: 'qwen3-coder, glm-5',
+        description: 'The model names it serves, separated by commas.',
+      },
+    ],
+    secret: { label: 'Key', description: 'Sent as x-api-key and as Authorization: Bearer.' },
+    deletion: 'Sessions on its models are refused until you move them onto another model.',
+  },
 ];
 
 /** What a grant lets a session do, in plain words. */
@@ -344,6 +363,8 @@ export function grantLabel(grant: Grant): string {
       return 'the model API';
     case 'codex':
       return 'Codex';
+    case 'endpoint':
+      return 'a model endpoint';
     case 'github':
       return 'read GitHub';
     case 'packages':

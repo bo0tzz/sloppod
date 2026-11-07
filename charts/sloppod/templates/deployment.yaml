@@ -26,6 +26,8 @@ spec:
         {{- end }}
     spec:
       serviceAccountName: {{ include "sloppod.serviceAccountName" . }}
+      # A stopping runtime lets model answers streaming through it finish, for up to 60 s (`endpoint::DRAIN`).
+      terminationGracePeriodSeconds: 75
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

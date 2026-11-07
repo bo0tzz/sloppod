@@ -67,6 +67,7 @@ pub fn describe(grant: &Grant) -> String {
                        others)."
             .into(),
         capability::CODEX => "Codex's API on chatgpt.com, with the first of the owner's ChatGPT logins this grant names.".into(),
+        capability::ENDPOINT => "The inference API of the owner's model endpoint this grant names, which the session's model is on, through the runtime with its key; it follows the model.".into(),
         capability::DOCS => "Library documentation, searched by library and topic, through Context7's MCP server (the `docs` \
                    tools)."
             .into(),

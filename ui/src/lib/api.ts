@@ -327,7 +327,7 @@ export type StackPayload = {
   auto_merge?: boolean;
 };
 
-export type CredentialKind = 'claude' | 'github-app' | 'memini' | 'chatgpt' | 'github-user' | 'token';
+export type CredentialKind = 'claude' | 'github-app' | 'memini' | 'chatgpt' | 'github-user' | 'token' | 'endpoint';
 
 export type Credential = {
   id: string;

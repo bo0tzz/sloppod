@@ -1460,6 +1460,31 @@ pub async fn add_grant(db: &PgPool, session: Uuid, grant: &Grant) -> sqlx::Resul
     insert_grant(db, session, grant, None).await.map(|_| ())
 }
 
+/// Moves a session onto `model`, with its endpoint grant following it (#461): the endpoint grant `endpoint` replaces
+/// any it had, or none is left. In one transaction, so the session is never on one model with another's grant.
+pub async fn set_model_and_endpoint(
+    db: &PgPool,
+    session: Uuid,
+    model: &str,
+    endpoint: Option<&Grant>,
+) -> sqlx::Result<()> {
+    let mut tx = db.begin().await?;
+    sqlx::query("update sessions set model = $2 where id = $1")
+        .bind(session)
+        .bind(model)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("delete from session_grants where session_id = $1 and capability = $2")
+        .bind(session)
+        .bind(sloppod_contracts::capability::ENDPOINT)
+        .execute(&mut *tx)
+        .await?;
+    if let Some(grant) = endpoint {
+        insert_grant(&mut *tx, session, grant, None).await?;
+    }
+    tx.commit().await
+}
+
 /// Has the session act on `repo` with one of the owner's GitHub tokens (ADR 29), `credential` its id and `login` whose
 /// it is, or with the GitHub App again (`None`). Says whether the session had a grant of `repo` to change.
 pub async fn set_repo_credential(

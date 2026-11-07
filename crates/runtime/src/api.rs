@@ -143,10 +143,12 @@ fn offered_models(agent_state: &serde_json::Value) -> Vec<serde_json::Value> {
 
 async fn settings(state: &AppState, user: &str) -> ApiResult<serde_json::Value> {
     let model = db::user_model(&state.db, user).await?;
-    let models = db::latest_agent_state(&state.db, user)
+    let mut models = db::latest_agent_state(&state.db, user)
         .await?
         .map(|s| offered_models(&s))
         .unwrap_or_default();
+    // The models of the user's endpoints too (#461), named by their ids.
+    models.extend(crate::endpoint::offered(&state.credentials, user).await?);
     let review = db::user_review(&state.db, user).await?;
     let timezone = db::user_timezone(&state.db, user).await?;
     let sub_session_model = db::user_sub_session_model(&state.db, user).await?;
@@ -694,9 +696,37 @@ async fn create_session(
     let Some(adapter) = state.agents.get(agent) else {
         return Err(bad_request(format!("there's no agent called {agent}")));
     };
+    let given = new
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty());
+    let model = match given {
+        Some(model) => {
+            crate::endpoint::chosen(&state.credentials, &user, adapter.as_ref(), Some(model))
+                .await?
+                .map_err(bad_request)?
+        }
+        // The user's default, unless it can't be used any more (its endpoint was deleted, or this agent doesn't
+        // run on endpoints): then the agent's own.
+        None => {
+            let default = db::user_model(&state.db, &user).await?;
+            crate::endpoint::chosen(
+                &state.credentials,
+                &user,
+                adapter.as_ref(),
+                default.as_deref(),
+            )
+            .await?
+            .unwrap_or(None)
+        }
+    };
+    // A session on an endpoint's model needs no account of the agent's own provider.
+    let on_endpoint =
+        crate::endpoint::EndpointModel::parse(model.as_deref().unwrap_or_default()).is_some();
     let needed = adapter.credential();
     let (kind, account) = (needed.kind.as_str(), needed.name.as_str());
-    if !state.credentials.has_default(&user, kind).await? {
+    if !on_endpoint && !state.credentials.has_default(&user, kind).await? {
         return Err(ApiError(
             StatusCode::CONFLICT,
             format!("add {account} in settings before starting a session"),
@@ -736,15 +766,6 @@ async fn create_session(
             .map_err(bad_request)?;
             (grants, repo)
         }
-    };
-    let model = match new
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-    {
-        Some(model) => Some(model.to_owned()),
-        None => db::user_model(&state.db, &user).await?,
     };
     let review = db::user_review(&state.db, &user).await?;
     let custom = new

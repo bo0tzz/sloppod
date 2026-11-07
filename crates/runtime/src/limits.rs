@@ -53,6 +53,9 @@ pub enum Next {
     Fallback(String),
     /// Every account on its grant is: it waits for the earliest reset, if one is known (#251).
     Wait(Option<DateTime<Utc>>),
+    /// It isn't a limit the runtime knows the accounts of: an endpoint's model (#461), whose errors (a budget spent, a
+    /// rate limit) are the endpoint's to explain. The turn counts as failed, with this error.
+    Failed(String),
 }
 
 /// The session's agent's kind of account, and the session, for looking up its accounts.
@@ -156,6 +159,13 @@ pub async fn fall_back(
 /// now, kept at once so a restart doesn't lose the wait.
 pub async fn hit(state: &AppState, session: Uuid) -> Next {
     let now = Utc::now();
+    if let Ok(Some(row)) = db::get_session(&state.db, session).await
+        && crate::endpoint::EndpointModel::parse(row.model.as_deref().unwrap_or_default()).is_some()
+    {
+        return Next::Failed(
+            "the model endpoint refused the request: its budget or rate limit".into(),
+        );
+    }
     let Some((kind, context)) = of_session(state, session).await else {
         return wait(state, session, None).await;
     };

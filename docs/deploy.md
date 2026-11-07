@@ -77,6 +77,12 @@ spec:
 
 The release name decides resource names. With release `sloppod`, the runtime Service is `sloppod`, port `http` (8080).
 
+## Model endpoints
+
+Sessions can run Claude Code on models of any Anthropic-compatible endpoint ([#461](https://github.com/bo0tzz/sloppod/issues/461)), such as a [LiteLLM](https://github.com/BerriAI/litellm) proxy in front of other providers or a model served in the cluster. Add one in Settings → Model endpoints: its base URL (e.g. `http://litellm.ai.svc.cluster.local:4000`), the model names it serves, and its key. Its models are then offered wherever a model is chosen. Sessions reach it through the runtime's sessions port, which adds the key, so the endpoint only has to be reachable from the runtime pod, by a cluster Service name or an internet host, over plain HTTP or HTTPS; nothing in the session's egress policy changes. The session image has to be one from this release or later: its supervisor serves the `/inference` route the agent is pointed at, and older pods are moved onto the new image as they go quiet (above).
+
+**A runtime restart during a turn on an endpoint model.** Model answers stream through the runtime, so stopping it would cut them. On `SIGTERM` the runtime stops taking new model requests (they get `503` with `retry-after`) and waits up to 60 seconds for answers in flight to finish before exiting; the chart sets `terminationGracePeriodSeconds: 75` to leave room for it. An answer still streaming after that is cut. Claude Code tries a cut answer again at once, and a refused or unreachable request again with backoff for about three minutes (checked against Claude Code 2.1.310), so a turn carries on once the next runtime is up: what it loses is the tokens spent on the cut answer, which the endpoint bills again. With the chart's `Recreate` strategy the next runtime starts only after this one exits, so a deploy takes up to a minute longer while answers finish. Sessions on Claude or Codex aren't affected: they reach their providers through the egress listener, not the runtime.
+
 ## What a session keeps
 
 What each session holds in the cluster, by its phase ([ADR 25](adr/0025-session-lifecycle.md), #455):

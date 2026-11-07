@@ -1550,6 +1550,12 @@ function startAgent(session, ms) {
   }, ms);
 }
 
+/** The user's endpoints' models (#461), as the runtime adds them to the models offered: `endpoint:<id>:<model>`. */
+const endpointModels = () =>
+  credentials
+    .filter((c) => c.kind === 'endpoint')
+    .flatMap((c) => c.config.models.map((model) => ({ value: `endpoint:${c.id}:${model}`, name: `${model} (${c.name})` })));
+
 /** The runtime remembers the models the agent offered, for the settings page. */
 const rememberModels = () => (settings.models = MODELS.map(({ value, name }) => ({ value, name })));
 
@@ -1809,6 +1815,19 @@ function handleCall(conn, message) {
 
     case 'session/set_config_option': {
       if (!needLoaded()) return;
+      // To or from an endpoint's model, the runtime moves the session itself and starts its agent again (#461).
+      const onEndpoint = (value) => typeof value === 'string' && value.startsWith('endpoint:');
+      if (params.configId === 'model' && (onEndpoint(params.value) || onEndpoint(session.data.model))) {
+        if (onEndpoint(params.value) && !endpointModels().some((model) => model.value === params.value)) {
+          conn.error(id, -32602, 'that endpoint isn\'t one of yours any more');
+          return;
+        }
+        session.data.model = params.value;
+        if (!onEndpoint(params.value)) session.model = params.value;
+        session.broadcast();
+        conn.respond(id, {});
+        return;
+      }
       if (params.configId !== 'model' || !MODELS.some((model) => model.value === params.value)) {
         conn.error(id, -32602, `Invalid value ${params.value} for ${params.configId}`);
         return;
@@ -1880,7 +1899,7 @@ async function handleApi(req, res, url) {
   }
 
   if (parts[0] === 'settings' && parts.length === 1) {
-    if (method === 'GET') return json(res, 200, settings);
+    if (method === 'GET') return json(res, 200, { ...settings, models: [...settings.models, ...endpointModels()] });
     if (method === 'PUT') {
       const body = await readBody(req);
       if ('model' in body) {
@@ -2399,7 +2418,7 @@ function handleStandingApprovals(req, res, parts) {
   return json(res, 404, { error: 'not found' });
 }
 
-const CREDENTIAL_CONFIG = { claude: [], 'github-app': ['app_id'], memini: ['url'], chatgpt: [], 'github-user': [], token: [] };
+const CREDENTIAL_CONFIG = { claude: [], 'github-app': ['app_id'], memini: ['url'], chatgpt: [], 'github-user': [], token: [], endpoint: ['url', 'models'] };
 
 /** Names a definition can't take: the built-in capabilities' (the runtime's `capability::BUILTIN`) and the MCP servers sloppod serves itself. */
 const RESERVED_NAMES = ['model', 'github', 'packages', 'docs', 'codex', 'repo', 'memory', 'sloppod', 'memini'];
@@ -2500,6 +2519,12 @@ async function handleCredentials(req, res, parts) {
       const header = String(body.config.header);
       if (!/^[A-Za-z0-9-]+$/.test(header)) return json(res, 400, { error: 'a header name is letters, digits and dashes' });
       config.header = header.toLowerCase();
+    }
+    // An endpoint's models come as one string of names, kept as a list.
+    if (body.kind === 'endpoint') {
+      const models = [...new Set(String(body.config.models).split(/[\s,]+/).filter(Boolean))];
+      if (models.length === 0) return json(res, 400, { error: 'name at least one model the endpoint serves, e.g. qwen3-coder' });
+      config = { url: String(body.config.url).replace(/\/+$/, ''), models };
     }
     if (body.kind === 'github-user') {
       const inspected = inspectUserToken(body.secret.trim());

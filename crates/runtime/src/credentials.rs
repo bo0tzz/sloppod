@@ -26,7 +26,18 @@ pub const GITHUB_USER: &str = "github-user";
 /// A token an owner-defined capability's server takes (ADR 2, 2026-10-29): sent as `Authorization: Bearer <token>`,
 /// or as the value of the header its config names.
 pub const TOKEN: &str = "token";
-const KINDS: &[&str] = &[CLAUDE, GITHUB_APP, MEMINI, CHATGPT, GITHUB_USER, TOKEN];
+/// An Anthropic-compatible endpoint the owner runs or uses, e.g. a LiteLLM proxy (#461): its base URL and the models
+/// it serves in the config, its key as the secret. Sessions on one of its models reach it through the runtime.
+pub const ENDPOINT: &str = "endpoint";
+const KINDS: &[&str] = &[
+    CLAUDE,
+    GITHUB_APP,
+    MEMINI,
+    CHATGPT,
+    GITHUB_USER,
+    TOKEN,
+    ENDPOINT,
+];
 
 /// Codex's OAuth client and token endpoint, which refresh a ChatGPT login.
 const CHATGPT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -162,6 +173,29 @@ fn host_of(url: &str) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
+/// The models an endpoint credential is given: a list, or one string of names separated by commas or whitespace, as a
+/// form sends them. Each once, in order.
+fn endpoint_models(config: &serde_json::Map<String, Value>) -> Vec<String> {
+    let names: Vec<String> = match config.get("models") {
+        Some(Value::Array(names)) => names
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        Some(Value::String(names)) => names
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut models: Vec<String> = Vec::new();
+    for name in names.iter().map(|n| n.trim()).filter(|n| !n.is_empty()) {
+        if !models.iter().any(|m| m == name) {
+            models.push(name.to_owned());
+        }
+    }
+    models
+}
 /// The repository a `github-user` token reaches that's `wanted`, as GitHub names it: one it listed when it was added,
 /// or, when it listed more than were read, any well-formed name, which GitHub then decides on when it's used.
 pub fn token_reaches(row: &CredentialRow, wanted: &str) -> Option<String> {
@@ -313,6 +347,28 @@ impl Credentials {
                     "repositories": token.repositories,
                     "more_repositories": token.more_repositories,
                 })
+            }
+            ENDPOINT => {
+                let url = config("url").trim_end_matches('/');
+                let scheme_ok =
+                    reqwest::Url::parse(url).is_ok_and(|u| matches!(u.scheme(), "http" | "https"));
+                if !scheme_ok || host_of(url).is_none() {
+                    return Ok(Err(Invalid(
+                        "an endpoint needs its base URL, e.g. http://litellm.ai.svc.cluster.local:4000".into(),
+                    )));
+                }
+                if has_userinfo(url) {
+                    return Ok(Err(Invalid(
+                        "the endpoint's URL can't hold a username or password; its key goes in the secret".into(),
+                    )));
+                }
+                let models = endpoint_models(&new.config);
+                if models.is_empty() {
+                    return Ok(Err(Invalid(
+                        "name at least one model the endpoint serves, e.g. qwen3-coder".into(),
+                    )));
+                }
+                serde_json::json!({"url": url, "models": models})
             }
             TOKEN => match config("header") {
                 "" => serde_json::json!({}),
@@ -1371,6 +1427,56 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[sqlx::test]
+    async fn an_endpoint_needs_its_url_and_models(db: PgPool) {
+        let credentials = credentials(db).await;
+        let endpoint = |url: &str, models: Value| {
+            let mut config = serde_json::Map::new();
+            config.insert("url".into(), json!(url));
+            config.insert("models".into(), models);
+            NewCredential {
+                kind: ENDPOINT.into(),
+                name: format!("e{}", url.len()),
+                config,
+                secret: "sk-key".into(),
+            }
+        };
+        for (url, models, why) in [
+            ("litellm:4000", json!("qwen3"), "base URL"),
+            ("ftp://litellm", json!("qwen3"), "base URL"),
+            (
+                "http://user:pw@litellm:4000",
+                json!("qwen3"),
+                "username or password",
+            ),
+            ("http://litellm:4000", json!(" , "), "at least one model"),
+        ] {
+            let refused = credentials
+                .create("dev", endpoint(url, models))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(refused.0.contains(why), "{url}: {}", refused.0);
+        }
+        let row = credentials
+            .create(
+                "dev",
+                endpoint(
+                    "http://litellm.ai.svc.cluster.local:4000/",
+                    json!("qwen3-coder, glm-5 qwen3-coder"),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        // Kept as given, each model once; the key is the secret, never in the config.
+        assert_eq!(
+            row.config,
+            json!({"url": "http://litellm.ai.svc.cluster.local:4000", "models": ["qwen3-coder", "glm-5"]})
+        );
+        assert_eq!(credentials.reveal(&row).unwrap(), "sk-key");
     }
 
     #[sqlx::test]

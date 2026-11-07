@@ -1,4 +1,5 @@
 mod codex;
+mod endpoint;
 mod github;
 mod memini;
 mod model;
@@ -8,6 +9,7 @@ use std::sync::Arc;
 use sloppod_contracts::{RequestPolicy, SessionContext};
 
 pub use codex::CodexPolicy;
+pub use endpoint::EndpointPolicy;
 pub use github::GitHubPolicy;
 pub use memini::{MeminiPolicy, SESSION_KEY};
 pub use model::ModelPolicy;
