@@ -6,6 +6,7 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use sloppod_contracts::{ModelTarget, SessionContext};
 use sloppod_protocol::api::{Spend, SpentKey};
 use sqlx::PgPool;
 use tokio::sync::broadcast;
@@ -104,10 +105,28 @@ pub async fn list(db: &PgPool, owner: &str) -> sqlx::Result<Spend> {
     .bind(owner)
     .fetch_all(db)
     .await?;
-    let keys: Vec<SpentKey> = rows
-        .into_iter()
-        .map(|row| SpentKey {
-            key_id: row.key_id,
+    // A session's own keys (one per endpoint it was on) add up to its spend; a shared key is its own line. Newest
+    // first, so a session's line takes its latest key's budget and time.
+    let mut keys: Vec<SpentKey> = Vec::new();
+    for row in rows {
+        let own = row
+            .shared_name
+            .is_none()
+            .then_some(row.session_id)
+            .flatten();
+        if let Some(session) = own
+            && let Some(line) = keys
+                .iter_mut()
+                .find(|k| k.session_id == Some(session) && k.key_id.starts_with("session:"))
+        {
+            line.spend += row.spend;
+            continue;
+        }
+        keys.push(SpentKey {
+            key_id: match own {
+                Some(session) => format!("session:{session}"),
+                None => row.key_id,
+            },
             session_id: row.session_id,
             name: row
                 .shared_name
@@ -116,8 +135,8 @@ pub async fn list(db: &PgPool, owner: &str) -> sqlx::Result<Spend> {
             spend: row.spend,
             max_budget: row.max_budget,
             observed_at: row.observed_at.to_rfc3339(),
-        })
-        .collect();
+        });
+    }
     Ok(Spend {
         total: keys.iter().map(|k| k.spend).sum(),
         keys,
@@ -143,53 +162,87 @@ pub async fn poll(state: &AppState) {
         let Ok(Some(row)) = db::get_session(&state.db, id).await else {
             continue;
         };
-        let target = match state.providers.target(&row.context()).await {
-            Ok(Some(target)) => target,
-            Ok(None) => continue,
-            Err(e) => {
-                tracing::debug!(%session, error = %format!("{e:#}"), "finding a session's endpoint key for its spend");
-                continue;
-            }
-        };
-        let (key_id, owned_by, shared_name) = match &target.shared {
-            Some(shared) => (shared.id.clone(), None, Some(shared.name.clone())),
-            None => (format!("session:{id}"), Some(id), None),
-        };
-        if !read.insert(key_id.clone()) {
-            continue;
-        }
-        let url = format!("{}/key/info", target.base_url.trim_end_matches('/'));
-        let answer = match state.inference_reach.get_json(&url, &target.key).await {
-            Ok(answer) => answer,
-            Err(e) => {
-                tracing::debug!(%session, error = %format!("{e:#}"), "reading an endpoint key's spend");
-                continue;
-            }
-        };
-        let Some(reading) = from_key_info(&answer) else {
-            continue;
-        };
-        match store(
-            &state.db,
-            &key_id,
-            &row.owner,
-            owned_by,
-            shared_name.as_deref(),
-            &reading,
-            Utc::now(),
-        )
-        .await
-        {
-            Ok(true) => {
-                changed.insert(row.owner.clone());
-            }
-            Ok(false) => {}
-            Err(e) => tracing::warn!(%session, error = %e, "keeping an endpoint key's spend"),
+        if let Some(true) = read_session(state, &row.context(), &mut read).await {
+            changed.insert(row.owner.clone());
         }
     }
     for owner in changed {
         let _ = state.spending.changed.send(owner);
     }
+}
+
+/// Reads the spend of the key a session's endpoint grant uses, once more before it goes: the session stopped or was
+/// purged, or moved off the endpoint (`session` as it was). Without it, what was spent since the last poll would be
+/// lost with the key.
+pub async fn read_last(state: &AppState, session: &SessionContext) {
+    if let Some(true) = read_session(state, session, &mut HashSet::new()).await {
+        let _ = state.spending.changed.send(session.owner.clone());
+    }
+}
+
+/// Reads and keeps the spend of the key `session`'s endpoint grant uses, unless it's in `read` already. Says whether
+/// that changed what was kept; `None` when there was nothing to read.
+async fn read_session(
+    state: &AppState,
+    session: &SessionContext,
+    read: &mut HashSet<String>,
+) -> Option<bool> {
+    let target = match state.providers.target(session).await {
+        Ok(Some(target)) => target,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::debug!(session = %session.session_id, error = %format!("{e:#}"), "finding a session's endpoint key for its spend");
+            return None;
+        }
+    };
+    if !read.insert(target.key_id.clone()) {
+        return None;
+    }
+    let id: Option<Uuid> = session.session_id.parse().ok();
+    match record(
+        &state.db,
+        &state.inference_reach,
+        &target,
+        &session.owner,
+        id,
+    )
+    .await
+    {
+        Ok(changed) => changed,
+        Err(e) => {
+            tracing::debug!(session = %session.session_id, error = %format!("{e:#}"), "reading an endpoint key's spend");
+            None
+        }
+    }
+}
+
+/// Reads a key's spend from its endpoint and keeps it, as the session's own (`session`) unless the key is shared.
+/// Says whether that changed what was kept; `None` for an endpoint whose answer isn't key info.
+pub async fn record(
+    db: &PgPool,
+    reach: &crate::proxy::Reach,
+    target: &ModelTarget,
+    owner: &str,
+    session: Option<Uuid>,
+) -> anyhow::Result<Option<bool>> {
+    let url = format!("{}/key/info", target.base_url.trim_end_matches('/'));
+    let answer = reach.get_json(&url, &target.key).await?;
+    let Some(reading) = from_key_info(&answer) else {
+        return Ok(None);
+    };
+    let session = session.filter(|_| target.shared.is_none());
+    Ok(Some(
+        store(
+            db,
+            &target.key_id,
+            owner,
+            session,
+            target.shared.as_deref(),
+            &reading,
+            Utc::now(),
+        )
+        .await?,
+    ))
 }
 
 /// Sends an owner's UI connection a `_sloppod/spend` notification whenever their spend changes, for it to read it
@@ -302,7 +355,7 @@ mod tests {
         .unwrap();
         let at = Utc::now();
         let reading = |spend: f64, max_budget: Option<f64>| Reading { spend, max_budget };
-        let session_key = format!("session:{id}");
+        let session_key = format!("litellm:sloppod-{id}-aaaaaaaaaa");
         assert!(
             store(
                 &db,
@@ -343,6 +396,18 @@ mod tests {
             .await
             .unwrap()
         );
+        // The session moved to another proxy: its key there is another, and its spend adds to the first's.
+        store(
+            &db,
+            &format!("litellm:sloppod-{id}-bbbbbbbbbb"),
+            "dev",
+            Some(id),
+            None,
+            &reading(0.25, Some(5.0)),
+            at,
+        )
+        .await
+        .unwrap();
         store(
             &db,
             "credential:1",
@@ -367,7 +432,7 @@ mod tests {
         .unwrap();
 
         let spend = list(&db, "dev").await.unwrap();
-        assert_eq!(spend.total, 2.75);
+        assert_eq!(spend.total, 3.0);
         let mut keys: Vec<(String, f64, Option<f64>)> = spend
             .keys
             .into_iter()
@@ -377,9 +442,71 @@ mod tests {
         assert_eq!(
             keys,
             [
-                ("Port the parser".to_owned(), 0.75, Some(5.0)),
+                ("Port the parser".to_owned(), 1.0, Some(5.0)),
                 ("litellm".to_owned(), 2.0, None)
             ]
         );
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_session_that_ends_between_reads_keeps_what_it_spent(db: PgPool) {
+        // Its key's last reading, taken before the key goes, is kept as the session's.
+        let app = axum::Router::new().route(
+            "/key/info",
+            axum::routing::get(|| async {
+                axum::Json(json!({"info": {"spend": 0.31, "max_budget": null}}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let reach = crate::proxy::Reach::local(std::time::Duration::from_secs(5));
+        let id = Uuid::now_v7();
+        crate::db::insert_session(
+            &db,
+            crate::db::NewSessionRow {
+                id,
+                owner: "dev",
+                title: "Short task",
+                custom_title: true,
+                pending_prompt: "",
+                agent: "claude-code",
+                kind: sloppod_protocol::api::SessionKind::Work,
+                review: sloppod_protocol::api::ReviewPolicy::Off,
+                model: None,
+                repo: None,
+                grants: &[],
+            },
+        )
+        .await
+        .unwrap();
+        let own = ModelTarget {
+            base_url: base.clone(),
+            key: "sk".into(),
+            key_id: format!("litellm:sloppod-{id}-aaaaaaaaaa"),
+            shared: None,
+        };
+        assert_eq!(
+            record(&db, &reach, &own, "dev", Some(id)).await.unwrap(),
+            Some(true)
+        );
+        let spend = list(&db, "dev").await.unwrap();
+        assert_eq!(spend.total, 0.31);
+        assert_eq!(spend.keys[0].key_id, format!("session:{id}"));
+        // A shared key's spend is the key's, not the session's.
+        let shared = ModelTarget {
+            base_url: base,
+            key: "sk".into(),
+            key_id: "credential:1".into(),
+            shared: Some("litellm".into()),
+        };
+        record(&db, &reach, &shared, "dev", Some(id)).await.unwrap();
+        let spend = list(&db, "dev").await.unwrap();
+        let line = spend
+            .keys
+            .iter()
+            .find(|k| k.key_id == "credential:1")
+            .unwrap();
+        assert_eq!((line.session_id, line.name.as_str()), (None, "litellm"));
     }
 }

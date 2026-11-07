@@ -459,6 +459,7 @@ impl ModelProvider for LiteLlm {
             return Ok(Some(ModelTarget {
                 base_url,
                 key,
+                key_id: format!("litellm:{name}"),
                 shared: None,
             }));
         }
@@ -467,10 +468,14 @@ impl ModelProvider for LiteLlm {
         let deadline = tokio::time::Instant::now() + self.key_wait;
         loop {
             if let Some(key) = self.keys.secret(&secret).await.map_err(contract_error)? {
-                self.minted.lock().unwrap().insert(name, key.clone());
+                self.minted
+                    .lock()
+                    .unwrap()
+                    .insert(name.clone(), key.clone());
                 return Ok(Some(ModelTarget {
                     base_url,
                     key,
+                    key_id: format!("litellm:{name}"),
                     shared: None,
                 }));
             }

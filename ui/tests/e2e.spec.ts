@@ -4557,6 +4557,14 @@ test('a budget per session is saved with the defaults', async ({ page }) => {
   await expect(defaults.getByRole('button', { name: 'Save' })).toBeDisabled();
   await page.reload();
   await expect(budget).toHaveValue('2.5');
+  // Something that isn't a number of dollars is an error, and the budget saved stays.
+  for (const typed of ['$5', '1,50', '0']) {
+    await budget.fill(typed);
+    await expect(defaults.getByTestId('session-budget-error')).toBeVisible();
+    await expect(defaults.getByRole('button', { name: 'Save' })).toBeDisabled();
+  }
+  await page.reload();
+  await expect(budget).toHaveValue('2.5');
   await budget.fill('');
   await defaults.getByRole('button', { name: 'Save' }).click();
   await expect(defaults.getByRole('button', { name: 'Save' })).toBeDisabled();

@@ -444,17 +444,14 @@ pub struct ModelTarget {
     /// The Messages API's base URL.
     pub base_url: String,
     pub key: String,
-    /// Whose spend the key's is, for the spend the runtime shows: the session's alone (`None`), or something several
-    /// sessions share, such as an endpoint credential's one key.
+    /// The key's stable identity, for the spend kept per key: a session's own key has one per session and endpoint (a
+    /// LiteLLM virtual key), a shared one, one for all (an endpoint credential's).
     #[serde(default)]
-    pub shared: Option<SharedKey>,
-}
-
-/// A key several sessions share: a stable id, and how it's shown.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SharedKey {
-    pub id: String,
-    pub name: String,
+    pub key_id: String,
+    /// What shares the key, by name, when several sessions do (an endpoint credential); `None` when it's the
+    /// session's own.
+    #[serde(default)]
+    pub shared: Option<String>,
 }
 
 /// Leaves the key out, so logging one can't leak it.

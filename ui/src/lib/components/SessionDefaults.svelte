@@ -12,7 +12,9 @@
   let review = $state<ReviewPolicy>('off');
   // Dollars, as typed; empty for no limit.
   let budget = $state('');
-  const budgetValue = $derived(budget.trim() === '' ? null : Number(budget));
+  // Only a plain number above 0 is a budget; anything else typed is an error, never taken for "no limit".
+  const budgetValue = $derived(budget.trim() === '' ? null : /^\d+(\.\d+)?$/.test(budget.trim()) && Number(budget) > 0 ? Number(budget) : NaN);
+  const budgetInvalid = $derived(Number.isNaN(budgetValue));
 
   const changed = $derived(
     model.trim() !== (settings?.model ?? '') ||
@@ -43,6 +45,7 @@
 
   async function save(event: SubmitEvent) {
     event.preventDefault();
+    if (budgetInvalid) return;
     saving = true;
     try {
       load(
@@ -50,7 +53,7 @@
           model: model.trim() || null,
           sub_session_model: subSessionModel.trim() || null,
           review,
-          session_budget: budgetValue,
+          session_budget: budgetInvalid ? undefined : budgetValue,
         }),
       );
       toastManager.success('Saved your defaults');
@@ -92,8 +95,12 @@
         <Field
           label="Budget per session"
           description="The most a session on a LiteLLM operator model may spend, in dollars; LiteLLM refuses it after that. Empty for no limit."
+          invalid={budgetInvalid}
         >
           <Input bind:value={budget} inputmode="decimal" placeholder="No limit" autocomplete="off" data-testid="session-budget" />
+          {#if budgetInvalid}
+            <Text color="danger" size="small" data-testid="session-budget-error">A number of dollars, like 5 or 2.50, or empty for no limit.</Text>
+          {/if}
         </Field>
       </div>
       <div class="min-w-48 grow">
@@ -101,7 +108,7 @@
           <Select options={reviewOptions} value={review} onChange={(value) => (review = value as ReviewPolicy)} />
         </Field>
       </div>
-      <Button type="submit" shape="round" loading={saving} disabled={!changed}>Save</Button>
+      <Button type="submit" shape="round" loading={saving} disabled={!changed || budgetInvalid}>Save</Button>
     </form>
   {/if}
 </section>

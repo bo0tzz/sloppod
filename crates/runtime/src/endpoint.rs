@@ -351,10 +351,8 @@ impl ModelProvider for OwnEndpoints {
             base_url,
             key,
             // Every session on the endpoint uses its one key.
-            shared: Some(sloppod_contracts::SharedKey {
-                id: format!("credential:{}", row.id),
-                name: row.name.clone(),
-            }),
+            key_id: format!("credential:{}", row.id),
+            shared: Some(row.name.clone()),
         }))
     }
 }
@@ -747,6 +745,10 @@ pub async fn switch(
         Ok(true) => {
             // What the old grant had made is no longer needed, unless the new one is on the same endpoint. A release
             // that fails is left to the sweep.
+            // What the old key spent since the last read, before it goes.
+            if old_grant.is_some() && !same_endpoint(old_grant.as_ref(), new_grant.as_ref()) {
+                crate::spend::read_last(state, &old_context).await;
+            }
             if let Some(old) = &old_grant
                 && !same_endpoint(Some(old), new_grant.as_ref())
                 && let Err(e) = state

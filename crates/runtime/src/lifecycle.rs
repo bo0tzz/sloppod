@@ -513,6 +513,8 @@ pub async fn remove_keys(state: &AppState, session: &db::SessionRow) -> anyhow::
     {
         tracing::warn!(session = %id, error = %e, "deleting the session's memini key");
     }
+    // What it spent since the last read, before its key goes (#461).
+    crate::spend::read_last(state, &session.context()).await;
     state
         .providers
         .release(&id.to_string(), &session.grants())

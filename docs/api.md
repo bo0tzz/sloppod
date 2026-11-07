@@ -280,7 +280,7 @@ type QuotaWindow = {
 };
 ```
 
-**Spend** ([#461](https://github.com/bo0tzz/sloppod/issues/461)): what sessions on endpoint models have spent, as the endpoints say. An endpoint like LiteLLM prices every call and keeps each key's spend and budget, which the key itself reads (`GET /key/info`), so the runtime reads it every five minutes, for each key a session not stopped or purged uses, the way it reads a ChatGPT login's limits, and keeps the latest. A session on a LiteLLM operator model has a key of its own, so its spend is its own; an endpoint credential's one key serves every session on it, so its spend is the credential's. An endpoint without key info (one that isn't LiteLLM) has none to show. A session's figure stays after it stops; the user's total is the sum over every key their sessions used. When a figure changes, every `/acp` connection of the owner gets `_sloppod/spend` (below), for the UI to read it again. The user's `session_budget` setting is set as `maxBudget` on each new session's virtual key (and on a move to another of a proxy's models), which LiteLLM enforces: a session past it is refused by LiteLLM, and its turn fails with LiteLLM's error, as other endpoint refusals do.
+**Spend** ([#461](https://github.com/bo0tzz/sloppod/issues/461)): what sessions on endpoint models have spent, as the endpoints say. An endpoint like LiteLLM prices every call and keeps each key's spend and budget, which the key itself reads (`GET /key/info`), so the runtime reads it every five minutes, for each key a session not stopped or purged uses, the way it reads a ChatGPT login's limits, and once more before a key goes (the session stops or is purged, or moves off the endpoint), and keeps each key's latest. A session on a LiteLLM operator model has a key of its own per proxy, so its spend is its own: the sum of its keys', if it moved between proxies; an endpoint credential's one key serves every session on it, so its spend is the credential's. An endpoint without key info (one that isn't LiteLLM) has none to show. A session's figure stays after it stops; the user's total is the sum over every key their sessions used. When a figure changes, every `/acp` connection of the owner gets `_sloppod/spend` (below), for the UI to read it again. The user's `session_budget` setting is set as `maxBudget` on each new session's virtual key (and on a move to another of a proxy's models), which LiteLLM enforces: a session past it is refused by LiteLLM, and its turn fails with LiteLLM's error, as other endpoint refusals do.
 
 ```
 GET /api/v1/spend -> Spend
@@ -290,7 +290,7 @@ GET /api/v1/spend -> Spend
 type Spend = {
   total: number;         // dollars, over every key the user's sessions used
   keys: {
-    key_id: string;      // "session:<id>" for a session's own key, or the shared key's, e.g. "credential:<id>"
+    key_id: string;      // "session:<id>" for a session's own keys, summed, or the shared key's, e.g. "credential:<id>"
     session_id: string | null;
     name: string;        // the session's title, or the shared key's name (an endpoint credential's)
     spend: number;
