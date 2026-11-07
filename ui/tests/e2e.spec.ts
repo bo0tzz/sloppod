@@ -4600,3 +4600,54 @@ test('Storage lists every volume: a session never measured, a reviewer, and one 
   await expect(unknown).toContainText('of no known session');
   await expect(unknown.getByTestId('storage-unknown-volume')).toHaveText('workdir-sloppod-00000000-0000-7000-8000-000000000000');
 });
+
+test('what sessions on endpoint models spent shows next to the usage meters, with the budget', async ({ page }) => {
+  await page.goto('/');
+  const spend = page.getByTestId('spend');
+  await expect(spend).toHaveCount(0);
+  const at = new Date().toISOString();
+  await page.request.post('/_mock/spend', {
+    data: {
+      total: 2.75,
+      keys: [
+        { key_id: 'session:1', session_id: '1', name: 'Port the parser', spend: 0.75, max_budget: 5, observed_at: at },
+        { key_id: 'credential:2', session_id: null, name: 'litellm', spend: 2, max_budget: null, observed_at: at },
+        { key_id: 'session:3', session_id: '3', name: 'Nothing yet', spend: 0, max_budget: 5, observed_at: at },
+      ],
+    },
+  });
+  // Pushed, not polled: it shows without a reload.
+  await expect(page.getByTestId('spend-total').first()).toHaveText('$2.75 spent');
+  const keys = page.getByTestId('spend').first().getByTestId('spend-key');
+  await expect(keys).toHaveCount(2);
+  await expect(keys.nth(0)).toContainText('Port the parser');
+  await expect(keys.nth(0)).toContainText('$0.750 of $5.00');
+  await expect(keys.nth(1)).toContainText('litellm');
+  await expect(keys.nth(1)).toContainText('$2.00');
+  await page.request.post('/_mock/spend', { data: { total: 0, keys: [] } });
+  await expect(page.getByTestId('spend')).toHaveCount(0);
+});
+
+test('a budget per session is saved with the defaults', async ({ page }) => {
+  await page.goto('/settings');
+  const defaults = page.getByTestId('session-defaults');
+  const budget = defaults.getByTestId('session-budget');
+  await budget.fill('2.5');
+  await defaults.getByRole('button', { name: 'Save' }).click();
+  await expect(defaults.getByRole('button', { name: 'Save' })).toBeDisabled();
+  await page.reload();
+  await expect(budget).toHaveValue('2.5');
+  // Something that isn't a number of dollars is an error, and the budget saved stays.
+  for (const typed of ['$5', '1,50', '0']) {
+    await budget.fill(typed);
+    await expect(defaults.getByTestId('session-budget-error')).toBeVisible();
+    await expect(defaults.getByRole('button', { name: 'Save' })).toBeDisabled();
+  }
+  await page.reload();
+  await expect(budget).toHaveValue('2.5');
+  await budget.fill('');
+  await defaults.getByRole('button', { name: 'Save' }).click();
+  await expect(defaults.getByRole('button', { name: 'Save' })).toBeDisabled();
+  await page.reload();
+  await expect(budget).toHaveValue('');
+});

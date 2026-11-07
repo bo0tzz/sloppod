@@ -112,9 +112,7 @@ pub async fn start_session(
     let mut grants = new.grants.to_vec();
     let endpoint = match crate::endpoint::EndpointModel::parse(new.model.unwrap_or_default()) {
         Some(model) => Some(
-            state
-                .providers
-                .grant(new.owner, &model)
+            crate::endpoint::session_grant(state, new.owner, &model)
                 .await?
                 .map_err(|why| anyhow::anyhow!(why))?,
         ),
@@ -515,6 +513,8 @@ pub async fn remove_keys(state: &AppState, session: &db::SessionRow) -> anyhow::
     {
         tracing::warn!(session = %id, error = %e, "deleting the session's memini key");
     }
+    // What it spent since the last read, before its key goes (#461).
+    crate::spend::read_last(state, &session.context()).await;
     state
         .providers
         .release(&id.to_string(), &session.grants())

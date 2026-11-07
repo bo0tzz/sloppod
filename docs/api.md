@@ -35,7 +35,7 @@ POST   /api/v1/sessions/{id}/highlights/{highlight}/seen -> Highlight  the user 
 GET    /api/v1/repos                -> string[]    repositories sessions can be granted, e.g. ["bo0tzz/sloppod"]
 GET    /api/v1/me                   -> {user: string, version: string | null, build: string | null}   version: the release, e.g. 0.1.2-main.153 (SLOPPOD_VERSION, the chart's version); build: the commit or tag it was built from (SLOPPOD_BUILD, the chart's app version)
 GET    /api/v1/settings             -> Settings
-PUT    /api/v1/settings             -> Settings    body: {model?: string | null, sub_session_model?: string | null, review?: "off" | "required", timezone?: string, instructions?: string | null}; fields left out stay as they are; 400 for a timezone that isn't one, or instructions over 32 KiB
+PUT    /api/v1/settings             -> Settings    body: {model?: string | null, sub_session_model?: string | null, review?: "off" | "required", timezone?: string, instructions?: string | null, session_budget?: number | null}; fields left out stay as they are; 400 for a timezone that isn't one, instructions over 32 KiB, or a session_budget that isn't a number of dollars above 0
 ```
 
 ```ts
@@ -54,6 +54,7 @@ PUT    /api/v1/settings             -> Settings    body: {model?: string | null,
 type Settings = {
   model: string | null;
   sub_session_model: string | null;
+  session_budget: number | null;  // the most a session on a LiteLLM operator model may spend, in dollars: its virtual key's maxBudget (#461); null for none
   models: { value: string; name: string }[];
   review: "off" | "required";
   timezone: string | null;
@@ -276,6 +277,26 @@ type QuotaWindow = {
   utilization: number | null;  // the fraction used, usually 0 to 1
   resets_at: string | null;
   status: "allowed" | "warning" | "rejected";  // warning: past a threshold the provider set; rejected: at the limit
+};
+```
+
+**Spend** ([#461](https://github.com/bo0tzz/sloppod/issues/461)): what sessions on endpoint models have spent, as the endpoints say. An endpoint like LiteLLM prices every call and keeps each key's spend and budget, which the key itself reads (`GET /key/info`), so the runtime reads it every five minutes, for each key a session not stopped or purged uses, the way it reads a ChatGPT login's limits, and once more before a key goes (the session stops or is purged, or moves off the endpoint), and keeps each key's latest. A session on a LiteLLM operator model has a key of its own per proxy, so its spend is its own: the sum of its keys', if it moved between proxies or came back to one (each key minted is kept apart); an endpoint credential's one key serves every session on it, so its spend is the credential's. An endpoint without key info (one that isn't LiteLLM) has none to show. A session's figure stays after it stops; the user's total is the sum over every key their sessions used. When a figure changes, every `/acp` connection of the owner gets `_sloppod/spend` (below), for the UI to read it again. The user's `session_budget` setting is set as `maxBudget` on each new session's virtual key (and on a move to another of a proxy's models), which LiteLLM enforces: a session past it is refused by LiteLLM, and its turn fails with LiteLLM's error, as other endpoint refusals do.
+
+```
+GET /api/v1/spend -> Spend
+```
+
+```ts
+type Spend = {
+  total: number;         // dollars, over every key the user's sessions used
+  keys: {
+    key_id: string;      // "session:<id>" for a session's own keys, summed, or the shared key's, e.g. "credential:<id>"
+    session_id: string | null;
+    name: string;        // the session's title, or the shared key's name (an endpoint credential's)
+    spend: number;
+    max_budget: number | null;
+    observed_at: string; // when it was last read
+  }[];                   // most recently read first
 };
 ```
 
@@ -512,6 +533,7 @@ Runtime → UI:
 | `_sloppod/queue` `{sessionId, messages: {id, prompt}[]}` | The messages waiting behind the running turn, sent whenever that changes and when a UI loads the session. |
 | `_sloppod/permission_resolved` `{sessionId, toolCallId, requestId}` | Sent to every UI, including the one that answered, once a permission request or question is answered or cancelled. `requestId` is the JSON-RPC id the request had on this connection. |
 | `_sloppod/quota` `{credentialId, quota: Quota \| null}` | One of the owner's quotas changed (see Quotas): `quota` as it stands now, or `null` once the credential is gone. Sent on every connection of the owner, with or without a session loaded. A connection that falls behind is dropped, so its UI reconnects and fetches them all. |
+| `_sloppod/spend` `{}` | What the owner's sessions on endpoint models spent changed (see Spend): read `GET /api/v1/spend` again. Sent on every connection of the owner, whatever session it has loaded. |
 | `_sloppod/session` `{session: Session}` | The session's phase, title, repository or grants changed, the agent's running commands (`commands`, `command_lines`), or what waits on the user (`waiting`: a proposal made, decided, withdrawn or carried out, a question asked or answered, a permission request opened or resolved). Sent on every connection of the owner for any of the owner's sessions, with or without it loaded, so a session list follows them without fetching; a connection that falls behind is dropped, so its UI reconnects and fetches the list. A connection that has the session loaded may get it twice. |
 | `_sloppod/proposal` `{proposal: Proposal}` | A proposal for a loaded session was created or changed. |
 | `_sloppod/highlight` `{highlight: Highlight}` | The agent highlighted something for a loaded session, or the user marked one seen (so another tab shows it). Either also changes the session's `waiting.highlights`, which `_sloppod/session` carries to every connection of the owner. |

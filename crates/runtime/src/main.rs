@@ -38,6 +38,7 @@ mod room;
 mod session;
 #[cfg(test)]
 mod session_tests;
+mod spend;
 mod starting;
 mod storage;
 mod store;
@@ -109,6 +110,8 @@ pub struct Inner {
     pub rechecks: Arc<rebases::Rechecks>,
     /// What's left of each inference credential's usage limits (#140).
     pub quotas: quota::Quotas,
+    /// What sessions on endpoint models spend changes for each owner (#461).
+    pub spending: spend::Spending,
     /// What each session's agent was last told its tools are, to tell it when they change (#323).
     pub tool_streams: mcp::ToolStreams,
 }
@@ -291,6 +294,7 @@ async fn main() -> anyhow::Result<()> {
         tool_streams: mcp::ToolStreams::default(),
         rechecks,
         quotas: quota::Quotas::new()?,
+        spending: Default::default(),
     }));
     // A message queued for a parked session's absent agent wakes the session.
     let waker = state.clone();
@@ -392,6 +396,7 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 every.tick().await;
                 quota::read_chatgpt(&state).await;
+                spend::poll(&state).await;
             }
         });
     }

@@ -225,6 +225,21 @@ impl Providers {
     }
 }
 
+/// The `endpoint` grant a session of the owner's on `model` gets, with the owner's budget per session where they set
+/// one, for providers whose keys keep one (#461).
+pub async fn session_grant(
+    state: &AppState,
+    owner: &str,
+    model: &EndpointModel,
+) -> anyhow::Result<Result<Grant, String>> {
+    let budget = db::user_session_budget(&state.db, owner).await?;
+    Ok(state.providers.grant(owner, model).await?.map(|mut grant| {
+        if let Some(budget) = budget {
+            grant.params["max_budget"] = json!(budget);
+        }
+        grant
+    }))
+}
 /// A session's grants with its endpoint grant following its model: the one its model needs, or none (#461). Every
 /// session gets it this way, a sub-session too (ADR 27, 2026-11-07): a model gives no reach into anything else, so a
 /// child's isn't limited to its parent's.
@@ -332,7 +347,13 @@ impl ModelProvider for OwnEndpoints {
             .trim_end_matches('/')
             .to_owned();
         let key = self.credentials.reveal(&row).map_err(contract_error)?;
-        Ok(Some(ModelTarget { base_url, key }))
+        Ok(Some(ModelTarget {
+            base_url,
+            key,
+            // Every session on the endpoint uses its one key.
+            key_id: format!("credential:{}", row.id),
+            shared: Some(row.name.clone()),
+        }))
     }
 }
 
@@ -676,7 +697,7 @@ pub async fn switch(
         }
     }
     let new_grant = match &to {
-        Some(to) => match state.providers.grant(&row.owner, to).await {
+        Some(to) => match session_grant(state, &row.owner, to).await {
             Ok(Ok(grant)) => Some(grant),
             Ok(Err(why)) => return Some(Err(RpcError::new(-32602, why))),
             Err(e) => return Some(Err(RpcError::new(-32603, format!("{e:#}")))),
@@ -724,6 +745,10 @@ pub async fn switch(
         Ok(true) => {
             // What the old grant had made is no longer needed, unless the new one is on the same endpoint. A release
             // that fails is left to the sweep.
+            // What the old key spent since the last read, before it goes.
+            if old_grant.is_some() && !same_endpoint(old_grant.as_ref(), new_grant.as_ref()) {
+                crate::spend::read_last(state, &old_context).await;
+            }
             if let Some(old) = &old_grant
                 && !same_endpoint(Some(old), new_grant.as_ref())
                 && let Err(e) = state

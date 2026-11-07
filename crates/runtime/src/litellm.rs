@@ -165,14 +165,29 @@ fn secret_name(session_id: &str, location: &str) -> String {
     format!("{}-key", key_name(session_id, location))
 }
 
+/// A minted key's identity for the spend kept per key: its virtual key's name, and a digest of the key itself, since a
+/// session that comes back to a proxy gets a new key under the same name, with spend of its own.
+fn spend_id(name: &str, key: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(key.as_bytes());
+    let short: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
+    format!("litellm:{name}:{short}")
+}
+
 /// The label every session virtual key carries, which the sweep lists them by.
 const KEY_LABEL: &str = "sloppod.dev/endpoint-key";
 
 /// The `LiteLLMVirtualKey` a session on `model` of the proxy at `namespace/proxy` gets: limited to that model, named
 /// for the session and its owner, its key in a Secret of its own.
-pub fn virtual_key(session: &SessionContext, namespace: &str, proxy: &str, model: &str) -> Value {
+pub fn virtual_key(
+    session: &SessionContext,
+    namespace: &str,
+    proxy: &str,
+    model: &str,
+    budget: Option<f64>,
+) -> Value {
     let at = location(namespace, proxy);
-    json!({
+    let mut key = json!({
         "apiVersion": format!("{GROUP}/{VERSION}"),
         "kind": "LiteLLMVirtualKey",
         "metadata": {
@@ -191,7 +206,12 @@ pub fn virtual_key(session: &SessionContext, namespace: &str, proxy: &str, model
             "keyAlias": key_name(&session.session_id, &at),
             "metadata": {"sloppod_session": session.session_id, "sloppod_owner": session.owner},
         },
-    })
+    });
+    // The owner's budget per session, which LiteLLM enforces on the key.
+    if let Some(budget) = budget {
+        key["spec"]["maxBudget"] = json!(budget.to_string());
+    }
+    key
 }
 
 /// What the runtime does with sessions' virtual keys in the cluster.
@@ -426,7 +446,13 @@ impl ModelProvider for LiteLlm {
             ));
         };
         self.keys
-            .apply(&virtual_key(session, namespace, proxy, model))
+            .apply(&virtual_key(
+                session,
+                namespace,
+                proxy,
+                model,
+                grant.params["max_budget"].as_f64(),
+            ))
             .await
             .map_err(contract_error)
     }
@@ -439,15 +465,28 @@ impl ModelProvider for LiteLlm {
         let name = key_name(&session.session_id, at);
         let cached = self.minted.lock().unwrap().get(&name).cloned();
         if let Some(key) = cached {
-            return Ok(Some(ModelTarget { base_url, key }));
+            return Ok(Some(ModelTarget {
+                base_url,
+                key_id: spend_id(&name, &key),
+                key,
+                shared: None,
+            }));
         }
         // The operator mints the key a moment after the virtual key is made; a session's first request may beat it.
         let secret = secret_name(&session.session_id, at);
         let deadline = tokio::time::Instant::now() + self.key_wait;
         loop {
             if let Some(key) = self.keys.secret(&secret).await.map_err(contract_error)? {
-                self.minted.lock().unwrap().insert(name, key.clone());
-                return Ok(Some(ModelTarget { base_url, key }));
+                self.minted
+                    .lock()
+                    .unwrap()
+                    .insert(name.clone(), key.clone());
+                return Ok(Some(ModelTarget {
+                    base_url,
+                    key_id: spend_id(&name, &key),
+                    key,
+                    shared: None,
+                }));
             }
             if tokio::time::Instant::now() >= deadline {
                 return Ok(None);
@@ -880,5 +919,42 @@ mod tests {
         let mut expected = vec![key_name("0195f3a2", "litellm/ai/main"), fresh];
         expected.sort();
         assert_eq!(left, expected);
+    }
+
+    #[tokio::test]
+    async fn a_key_made_again_for_a_proxy_has_a_spend_of_its_own() {
+        let keys = Arc::new(FakeKeys::default());
+        let providers = providers_with(&keys);
+        let main = grant_of(&providers, "endpoint:litellm/ai/main:glm-5.2").await;
+        let name = key_name("0195f3a2", "litellm/ai/main");
+        providers.provision(&on(Some(&main))).await.unwrap();
+        keys.secrets
+            .lock()
+            .unwrap()
+            .insert(format!("{name}-key"), "sk-first".into());
+        let first = providers
+            .target(&on(Some(&main)))
+            .await
+            .unwrap()
+            .unwrap()
+            .key_id;
+        // Away to another proxy and back: the first key is deleted, and the operator mints another under its name.
+        providers
+            .release("0195f3a2", std::slice::from_ref(&main))
+            .await
+            .unwrap();
+        keys.secrets
+            .lock()
+            .unwrap()
+            .insert(format!("{name}-key"), "sk-second".into());
+        providers.provision(&on(Some(&main))).await.unwrap();
+        let second = providers
+            .target(&on(Some(&main)))
+            .await
+            .unwrap()
+            .unwrap()
+            .key_id;
+        assert!(first.starts_with(&format!("litellm:{name}:")));
+        assert_ne!(first, second, "each key's spend is its own");
     }
 }

@@ -444,6 +444,14 @@ pub struct ModelTarget {
     /// The Messages API's base URL.
     pub base_url: String,
     pub key: String,
+    /// The key's stable identity, for the spend kept per key: a session's own key has one per session and endpoint (a
+    /// LiteLLM virtual key), a shared one, one for all (an endpoint credential's).
+    #[serde(default)]
+    pub key_id: String,
+    /// What shares the key, by name, when several sessions do (an endpoint credential); `None` when it's the
+    /// session's own.
+    #[serde(default)]
+    pub shared: Option<String>,
 }
 
 /// Leaves the key out, so logging one can't leak it.

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Alert, Button, Field, Heading, LoadingSpinner, Select, Text, toastManager } from '@immich/ui';
+  import { Alert, Button, Field, Heading, Input, LoadingSpinner, Select, Text, toastManager } from '@immich/ui';
   import { onMount } from 'svelte';
   import { api, type ReviewPolicy, type Settings } from '#lib/api.ts';
   import ModelField from './ModelField.svelte';
@@ -10,11 +10,17 @@
   let model = $state('');
   let subSessionModel = $state('');
   let review = $state<ReviewPolicy>('off');
+  // Dollars, as typed; empty for no limit.
+  let budget = $state('');
+  // Only a plain number above 0 is a budget; anything else typed is an error, never taken for "no limit".
+  const budgetValue = $derived(budget.trim() === '' ? null : /^\d+(\.\d+)?$/.test(budget.trim()) && Number(budget) > 0 ? Number(budget) : NaN);
+  const budgetInvalid = $derived(Number.isNaN(budgetValue));
 
   const changed = $derived(
     model.trim() !== (settings?.model ?? '') ||
       subSessionModel.trim() !== (settings?.sub_session_model ?? '') ||
-      review !== (settings?.review ?? 'off'),
+      review !== (settings?.review ?? 'off') ||
+      budgetValue !== (settings?.session_budget ?? null),
   );
   const reviewOptions = [
     { value: 'off', label: 'Only when the agent asks' },
@@ -26,6 +32,7 @@
     model = loaded.model ?? '';
     subSessionModel = loaded.sub_session_model ?? '';
     review = loaded.review;
+    budget = loaded.session_budget === null ? '' : String(loaded.session_budget);
   }
 
   onMount(async () => {
@@ -38,6 +45,7 @@
 
   async function save(event: SubmitEvent) {
     event.preventDefault();
+    if (budgetInvalid) return;
     saving = true;
     try {
       load(
@@ -45,6 +53,7 @@
           model: model.trim() || null,
           sub_session_model: subSessionModel.trim() || null,
           review,
+          session_budget: budgetInvalid ? undefined : budgetValue,
         }),
       );
       toastManager.success('Saved your defaults');
@@ -83,11 +92,23 @@
         />
       </div>
       <div class="min-w-48 grow">
+        <Field
+          label="Budget per session"
+          description="The most a session on a LiteLLM operator model may spend, in dollars; LiteLLM refuses it after that. Empty for no limit."
+          invalid={budgetInvalid}
+        >
+          <Input bind:value={budget} inputmode="decimal" placeholder="No limit" autocomplete="off" data-testid="session-budget" />
+          {#if budgetInvalid}
+            <Text color="danger" size="small" data-testid="session-budget-error">A number of dollars, like 5 or 2.50, or empty for no limit.</Text>
+          {/if}
+        </Field>
+      </div>
+      <div class="min-w-48 grow">
         <Field label="Review by Codex" description="Another model reviews proposals before you see them; needs a ChatGPT login.">
           <Select options={reviewOptions} value={review} onChange={(value) => (review = value as ReviewPolicy)} />
         </Field>
       </div>
-      <Button type="submit" shape="round" loading={saving} disabled={!changed}>Save</Button>
+      <Button type="submit" shape="round" loading={saving} disabled={!changed || budgetInvalid}>Save</Button>
     </form>
   {/if}
 </section>
