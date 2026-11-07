@@ -1321,8 +1321,11 @@ test('marks where the reader left off, and opens there, on this device or anothe
 
   // Reading to the end takes the bar away, and moves the position on for both.
   await page.getByText('Unread first.').hover();
-  await page.mouse.wheel(0, 5000);
-  await expect(divider).toHaveCount(0);
+  // A wheel event scrolls a page at most in some browsers (Firefox), so it takes as many as it takes to reach the end.
+  await expect(async () => {
+    await page.mouse.wheel(0, 5000);
+    await expect(divider).toHaveCount(0, { timeout: 1000 });
+  }).toPass();
   const moved = await readPosition(page, id, read);
   await phone.reload();
   await expect(phone.getByText('line 11', { exact: true }).last()).toBeInViewport();
@@ -1451,6 +1454,7 @@ test('jumping to the latest message from the unread bar goes on following the bo
   const read = await readPosition(page, id);
   await page.getByText('The end.').hover();
   await page.mouse.wheel(0, -2000);
+  await expect(page.getByText('The end.')).not.toBeInViewport();
   await page.request.post(`/_mock/say?text=Unread%20one.%0A%0A${LONG_SAY}`);
   await expect(page.getByTestId('unread-divider')).toHaveCount(1);
   expect(await readPosition(page, id)).toBe(read);
