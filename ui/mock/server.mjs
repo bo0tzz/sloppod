@@ -1868,6 +1868,17 @@ async function handleApi(req, res, url) {
   if (parts[0] === 'quotas' && parts.length === 1 && method === 'GET') return json(res, 200, quotas);
   if (parts[0] === 'standing-approvals') return handleStandingApprovals(req, res, parts);
 
+  if (parts[0] === 'storage' && parts.length === 1 && method === 'GET') {
+    // Every session has a volume, of 20 GB, deleted ones too; and one whose session nobody knows.
+    const volumes = [...sessions.values()].map((session) => ({
+      name: `workdir-sloppod-${session.data.id}`,
+      capacity: 20_000_000_000,
+      session: session.data,
+    }));
+    volumes.push({ name: 'workdir-sloppod-00000000-0000-7000-8000-000000000000', capacity: 20_000_000_000 });
+    return json(res, 200, { volumes });
+  }
+
   if (parts[0] === 'settings' && parts.length === 1) {
     if (method === 'GET') return json(res, 200, settings);
     if (method === 'PUT') {
@@ -2718,6 +2729,29 @@ const server = http.createServer(async (req, res) => {
       const task = url.searchParams.get('task') ?? 'A sub-task';
       const child = createSession({ prompt: task, repo: parent.data.repo ?? undefined, title: task, parent: parent.data.id });
       return json(res, 200, child.data);
+    }
+    if (url.pathname === '/_mock/unmeasured' && req.method === 'POST') {
+      // Parked before sessions said how much they use: a work session, and a reviewer.
+      const made = ['work', 'review'].map((kind) => {
+        const at = now();
+        const session = new MockSession({
+          id: randomUUID(),
+          title: kind === 'work' ? 'Parked long ago' : 'Review: an old change',
+          repo: 'bo0tzz/sloppod',
+          branch: null,
+          grants: [],
+          phase: 'parked',
+          agent: kind === 'work' ? 'claude-code' : 'codex',
+          kind,
+          review: 'off',
+          created_at: at,
+          updated_at: at,
+          active_at: at,
+        });
+        sessions.set(session.data.id, session);
+        return session.data.id;
+      });
+      return json(res, 200, made);
     }
     if (url.pathname === '/_mock/notice' && req.method === 'POST') {
       // A notice in every session, folded under `summary` if given, as a message from another session is.

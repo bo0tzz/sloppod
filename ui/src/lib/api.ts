@@ -453,6 +453,8 @@ export const api = {
   listDeletedSessions: () => call<Session[]>('GET', '/sessions/deleted'),
   restoreSession: (id: string) => call<Session>('POST', `/sessions/${encodeURIComponent(id)}/restore`, {}),
   parkSession: (id: string) => call<Session>('POST', `/sessions/${encodeURIComponent(id)}/park`, {}),
+  /** Every session volume the cluster holds that the user should see (#455): their sessions', and unknown ones. */
+  getStorage: () => call<Storage>('GET', '/storage'),
   setVolumeKept: (id: string, kept: boolean) =>
     call<Session>('PUT', `/sessions/${encodeURIComponent(id)}/volume`, { kept }),
   wakeSession: (id: string) => call<Session>('POST', `/sessions/${encodeURIComponent(id)}/wake`, {}),
@@ -567,3 +569,8 @@ export function newerProposal(current: Proposal | undefined, incoming: Proposal)
 export function sortSessions(sessions: Session[]): Session[] {
   return [...sessions].sort((a, b) => Date.parse(b.active_at) - Date.parse(a.active_at));
 }
+
+/** A session's workspace volume in the cluster: its claim's name and size, and its session, absent when unknown. */
+export type StoredVolume = { name: string; capacity: number | null; session?: Session };
+
+export type Storage = { volumes: StoredVolume[] };

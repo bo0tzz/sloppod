@@ -4456,8 +4456,26 @@ test("a session's disk use shows in the list, its header and Settings, and stays
   const storage = page.getByTestId('storage');
   const listed = storage.locator(`[data-testid="storage-session"][data-session="${id}"]`);
   await expect(listed.getByTestId('storage-used')).toHaveText('700 MB');
-  await expect(storage.getByTestId('storage-total')).toContainText(/used by \d+ sessions?/);
+  await expect(storage.getByTestId('storage-total')).toContainText(/^\d+ volumes?, .* used/);
   await listed.getByRole('button', { name: /^Park the session/ }).click();
   await expect(listed.getByRole('button', { name: /^Park the session/ })).toHaveCount(0);
   await expect(listed.getByTestId('storage-used')).toHaveText('700 MB');
+});
+
+test('Storage lists every volume: a session never measured, a reviewer, and one of no known session', async ({ page }) => {
+  const [parked, reviewer] = await (await page.request.post('/_mock/unmeasured')).json();
+  await page.goto('/settings');
+  const storage = page.getByTestId('storage');
+  const row = (id: string) => storage.locator(`[data-testid="storage-session"][data-session="${id}"]`);
+
+  // Parked before sessions said how much they use: listed, and not measured, rather than left out.
+  await expect(row(parked).getByTestId('storage-used')).toHaveText('not measured');
+  await expect(row(reviewer).getByTestId('storage-used')).toHaveText('not measured');
+  await expect(row(reviewer).getByTestId('storage-reviewer')).toHaveText('reviewer');
+  await expect(storage.getByTestId('storage-total')).toContainText(/\d+ not measured/);
+
+  // A volume whose session nobody knows has a group of its own, by its name, and is left alone.
+  const unknown = storage.getByTestId('storage-unknown');
+  await expect(unknown).toContainText('of no known session');
+  await expect(unknown.getByTestId('storage-unknown-volume')).toHaveText('workdir-sloppod-00000000-0000-7000-8000-000000000000');
 });

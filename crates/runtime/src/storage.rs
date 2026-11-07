@@ -7,7 +7,8 @@
 
 use std::collections::BTreeSet;
 
-use sloppod_protocol::api::Phase;
+use sloppod_contracts::Volume;
+use sloppod_protocol::api::{self, Phase};
 use uuid::Uuid;
 
 use crate::{AppState, db, lifecycle};
@@ -191,9 +192,96 @@ pub async fn sweep_leftovers(state: &AppState) {
     }
 }
 
+/// Which of the cluster's session volumes the user sees, and whose: each volume of a session of theirs, of any kind and
+/// deleted ones included, with that session; each volume whose session the database doesn't know, with none (they're
+/// left alone by the sweep, and shown so they can be found); not other users' sessions' volumes.
+pub fn account<'a>(
+    volumes: Vec<Volume>,
+    sessions: &'a [db::SessionRow],
+    owner: &str,
+) -> Vec<(Volume, Option<&'a db::SessionRow>)> {
+    volumes
+        .into_iter()
+        .filter_map(|volume| {
+            let id = volume
+                .session_id
+                .as_deref()
+                .and_then(|s| s.parse::<Uuid>().ok());
+            match id.and_then(|id| sessions.iter().find(|row| row.id == id)) {
+                Some(row) if row.owner == owner => Some((volume, Some(row))),
+                Some(_) => None,
+                None => Some((volume, None)),
+            }
+        })
+        .collect()
+}
+
+/// `GET /storage`: every volume the cluster holds for the user's sessions, and those of sessions nobody knows.
+pub async fn storage(state: &AppState, owner: &str) -> anyhow::Result<api::Storage> {
+    let volumes = state
+        .placement
+        .volumes()
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let ids: Vec<Uuid> = volumes
+        .iter()
+        .filter_map(|v| v.session_id.as_deref()?.parse().ok())
+        .collect();
+    let sessions = db::sessions_by_id(&state.db, &ids).await?;
+    let mut listed = Vec::new();
+    for (volume, session) in account(volumes, &sessions, owner) {
+        let session = match session {
+            Some(row) => Some(state.hub.session_api(row).await),
+            None => None,
+        };
+        listed.push(api::StoredVolume {
+            name: volume.name,
+            capacity: volume.capacity,
+            session,
+        });
+    }
+    Ok(api::Storage { volumes: listed })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_user_sees_their_sessions_volumes_of_any_kind_and_unknown_ones() {
+        let volume = |id: Uuid| Volume {
+            name: format!("workdir-sloppod-{id}"),
+            session_id: Some(id.to_string()),
+            capacity: Some(20 << 30),
+        };
+        let mut parked = db::SessionRow::for_test(Uuid::new_v4(), "dev");
+        parked.phase = "parked".into();
+        let mut reviewer = db::SessionRow::for_test(Uuid::new_v4(), "dev");
+        reviewer.kind = sloppod_protocol::api::SessionKind::Review;
+        let mut deleted = db::SessionRow::for_test(Uuid::new_v4(), "dev");
+        deleted.deleted_at = Some(chrono::Utc::now());
+        let theirs = db::SessionRow::for_test(Uuid::new_v4(), "someone-else");
+        let unknown = Uuid::new_v4();
+        let rows = [
+            parked.clone(),
+            reviewer.clone(),
+            deleted.clone(),
+            theirs.clone(),
+        ];
+        let volumes = [parked.id, reviewer.id, deleted.id, theirs.id, unknown]
+            .map(volume)
+            .to_vec();
+        let shown = account(volumes, &rows, "dev");
+        let ids: Vec<Option<Uuid>> = shown.iter().map(|(_, row)| row.map(|r| r.id)).collect();
+        assert_eq!(
+            ids,
+            [Some(parked.id), Some(reviewer.id), Some(deleted.id), None]
+        );
+        // Never measured, its claim's size still shows.
+        assert!(shown[0].1.unwrap().disk_used.is_none());
+        assert_eq!(shown[0].0.capacity, Some(20 << 30));
+        assert_eq!(shown[3].0.name, format!("workdir-sloppod-{unknown}"));
+    }
 
     #[test]
     fn only_a_purged_sessions_objects_are_removed_and_an_unknown_ones_are_reported() {

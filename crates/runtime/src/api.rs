@@ -38,6 +38,7 @@ pub fn routes() -> Router<AppState> {
         .route("/sessions/{id}/wake", post(wake_session))
         .route("/sessions/{id}/review", put(set_review))
         .route("/sessions/{id}/volume", put(set_volume))
+        .route("/storage", get(list_storage))
         .route("/sessions/{id}/debug-bundle", get(debug_bundle))
         .route("/sessions/{id}/read", put(set_read))
         .route("/sessions/{id}/work-done", get(work_done))
@@ -318,6 +319,14 @@ async fn set_review(
 #[derive(Deserialize)]
 struct SetVolume {
     kept: bool,
+}
+
+/// Every session volume the cluster holds that the user should see: their sessions' and those of unknown sessions.
+async fn list_storage(
+    State(state): State<AppState>,
+    User(user): User,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(crate::storage::storage(&state, &user).await?))
 }
 
 /// Keeps a stopped session's volume, or lets it be removed a week after the session stopped (#455).

@@ -660,6 +660,16 @@ pub async fn set_volume_kept(db: &PgPool, id: Uuid, kept: bool) -> sqlx::Result<
     Ok(result.rows_affected() > 0)
 }
 
+/// The sessions with these ids, whoever owns them and whatever became of them.
+pub async fn sessions_by_id(db: &PgPool, ids: &[Uuid]) -> sqlx::Result<Vec<SessionRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "select {SESSION_COLUMNS} from sessions where id = any($1)"
+    )))
+    .bind(ids)
+    .fetch_all(db)
+    .await
+}
+
 /// Of `ids`, the sessions the database knows, and of those the ones it has purged: whose objects may go.
 pub async fn known_sessions(db: &PgPool, ids: &[Uuid]) -> sqlx::Result<(Vec<Uuid>, Vec<Uuid>)> {
     let rows: Vec<(Uuid, bool)> =

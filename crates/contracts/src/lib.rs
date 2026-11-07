@@ -471,6 +471,22 @@ pub trait PlacementBackend: Send + Sync {
     async fn sessions(&self) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
+    /// The volumes it holds in the cluster for sessions, whatever becomes of their sessions: what Settings → Storage
+    /// accounts for. None by default, for a backend that can't list them.
+    async fn volumes(&self) -> Result<Vec<Volume>> {
+        Ok(Vec::new())
+    }
+}
+
+/// A volume the placement backend holds for a session, as the cluster has it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Volume {
+    /// Its name in the cluster, e.g. a PersistentVolumeClaim's.
+    pub name: String,
+    /// The session it's for, by its name; none when it doesn't say.
+    pub session_id: Option<String>,
+    /// Its size in bytes, as the cluster provisioned it (or was asked to); none when it doesn't say.
+    pub capacity: Option<u64>,
 }
 
 /// A session's pod the cluster can't place, as the placement backend sees it (#454).

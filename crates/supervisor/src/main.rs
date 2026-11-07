@@ -466,6 +466,11 @@ async fn run(
             }
             stop(&mut a.child).await;
             sync_transcript(&a.transcript_dir, &mut a.synced, &mut sink).await;
+            // A last measurement once the agent has stopped writing, so a parked session shows what it keeps (#455).
+            // `df` reads the filesystem's counters, so it takes milliseconds, well inside the grace period.
+            if let Some((used, size)) = disk_use(&args.workdir).await {
+                let _ = send(&mut sink, &FromSupervisor::Disk { used, size }).await;
+            }
             Ending::Terminate
         }
     };

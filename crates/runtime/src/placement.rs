@@ -5,7 +5,9 @@ use kube::api::{
     Api, ApiResource, DeleteParams, DynamicObject, GroupVersionKind, Patch, PatchParams,
 };
 use serde_json::json;
-use sloppod_contracts::{Error, Manifest, PlacementBackend, PlacementSpec, Result, Unschedulable};
+use sloppod_contracts::{
+    Error, Manifest, PlacementBackend, PlacementSpec, Result, Unschedulable, Volume,
+};
 
 pub const WORKDIR: &str = "/workspace";
 pub const TOKEN_DIR: &str = "/var/run/secrets/sloppod";
@@ -23,6 +25,31 @@ fn claim_name(session_id: &str) -> String {
 fn claim_session(name: &str) -> Option<&str> {
     name.strip_prefix("workdir-sloppod-")
         .filter(|rest| rest.parse::<uuid::Uuid>().is_ok())
+}
+
+/// A Kubernetes quantity of storage in bytes, e.g. `20Gi`, `10G`, `512Mi` or `1048576`; none for one it can't read.
+fn bytes(quantity: &str) -> Option<u64> {
+    let quantity = quantity.trim();
+    let split = quantity
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(quantity.len());
+    let (number, suffix) = quantity.split_at(split);
+    let number: f64 = number.parse().ok()?;
+    let factor: f64 = match suffix {
+        "" => 1.0,
+        "k" => 1e3,
+        "M" => 1e6,
+        "G" => 1e9,
+        "T" => 1e12,
+        "P" => 1e15,
+        "Ki" => 1024.0,
+        "Mi" => 1024f64.powi(2),
+        "Gi" => 1024f64.powi(3),
+        "Ti" => 1024f64.powi(4),
+        "Pi" => 1024f64.powi(5),
+        _ => return None,
+    };
+    Some((number * factor).round() as u64)
 }
 
 pub struct AgentSandbox {
@@ -245,6 +272,44 @@ impl PlacementBackend for AgentSandbox {
         Ok(sessions)
     }
 
+    async fn volumes(&self) -> Result<Vec<Volume>> {
+        let claims = self
+            .claims
+            .list(&kube::api::ListParams::default())
+            .await
+            .map_err(err)?;
+        Ok(claims
+            .items
+            .iter()
+            .filter_map(|claim| {
+                let name = claim.metadata.name.clone()?;
+                // Only sessions' workspace claims: the namespace may hold others.
+                let session_id = claim_session(&name)?.to_owned();
+                // What was provisioned, or else what was asked for.
+                let capacity = claim
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.capacity.as_ref()?.get("storage"))
+                    .or_else(|| {
+                        claim
+                            .spec
+                            .as_ref()?
+                            .resources
+                            .as_ref()?
+                            .requests
+                            .as_ref()?
+                            .get("storage")
+                    })
+                    .and_then(|quantity| bytes(&quantity.0));
+                Some(Volume {
+                    name,
+                    session_id: Some(session_id),
+                    capacity,
+                })
+            })
+            .collect())
+    }
+
     fn unschedulable(&self) -> Vec<Unschedulable> {
         self.index.unschedulable()
     }
@@ -263,5 +328,24 @@ impl PlacementBackend for AgentSandbox {
         session_id
             .parse()
             .is_ok_and(|session| self.index.has_pod(session))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_storage_quantities() {
+        assert_eq!(bytes("20Gi"), Some(20 * 1024 * 1024 * 1024));
+        assert_eq!(bytes("10G"), Some(10_000_000_000));
+        assert_eq!(bytes("1.5Gi"), Some(1_610_612_736));
+        assert_eq!(bytes("1048576"), Some(1_048_576));
+        assert_eq!(bytes("lots"), None);
+        assert_eq!(
+            claim_session("workdir-sloppod-0194f0a2-0000-7000-8000-000000000000"),
+            Some("0194f0a2-0000-7000-8000-000000000000")
+        );
+        assert_eq!(claim_session("data-postgres-0"), None);
     }
 }
