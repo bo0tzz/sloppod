@@ -202,15 +202,29 @@
     };
   });
 
+  /**
+   * How tall the view was, and how far from the bottom, when it last settled. The view getting taller or shorter (the
+   * message box growing as it's typed in) can come with a scroll event of its own, from the browser, and that says
+   * nothing about the reader: whether the view was following the bottom is what it was before the resize.
+   */
+  let settled = { height: 0, gap: 0 };
+  function settle() {
+    if (scroller) settled = { height: scroller.clientHeight, gap: bottomGap() };
+  }
+  const bottomGap = () => (scroller ? scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight : 0);
+  const viewResized = () => Boolean(scroller) && scroller!.clientHeight !== settled.height;
+
   function onScroll() {
     if (!scroller || !positioned) return;
     scheduleRead();
     if (holdBar) return;
-    if (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80) {
+    const resized = viewResized();
+    if (bottomGap() < 80) {
       atBottom = true;
-    } else if (pointerHeld || performance.now() - lastUserScroll < 1000) {
+    } else if (!resized && (pointerHeld || performance.now() - lastUserScroll < 1000)) {
       atBottom = false;
     }
+    if (!resized) settle();
   }
 
   // Only the reader stops the view following new output. The browser scrolls by itself too, e.g. to keep what's on
@@ -343,9 +357,12 @@
     if (!content || !scroller) return;
     const observer = new ResizeObserver(() => {
       if (!positioned) return;
+      // A view that was at the bottom before it was resized stays there, whatever scroll events the resize caused.
+      if (settled.height > 0 && viewResized() && settled.gap < 80) atBottom = true;
       // Rows off screen are laid out at a guess until they come near, so the bar's place keeps moving as they do.
       if (holdBar) scrollToBar();
       else if (atBottom) scrollToBottom();
+      settle();
       scheduleRead();
     });
     observer.observe(content);
