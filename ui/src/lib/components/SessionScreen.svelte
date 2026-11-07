@@ -265,6 +265,42 @@
 
   /** What the reader has scrolled past, and where the "Unread" bar goes (#48). */
   const CONTEXT_ABOVE_UNREAD = 96;
+  /**
+   * Whether the reader is here: the page is showing, and its window has focus. A page in a background tab, or a window
+   * behind others, follows the bottom as output comes in but isn't being read. Focus counts as well as visibility, as a
+   * window behind another is still visible; it's reliable in desktop browsers and on phones, though someone reading
+   * a window beside the one they type in isn't counted until they click it.
+   */
+  const attending = () => document.visibilityState === 'visible' && document.hasFocus();
+  /** Here, and for a moment already: only then does what's on screen count as read, and the bar give way. */
+  let reading = $state(typeof document === 'undefined' || attending());
+  const BACK_FOR_A_MOMENT_MS = 1500;
+  let backTimer: ReturnType<typeof setTimeout> | undefined;
+  function attentionChanged() {
+    clearTimeout(backTimer);
+    if (!attending()) {
+      reading = false;
+      return;
+    }
+    backTimer = setTimeout(() => {
+      reading = true;
+      scheduleRead();
+    }, BACK_FOR_A_MOMENT_MS);
+  }
+  onMount(() => {
+    document.addEventListener('visibilitychange', attentionChanged);
+    window.addEventListener('focus', attentionChanged);
+    window.addEventListener('blur', attentionChanged);
+    // Opened in the background: the first time the reader looks, not now.
+    if (!reading) attentionChanged();
+    return () => {
+      document.removeEventListener('visibilitychange', attentionChanged);
+      window.removeEventListener('focus', attentionChanged);
+      window.removeEventListener('blur', attentionChanged);
+      clearTimeout(backTimer);
+    };
+  });
+
   /** Set once the view has started where it's going to, at the bar or the bottom: until then nothing counts as read. */
   let positioned = $state(false);
   /** The read position the bar is drawn from. It follows reading while the view is at the bottom, and holds still while scrolled up, so the bar stays put as the reader passes it. */
@@ -273,7 +309,7 @@
   let holdBar = $state(false);
 
   $effect(() => {
-    if (positioned && atBottom && !holdBar) unreadAfter = view.readSeq || null;
+    if (positioned && atBottom && !holdBar && reading) unreadAfter = view.readSeq;
   });
 
   const rowElements = () => (content ? [...content.querySelectorAll<HTMLElement>('[data-seq]')] : []);
@@ -284,7 +320,7 @@
    * later in the log than rows after it that haven't been seen.
    */
   function reportRead() {
-    if (!positioned || !scroller) return;
+    if (!positioned || !scroller || !reading) return;
     const bottom = scroller.getBoundingClientRect().bottom + 1;
     let seq = 0;
     let below = Infinity;
@@ -320,9 +356,10 @@
     if (positioned || !view.loaded || !view.session || !scroller) return;
     const read = view.session.read_seq;
     positioned = true;
-    unreadAfter = read ?? null;
+    unreadAfter = read ?? 0;
     if (read === undefined || !view.transcript.items.some((item) => item.addedSeq > read)) {
-      unreadAfter = view.readSeq || null;
+      // Nothing read yet is a baseline of 0, so what comes in before the first report is unread if nobody is looking.
+      unreadAfter = view.readSeq;
       scrollToBottom();
       void tick().then(() => scrollToBottom());
       return;
@@ -678,7 +715,7 @@
                   onSeen={(highlight) => view.markHighlightSeen(highlight)}
                   onResume={view.unsent.length > 0 ? undefined : resume}
                   awaiting={new Set(view.permissions.map((request) => request.toolCall.toolCallId))}
-                  unreadAfter={atBottom && !holdBar ? null : unreadAfter}
+                  unreadAfter={atBottom && !holdBar && reading ? null : unreadAfter}
                 />
                 {#if activity}
                   <div class="text-muted flex items-center gap-2 py-1 text-sm" data-testid="activity">
