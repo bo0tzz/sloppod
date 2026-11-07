@@ -1380,6 +1380,29 @@ mod tests {
                 .await
                 .is_err()
         );
+        // An endpoint grant's endpoint is its model's: it changes with the model, never on its own (#461).
+        let endpoint = add(&credentials, "dev", {
+            let mut config = serde_json::Map::new();
+            config.insert("url".into(), json!("http://litellm:4000"));
+            config.insert("models".into(), json!("qwen3"));
+            NewCredential {
+                kind: ENDPOINT.into(),
+                name: "litellm".into(),
+                config,
+                secret: "sk".into(),
+            }
+        })
+        .await;
+        let refused = given(
+            &Grant::new(
+                "endpoint",
+                json!({"credentials": [endpoint.id.to_string()]}),
+            ),
+            &[endpoint.id],
+        )
+        .await
+        .unwrap_err();
+        assert!(refused.contains("model selector"), "{refused}");
     }
     async fn defaults(credentials: &Credentials) -> Vec<String> {
         let rows = credentials.list("dev").await.unwrap();

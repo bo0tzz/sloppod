@@ -41,6 +41,13 @@ pub async fn accounts_given(
             grant.capability
         )));
     };
+    // Its endpoint is the model's: another one is another model, which the session moves onto as a whole (#461).
+    if grant.capability == sloppod_contracts::capability::ENDPOINT {
+        return Ok(Err(
+            "an endpoint grant follows the session's model; choose another model in the session's model selector instead"
+                .into(),
+        ));
+    }
     if ids.is_empty() {
         return Ok(Err("a model grant names at least one account".into()));
     }

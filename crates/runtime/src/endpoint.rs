@@ -423,39 +423,69 @@ pub async fn switch(
     if was.is_none() && to.is_none() {
         return None;
     }
-    let phase = row.phase();
-    if matches!(
-        phase,
-        sloppod_protocol::api::Phase::Working | sloppod_protocol::api::Phase::Waiting
-    ) {
-        return Some(Err(RpcError::new(
-            -32602,
-            "switching to or from an endpoint's model starts the agent again; do it while the session is idle",
-        )));
+    // Off an endpoint, onto the agent's own provider: the session needs its account and grant for that.
+    if to.is_none() {
+        let needed = adapter.credential();
+        let has_account = match state
+            .credentials
+            .has_default(&row.owner, &needed.kind)
+            .await
+        {
+            Ok(has) => has,
+            Err(e) => return Some(Err(RpcError::new(-32603, e.to_string()))),
+        };
+        let inference = adapter.inference_capability();
+        if !has_account || !row.grants().iter().any(|g| g.capability == inference) {
+            return Some(Err(RpcError::new(
+                -32602,
+                format!(
+                    "{model} needs {} and the {inference} grant; add the account in Settings, or choose another of your endpoints' models",
+                    needed.name
+                ),
+            )));
+        }
     }
     let mut grants = Vec::new();
     follow_model(&mut grants, to.as_ref());
-    if let Err(e) = db::set_model_and_endpoint(&state.db, session, &model, grants.first()).await {
-        return Some(Err(RpcError::new(-32603, e.to_string())));
-    }
-    state.hub.broadcast_session(session).await;
-    // A parked session starts on it when it's woken.
-    if phase != sloppod_protocol::api::Phase::Parked
-        && phase != sloppod_protocol::api::Phase::Stopped
-    {
-        let id = session.to_string();
-        let replaced = state
-            .hub
-            .replace_pod(session, || async {
+    let old_grant = row
+        .grants()
+        .into_iter()
+        .find(|g| g.capability == capability::ENDPOINT);
+    let old_model = row.model.clone().unwrap_or_default();
+    let id = session.to_string();
+    let moved = state
+        .hub
+        .switch_provider(
+            session,
+            || async {
+                db::set_model_and_endpoint(&state.db, session, &model, grants.first()).await?;
+                Ok(())
+            },
+            || async {
                 state.placement.replace_pod(&id).await?;
                 Ok(())
-            })
-            .await;
-        if !matches!(replaced, Ok(true)) {
-            tracing::warn!(%session, result = ?replaced, "starting a session again on its new model; it moves when its pod is next replaced");
+            },
+            || async {
+                db::set_model_and_endpoint(&state.db, session, &old_model, old_grant.as_ref())
+                    .await?;
+                Ok(())
+            },
+        )
+        .await;
+    match moved {
+        Ok(true) => {
+            state.hub.broadcast_session(session).await;
+            Some(Ok(json!({})))
         }
+        Ok(false) => Some(Err(RpcError::new(
+            -32602,
+            "switching to or from an endpoint's model starts the agent again, so it waits until the session is quiet: no turn, nothing queued, no open question and none of its commands running",
+        ))),
+        Err(e) => Some(Err(RpcError::new(
+            -32603,
+            format!("the session stays on its model: {e:#}"),
+        ))),
     }
-    Some(Ok(json!({})))
 }
 
 #[cfg(test)]

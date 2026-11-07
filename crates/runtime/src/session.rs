@@ -2811,6 +2811,63 @@ impl Hub {
         Ok(true)
     }
 
+    /// Moves a session onto another provider's model (#461), under its transition lock and only while nothing is in
+    /// flight: parked, when `change` records it and the session starts on it when woken; or idle, with no turn,
+    /// queue, open request or running command, when `change` records it and `replace` starts the agent again on a
+    /// new pod. If the pod can't be replaced, `revert` puts the record back and the old agent carries on, so the
+    /// agent never runs against routing that isn't its own. Says whether it moved; `false` when the session isn't
+    /// quiet, and nothing was changed.
+    pub async fn switch_provider<C, CF, R, RF, V, VF>(
+        self: &Arc<Self>,
+        id: Uuid,
+        change: C,
+        replace: R,
+        revert: V,
+    ) -> anyhow::Result<bool>
+    where
+        C: FnOnce() -> CF,
+        CF: Future<Output = anyhow::Result<()>>,
+        R: FnOnce() -> RF,
+        RF: Future<Output = anyhow::Result<()>>,
+        V: FnOnce() -> VF,
+        VF: Future<Output = anyhow::Result<()>>,
+    {
+        let live = self.live(id);
+        let _transition = live.transition.lock().await;
+        let phase = self.store.get_session(id).await?.map(|row| row.phase());
+        match phase {
+            Some(Phase::Parked) => {
+                change().await?;
+                return Ok(true);
+            }
+            Some(Phase::Idle) => {}
+            _ => return Ok(false),
+        }
+        let (agent, agent_session_id) = {
+            let mut state = live.state.lock().await;
+            let busy = state.turn_running
+                || !state.queue.is_empty()
+                || !state.permissions.is_empty()
+                || live.running_commands().is_some_and(|running| running > 0);
+            if busy || state.agent_session_id.is_none() {
+                return Ok(false);
+            }
+            (state.agent.clone(), state.agent_session_id.take())
+        };
+        if let Err(e) = change().await {
+            self.unpark(id, agent, agent_session_id).await;
+            return Err(e);
+        }
+        if let Err(e) = replace().await {
+            if let Err(undo) = revert().await {
+                tracing::error!(session = %id, error = %undo, "putting back a session's model after its pod wasn't replaced");
+            }
+            self.unpark(id, agent, agent_session_id).await;
+            return Err(e);
+        }
+        Ok(true)
+    }
+
     /// Gives a session whose suspend failed its agent back, and runs what was sent to it meanwhile.
     async fn unpark(
         self: &Arc<Self>,
