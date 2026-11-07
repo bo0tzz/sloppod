@@ -427,6 +427,66 @@ pub trait RequestPolicy: Send + Sync {
     async fn decide(&self, session: &SessionContext, request: &HttpRequest) -> Result<Decision>;
 }
 
+/// A model an endpoint provider offers (#461): `value` is how it's chosen, `endpoint:<location>:<model>`, `name` how
+/// it's shown, `model` its name at the endpoint, and `info` what's known of it (context size, function calling).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OfferedModel {
+    pub value: String,
+    pub name: String,
+    pub model: String,
+    #[serde(default)]
+    pub info: Value,
+}
+
+/// Where a session's model requests go, and the key they carry.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelTarget {
+    /// The Messages API's base URL.
+    pub base_url: String,
+    pub key: String,
+}
+
+/// Leaves the key out, so logging one can't leak it.
+impl std::fmt::Debug for ModelTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelTarget")
+            .field("base_url", &self.base_url)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Offers models of Anthropic-compatible endpoints and gives sessions on them their way in (#461): the owner's own
+/// endpoints, or the proxies the LiteLLM operator runs. Each names its endpoints by locations only it owns, the middle
+/// part of a model's id; the session's `endpoint` grant carries the location and whatever else the provider needs.
+#[async_trait]
+pub trait ModelProvider: Send + Sync {
+    fn manifest(&self) -> Manifest;
+    /// Whether an endpoint location is one of this provider's.
+    fn owns(&self, location: &str) -> bool;
+    /// The models it offers the owner.
+    async fn models(&self, owner: &str) -> Result<Vec<OfferedModel>>;
+    /// The `endpoint` grant's params for a session of the owner's on `model` (its name at `location`), or why it
+    /// can't be had.
+    async fn grant(
+        &self,
+        owner: &str,
+        location: &str,
+        model: &str,
+    ) -> Result<std::result::Result<Value, String>>;
+    /// Makes ready what a session's grant needs before its agent's first request, e.g. a key minted for it. Called
+    /// whenever the session is placed, so it has to do nothing when it's ready already.
+    async fn provision(&self, _session: &SessionContext, _grant: &Grant) -> Result<()> {
+        Ok(())
+    }
+    /// Where a session's requests go, and with which key, by its grant; `None` when the endpoint or key is gone.
+    async fn target(&self, session: &SessionContext, grant: &Grant) -> Result<Option<ModelTarget>>;
+    /// Removes what `provision` made, once the session doesn't need it any more: it moved off the model, stopped
+    /// or was purged.
+    async fn release(&self, _session_id: &str, _grant: &Grant) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// What a placement backend needs to run one session pod.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlacementSpec {

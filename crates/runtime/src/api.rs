@@ -148,7 +148,14 @@ async fn settings(state: &AppState, user: &str) -> ApiResult<serde_json::Value> 
         .map(|s| offered_models(&s))
         .unwrap_or_default();
     // The models of the user's endpoints too (#461), named by their ids.
-    models.extend(crate::endpoint::offered(&state.credentials, user).await?);
+    models.extend(
+        state
+            .providers
+            .offered(user)
+            .await
+            .into_iter()
+            .map(|m| serde_json::json!({"value": m.value, "name": m.name})),
+    );
     let review = db::user_review(&state.db, user).await?;
     let timezone = db::user_timezone(&state.db, user).await?;
     let sub_session_model = db::user_sub_session_model(&state.db, user).await?;
@@ -703,7 +710,7 @@ async fn create_session(
         .filter(|m| !m.is_empty());
     let model = match given {
         Some(model) => {
-            crate::endpoint::chosen(&state.credentials, &user, adapter.as_ref(), Some(model))
+            crate::endpoint::chosen(&state.providers, &user, adapter.as_ref(), Some(model))
                 .await?
                 .map_err(bad_request)?
         }
@@ -712,7 +719,7 @@ async fn create_session(
         None => {
             let default = db::user_model(&state.db, &user).await?;
             crate::endpoint::chosen(
-                &state.credentials,
+                &state.providers,
                 &user,
                 adapter.as_ref(),
                 default.as_deref(),

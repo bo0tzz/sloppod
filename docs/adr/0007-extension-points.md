@@ -43,6 +43,7 @@ Extension points so far:
 | Wake source | Emits events that can satisfy wake conditions ([ADR 5](0005-park-and-wake.md)) |
 | Placement backend | Creates, suspends and deletes session pods ([ADR 16](0016-agent-sandbox.md)) |
 | Memory provider | Memory storage and recall ([ADR 8](0008-shared-memory-service.md)) |
+| Model provider | Offers models of Anthropic-compatible endpoints, and gives a session on one its grant, key and endpoint (#461) |
 
 ### Consequences
 
@@ -52,3 +53,5 @@ Extension points so far:
 ## More Information
 
 2026-10-27: the `CredentialProvider` trait was removed from `sloppod-contracts` because nothing implemented it. GitHub installation tokens are minted by the GitHub client, which the GitHub request policy calls when it decides to attach a credential. Credential provider stays an extension point in the design; its contract comes back when there's a second provider to shape it against.
+
+2026-11-07: a model provider extension point, `ModelProvider` in `sloppod-contracts` ([#461](https://github.com/bo0tzz/sloppod/issues/461)). Sessions can run on models of Anthropic-compatible endpoints, which come from two places: the owner's own endpoint credentials, and the proxies the LiteLLM operator runs, discovered from its `LiteLLMProxy` and `LiteLLMModel` resources. Each provider offers its models (named `endpoint:<location>:<model>`, the location being the endpoint in the provider's terms, which it alone owns), turns one into the session's `endpoint` grant, makes ready what a session needs (the operator's provider makes a `LiteLLMVirtualKey` for it), says where its requests go and with which key, and removes what it made when the session no longer needs it. The core dispatches by location and never knows which provider it has; both built-ins register through it.

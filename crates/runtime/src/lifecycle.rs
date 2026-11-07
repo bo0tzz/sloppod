@@ -110,10 +110,17 @@ pub async fn start_session(
 ) -> anyhow::Result<db::SessionRow> {
     // The endpoint grant follows the model (#461): `new.model` was checked by `endpoint::chosen`.
     let mut grants = new.grants.to_vec();
-    crate::endpoint::follow_model(
-        &mut grants,
-        crate::endpoint::EndpointModel::parse(new.model.unwrap_or_default()).as_ref(),
-    );
+    let endpoint = match crate::endpoint::EndpointModel::parse(new.model.unwrap_or_default()) {
+        Some(model) => Some(
+            state
+                .providers
+                .grant(new.owner, &model)
+                .await?
+                .map_err(|why| anyhow::anyhow!(why))?,
+        ),
+        None => None,
+    };
+    crate::endpoint::follow_model(&mut grants, endpoint);
     db::insert_session(
         &state.db,
         db::NewSessionRow {
@@ -243,6 +250,8 @@ pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result
     if let Err(e) = ensure_memini_key(state, session).await {
         tracing::warn!(session = %session.id, error = %e, "minting the session's memini key; no memory");
     }
+    // What its endpoint grant needs, e.g. a key minted for it, before its agent asks (#461).
+    state.providers.provision(&session.context()).await?;
     let id = session.id.to_string();
     let labels = BTreeMap::from([
         (SESSION_LABEL.to_owned(), id.clone()),
@@ -480,7 +489,8 @@ pub async fn remove_session(state: &AppState, session: &db::SessionRow) -> anyho
     remove_keys(state, session).await
 }
 
-/// Deletes the keys a session's pod uses: its memini key and its own key (#455). Placing the session mints them again.
+/// Deletes the keys a session's pod uses: its memini key, its own key (#455), and its endpoint's key (#461). Placing
+/// the session mints them again.
 pub async fn remove_keys(state: &AppState, session: &db::SessionRow) -> anyhow::Result<()> {
     let id = session.id;
     if crate::capabilities::holds(&session.context(), &crate::capabilities::Part::Memory)
@@ -491,6 +501,10 @@ pub async fn remove_keys(state: &AppState, session: &db::SessionRow) -> anyhow::
     {
         tracing::warn!(session = %id, error = %e, "deleting the session's memini key");
     }
+    state
+        .providers
+        .release(&id.to_string(), &session.grants())
+        .await;
     state
         .credentials
         .delete_session_secret(id, SESSION_KEY)

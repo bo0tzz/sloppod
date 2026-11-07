@@ -19,6 +19,7 @@ mod inference;
 mod lifecycle;
 mod limits;
 mod link;
+mod litellm;
 mod mcp;
 mod memini;
 mod memory;
@@ -85,6 +86,8 @@ pub struct Inner {
     pub memory: Arc<MeminiPolicy>,
     /// Decides session requests to the endpoint their model is on (#461), which reach it through the runtime.
     pub endpoint: Arc<EndpointPolicy>,
+    /// The model providers for endpoint models (#461): the owner's own endpoints, and the LiteLLM operator's proxies.
+    pub providers: Arc<endpoint::Providers>,
     pub proposals: ProposalKinds,
     pub placement: Arc<dyn PlacementBackend>,
     pub enforcer: Arc<dyn Enforcer>,
@@ -169,6 +172,16 @@ async fn main() -> anyhow::Result<()> {
     let vault = vault::Vault::from_base64(&config.secret_key).context("loading the master key")?;
     let credentials = Arc::new(Credentials::new(db.clone(), vault).await?);
 
+    let mut providers = endpoint::Providers::default();
+    providers.register(Arc::new(endpoint::OwnEndpoints::new(credentials.clone())));
+    if !config.litellm_namespaces.is_empty() {
+        providers.register(Arc::new(litellm::LiteLlm::new(
+            litellm::Catalog::watch(&kube, &config.litellm_namespaces),
+            Arc::new(litellm::ClusterKeys::new(&kube, &config.namespace)),
+            &config.cluster_domain,
+        )));
+    }
+    let providers = Arc::new(providers);
     let mut policies = Policies::default();
     policies.register(
         Part::Model(Provider::Anthropic),
@@ -258,7 +271,8 @@ async fn main() -> anyhow::Result<()> {
         kube,
         pods,
         memory: Arc::new(MeminiPolicy::new(credentials.clone())),
-        endpoint: Arc::new(EndpointPolicy::new(credentials.clone())),
+        endpoint: Arc::new(EndpointPolicy::new(providers.clone())),
+        providers,
         credentials,
         policies,
         proposals,

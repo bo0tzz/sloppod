@@ -16,7 +16,10 @@ use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use serde_json::{Value, json};
-use sloppod_contracts::{Decision, Grant, HttpRequest, RequestPolicy, SessionContext, capability};
+use sloppod_contracts::{
+    Decision, Grant, HttpRequest, ModelProvider, ModelTarget, OfferedModel, RequestPolicy,
+    SessionContext, capability,
+};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
@@ -25,7 +28,8 @@ use crate::{AppState, db};
 
 /// Where sessions reach their endpoint on the runtime's sessions port.
 pub const PREFIX: &str = "/inference";
-/// How an endpoint's model is named wherever a model is chosen: `endpoint:<credential>:<model>`.
+/// How an endpoint's model is named wherever a model is chosen: `endpoint:<location>:<model>`, the location naming the
+/// endpoint in its provider's terms (an endpoint credential's id, a LiteLLM proxy).
 const ID_PREFIX: &str = "endpoint:";
 /// A request body the runtime takes: a long conversation with images is several megabytes.
 const MAX_BODY: usize = 64 << 20;
@@ -38,27 +42,181 @@ pub const DRAIN: Duration = Duration::from_secs(60);
 /// One of an endpoint's models.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointModel {
-    pub credential: Uuid,
+    pub location: String,
     pub model: String,
 }
 
 impl EndpointModel {
-    /// The model a value names, if it's an endpoint's.
+    /// The model a value names, if it's an endpoint's. A location never has a `:`; a model's name may.
     pub fn parse(value: &str) -> Option<Self> {
-        let (credential, model) = value.strip_prefix(ID_PREFIX)?.split_once(':')?;
-        if model.is_empty() {
+        let (location, model) = value.strip_prefix(ID_PREFIX)?.split_once(':')?;
+        if location.is_empty() || model.is_empty() {
             return None;
         }
         Some(Self {
-            credential: credential.parse().ok()?,
+            location: location.to_owned(),
             model: model.to_owned(),
         })
     }
 
     /// How it's named wherever a model is chosen.
     pub fn id(&self) -> String {
-        format!("{ID_PREFIX}{}:{}", self.credential, self.model)
+        format!("{ID_PREFIX}{}:{}", self.location, self.model)
     }
+}
+
+/// The model providers registered (ADR 7): the owner's own endpoints, and the LiteLLM operator's proxies where the
+/// deployment watches them. Everything the core does with endpoint models goes through here, by location.
+#[derive(Default)]
+pub struct Providers(Vec<Arc<dyn ModelProvider>>);
+
+impl Providers {
+    pub fn register(&mut self, provider: Arc<dyn ModelProvider>) {
+        self.0.push(provider);
+    }
+
+    fn of_location(&self, location: &str) -> Option<&Arc<dyn ModelProvider>> {
+        self.0.iter().find(|p| p.owns(location))
+    }
+
+    /// The location a session's endpoint grant names. A grant made before grants carried one names the endpoint
+    /// credential it's for.
+    fn location(grant: &Grant) -> Option<String> {
+        grant.param("location").map(str::to_owned).or_else(|| {
+            crate::grants::accounts(grant)?
+                .first()
+                .map(|id| (*id).to_owned())
+        })
+    }
+
+    fn of_grant(&self, grant: &Grant) -> Option<&Arc<dyn ModelProvider>> {
+        self.of_location(&Self::location(grant)?)
+    }
+
+    /// The models every provider offers the owner. A provider that fails to say is left out, and logged.
+    pub async fn offered(&self, owner: &str) -> Vec<OfferedModel> {
+        let mut offered = Vec::new();
+        for provider in &self.0 {
+            match provider.models(owner).await {
+                Ok(models) => offered.extend(models),
+                Err(e) => {
+                    tracing::warn!(provider = %provider.manifest().name, error = %e.0, "listing an endpoint provider's models")
+                }
+            }
+        }
+        offered
+    }
+
+    /// Which endpoint model `value` is: one named by its id, which has to be offered to the owner, or by its bare
+    /// name when exactly one endpoint offered to them serves a model of that name. `None` for any other value, which
+    /// is a model of the agent's own; an error, for the user or agent, for one that can't be used.
+    pub async fn resolve(&self, owner: &str, value: &str) -> Result<Option<EndpointModel>, String> {
+        let offered = self.offered(owner).await;
+        if let Some(wanted) = EndpointModel::parse(value) {
+            return if offered.iter().any(|m| m.value == value) {
+                Ok(Some(wanted))
+            } else {
+                Err(format!(
+                    "{} isn't a model of an endpoint you have (any more)",
+                    wanted.model
+                ))
+            };
+        }
+        if value.starts_with(ID_PREFIX) {
+            return Err(format!("{value} isn't an endpoint model's id"));
+        }
+        let matching: Vec<EndpointModel> = offered
+            .iter()
+            .filter(|m| m.model == value)
+            .filter_map(|m| EndpointModel::parse(&m.value))
+            .collect();
+        match matching.as_slice() {
+            [] => Ok(None),
+            [one] => Ok(Some(one.clone())),
+            _ => Err(format!(
+                "more than one of your endpoints serves {value}; name it by its id (endpoint:<endpoint>:{value})"
+            )),
+        }
+    }
+
+    /// The `endpoint` grant a session of the owner's on `model` gets (#461).
+    pub async fn grant(
+        &self,
+        owner: &str,
+        model: &EndpointModel,
+    ) -> anyhow::Result<Result<Grant, String>> {
+        let Some(provider) = self.of_location(&model.location) else {
+            return Ok(Err(format!(
+                "{} isn't an endpoint you have",
+                model.location
+            )));
+        };
+        Ok(provider
+            .grant(owner, &model.location, &model.model)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.0))?
+            .map(|mut params| {
+                params["location"] = json!(model.location);
+                Grant::new(capability::ENDPOINT, params)
+            }))
+    }
+
+    /// Makes ready what the session's endpoint grant needs, e.g. a key minted for it.
+    pub async fn provision(&self, session: &SessionContext) -> anyhow::Result<()> {
+        for grant in session
+            .grants
+            .iter()
+            .filter(|g| g.capability == capability::ENDPOINT)
+        {
+            if let Some(provider) = self.of_grant(grant) {
+                provider
+                    .provision(session, grant)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.0))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes what provisioning made for these grants of a session's.
+    pub async fn release(&self, session_id: &str, grants: &[Grant]) {
+        for grant in grants
+            .iter()
+            .filter(|g| g.capability == capability::ENDPOINT)
+        {
+            if let Some(provider) = self.of_grant(grant)
+                && let Err(e) = provider.release(session_id, grant).await
+            {
+                tracing::warn!(session = session_id, error = %e.0, "releasing a session's endpoint key");
+            }
+        }
+    }
+
+    /// Where the session's model requests go, and with which key.
+    pub async fn target(&self, session: &SessionContext) -> anyhow::Result<Option<ModelTarget>> {
+        let Some(grant) = session
+            .grants
+            .iter()
+            .find(|g| g.capability == capability::ENDPOINT)
+        else {
+            return Ok(None);
+        };
+        let Some(provider) = self.of_grant(grant) else {
+            return Ok(None);
+        };
+        provider
+            .target(session, grant)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.0))
+    }
+}
+
+/// A session's grants with its endpoint grant following its model: the one its model needs, or none (#461). Every
+/// session gets it this way, a sub-session too (ADR 27, 2026-11-07): a model gives no reach into anything else, so a
+/// child's isn't limited to its parent's.
+pub fn follow_model(grants: &mut Vec<Grant>, endpoint: Option<Grant>) {
+    grants.retain(|g| g.capability != capability::ENDPOINT);
+    grants.extend(endpoint);
 }
 
 /// The models an endpoint credential serves.
@@ -72,77 +230,95 @@ pub fn models_of(endpoint: &CredentialRow) -> Vec<String> {
         .collect()
 }
 
-/// The owner's endpoints' models, as a model list names them: `{value, name}`, the name saying which endpoint.
-pub async fn offered(credentials: &Credentials, owner: &str) -> sqlx::Result<Vec<Value>> {
-    let endpoints = credentials.list(owner).await?;
-    Ok(endpoints
-        .iter()
-        .filter(|row| row.kind == ENDPOINT)
-        .flat_map(|row| {
-            models_of(row).into_iter().map(|model| {
-                let id = EndpointModel {
-                    credential: row.id,
-                    model: model.clone(),
-                }
-                .id();
-                json!({"value": id, "name": format!("{model} ({})", row.name)})
-            })
-        })
-        .collect())
+/// The owner's own endpoints, as credentials (ADR 21): each located by its credential's id, its key the secret.
+pub struct OwnEndpoints {
+    credentials: Arc<Credentials>,
 }
 
-/// Which of the owner's endpoint models `value` is: one named by its id, which has to be one of theirs and still
-/// listed, or by its bare name when exactly one of their endpoints serves a model of that name. `None` for any other
-/// value, which is a model of the agent's own; an error, for the user or agent, for one that can't be used.
-pub async fn resolve(
-    credentials: &Credentials,
-    owner: &str,
-    value: &str,
-) -> sqlx::Result<Result<Option<EndpointModel>, String>> {
-    if let Some(wanted) = EndpointModel::parse(value) {
-        let row = credentials
-            .owned(owner, ENDPOINT, &wanted.credential.to_string())
-            .await?;
-        return Ok(match row {
-            Some(row) if models_of(&row).contains(&wanted.model) => Ok(Some(wanted)),
+impl OwnEndpoints {
+    pub fn new(credentials: Arc<Credentials>) -> Self {
+        Self { credentials }
+    }
+}
+
+fn contract_error(e: impl std::fmt::Display) -> sloppod_contracts::Error {
+    sloppod_contracts::Error::new(e.to_string())
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for OwnEndpoints {
+    fn manifest(&self) -> sloppod_contracts::Manifest {
+        sloppod_contracts::Manifest::builtin("endpoint-credential")
+    }
+
+    fn owns(&self, location: &str) -> bool {
+        location.parse::<Uuid>().is_ok()
+    }
+
+    async fn models(&self, owner: &str) -> sloppod_contracts::Result<Vec<OfferedModel>> {
+        let endpoints = self.credentials.list(owner).await.map_err(contract_error)?;
+        Ok(endpoints
+            .iter()
+            .filter(|row| row.kind == ENDPOINT)
+            .flat_map(|row| {
+                models_of(row).into_iter().map(|model| OfferedModel {
+                    value: EndpointModel {
+                        location: row.id.to_string(),
+                        model: model.clone(),
+                    }
+                    .id(),
+                    name: format!("{model} ({})", row.name),
+                    model,
+                    info: Value::Null,
+                })
+            })
+            .collect())
+    }
+
+    async fn grant(
+        &self,
+        owner: &str,
+        location: &str,
+        model: &str,
+    ) -> sloppod_contracts::Result<Result<Value, String>> {
+        let row = self
+            .credentials
+            .owned(owner, ENDPOINT, location)
+            .await
+            .map_err(contract_error)?;
+        Ok(match row {
+            Some(row) if models_of(&row).iter().any(|m| m == model) => {
+                Ok(json!({"credentials": [row.id.to_string()]}))
+            }
             Some(row) => Err(format!(
-                "the endpoint {} doesn't list the model {}",
-                row.name, wanted.model
+                "the endpoint {} doesn't list the model {model}",
+                row.name
             )),
             None => Err("that endpoint isn't one of yours any more".into()),
-        });
-    }
-    if value.starts_with(ID_PREFIX) {
-        return Ok(Err(format!("{value} isn't an endpoint model's id")));
-    }
-    let endpoints = credentials.list(owner).await?;
-    let matching: Vec<EndpointModel> = endpoints
-        .iter()
-        .filter(|row| row.kind == ENDPOINT && models_of(row).iter().any(|m| m == value))
-        .map(|row| EndpointModel {
-            credential: row.id,
-            model: value.to_owned(),
         })
-        .collect();
-    Ok(match matching.as_slice() {
-        [] => Ok(None),
-        [one] => Ok(Some(one.clone())),
-        _ => Err(format!(
-            "more than one of your endpoints serves {value}; name it by its id (endpoint:<endpoint>:{value})"
-        )),
-    })
-}
+    }
 
-/// A session's grants with its endpoint grant following its model: the one endpoint its model is on, or none
-/// (#461). Every session gets it this way, a sub-session too (ADR 27, 2026-11-07): a model gives no reach into
-/// anything else, so a child's isn't limited to its parent's.
-pub fn follow_model(grants: &mut Vec<Grant>, model: Option<&EndpointModel>) {
-    grants.retain(|g| g.capability != capability::ENDPOINT);
-    if let Some(model) = model {
-        grants.push(Grant::new(
-            capability::ENDPOINT,
-            json!({"credentials": [model.credential.to_string()]}),
-        ));
+    async fn target(
+        &self,
+        session: &SessionContext,
+        _grant: &Grant,
+    ) -> sloppod_contracts::Result<Option<ModelTarget>> {
+        let row = match self
+            .credentials
+            .account(session, ENDPOINT)
+            .await
+            .map_err(contract_error)?
+        {
+            Account::Found(row) => row,
+            Account::Gone | Account::None => return Ok(None),
+        };
+        let base_url = row
+            .config("url")
+            .ok_or_else(|| contract_error("the endpoint credential has no URL"))?
+            .trim_end_matches('/')
+            .to_owned();
+        let key = self.credentials.reveal(&row).map_err(contract_error)?;
+        Ok(Some(ModelTarget { base_url, key }))
     }
 }
 
@@ -261,7 +437,7 @@ async fn forward(state: &AppState, peer: SocketAddr, request: Request) -> anyhow
     send(
         Target {
             policy: state.endpoint.as_ref(),
-            credentials: &state.credentials,
+            providers: &state.providers,
             reach: &state.inference_reach,
             user_header: &state.config.user_header,
         },
@@ -277,7 +453,7 @@ async fn forward(state: &AppState, peer: SocketAddr, request: Request) -> anyhow
 /// What a session's request to its endpoint goes through.
 pub struct Target<'a> {
     pub policy: &'a dyn RequestPolicy,
-    pub credentials: &'a Credentials,
+    pub providers: &'a Providers,
     pub reach: &'a crate::proxy::Reach,
     pub user_header: &'a str,
 }
@@ -300,15 +476,13 @@ pub async fn send(
     let Ok(path) = crate::proxy::canonical_path(&path) else {
         return Ok((StatusCode::BAD_REQUEST, "sloppod: invalid path\n").into_response());
     };
-    let base = match target.credentials.account(session, ENDPOINT).await? {
-        Account::Found(row) => row
-            .config("url")
-            .context("the endpoint credential has no URL")?
-            .trim_end_matches('/')
-            .to_owned(),
-        // The policy says so.
-        Account::Gone | Account::None => String::new(),
-    };
+    // The policy refuses a session whose endpoint is gone.
+    let base = target
+        .providers
+        .target(session)
+        .await?
+        .map(|t| t.base_url.trim_end_matches('/').to_owned())
+        .unwrap_or_default();
     let header_map: BTreeMap<String, String> = headers
         .iter()
         .filter_map(|(name, value)| {
@@ -366,7 +540,7 @@ pub async fn send(
 /// The model a new session starts on, checked (#461): an endpoint's model as its id, whether it was named by its id
 /// or its bare name, and only for an agent that runs on endpoints; any other model as it was given.
 pub async fn chosen(
-    credentials: &Credentials,
+    providers: &Providers,
     owner: &str,
     agent: &dyn sloppod_contracts::AgentAdapter,
     model: Option<&str>,
@@ -374,7 +548,7 @@ pub async fn chosen(
     let Some(model) = model else {
         return Ok(Ok(None));
     };
-    Ok(match resolve(credentials, owner, model).await? {
+    Ok(match providers.resolve(owner, model).await {
         Ok(Some(endpoint)) if agent.takes_endpoints() => Ok(Some(endpoint.id())),
         Ok(Some(endpoint)) => Err(format!(
             "{} can't run on an endpoint's model like {}",
@@ -432,14 +606,7 @@ pub async fn switch(
         Err(e) => return Some(Err(RpcError::new(-32603, e.to_string()))),
     };
     let adapter = state.agents.get(&row.agent)?;
-    let resolved = match chosen(
-        &state.credentials,
-        &row.owner,
-        adapter.as_ref(),
-        Some(value),
-    )
-    .await
-    {
+    let resolved = match chosen(&state.providers, &row.owner, adapter.as_ref(), Some(value)).await {
         Ok(resolved) => resolved,
         Err(e) => return Some(Err(RpcError::new(-32603, e.to_string()))),
     };
@@ -462,20 +629,30 @@ pub async fn switch(
             Err(e) => return Some(Err(RpcError::new(-32603, e.to_string()))),
         }
     }
-    let mut grants = Vec::new();
-    follow_model(&mut grants, to.as_ref());
+    let new_grant = match &to {
+        Some(to) => match state.providers.grant(&row.owner, to).await {
+            Ok(Ok(grant)) => Some(grant),
+            Ok(Err(why)) => return Some(Err(RpcError::new(-32602, why))),
+            Err(e) => return Some(Err(RpcError::new(-32603, format!("{e:#}")))),
+        },
+        None => None,
+    };
     let old_grant = row
         .grants()
         .into_iter()
         .find(|g| g.capability == capability::ENDPOINT);
     let old_model = row.model.clone().unwrap_or_default();
     let id = session.to_string();
+    // The session as it'll be, for provisioning its new grant (a key minted for it, say) before its agent starts.
+    let mut moved_context = row.context();
+    follow_model(&mut moved_context.grants, new_grant.clone());
     let moved = state
         .hub
         .switch_provider(
             session,
             || async {
-                db::set_model_and_endpoint(&state.db, session, &model, grants.first()).await?;
+                db::set_model_and_endpoint(&state.db, session, &model, new_grant.as_ref()).await?;
+                state.providers.provision(&moved_context).await?;
                 Ok(())
             },
             || async {
@@ -491,6 +668,15 @@ pub async fn switch(
         .await;
     match moved {
         Ok(true) => {
+            // What the old grant had made is no longer needed, unless the new one is on the same endpoint.
+            if let Some(old) = &old_grant
+                && old.param("location") != new_grant.as_ref().and_then(|g| g.param("location"))
+            {
+                state
+                    .providers
+                    .release(&id, std::slice::from_ref(old))
+                    .await;
+            }
             state.hub.broadcast_session(session).await;
             Some(Ok(json!({})))
         }
@@ -519,37 +705,30 @@ mod tests {
     #[test]
     fn an_endpoint_model_is_named_by_its_endpoint_and_name() {
         let model = EndpointModel {
-            credential: Uuid::nil(),
+            location: "litellm/ai/main".into(),
             model: "qwen/qwen3:32b".into(),
         };
+        assert_eq!(model.id(), "endpoint:litellm/ai/main:qwen/qwen3:32b");
         assert_eq!(EndpointModel::parse(&model.id()), Some(model.clone()));
         for other in [
             "sonnet",
             "endpoint:",
-            "endpoint:nope:qwen3",
-            &format!("endpoint:{}:", Uuid::nil()),
+            "endpoint:nope",
+            "endpoint::qwen3",
+            "endpoint:litellm/ai/main:",
         ] {
             assert_eq!(EndpointModel::parse(other), None, "{other}");
         }
         // The grant follows the model, replacing one for another endpoint, or going.
         let mut grants = vec![
             Grant::new(capability::MODEL, json!({})),
-            Grant::new(capability::ENDPOINT, json!({"credentials": ["old"]})),
+            Grant::new(capability::ENDPOINT, json!({"location": "old"})),
         ];
-        follow_model(&mut grants, Some(&model));
-        assert_eq!(grants.len(), 2);
-        assert_eq!(
-            grants[1].params,
-            json!({"credentials": [Uuid::nil().to_string()]})
-        );
+        let new = Grant::new(capability::ENDPOINT, json!({"location": "litellm/ai/main"}));
+        follow_model(&mut grants, Some(new.clone()));
+        assert_eq!(grants, [Grant::new(capability::MODEL, json!({})), new]);
         follow_model(&mut grants, None);
-        assert_eq!(
-            grants
-                .iter()
-                .map(|g| g.capability.as_str())
-                .collect::<Vec<_>>(),
-            ["model"]
-        );
+        assert_eq!(grants, [Grant::new(capability::MODEL, json!({}))]);
     }
 
     #[tokio::test]
@@ -651,6 +830,12 @@ mod tests {
         }
     }
 
+    fn providers_of(credentials: &Arc<Credentials>) -> Arc<Providers> {
+        let mut providers = Providers::default();
+        providers.register(Arc::new(OwnEndpoints::new(credentials.clone())));
+        Arc::new(providers)
+    }
+
     async fn ask(
         credentials: &Arc<Credentials>,
         reach: &crate::proxy::Reach,
@@ -658,7 +843,8 @@ mod tests {
         method: Method,
         path: &str,
     ) -> Response {
-        let policy = EndpointPolicy::new(credentials.clone());
+        let providers = providers_of(credentials);
+        let policy = EndpointPolicy::new(providers.clone());
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
@@ -669,7 +855,7 @@ mod tests {
         send(
             Target {
                 policy: &policy,
-                credentials,
+                providers: &providers,
                 reach,
                 user_header: "x-sloppod-user",
             },
@@ -797,57 +983,66 @@ mod tests {
     async fn an_endpoint_model_is_one_of_the_owner_s_by_its_id_or_name(db: sqlx::PgPool) {
         let (credentials, id) =
             credentials_with(db, "http://litellm.ai.svc.cluster.local:4000").await;
-        let qwen = EndpointModel {
-            credential: id,
-            model: "qwen3-coder".into(),
+        let providers = providers_of(&credentials);
+        let model = |name: &str| EndpointModel {
+            location: id.to_string(),
+            model: name.into(),
         };
+        let qwen = model("qwen3-coder");
         assert_eq!(
-            resolve(&credentials, "dev", &qwen.id()).await.unwrap(),
+            providers.resolve("dev", &qwen.id()).await,
             Ok(Some(qwen.clone()))
         );
         assert_eq!(
-            resolve(&credentials, "dev", "qwen3-coder").await.unwrap(),
+            providers.resolve("dev", "qwen3-coder").await,
             Ok(Some(qwen.clone()))
         );
-        assert_eq!(
-            resolve(&credentials, "dev", "sonnet").await.unwrap(),
-            Ok(None)
-        );
+        assert_eq!(providers.resolve("dev", "sonnet").await, Ok(None));
+        assert!(providers.resolve("someone", &qwen.id()).await.is_err());
         assert!(
-            resolve(&credentials, "someone", &qwen.id())
+            providers
+                .resolve("dev", &model("llama").id())
                 .await
-                .unwrap()
                 .is_err()
         );
-        let unlisted = EndpointModel {
-            credential: id,
-            model: "llama".into(),
-        };
-        assert!(
-            resolve(&credentials, "dev", &unlisted.id())
-                .await
-                .unwrap()
-                .is_err()
-        );
-        let offered = offered(&credentials, "dev").await.unwrap();
+        let offered: Vec<(String, String, String)> = providers
+            .offered("dev")
+            .await
+            .into_iter()
+            .map(|m| (m.value, m.name, m.model))
+            .collect();
         assert_eq!(
             offered,
             [
-                json!({"value": qwen.id(), "name": "qwen3-coder (litellm)"}),
-                json!({"value": EndpointModel { credential: id, model: "glm-5".into() }.id(), "name": "glm-5 (litellm)"}),
+                (
+                    qwen.id(),
+                    "qwen3-coder (litellm)".to_owned(),
+                    "qwen3-coder".to_owned()
+                ),
+                (
+                    model("glm-5").id(),
+                    "glm-5 (litellm)".to_owned(),
+                    "glm-5".to_owned()
+                ),
             ]
         );
+        // Its grant names the endpoint, both as its location and as the credential it acts with (ADR 29).
+        assert_eq!(
+            providers.grant("dev", &qwen).await.unwrap().unwrap().params,
+            json!({"location": id.to_string(), "credentials": [id.to_string()]})
+        );
+        assert!(providers.grant("someone", &qwen).await.unwrap().is_err());
         // Only for an agent that runs on endpoints.
         let claude = crate::adapter::ClaudeCode;
         assert_eq!(
-            chosen(&credentials, "dev", &claude, Some("qwen3-coder"))
+            chosen(&providers, "dev", &claude, Some("qwen3-coder"))
                 .await
                 .unwrap(),
             Ok(Some(qwen.id()))
         );
         assert!(
             chosen(
-                &credentials,
+                &providers,
                 "dev",
                 &crate::adapter::Codex,
                 Some("qwen3-coder")
@@ -857,7 +1052,7 @@ mod tests {
             .is_err()
         );
         assert_eq!(
-            chosen(&credentials, "dev", &claude, Some("opus"))
+            chosen(&providers, "dev", &claude, Some("opus"))
                 .await
                 .unwrap(),
             Ok(Some("opus".into()))
