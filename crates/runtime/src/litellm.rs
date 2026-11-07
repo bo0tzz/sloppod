@@ -279,10 +279,14 @@ impl Keys for ClusterKeys {
     }
 
     async fn list(&self) -> anyhow::Result<Vec<(String, Option<chrono::DateTime<chrono::Utc>>)>> {
-        let keys = self
+        let keys = match self
             .keys
             .list(&kube::api::ListParams::default().labels(KEY_LABEL))
-            .await?;
+            .await
+        {
+            Ok(keys) => keys,
+            Err(e) => return nothing_if_absent(e),
+        };
         Ok(keys
             .items
             .into_iter()
@@ -318,16 +322,35 @@ enum Found {
     Error,
 }
 
+/// Why the operator's resources can't be had at all, if that's what an error says: they aren't installed (404), or the
+/// runtime may not read them (403).
+fn absent(e: &kube::Error) -> Option<&'static str> {
+    match e {
+        kube::Error::Api(e) if e.code == 404 => {
+            Some("LiteLLM operator CRDs not found; no LiteLLM models")
+        }
+        kube::Error::Api(e) if e.code == 403 => {
+            Some("not allowed to read the LiteLLM operator's resources; no LiteLLM models")
+        }
+        _ => None,
+    }
+}
+
+/// No virtual keys, when the operator isn't installed or its resources can't be read: the hourly sweep then has
+/// nothing to do, rather than a warning to give every hour. Other errors are errors.
+fn nothing_if_absent<T>(e: kube::Error) -> anyhow::Result<Vec<T>> {
+    match absent(&e) {
+        Some(why) => {
+            tracing::debug!("{why}; no virtual keys to sweep");
+            Ok(Vec::new())
+        }
+        None => Err(e.into()),
+    }
+}
 fn found(listed: &kube::Result<kube::core::ObjectList<DynamicObject>>) -> Found {
     match listed {
         Ok(_) => Found::Yes,
-        Err(kube::Error::Api(e)) if e.code == 404 => {
-            Found::Absent("LiteLLM operator CRDs not found; no LiteLLM models")
-        }
-        Err(kube::Error::Api(e)) if e.code == 403 => {
-            Found::Absent("not allowed to read the LiteLLM operator's resources; no LiteLLM models")
-        }
-        Err(_) => Found::Error,
+        Err(e) => absent(e).map_or(Found::Error, Found::Absent),
     }
 }
 
@@ -1021,5 +1044,17 @@ mod tests {
         let listed: kube::core::ObjectList<DynamicObject> =
             serde_json::from_value(json!({"metadata": {}, "items": []})).unwrap();
         assert_eq!(found(&Ok(listed)), Found::Yes);
+        // Nor does the hourly sweep warn about keys it can't list for the same reasons.
+        let error = |code: u16| {
+            kube::Error::Api(
+                kube::core::Status::failure("nope", "NotFound")
+                    .with_code(code)
+                    .boxed(),
+            )
+        };
+        for code in [404, 403] {
+            assert!(nothing_if_absent::<String>(error(code)).unwrap().is_empty());
+        }
+        assert!(nothing_if_absent::<String>(error(500)).is_err());
     }
 }

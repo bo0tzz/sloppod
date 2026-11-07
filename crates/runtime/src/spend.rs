@@ -51,7 +51,9 @@ impl Spending {
     }
 }
 
-/// Keeps a key's reading; says whether it changed what was kept.
+/// Keeps a key's reading, taken when its request went out (`at`), unless a reading of a request sent later is kept
+/// already: a poll whose answer comes in after a key's final reading doesn't replace it. Says whether it changed what
+/// was kept.
 pub async fn store(
     db: &PgPool,
     key_id: &str,
@@ -66,12 +68,13 @@ pub async fn store(
             .bind(key_id)
             .fetch_optional(db)
             .await?;
-    sqlx::query(
+    let kept = sqlx::query(
         "insert into endpoint_spend (key_id, owner, session_id, shared_name, spend, max_budget, observed_at) \
          values ($1, $2, $3, $4, $5, $6, $7) \
          on conflict (key_id) do update set owner = excluded.owner, session_id = excluded.session_id, \
            shared_name = excluded.shared_name, spend = excluded.spend, max_budget = excluded.max_budget, \
-           observed_at = excluded.observed_at",
+           observed_at = excluded.observed_at \
+         where endpoint_spend.observed_at <= excluded.observed_at",
     )
     .bind(key_id)
     .bind(owner)
@@ -81,8 +84,10 @@ pub async fn store(
     .bind(reading.max_budget)
     .bind(at)
     .execute(db)
-    .await?;
-    Ok(before != Some((reading.spend, reading.max_budget)))
+    .await?
+    .rows_affected()
+        > 0;
+    Ok(kept && before != Some((reading.spend, reading.max_budget)))
 }
 
 /// The owner's spend: every key's their sessions used, newest first, and the sum.
@@ -226,6 +231,8 @@ pub async fn record(
     session: Option<Uuid>,
 ) -> anyhow::Result<Option<bool>> {
     let url = format!("{}/key/info", target.base_url.trim_end_matches('/'));
+    // When the request goes out: a later one's answer is the newer, whichever arrives first.
+    let at = Utc::now();
     let answer = reach.get_json(&url, &target.key).await?;
     let Some(reading) = from_key_info(&answer) else {
         return Ok(None);
@@ -239,7 +246,7 @@ pub async fn record(
             session,
             target.shared.as_deref(),
             &reading,
-            Utc::now(),
+            at,
         )
         .await?,
     ))
@@ -508,5 +515,43 @@ mod tests {
             .find(|k| k.key_id == "credential:1")
             .unwrap();
         assert_eq!((line.session_id, line.name.as_str()), (None, "litellm"));
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_poll_answered_after_a_key_s_final_reading_doesn_t_replace_it(db: PgPool) {
+        let reading = |spend: f64| Reading {
+            spend,
+            max_budget: None,
+        };
+        let polled = Utc::now();
+        let last = polled + chrono::Duration::seconds(1);
+        // The final reading, sent after the poll's request, is kept first; the poll's answer comes in after it.
+        assert!(
+            store(
+                &db,
+                "credential:1",
+                "dev",
+                None,
+                Some("litellm"),
+                &reading(1.0),
+                last
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !store(
+                &db,
+                "credential:1",
+                "dev",
+                None,
+                Some("litellm"),
+                &reading(0.5),
+                polled
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(list(&db, "dev").await.unwrap().total, 1.0);
     }
 }
