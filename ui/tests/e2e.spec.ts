@@ -1349,7 +1349,23 @@ test('follows new output while the reader is at the bottom, across a reconnect',
   await end.hover();
   await page.mouse.wheel(0, -2000);
   await expect(end).not.toBeInViewport();
-  const kept = await scrollTop();
+  // Up this far in a long session, the page before comes in by itself, and what it puts above the reader moves the
+  // scroll for a few frames as it settles: both are waited for, so what's measured below is the new output's doing.
+  await expect(page.getByTestId('history-start')).toBeVisible();
+  const kept = await scroller.evaluate(
+    (element) =>
+      new Promise<number>((resolve) => {
+        let last = element.scrollTop;
+        let still = 0;
+        const frame = () => {
+          still = element.scrollTop === last ? still + 1 : 0;
+          last = element.scrollTop;
+          if (still >= 6) return resolve(last);
+          requestAnimationFrame(frame);
+        };
+        requestAnimationFrame(frame);
+      }),
+  );
   await page.request.post('/_mock/say?text=One%20more%20thing.');
   await expect(page.getByText('One more thing.')).toBeAttached();
   expect(await scrollTop()).toBe(kept);
@@ -1787,6 +1803,83 @@ test('sending a message scrolls the chat to it, and so does scrolling the sessio
   await expect(userMessages(page).filter({ hasText: message })).toBeInViewport();
 });
 
+/** Opens a session whose log is longer than one page of history: the latest in the transcript, the rest below it. */
+async function openLongHistory(page: Page) {
+  await page.setViewportSize({ width: 1000, height: 500 });
+  const prompt = 'Write a long history in sloppod';
+  await createSession(page, prompt);
+  await expect(page.getByText('The end.')).toBeVisible({ timeout: 20_000 });
+  await page.reload();
+  await expect(page.getByText('The end.')).toBeVisible();
+  await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(0);
+  return prompt;
+}
+
+/** Scrolls up the way the reader does: from the chat, so the wheel goes to the transcript and not the session list. */
+async function wheelUp(page: Page) {
+  await page.getByText('The end.').hover();
+  await page.mouse.wheel(0, -100_000);
+}
+
+test('reading up brings in the earlier history by itself, with no click', { tag: '@scroll' }, async ({ page }) => {
+  const prompt = await openLongHistory(page);
+  await expect(page.getByRole('button', { name: 'Load earlier messages' })).toHaveCount(0);
+
+  await wheelUp(page);
+  await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(1);
+});
+
+test('the row the reader is looking at stays put as the earlier page goes in above it', { tag: '@scroll' }, async ({ page }) => {
+  const prompt = await openLongHistory(page);
+  // The message the reader is in, found by its words rather than by its place: the page that goes in joins the same
+  // message, its own start being what was missing.
+  const row = page.locator('[data-testid="transcript"] [data-seq]').filter({ hasText: /word word word/ });
+  const end = async () => {
+    const box = (await row.boundingBox())!;
+    return box.y + box.height;
+  };
+  // The page the reader has reached for is on its way but held, so what they were looking at is still there.
+  await page.request.post('/_mock/hold-history');
+  await wheelUp(page);
+  await expect(page.getByTestId('loading-earlier')).toBeVisible();
+  const held = await end();
+
+  await page.request.post('/_mock/release-history');
+  await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(1);
+  // Nothing of what went in above shows once it has settled (the rows off screen are laid out at a guess until they
+  // come near): the words the reader was at are where they were, the message around them growing upwards instead.
+  await expect.poll(async () => Math.abs((await end()) - held)).toBeLessThan(2);
+});
+
+test('the start of the session is marked once nothing earlier is left', { tag: '@scroll' }, async ({ page }) => {
+  const prompt = await openLongHistory(page);
+  await expect(page.getByTestId('history-start')).toHaveCount(0);
+
+  await wheelUp(page);
+  await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(1);
+  // Up to the top of what's now all of it: the marker is at the beginning, and nothing is asked for again.
+  await page.mouse.wheel(0, -100_000);
+  await expect(page.getByTestId('history-start')).toBeInViewport();
+});
+
+test('an earlier page that could not be loaded offers a retry', { tag: '@scroll' }, async ({ page }) => {
+  const prompt = await openLongHistory(page);
+  await page.request.post('/_mock/fail-history');
+
+  await wheelUp(page);
+  const failed = page.getByTestId('history-error');
+  await expect(failed).toContainText("Couldn't load earlier messages");
+  await expect(failed.getByRole('button', { name: 'Retry' })).toBeVisible();
+  // Nothing retries by itself: the reader says when.
+  await page.mouse.wheel(0, -500);
+  await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(0);
+  await expect(failed).toBeVisible();
+
+  await failed.getByRole('button', { name: 'Retry' }).click();
+  await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(1);
+  await expect(failed).toHaveCount(0);
+});
+
 test('says what the pod is doing while the agent starts, and why a start failed', async ({ page }) => {
   await createSession(page, 'failing start: fix the build in bo0tzz/sloppod');
   const activity = page.getByTestId('activity');
@@ -1810,23 +1903,6 @@ test("a session whose pod can't be placed says why, then starts", async ({ page 
   await expect(activity).toHaveText('Waiting for room (insufficient memory)…');
   await expect(permissionCard(page)).toBeVisible({ timeout: 20_000 });
   await finishTurn(page);
-});
-
-test('a long session opens at its latest messages, and older ones load on the way up', async ({ page }) => {
-  const prompt = 'Write a long history in sloppod';
-  await createSession(page, prompt);
-  await expect(page.getByText('The end.')).toBeVisible({ timeout: 20_000 });
-
-  await page.reload();
-  await expect(page.getByText('The end.')).toBeVisible();
-  const earlier = page.getByRole('button', { name: 'Load earlier messages' });
-  await expect(earlier).toBeAttached();
-  // The first message is in the page before; scrolling up to the top brings it in.
-  await page.getByText('The end.').hover();
-  for (let i = 0; i < 20 && (await earlier.count()) > 0; i++) await page.mouse.wheel(0, -5000);
-  await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(1);
-  await expect(earlier).not.toBeAttached();
-  await expect(page.getByText('The end.')).toBeVisible();
 });
 
 test('a message sent again after a reload runs once, even when it is older than the latest page', async ({ page }) => {

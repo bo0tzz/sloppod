@@ -1722,6 +1722,18 @@ function handleCall(conn, message) {
 
     case '_sloppod/history': {
       if (!needLoaded()) return;
+      if (failHistory) {
+        failHistory = false;
+        conn.error(id, -32000, 'the session log could not be read');
+        return;
+      }
+      // Held, the reader waiting on it; released, this call is handled then, as the runtime would have answered it.
+      if (holdHistory && !holdHistory.taken) {
+        const { held } = holdHistory;
+        holdHistory.taken = true;
+        held.then(() => handleCall(conn, message));
+        return;
+      }
       const end = Math.max(0, Math.min(session.log.length, Number(params.before) - 1));
       const start = Math.max(0, end - HISTORY_PAGE);
       conn.respond(id, {
@@ -2911,6 +2923,20 @@ const server = http.createServer(async (req, res) => {
       session.setPhase(url.searchParams.get('phase') ?? 'idle');
       return json(res, 200, session.data);
     }
+    if (url.pathname === '/_mock/fail-history' && req.method === 'POST') {
+      failHistory = true;
+      return json(res, 200, {});
+    }
+    if (url.pathname === '/_mock/hold-history' && req.method === 'POST') {
+      let release = () => {};
+      const held = new Promise((resolve) => (release = resolve));
+      holdHistory = { held, release, taken: false };
+      return json(res, 200, {});
+    }
+    if (url.pathname === '/_mock/release-history' && req.method === 'POST') {
+      holdHistory?.release();
+      return json(res, 200, {});
+    }
     if (url.pathname === '/_mock/slow-loads' && req.method === 'POST') {
       slowLoadsUntil = Date.now() + Number(url.searchParams.get('for') ?? 0);
       return json(res, 200, {});
@@ -2945,6 +2971,10 @@ let slowSessionsUntil = 0;
 let proposalDetailDelay = 0;
 let slowLoadsUntil = 0;
 let failLoadsUntil = 0;
+/** Set by `/_mock/fail-history`: the next ask for an older page of history fails, as a runtime that can't read it does. */
+let failHistory = false;
+/** Set by `/_mock/hold-history`: the next ask for an older page waits for `/_mock/release-history`. */
+let holdHistory = null;
 
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {

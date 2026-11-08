@@ -156,6 +156,8 @@ export class SessionView {
   /** Where to ask for older history, when the session has more than was loaded; `null` once it's all here. */
   historyBefore = $state<number | null>(null);
   loadingHistory = $state(false);
+  /** Why the last page of older history didn't arrive; the reader asks for it again from there. */
+  historyError = $state<string | null>(null);
   /** Messages a dropped connection cut off before the runtime confirmed them; the next load settles each. */
   #unconfirmed: Outgoing[] = [];
   /** Messages written while the connection was down, shown as waiting; the next load sends them. */
@@ -289,6 +291,7 @@ export class SessionView {
       this.transcript = this.#replay;
       this.#updates = this.#replayUpdates;
       this.historyBefore = (response?._meta?.sloppod as { historyBefore?: number | null } | undefined)?.historyBefore ?? null;
+      this.historyError = null;
       this.configOptions = response?.configOptions ?? [];
     } finally {
       this.#loading = false;
@@ -388,11 +391,15 @@ export class SessionView {
     (this.#replayUpdates ?? this.#updates).push({ update, seq, at });
   }
 
-  /** Puts the page of history before what's loaded in front of it. */
+  /**
+   * Puts the page of history before what's loaded in front of it. A failure is kept for the reader to ask again, since
+   * nothing else would: the page is fetched by itself as they read up.
+   */
   async loadEarlier() {
     const before = this.historyBefore;
     if (before === null || this.loadingHistory || this.#replay) return;
     this.loadingHistory = true;
+    this.historyError = null;
     try {
       const page = await app.request<{ updates: SessionUpdate[]; at?: string[]; before: number | null }>('_sloppod/history', {
         sessionId: this.id,
@@ -407,6 +414,8 @@ export class SessionView {
       this.#updates = updates;
       this.transcript = transcript;
       this.historyBefore = page.before;
+    } catch (error) {
+      this.historyError = error instanceof Error ? error.message : String(error);
     } finally {
       this.loadingHistory = false;
     }
