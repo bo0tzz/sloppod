@@ -4655,6 +4655,8 @@ test("a session's disk use shows in the list, its header and Settings, and stays
   const storage = page.getByTestId('storage');
   const listed = storage.locator(`[data-testid="storage-session"][data-session="${id}"]`);
   await expect(listed.getByTestId('storage-used')).toHaveText('700 MB');
+  // The volume's own size, as the cluster has it, next to what the session says it uses (#479).
+  await expect(listed.getByTestId('storage-size')).toHaveText('of 20.0 GB');
   await expect(storage.getByTestId('storage-total')).toContainText(/^\d+ volumes?, .* used/);
   await listed.getByRole('button', { name: /^Park the session/ }).click();
   await expect(listed.getByRole('button', { name: /^Park the session/ })).toHaveCount(0);
