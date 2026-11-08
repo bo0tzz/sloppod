@@ -2891,7 +2891,23 @@ async fn the_models_offered_come_from_a_session_on_the_agent_s_own(db: PgPool) {
         .unwrap();
     // The endpoint's session is the latest, but its agent's aliases aren't a choice.
     assert_eq!(
-        db::latest_agent_state(&db, "dev").await.unwrap(),
+        db::latest_agent_state(&db, "dev", None).await.unwrap(),
+        Some(json!({"configOptions": "own"}))
+    );
+    // Another agent's, newer still, isn't Claude Code's.
+    let codex = session(&db, "dev").await;
+    sqlx::query("update sessions set agent = 'codex' where id = $1")
+        .bind(codex)
+        .execute(&db)
+        .await
+        .unwrap();
+    db::set_agent_session(&db, codex, "c", &json!({"configOptions": "codex"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        db::latest_agent_state(&db, "dev", Some("claude-code"))
+            .await
+            .unwrap(),
         Some(json!({"configOptions": "own"}))
     );
 }

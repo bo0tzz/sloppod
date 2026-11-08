@@ -1911,7 +1911,7 @@ async function handleApi(req, res, url) {
   }
 
   if (parts[0] === 'settings' && parts.length === 1) {
-    if (method === 'GET') return json(res, 200, { ...settings, models: [...settings.models, ...endpointModels()] });
+    if (method === 'GET') return json(res, 200, { ...settings, models: [...settings.models, ...endpointModels()], agent_models: settings.models.length > 0 ? { 'claude-code': settings.models } : {} });
     if (method === 'PUT') {
       const body = await readBody(req);
       if ('model' in body) {

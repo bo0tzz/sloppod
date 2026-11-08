@@ -224,8 +224,14 @@ impl Conn {
                 "create sessions with POST /api/v1/sessions",
             )),
             ("session/prompt", Some(session)) => {
-                // A model the user picked that needs the agent started again is moved onto first (#461).
-                match crate::endpoint::apply_pending(&self.state, session).await {
+                // A model the user picked that needs the agent started again is moved onto first (#461), for a new
+                // message: one sent again is answered as before, and moves nothing.
+                let moved = match hub.is_new_prompt(session, &params).await {
+                    Ok(true) => crate::endpoint::apply_pending(&self.state, session).await,
+                    Ok(false) => Ok(()),
+                    Err(e) => Err(e),
+                };
+                match moved {
                     Ok(()) => hub.prompt(session, params).await,
                     Err(e) => Err(e),
                 }

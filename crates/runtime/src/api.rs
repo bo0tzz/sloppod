@@ -144,7 +144,7 @@ fn offered_models(agent_state: &serde_json::Value) -> Vec<serde_json::Value> {
 
 async fn settings(state: &AppState, user: &str) -> ApiResult<serde_json::Value> {
     let model = db::user_model(&state.db, user).await?;
-    let mut models = db::latest_agent_state(&state.db, user)
+    let mut models = db::latest_agent_state(&state.db, user, None)
         .await?
         .map(|s| offered_models(&s))
         .unwrap_or_default();
@@ -162,8 +162,15 @@ async fn settings(state: &AppState, user: &str) -> ApiResult<serde_json::Value> 
     let sub_session_model = db::user_sub_session_model(&state.db, user).await?;
     let instructions = db::user_instructions(&state.db, user).await?;
     let session_budget = db::user_session_budget(&state.db, user).await?;
+    // Each agent's own models, from a session of it: a session on an endpoint's model offers its agent's (#461).
+    let mut agent_models = serde_json::Map::new();
+    for agent in state.agents.names() {
+        if let Some(agent_state) = db::latest_agent_state(&state.db, user, Some(agent)).await? {
+            agent_models.insert(agent.to_owned(), offered_models(&agent_state).into());
+        }
+    }
     Ok(
-        json!({"model": model, "sub_session_model": sub_session_model, "models": models, "review": review, "timezone": timezone, "instructions": instructions, "session_budget": session_budget}),
+        json!({"model": model, "sub_session_model": sub_session_model, "models": models, "agent_models": agent_models, "review": review, "timezone": timezone, "instructions": instructions, "session_budget": session_budget}),
     )
 }
 

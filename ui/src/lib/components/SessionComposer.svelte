@@ -48,17 +48,19 @@
   const canSend = $derived(!blockedReason && attaching === 0 && (text.trim().length > 0 || images.length > 0));
 
   const model = $derived(phase === 'stopped' ? undefined : view.model);
-  // The user's endpoints' models (#461), offered next to the agent's own; Claude Code runs on them. Claude's own, as a
-  // session on them offered them, for a session on an endpoint's model: its agent offers its aliases with the
+  // The user's endpoints' models (#461), offered next to the agent's own; Claude Code runs on them. The agent's own, as a
+  // session of it on them offered them, for a session on an endpoint's model: its agent offers its aliases with the
   // endpoint's model behind each, which aren't a choice.
   let endpointModels = $state<{ value: string; label: string }[]>([]);
   let ownModels = $state<{ value: string; label: string }[]>([]);
   $effect(() => {
-    if (view.session?.agent !== 'claude-code') return;
+    const agent = view.session?.agent;
+    if (agent !== 'claude-code') return;
     api.getSettings().then((settings) => {
-      const options = settings.models.map((entry) => ({ value: entry.value, label: entry.name }));
-      endpointModels = options.filter((option) => option.value.startsWith('endpoint:'));
-      ownModels = options.filter((option) => !option.value.startsWith('endpoint:'));
+      const options = (models: { value: string; name: string }[]) =>
+        models.map((entry) => ({ value: entry.value, label: entry.name }));
+      endpointModels = options(settings.models).filter((option) => option.value.startsWith('endpoint:'));
+      ownModels = options(settings.agent_models?.[agent] ?? []);
     }, () => {});
   });
   const onEndpoint = $derived(view.session?.model?.startsWith('endpoint:') ?? false);

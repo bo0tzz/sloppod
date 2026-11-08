@@ -47,6 +47,10 @@ impl Agents {
     pub fn get(&self, agent: &str) -> Option<&Arc<dyn AgentAdapter>> {
         self.by_name.get(agent)
     }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.by_name.keys().map(String::as_str)
+    }
 }
 
 /// What every agent is told about the session it runs in, in sections that depend on what the session is for

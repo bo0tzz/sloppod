@@ -1719,12 +1719,19 @@ pub async fn set_user_session_budget(
 
 /// The agent's state from the owner's most recently active session on the agent's own models, for the models it offered.
 /// On an endpoint's model Claude Code offers its aliases with the endpoint's model behind each (#461), which aren't a choice.
-pub async fn latest_agent_state(db: &PgPool, owner: &str) -> sqlx::Result<Option<Value>> {
+/// With `agent`, from a session of that agent.
+pub async fn latest_agent_state(
+    db: &PgPool,
+    owner: &str,
+    agent: Option<&str>,
+) -> sqlx::Result<Option<Value>> {
     let row: Option<(Option<Value>,)> = sqlx::query_as(
         "select agent_state from sessions where owner = $1 and agent_state is not null \
-         and (model is null or model not like 'endpoint:%') order by updated_at desc limit 1",
+         and (model is null or model not like 'endpoint:%') and ($2::text is null or agent = $2) \
+         order by updated_at desc limit 1",
     )
     .bind(owner)
+    .bind(agent)
     .fetch_optional(db)
     .await?;
     Ok(row.and_then(|(state,)| state))
