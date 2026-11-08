@@ -3,7 +3,7 @@
   import { mdiAlertCircleOutline, mdiBugOutline, mdiCheck, mdiContentCopy, mdiLinkVariant, mdiSteering } from '@mdi/js';
   import { messageMarkdown, type MessageItem } from '#lib/acp/transcript.svelte.ts';
   import { MediaQuery } from 'svelte/reactivity';
-  import { messageTime } from '#lib/format.ts';
+  import { timeWithDay } from '#lib/format.ts';
   import { userTimezone } from '#lib/user-timezone.svelte.ts';
   import Markdown from './Markdown.svelte';
 
@@ -12,7 +12,7 @@
 
   const user = $derived(message.type === 'user');
   /** When it was made, as the user's setting has it; their messages have no toolbar to put it in. */
-  const time = $derived(message.at ? messageTime(message.at, userTimezone.value) : null);
+  const time = $derived(message.at ? timeWithDay(message.at, userTimezone.value) : null);
   // With a pointer the actions overlay the message's last line, so they're small enough to fit inside it; touch keeps
   // the size a finger needs.
   const fine = new MediaQuery('(pointer: fine)');

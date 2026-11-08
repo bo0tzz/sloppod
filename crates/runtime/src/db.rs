@@ -1909,6 +1909,7 @@ pub struct HighlightRow {
     pub text: String,
     pub created_at: DateTime<Utc>,
     pub seen_at: Option<DateTime<Utc>>,
+    pub snoozed_until: Option<DateTime<Utc>>,
     pub retracted_at: Option<DateTime<Utc>>,
     pub retraction_reason: Option<String>,
 }
@@ -1921,14 +1922,15 @@ impl HighlightRow {
             text: self.text.clone(),
             created_at: self.created_at.to_rfc3339(),
             seen_at: self.seen_at.map(|at| at.to_rfc3339()),
+            snoozed_until: self.snoozed_until.map(|at| at.to_rfc3339()),
             retracted_at: self.retracted_at.map(|at| at.to_rfc3339()),
             retraction_reason: self.retraction_reason.clone(),
         }
     }
 }
 
-const HIGHLIGHT_COLUMNS: &str =
-    "id, session_id, text, created_at, seen_at, retracted_at, retraction_reason";
+const HIGHLIGHT_COLUMNS: &str = "id, session_id, text, created_at, seen_at, snoozed_until, retracted_at, \
+     retraction_reason";
 
 /// Keeps what the agent highlighted for the user (#439).
 pub async fn insert_highlight(
@@ -1956,15 +1958,50 @@ pub async fn list_highlights(db: &PgPool, session: Uuid) -> sqlx::Result<Vec<Hig
     .await
 }
 
-/// How many of the session's highlights are open: neither marked seen by the user nor taken back by the agent.
+/// How many of the session's highlights are open: neither marked seen by the user nor taken back by the agent, and not
+/// put off until later (#467), which stops counting as waiting on them until its time.
 pub async fn open_highlights(db: &PgPool, session: Uuid) -> sqlx::Result<usize> {
     let count: i64 = sqlx::query_scalar(
-        "select count(*) from highlights where session_id = $1 and seen_at is null and retracted_at is null",
+        "select count(*) from highlights \
+         where session_id = $1 and seen_at is null and retracted_at is null \
+           and (snoozed_until is null or snoozed_until <= now())",
     )
     .bind(session)
     .fetch_one(db)
     .await?;
     Ok(count as usize)
+}
+
+/// The user puts one of the session's open highlights off until `until` (#467); none if it isn't the session's, or is
+/// already seen or taken back. The agent isn't told, and it stays the agent's to retract: it counts as not seen.
+pub async fn snooze_highlight(
+    db: &PgPool,
+    session: Uuid,
+    id: Uuid,
+    until: DateTime<Utc>,
+) -> sqlx::Result<Option<HighlightRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "update highlights set snoozed_until = $3 \
+         where id = $1 and session_id = $2 and seen_at is null and retracted_at is null \
+         returning {HIGHLIGHT_COLUMNS}"
+    )))
+    .bind(id)
+    .bind(session)
+    .bind(until)
+    .fetch_optional(db)
+    .await
+}
+
+/// The open highlights whose snooze has run out, bringing them back and clearing it (#467): each comes back to the
+/// user's "for you" list and counts as waiting on them again. Run by the runtime's periodic check.
+pub async fn due_highlights(db: &PgPool) -> sqlx::Result<Vec<HighlightRow>> {
+    sqlx::query_as(AssertSqlSafe(format!(
+        "update highlights set snoozed_until = null \
+         where snoozed_until is not null and snoozed_until <= now() and seen_at is null and retracted_at is null \
+         returning {HIGHLIGHT_COLUMNS}"
+    )))
+    .fetch_all(db)
+    .await
 }
 
 /// Marks one of the session's highlights seen, if it's still open; the row either way, none if it isn't the session's.

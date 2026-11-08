@@ -2537,6 +2537,128 @@ test('a highlight the agent takes back leaves the for-you list, and its card sta
   await expect(page.getByTestId('highlight-item')).toHaveCount(0);
 });
 
+test('snoozing a highlight moves it to the Snoozed group, out of what waits, and starts no turn', async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1000 });
+  // Its own highlight texts: the session list is one page, and a row is found by its title, so this test's must not
+  // share a prefix with another test's session.
+  await createSession(page, 'Highlight: Snooze the deploy check | Re-run the nightly job');
+  const panel = page.getByTestId('side-panel');
+  await expect(panel.getByTestId('highlight-item')).toHaveCount(2);
+  await expect(phase(page)).toHaveAttribute('title', /2 highlights/);
+  const row = page.getByRole('navigation', { name: 'Sessions' }).getByTestId('session-row').filter({ hasText: 'Snooze the deploy check' });
+
+  const turnsBefore = await agentMessages(page).count();
+  const noticesBefore = await userMessages(page).count();
+  await panel.getByTestId('highlight-item').filter({ hasText: 'Snooze the deploy check' }).getByRole('button', { name: 'Snooze' }).click();
+  await page.getByRole('menuitem', { name: 'In an hour' }).click();
+
+  // Out of what waits on the user, into a group folded away under it.
+  await expect(panel.getByTestId('highlight-item')).toHaveCount(1);
+  await expect(phase(page)).toHaveAttribute('title', /1 highlight/);
+  const toggle = panel.getByTestId('snoozed-toggle');
+  await expect(toggle).toHaveText(/Snoozed \(1\)/);
+  await expect(panel.getByTestId('snoozed-items')).toHaveCount(0);
+  // Its card in the chat says it's put off, and keeps Seen.
+  const card = page.getByTestId('highlight-card').filter({ hasText: 'Snooze the deploy check' });
+  await expect(card).toHaveAttribute('data-snoozed', 'true');
+  await expect(card).toContainText('Snoozed until');
+  await expect(card.getByRole('button', { name: 'Seen' })).toBeVisible();
+
+  // Unfolded: its text, until when, and Seen and Snooze again.
+  await toggle.click();
+  const snoozed = panel.getByTestId('snoozed-item');
+  await expect(snoozed).toHaveCount(1);
+  await expect(snoozed).toContainText('Snooze the deploy check');
+  await expect(snoozed.getByTestId('highlight-snoozed-until')).toContainText('until');
+  await expect(snoozed.getByRole('button', { name: 'Snooze' })).toBeVisible();
+
+  // Put the other off too: nothing waits on the user, and no turn ran for either.
+  await panel.getByTestId('highlight-item').getByRole('button', { name: 'Snooze' }).click();
+  await page.getByRole('menuitem', { name: 'In an hour' }).click();
+  await expect(panel.getByTestId('highlight-item')).toHaveCount(0);
+  await expect(panel.getByTestId('snoozed-toggle')).toHaveText(/Snoozed \(2\)/);
+  await expect(phase(page)).toHaveText('Idle');
+  await expect(row.getByTestId('phase')).toHaveText('Idle');
+  await page.waitForTimeout(500);
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+  expect(await agentMessages(page).count()).toBe(turnsBefore);
+  expect(await userMessages(page).count()).toBe(noticesBefore);
+
+  // Seen from the group is done with it for good, and stays so after a reload.
+  await panel.getByTestId('snoozed-item').filter({ hasText: 'Snooze the deploy check' }).getByRole('button', { name: 'Seen' }).click();
+  await expect(panel.getByTestId('snoozed-toggle')).toHaveText(/Snoozed \(1\)/);
+  await expect(card).toHaveAttribute('data-seen', 'true');
+  await page.reload();
+  await expect(panel.getByTestId('snoozed-toggle')).toHaveText(/Snoozed \(1\)/);
+  await expect(card).toHaveAttribute('data-seen', 'true');
+});
+
+test('a snoozed highlight comes back at its time, without a reload', async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1000 });
+  const id = await createSession(page, 'Highlight: Re-run the nightly job');
+  const panel = page.getByTestId('side-panel');
+  const item = panel.getByTestId('highlight-item');
+  await expect(item).toHaveCount(1);
+
+  // Put off for a moment: the check the UI's choices never need brings it back when its time passes.
+  const [highlight] = await (await page.request.get(`/api/v1/sessions/${id}/highlights`)).json();
+  await page.request.post(`/api/v1/sessions/${id}/highlights/${highlight.id}/snooze`, {
+    data: { until: new Date(Date.now() + 3000).toISOString() },
+  });
+  await expect(item).toHaveCount(0);
+  await expect(panel.getByTestId('snoozed-toggle')).toHaveText(/Snoozed \(1\)/);
+  await expect(phase(page)).toHaveText('Idle');
+
+  // Back among what waits on the user, with nothing reloaded.
+  await expect(item).toHaveCount(1);
+  await expect(panel.getByTestId('snoozed-toggle')).toHaveCount(0);
+  await expect(phase(page)).toHaveText('Waiting on you');
+  await expect(page.getByTestId('highlight-card')).toHaveAttribute('data-snoozed', 'false');
+});
+
+test('snoozing a highlight again pushes it further out, past the first time', async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1000 });
+  const id = await createSession(page, 'Highlight: Check the deploy after the nightly job');
+  const panel = page.getByTestId('side-panel');
+  await expect(panel.getByTestId('highlight-item')).toHaveCount(1);
+  const [highlight] = await (await page.request.get(`/api/v1/sessions/${id}/highlights`)).json();
+  const snoozeFor = (ms: number) =>
+    page.request.post(`/api/v1/sessions/${id}/highlights/${highlight.id}/snooze`, {
+      data: { until: new Date(Date.now() + ms).toISOString() },
+    });
+
+  await snoozeFor(2000);
+  await expect(panel.getByTestId('snoozed-toggle')).toHaveText(/Snoozed \(1\)/);
+  // Pushed a few seconds further out, as Snooze again does: the first time passing doesn't bring it back.
+  await snoozeFor(6000);
+  await page.waitForTimeout(2500);
+  await expect(panel.getByTestId('snoozed-toggle')).toHaveText(/Snoozed \(1\)/);
+  await expect(panel.getByTestId('highlight-item')).toHaveCount(0);
+
+  // And it comes back at the time it was pushed to.
+  await expect(panel.getByTestId('highlight-item')).toHaveCount(1);
+  await expect(panel.getByTestId('snoozed-toggle')).toHaveCount(0);
+});
+
+test('the agent can still take back a highlight the user has snoozed', async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1000 });
+  await createSession(page, 'Highlight: Merge pull request 12 by hand');
+  const panel = page.getByTestId('side-panel');
+  await panel.getByTestId('highlight-item').getByRole('button', { name: 'Snooze' }).click();
+  await page.getByRole('menuitem', { name: 'In an hour' }).click();
+  await expect(panel.getByTestId('snoozed-toggle')).toHaveText(/Snoozed \(1\)/);
+
+  // Snoozing isn't seeing it: the agent takes it back, and it leaves the user's list for good.
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Retract the highlight: It was pull request 21, not 12');
+  await box.press('Enter');
+  const card = page.getByTestId('highlight-card');
+  await expect(card).toHaveAttribute('data-retracted', 'true');
+  await expect(card.getByTestId('highlight-retraction')).toHaveText('Retracted: It was pull request 21, not 12');
+  await expect(panel.getByTestId('snoozed-toggle')).toHaveCount(0);
+  await expect(panel.getByTestId('snoozed-item')).toHaveCount(0);
+});
+
 test('a question the agent withdraws closes, with a note in the chat, and stops counting as waiting', async ({ page }) => {
   await createSession(page, 'Withdraw the question: The user answered in the chat');
   await expect(page.getByTestId('notice')).toContainText('Withdrawn: The user answered in the chat');
@@ -4135,6 +4257,45 @@ test.describe('in UTC', () => {
     await setting.click();
     await page.getByRole('option', { name: 'UTC', exact: true }).click();
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('UTC');
+  });
+
+  test('the snooze choices follow a timezone chosen in Settings, without a reload', async ({ page }) => {
+    await page.setViewportSize({ width: 1920, height: 1000 });
+    await page.request.post('/_mock/forget-timezone');
+    const id = await createSession(page, 'Highlight: Put the deploy check off until the morning');
+    const panel = page.getByTestId('side-panel');
+    // The menu has been open once already, in the browser's own zone.
+    await panel.getByTestId('highlight-item').getByRole('button', { name: 'Snooze' }).click();
+    await expect(page.getByRole('menuitem', { name: 'In an hour' })).toBeVisible();
+    await page.keyboard.press('Escape');
+
+    // Another timezone in Settings, and back to the session without a reload.
+    await page.getByRole('link', { name: 'Settings' }).first().click();
+    const setting = page.getByTestId('timezone-setting').getByRole('combobox', { name: 'Timezone' });
+    await setting.click();
+    await page.getByRole('option', { name: 'Asia/Tokyo', exact: true }).click();
+    await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Asia/Tokyo');
+    await page.getByRole('navigation', { name: 'Sessions' }).getByRole('link', { name: /Put the deploy check off/ }).click();
+
+    // Tomorrow morning is 09:00 in that zone, not in the one the menu was opened in before the change.
+    await panel.getByTestId('highlight-item').getByRole('button', { name: 'Snooze' }).click();
+    await page.getByRole('menuitem', { name: 'Tomorrow morning (09:00)' }).click();
+    await expect.poll(async () => {
+      const [highlight] = await (await page.request.get(`/api/v1/sessions/${id}/highlights`)).json();
+      return highlight.snoozed_until ?? null;
+    }).not.toBeNull();
+    const [highlight] = await (await page.request.get(`/api/v1/sessions/${id}/highlights`)).json();
+    const clockIn = (zone: string) =>
+      new Intl.DateTimeFormat('en-GB', { timeZone: zone, hour: '2-digit', minute: '2-digit', hour12: false }).format(
+        new Date(highlight.snoozed_until),
+      );
+    expect(clockIn('Asia/Tokyo')).toBe('09:00');
+    expect(clockIn('UTC')).not.toBe('09:00');
+
+    // The card says the same 09:00 the choice meant, in that zone: read in the browser's it would say 00:00.
+    const until = page.getByTestId('highlight-card').filter({ hasText: 'Put the deploy check off' }).getByTestId('highlight-snoozed-until');
+    await expect(until).toContainText('09:00');
+    await expect(until).toHaveAttribute('title', /09:00/);
   });
 });
 

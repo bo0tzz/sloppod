@@ -18,6 +18,7 @@
     sessionId,
     highlights = [],
     onSeen,
+    onSnooze,
     onResume,
     awaiting = new Set<string>(),
     unreadAfter = null,
@@ -28,6 +29,8 @@
     /** What the agent highlighted: a `highlight` tool call that made one shows as its card. */
     highlights?: Highlight[];
     onSeen?: (highlight: Highlight) => Promise<void>;
+    /** Puts a highlight off until later (#467). */
+    onSnooze?: (highlight: Highlight, until: Date) => Promise<void>;
     onResume?: () => void;
     /** The ids of the tool calls waiting for the user's permission: they stay out of a fold. */
     awaiting?: Set<string>;
@@ -136,7 +139,7 @@
         {:else if item.type === 'thought'}
           <ThoughtView thought={item} active={running && index === items.length - 1} />
         {:else if item.type === 'tool' && highlighted.has(item.toolCallId) && onSeen}
-          <HighlightCard highlight={highlighted.get(item.toolCallId)!} {onSeen} />
+          <HighlightCard highlight={highlighted.get(item.toolCallId)!} {onSeen} {onSnooze} />
         {:else if item.type === 'tool'}
           <ToolCallView tool={item} />
         {:else if item.type === 'plan'}

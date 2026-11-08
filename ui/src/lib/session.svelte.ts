@@ -458,6 +458,11 @@ export class SessionView {
     this.upsertHighlight(await api.markHighlightSeen(this.id, highlight.id));
   }
 
+  /** The user puts a highlight off until later (#467); the runtime brings it back at its time. No turn starts. */
+  async snoozeHighlight(highlight: Highlight, until: Date) {
+    this.upsertHighlight(await api.snoozeHighlight(this.id, highlight.id, until.toISOString()));
+  }
+
   upsertProposal(proposal: Proposal) {
     const index = this.proposals.findIndex((existing) => existing.id === proposal.id);
     const before = this.proposals[index]?.status;

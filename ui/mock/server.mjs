@@ -70,7 +70,7 @@ class MockSession {
           proposals: [...proposals.values()].filter((p) => p.session_id === data.id && p.status === 'pending').length,
           questions: pending.filter((p) => p.method === 'elicitation/create').length,
           permissions: pending.filter((p) => p.method !== 'elicitation/create').length,
-          highlights: [...highlights.values()].filter((h) => h.session_id === data.id && !h.seen_at && !h.retracted_at).length,
+          highlights: [...highlights.values()].filter((h) => h.session_id === data.id && !h.seen_at && !h.retracted_at && !isSnoozed(h)).length,
         };
       },
     });
@@ -839,6 +839,26 @@ async function agentScript(session, turn, prompt) {
     await say('Done.');
     return;
   }
+  // With `Retract the highlight: <reason>` the agent takes back the session's open highlight (`retract_highlight`), as
+  // it may while the user has put it off (#467): snoozing isn't seeing it.
+  if (/^retract the highlight:/i.test(prompt)) {
+    const reason = prompt.replace(/^retract the highlight:\s*/i, '').trim();
+    const open = [...highlights.values()].filter((h) => h.session_id === session.data.id && !h.seen_at && !h.retracted_at).at(-1);
+    const retractId = randomUUID();
+    tool({ toolCallId: retractId, title: 'mcp__sloppod__retract_highlight', kind: 'other', status: 'pending', rawInput: { id: open?.id, reason } });
+    await step(1);
+    if (open) {
+      open.retracted_at = now();
+      open.retraction_reason = reason;
+      broadcastHighlight(open);
+    }
+    update(retractId, {
+      status: open ? 'completed' : 'failed',
+      content: [{ type: 'content', content: { type: 'text', text: open ? "Retracted: it leaves the user's list." : 'no such highlight of yours' } }],
+    });
+    await say('Done.');
+    return;
+  }
   // With `Withdraw the question: <reason>` the agent asks a question, then takes it back (`withdraw_question`): it closes
   // without an answer, nothing is sent to the agent, and the chat says so.
   if (/^withdraw the question:/i.test(prompt)) {
@@ -1409,6 +1429,33 @@ function createHighlight(session, text) {
   highlights.set(highlight.id, highlight);
   broadcastHighlight(highlight);
   return highlight;
+}
+
+/** Whether a highlight is put off until later (#467): open, with a time still ahead of it. */
+const isSnoozed = (highlight) =>
+  !highlight.seen_at && !highlight.retracted_at && Boolean(highlight.snoozed_until) && Date.parse(highlight.snoozed_until) > Date.now();
+
+/** Snoozing a highlight again pushes it further out: the timer set for its first time is replaced, not left to fire. */
+const wakeTimers = new Map();
+
+/** The user puts a highlight off until later (#467); nothing waits on them until its time, and the runtime brings it
+ * back then, pushing it as it does when the agent highlights something. */
+function snoozeHighlight(highlight, until) {
+  highlight.snoozed_until = until;
+  broadcastHighlight(highlight);
+  clearTimeout(wakeTimers.get(highlight.id));
+  const delay = Date.parse(until) - Date.now();
+  if (delay > 0) wakeTimers.set(highlight.id, setTimeout(() => wakeHighlight(highlight), delay));
+}
+
+/** Its time has passed: it's in the user's list again, as the runtime's periodic check brings it back. */
+function wakeHighlight(highlight) {
+  wakeTimers.delete(highlight.id);
+  if (highlight.seen_at || highlight.retracted_at) return;
+  // The runtime's check only clears what is due; a snooze pushed further out since is left alone.
+  if (!highlight.snoozed_until || Date.parse(highlight.snoozed_until) > Date.now()) return;
+  delete highlight.snoozed_until;
+  broadcastHighlight(highlight);
 }
 
 function broadcastHighlight(highlight) {
@@ -2036,6 +2083,15 @@ async function handleApi(req, res, url) {
       // The user's alone: no turn starts and the agent isn't told.
       highlight.seen_at ??= now();
       broadcastHighlight(highlight);
+      return json(res, 200, highlight);
+    }
+    if (parts.length === 5 && parts[2] === 'highlights' && parts[4] === 'snooze' && method === 'POST') {
+      const highlight = highlights.get(parts[3]);
+      if (!highlight || highlight.session_id !== session.data.id) return json(res, 404, { error: 'not found' });
+      const { until } = await readBody(req);
+      if (typeof until !== 'string' || Number.isNaN(Date.parse(until))) return json(res, 400, { error: 'until must be an RFC 3339 time' });
+      // Like seen: no turn starts and the agent isn't told; it stays the agent's to retract.
+      snoozeHighlight(highlight, until);
       return json(res, 200, highlight);
     }
     if (parts.length === 3 && parts[2] === 'debug-bundle' && method === 'GET') {
