@@ -349,6 +349,14 @@ export const credentialKinds: CredentialKindSpec[] = [
         placeholder: 'qwen3-coder, glm-5',
         description: 'The model names it serves, separated by commas.',
       },
+      {
+        key: 'context_windows',
+        label: 'Context windows',
+        placeholder: 'qwen3-coder=262144, glm-5=200000',
+        description:
+          "Each model's context window in tokens, for those Claude Code doesn't know, so it compacts near the real limit. Without one it assumes its default.",
+        optional: true,
+      },
     ],
     secret: { label: 'Key', description: 'Sent as x-api-key and as Authorization: Bearer.' },
     deletion: 'Sessions on its models are refused until you move them onto another model.',

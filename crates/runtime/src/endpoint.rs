@@ -107,6 +107,16 @@ impl Providers {
         offered
     }
 
+    /// The context window of the endpoint model `value` (its id) in tokens, when its provider knows it: a LiteLLM
+    /// model's `maxInputTokens`, or the one given with an endpoint credential.
+    pub async fn context_window(&self, owner: &str, value: &str) -> Option<u64> {
+        self.offered(owner)
+            .await
+            .into_iter()
+            .find(|m| m.value == value)
+            .and_then(|m| m.info["maxInputTokens"].as_u64())
+    }
+
     /// Which endpoint model `value` is: one named by its id, which has to be offered to the owner, or by its bare
     /// name when exactly one endpoint offered to them serves a model of that name. `None` for any other value, which
     /// is a model of the agent's own; an error, for the user or agent, for one that can't be used.
@@ -297,8 +307,12 @@ impl ModelProvider for OwnEndpoints {
                     }
                     .id(),
                     name: format!("{model} ({})", row.name),
+                    // In LiteLLM's terms, as the operator's models carry it.
+                    info: match row.config["context_windows"][&model].as_u64() {
+                        Some(tokens) => json!({"maxInputTokens": tokens}),
+                        None => Value::Null,
+                    },
                     model,
-                    info: Value::Null,
                 })
             })
             .collect())

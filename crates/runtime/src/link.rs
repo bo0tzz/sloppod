@@ -498,6 +498,21 @@ pub async fn agent_context(
     } else {
         state.config.runtime_url()
     };
+    let inference = match session
+        .model
+        .as_deref()
+        .and_then(crate::endpoint::EndpointModel::parse)
+    {
+        Some(model) => Some(InferenceContext {
+            base_url: format!("{endpoints}{}", crate::endpoint::PREFIX),
+            context_window: state
+                .providers
+                .context_window(&session.owner, session.model.as_deref().unwrap_or_default())
+                .await,
+            model: model.model,
+        }),
+        None => None,
+    };
     let context = session.context();
     let work = crate::work::agent::prompt(&state.db, &context).await;
     let namespace = crate::capabilities::grant_with(&context, &crate::capabilities::Part::Memory)
@@ -536,13 +551,7 @@ pub async fn agent_context(
             SessionKind::Utility => None,
         },
         model: session.model.clone(),
-        inference: crate::endpoint::EndpointModel::parse(
-            session.model.as_deref().unwrap_or_default(),
-        )
-        .map(|model| InferenceContext {
-            base_url: format!("{endpoints}{}", crate::endpoint::PREFIX),
-            model: model.model,
-        }),
+        inference,
         work,
         memory,
     }
