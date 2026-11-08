@@ -89,9 +89,10 @@ class MockSession {
     this.startTimer = null;
   }
 
-  emit(update) {
-    // Like the runtime, an update says where it falls in the log, from 1: what a read position counts in.
-    const params = { sessionId: this.data.id, update, _meta: { sloppod: { seq: this.log.length + 1 } } };
+  emit(update, at = now()) {
+    // Like the runtime, an update says where it falls in the log, from 1 (what a read position counts in), and when it
+    // was recorded.
+    const params = { sessionId: this.data.id, update, _meta: { sloppod: { seq: this.log.length + 1, at } } };
     this.log.push(params);
     this.data.active_at = now();
     for (const conn of this.subscribers) conn.notify('session/update', params);
@@ -1678,6 +1679,7 @@ function handleCall(conn, message) {
       const start = Math.max(0, end - HISTORY_PAGE);
       conn.respond(id, {
         updates: session.log.slice(start, end).map((entry) => entry.update),
+        at: session.log.slice(start, end).map((entry) => entry._meta.sloppod.at),
         before: start > 0 ? start + 1 : null,
       });
       return;
@@ -2771,7 +2773,8 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/_mock/update' && req.method === 'POST') {
       // Any session update, as the agent might send it, in every session: the body is the update.
       const update = await readBody(req);
-      for (const session of sessions.values()) session.emit(update);
+      // `?at=` says when it was recorded.
+      for (const session of sessions.values()) session.emit(update, url.searchParams.get('at') ?? undefined);
       return json(res, 200, {});
     }
     if (url.pathname === '/_mock/spawn' && req.method === 'POST') {

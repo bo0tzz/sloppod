@@ -733,14 +733,14 @@ async fn a_session_log_reads_back_from_its_latest(db: PgPool) {
     let other = session(&db, "dev").await;
     let mut seqs = Vec::new();
     for n in 0..5 {
-        seqs.push(db::append_event(&db, s, &json!({"n": n})).await.unwrap());
+        seqs.push(db::append_event(&db, s, &json!({"n": n})).await.unwrap().0);
         db::append_event(&db, other, &json!({"other": n}))
             .await
             .unwrap();
     }
     let latest = db::events_before(&db, s, i64::MAX, 2).await.unwrap();
     assert_eq!(
-        latest.iter().map(|e| e.1["n"].clone()).collect::<Vec<_>>(),
+        latest.iter().map(|e| e.2["n"].clone()).collect::<Vec<_>>(),
         [json!(3), json!(4)]
     );
     let older = db::events_before(&db, s, latest[0].0, 10).await.unwrap();
@@ -757,7 +757,7 @@ async fn a_session_log_reads_back_from_its_latest(db: PgPool) {
 async fn a_session_log_has_a_last_event(db: PgPool) {
     let s = session(&db, "dev").await;
     assert_eq!(db::last_event(&db, s).await.unwrap(), 0);
-    let seq = db::append_event(&db, s, &json!({})).await.unwrap();
+    let seq = db::append_event(&db, s, &json!({})).await.unwrap().0;
     db::append_event(&db, session(&db, "dev").await, &json!({}))
         .await
         .unwrap();

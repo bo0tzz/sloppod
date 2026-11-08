@@ -3,12 +3,16 @@
   import { mdiAlertCircleOutline, mdiBugOutline, mdiCheck, mdiContentCopy, mdiLinkVariant, mdiSteering } from '@mdi/js';
   import { messageMarkdown, type MessageItem } from '#lib/acp/transcript.svelte.ts';
   import { MediaQuery } from 'svelte/reactivity';
+  import { messageTime } from '#lib/format.ts';
+  import { userTimezone } from '#lib/user-timezone.svelte.ts';
   import Markdown from './Markdown.svelte';
 
   /** `bundleUrl`: where the debug bundle of the message's turn downloads from (#378). */
   let { message, bundleUrl }: { message: MessageItem; bundleUrl?: string } = $props();
 
   const user = $derived(message.type === 'user');
+  /** When it was made, as the user's setting has it; their messages have no toolbar to put it in. */
+  const time = $derived(message.at ? messageTime(message.at, userTimezone.value) : null);
   // With a pointer the actions overlay the message's last line, so they're small enough to fit inside it; touch keeps
   // the size a finger needs.
   const fine = new MediaQuery('(pointer: fine)');
@@ -40,7 +44,7 @@
 <div class="flex {user ? 'justify-end' : ''}" data-testid="message-{message.type}" data-steering={message.steering || undefined}>
   <div
     class={user
-      ? `max-w-[85%] rounded-2xl rounded-ee-md px-4 py-2.5 ${message.steering ? 'bg-warning-500/15' : 'bg-primary/10'}`
+      ? `group relative max-w-[85%] rounded-2xl rounded-ee-md px-4 py-2.5 ${message.steering ? 'bg-warning-500/15' : 'bg-primary/10'}`
       : 'group relative w-full min-w-0'}
   >
     {#if message.steering}
@@ -66,6 +70,16 @@
         </a>
       {/if}
     {/each}
+    {#if user && time}
+      <!-- On hover, in the corner of the bubble, in the padding under its last line; on touch screens always, as a line under it. -->
+      <time
+        datetime={message.at ?? undefined}
+        title={time.title}
+        data-testid="message-time"
+        class="text-muted block text-end text-xs transition-opacity select-none pointer-fine:pointer-events-none pointer-fine:absolute pointer-fine:right-3 pointer-fine:bottom-0.5 pointer-fine:text-[10px] pointer-fine:leading-none pointer-fine:opacity-0 pointer-fine:group-hover:opacity-100"
+        >{time.label}</time
+      >
+    {/if}
     {#if !user}
       <!-- With a pointer, a small toolbar over the message's bottom corner, where a last line seldom reaches, shown on
            hover or keyboard focus and taking no room of its own: it can't stick out of the message, as the transcript's
@@ -74,6 +88,15 @@
         data-testid="message-actions"
         class="-ms-2 flex items-center transition-opacity pointer-fine:pointer-events-none pointer-fine:absolute pointer-fine:bottom-0 pointer-fine:right-0 pointer-fine:ms-0 pointer-fine:rounded-full pointer-fine:bg-light-50 pointer-fine:opacity-0 pointer-fine:shadow-sm pointer-fine:group-hover:pointer-events-auto pointer-fine:group-hover:opacity-100 pointer-fine:focus-within:pointer-events-auto pointer-fine:focus-within:opacity-100"
       >
+        {#if time}
+          <time
+            datetime={message.at ?? undefined}
+            title={time.title}
+            data-testid="message-time"
+            class="text-muted px-1.5 text-xs whitespace-nowrap select-none"
+            >{time.label}</time
+          >
+        {/if}
         <IconButton
           icon={copyFeedback[copyState].icon}
           aria-label={copyFeedback[copyState].label}
