@@ -4259,12 +4259,12 @@ test.describe('in UTC', () => {
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('UTC');
   });
 
-  test('the snooze choices are of a timezone chosen after the menu was first opened', async ({ page }) => {
+  test('the snooze choices follow a timezone chosen in Settings, without a reload', async ({ page }) => {
     await page.setViewportSize({ width: 1920, height: 1000 });
     await page.request.post('/_mock/forget-timezone');
     const id = await createSession(page, 'Highlight: Put the deploy check off until the morning');
     const panel = page.getByTestId('side-panel');
-    // The menu opened once already, in the browser's own zone.
+    // The menu has been open once already, in the browser's own zone.
     await panel.getByTestId('highlight-item').getByRole('button', { name: 'Snooze' }).click();
     await expect(page.getByRole('menuitem', { name: 'In an hour' })).toBeVisible();
     await page.keyboard.press('Escape');
@@ -4277,7 +4277,7 @@ test.describe('in UTC', () => {
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Asia/Tokyo');
     await page.getByRole('navigation', { name: 'Sessions' }).getByRole('link', { name: /Put the deploy check off/ }).click();
 
-    // Tomorrow morning is 09:00 in that zone, not in the one the menu was first opened in.
+    // Tomorrow morning is 09:00 in that zone, not in the one the menu was opened in before the change.
     await panel.getByTestId('highlight-item').getByRole('button', { name: 'Snooze' }).click();
     await page.getByRole('menuitem', { name: 'Tomorrow morning (09:00)' }).click();
     await expect.poll(async () => {

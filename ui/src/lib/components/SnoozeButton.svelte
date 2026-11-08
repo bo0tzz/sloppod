@@ -3,7 +3,7 @@
   import { mdiClockOutline } from '@mdi/js';
   import { tick } from 'svelte';
   import { snoozeChoices } from '#lib/snooze.ts';
-  import { userTimezone } from '#lib/timezone.ts';
+  import { userTimezone } from '#lib/user-timezone.svelte.ts';
 
   /**
    * Snooze, next to Seen (#467): a menu of when to be shown it again, worked out in the user's timezone. The choice
@@ -14,11 +14,10 @@
   async function open(event: MouseEvent) {
     event.stopPropagation();
     event.preventDefault();
-    // The event is over by the time the timezone is read, and takes `currentTarget` with it.
     const target = event.currentTarget as HTMLElement;
-    const zone = await userTimezone();
+    // Read as the menu opens, so a zone changed in Settings since it was last read (#482) is the one used.
     let chosen: Date | null = null;
-    const items: ActionItem[] = snoozeChoices(zone).map((choice) => ({
+    const items: ActionItem[] = snoozeChoices(userTimezone.value).map((choice) => ({
       title: choice.title,
       onAction: () => {
         chosen = choice.until;

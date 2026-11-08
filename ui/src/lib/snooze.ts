@@ -1,5 +1,5 @@
 import type { Highlight } from './api.ts';
-import { addDays, weekday, zonedDate, zonedTime } from './timezone.ts';
+import { addDays, weekday, zonedDate, zonedTime, type Zone } from './timezone.ts';
 
 const HOUR = 3600_000;
 
@@ -20,7 +20,7 @@ export type SnoozeChoice = { title: string; until: Date };
  * once that has gone; tomorrow at 09:00; and next Monday at 09:00, a week on when today is a Monday. Every one is
  * ahead of `now`, so nothing comes straight back.
  */
-export function snoozeChoices(zone: string, now = new Date()): SnoozeChoice[] {
+export function snoozeChoices(zone: Zone, now = new Date()): SnoozeChoice[] {
   const today = zonedDate(zone, now);
   const tonight = zonedTime(zone, today, 18);
   const thisEvening = tonight.getTime() > now.getTime();

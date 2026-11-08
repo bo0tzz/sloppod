@@ -32,26 +32,16 @@ export async function adoptBrowserTimezone() {
   }
 }
 
-/**
- * The user's timezone from Settings, the browser's for a user without one (#253), read when it's needed (#467): a
- * timezone chosen in Settings afterwards is the one the next choice uses, with no reload.
- */
-export async function userTimezone(): Promise<string> {
-  try {
-    return (await api.getSettings()).timezone ?? browserTimezone();
-  } catch {
-    // A moment without the runtime shouldn't pin the browser's over the user's.
-    return browserTimezone();
-  }
-}
-
 /** A date on a zone's calendar. */
 export type CalendarDate = { year: number; month: number; day: number };
 
+/** A zone to work in: an IANA name, or none for the browser's, as a user's setting that isn't read yet is. */
+export type Zone = string | null | undefined;
+
 /** What a zone's clock reads at `at`. */
-function zonedFields(zone: string, at: Date) {
+function zonedFields(zone: Zone, at: Date) {
   const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: zone,
+    timeZone: zone ?? undefined,
     hour12: false,
     year: 'numeric',
     month: '2-digit',
@@ -66,13 +56,13 @@ function zonedFields(zone: string, at: Date) {
 }
 
 /** How far ahead of UTC a zone's clock is at `at`. */
-function offsetAt(zone: string, at: Date): number {
+function offsetAt(zone: Zone, at: Date): number {
   const { year, month, day, hour, minute, second } = zonedFields(zone, at);
   return Date.UTC(year, month - 1, day, hour, minute, second) - (at.getTime() - at.getMilliseconds());
 }
 
 /** The date a zone's clock is on at `at`. */
-export function zonedDate(zone: string, at: Date): CalendarDate {
+export function zonedDate(zone: Zone, at: Date): CalendarDate {
   const { year, month, day } = zonedFields(zone, at);
   return { year, month, day };
 }
@@ -93,7 +83,7 @@ export function weekday(date: CalendarDate): number {
  * resolves the way the browser resolves the zone's own: two rounds of converting settle the offset, which differs
  * either side of the change.
  */
-export function zonedTime(zone: string, date: CalendarDate, hour: number, minute = 0): Date {
+export function zonedTime(zone: Zone, date: CalendarDate, hour: number, minute = 0): Date {
   const wall = Date.UTC(date.year, date.month - 1, date.day, hour, minute);
   let at = wall;
   for (let round = 0; round < 2; round++) at = wall - offsetAt(zone, new Date(at));
