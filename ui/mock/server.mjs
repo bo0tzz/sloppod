@@ -688,6 +688,19 @@ async function agentScript(session, turn, prompt) {
     return;
   }
 
+  if (/long log with a tool call/i.test(prompt)) {
+    // More updates than one page, and the latest page begins at a tool call: the row at the top of what a reader has is
+    // then one a live turn can still write to, while the page before it is on its way.
+    const toolCallId = randomUUID();
+    tool({ toolCallId, title: 'Shell', kind: 'execute', status: 'pending', rawInput: { command: 'npm test' } });
+    const messageId = randomUUID();
+    for (let i = 0; i < HISTORY_PAGE - 2; i++) {
+      session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'word ' }, messageId });
+    }
+    await say('The end.');
+    return;
+  }
+
   if (/ask me/i.test(prompt)) {
     await step(2);
     await say('Before I start, a couple of questions.');

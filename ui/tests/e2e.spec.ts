@@ -1851,6 +1851,59 @@ test('the row the reader is looking at stays put as the earlier page goes in abo
   await expect.poll(async () => Math.abs((await end()) - held)).toBeLessThan(2);
 });
 
+test('the reader’s place holds when the row they are at is written to as the page comes in', { tag: '@scroll' }, async ({ page }) => {
+  await page.setViewportSize({ width: 1000, height: 500 });
+  const prompt = 'Write a long log with a tool call in sloppod';
+  await createSession(page, prompt);
+  await expect(page.getByText('The end.')).toBeVisible({ timeout: 20_000 });
+  await page.reload();
+  await expect(page.getByText('The end.')).toBeVisible();
+  // The page that opens holds the latest of the log, which begins at the tool call: at the top of the chat, that row
+  // is the reader's.
+  await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(0);
+  const row = page.locator('[data-testid="transcript"] [data-row-name^="tool:"]');
+  await expect(row).toHaveCount(1);
+
+  await page.request.post('/_mock/hold-history');
+  await wheelUp(page);
+  await expect(page.getByTestId('loading-earlier')).toBeVisible();
+  await expect(row).toBeInViewport();
+
+  // The tool goes on working while the page is on its way: the row is the same row, though the seq it ends at moves on.
+  const was = await row.getAttribute('data-seq');
+  await page.request.post('/_mock/update', {
+    data: {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: (await row.getAttribute('data-row-name'))!.replace('tool:', ''),
+      status: 'in_progress',
+    },
+  });
+  await expect.poll(async () => row.getAttribute('data-seq')).not.toBe(was);
+
+  const end = async () => {
+    const box = (await row.boundingBox())!;
+    return box.y + box.height;
+  };
+  const held = await end();
+  await page.request.post('/_mock/release-history');
+  await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(1);
+  // The page that went in above is all that moved the row, and the view was scrolled by as much: the reader's place is
+  // where it was, the tool call's own update having been theirs to see rather than something to compensate for.
+  await expect.poll(async () => Math.abs((await end()) - held)).toBeLessThan(2);
+});
+
+test('older history comes in for a reader who only drags the scrollbar', { tag: '@scroll' }, async ({ page }) => {
+  const prompt = await openLongHistory(page);
+  const scroller = page.getByTestId('transcript-scroller');
+  // The scrollbar is all they use: no wheel, no key, no touch, and no button to fall back on.
+  await page.getByText('The end.').hover();
+  await page.mouse.down();
+  await scroller.evaluate((element) => element.scrollTo({ top: 0 }));
+  await page.mouse.up();
+
+  await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(1);
+});
+
 test('the start of the session is marked once nothing earlier is left', { tag: '@scroll' }, async ({ page }) => {
   const prompt = await openLongHistory(page);
   await expect(page.getByTestId('history-start')).toHaveCount(0);

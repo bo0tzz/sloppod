@@ -184,7 +184,11 @@
   let scroller = $state<HTMLElement | null>(null);
   let content = $state<HTMLElement | null>(null);
   let atBottom = $state(true);
-  /** Earlier history loads by itself only once the reader has scrolled, not when the view starts out at the top. */
+  /**
+   * Earlier history loads by itself only once the reader has scrolled — by wheel, touch, key or the scrollbar — and not
+   * when the view opens at the top, where the scrolling is the view's own. A reader who only drags the scrollbar has no
+   * other way to it, the button that used to be there being gone.
+   */
   let userScrolled = false;
   /**
    * Set while a page of older history is on its way in. The page's rows are laid out as it lands, and a view that looks
@@ -218,6 +222,9 @@
   function onScroll() {
     if (!scroller || !positioned) return;
     scheduleRead();
+    // A scrollbar drag scrolls as much as a wheel does, and counts the same; the view's own scrolling and its opening
+    // position come with neither a pointer down nor a wheel, touch or key before them.
+    if (pointerHeld || performance.now() - lastUserScroll < 1000) userScrolled = true;
     if (holdBar) return;
     const resized = viewResized();
     if (!holdingPlace && bottomGap() < 80) {
@@ -259,9 +266,10 @@
     const page = view.loadEarlier();
     holdingPlace = true;
     let held = at < 0 ? undefined : endOf(rows[at]);
-    // A row of the log loaded here has a place of its own, its last seq; the rows that go in above it have none (they
-    // are 0, as the earlier pages are). Found by that, the reader's row is theirs even if rows arrive at the end too.
-    const place = rows[at]?.dataset.seq ?? '0';
+    // The reader's row by the name it has of its own — a message's id, a tool call's — which a page going in above it
+    // leaves alone, as an update of a live turn to that row does; rows of an earlier page have no name, and there the
+    // rows that went in above them are counted instead.
+    const name = rows[at]?.dataset.rowName ?? '';
     try {
       while (view.loadingHistory && held !== undefined) {
         await new Promise((resolve) => requestAnimationFrame(resolve));
@@ -280,9 +288,8 @@
         // Scrolling on themselves, the reader has taken the view where they want it: what a page did above them is
         // theirs to scroll past as well, and holding them back would be the jump.
         if (pointerHeld || lastUserScroll !== scrolledBy) return;
-        // Where that place isn't a row's own, the reader's is as many rows further down as went in above them.
         const now = rowElements();
-        const row = place === '0' ? now[at + (now.length - rows.length)] : now.find((row) => row.dataset.seq === place);
+        const row = name ? now.find((row) => row.dataset.rowName === name) : now[at + (now.length - rows.length)];
         // Past the end: what's here isn't the transcript this page went into, so there's no place to hold.
         if (!row) return;
         // What has gone in above the reader so far; scrolling there doesn't move it, and where it couldn't be scrolled
@@ -453,14 +460,6 @@
       top: bar.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop - CONTEXT_ABOVE_UNREAD,
     });
   }
-
-  $effect(() => {
-    if (!scroller) return;
-    const scrolled = () => (userScrolled = true);
-    const events = ['wheel', 'touchmove', 'keydown'] as const;
-    for (const event of events) scroller.addEventListener(event, scrolled, { passive: true });
-    return () => events.forEach((event) => scroller?.removeEventListener(event, scrolled));
-  });
 
   // Follow new output while the reader is at the bottom, but leave them alone when they scrolled up.
   $effect(() => {
