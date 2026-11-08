@@ -2548,6 +2548,30 @@ test('a snoozed highlight comes back at its time, without a reload', async ({ pa
   await expect(page.getByTestId('highlight-card')).toHaveAttribute('data-snoozed', 'false');
 });
 
+test('snoozing a highlight again pushes it further out, past the first time', async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1000 });
+  const id = await createSession(page, 'Highlight: Check the deploy after the nightly job');
+  const panel = page.getByTestId('side-panel');
+  await expect(panel.getByTestId('highlight-item')).toHaveCount(1);
+  const [highlight] = await (await page.request.get(`/api/v1/sessions/${id}/highlights`)).json();
+  const snoozeFor = (ms: number) =>
+    page.request.post(`/api/v1/sessions/${id}/highlights/${highlight.id}/snooze`, {
+      data: { until: new Date(Date.now() + ms).toISOString() },
+    });
+
+  await snoozeFor(2000);
+  await expect(panel.getByTestId('snoozed-toggle')).toHaveText(/Snoozed \(1\)/);
+  // Pushed a few seconds further out, as Snooze again does: the first time passing doesn't bring it back.
+  await snoozeFor(6000);
+  await page.waitForTimeout(2500);
+  await expect(panel.getByTestId('snoozed-toggle')).toHaveText(/Snoozed \(1\)/);
+  await expect(panel.getByTestId('highlight-item')).toHaveCount(0);
+
+  // And it comes back at the time it was pushed to.
+  await expect(panel.getByTestId('highlight-item')).toHaveCount(1);
+  await expect(panel.getByTestId('snoozed-toggle')).toHaveCount(0);
+});
+
 test('the agent can still take back a highlight the user has snoozed', async ({ page }) => {
   await page.setViewportSize({ width: 1920, height: 1000 });
   await createSession(page, 'Highlight: Merge pull request 12 by hand');
@@ -4165,6 +4189,40 @@ test.describe('in UTC', () => {
     await setting.click();
     await page.getByRole('option', { name: 'UTC', exact: true }).click();
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('UTC');
+  });
+
+  test('the snooze choices are of a timezone chosen after the menu was first opened', async ({ page }) => {
+    await page.setViewportSize({ width: 1920, height: 1000 });
+    await page.request.post('/_mock/forget-timezone');
+    const id = await createSession(page, 'Highlight: Put the deploy check off until the morning');
+    const panel = page.getByTestId('side-panel');
+    // The menu opened once already, in the browser's own zone.
+    await panel.getByTestId('highlight-item').getByRole('button', { name: 'Snooze' }).click();
+    await expect(page.getByRole('menuitem', { name: 'In an hour' })).toBeVisible();
+    await page.keyboard.press('Escape');
+
+    // Another timezone in Settings, and back to the session without a reload.
+    await page.getByRole('link', { name: 'Settings' }).first().click();
+    const setting = page.getByTestId('timezone-setting').getByRole('combobox', { name: 'Timezone' });
+    await setting.click();
+    await page.getByRole('option', { name: 'Asia/Tokyo', exact: true }).click();
+    await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Asia/Tokyo');
+    await page.getByRole('navigation', { name: 'Sessions' }).getByRole('link', { name: /Put the deploy check off/ }).click();
+
+    // Tomorrow morning is 09:00 in that zone, not in the one the menu was first opened in.
+    await panel.getByTestId('highlight-item').getByRole('button', { name: 'Snooze' }).click();
+    await page.getByRole('menuitem', { name: 'Tomorrow morning (09:00)' }).click();
+    await expect.poll(async () => {
+      const [highlight] = await (await page.request.get(`/api/v1/sessions/${id}/highlights`)).json();
+      return highlight.snoozed_until ?? null;
+    }).not.toBeNull();
+    const [highlight] = await (await page.request.get(`/api/v1/sessions/${id}/highlights`)).json();
+    const clockIn = (zone: string) =>
+      new Intl.DateTimeFormat('en-GB', { timeZone: zone, hour: '2-digit', minute: '2-digit', hour12: false }).format(
+        new Date(highlight.snoozed_until),
+      );
+    expect(clockIn('Asia/Tokyo')).toBe('09:00');
+    expect(clockIn('UTC')).not.toBe('09:00');
   });
 });
 

@@ -22,13 +22,15 @@ export type SnoozeChoice = { title: string; until: Date };
  */
 export function snoozeChoices(zone: string, now = new Date()): SnoozeChoice[] {
   const today = zonedDate(zone, now);
-  const evening = zonedTime(zone, today, 18);
+  const tonight = zonedTime(zone, today, 18);
+  const thisEvening = tonight.getTime() > now.getTime();
   const nextMonday = addDays(today, ((8 - (weekday(today) || 7)) % 7) || 7);
   return [
     { title: 'In an hour', until: new Date(now.getTime() + HOUR) },
     {
-      title: 'This evening (18:00)',
-      until: evening.getTime() > now.getTime() ? evening : zonedTime(zone, addDays(today, 1), 18),
+      // Said as the evening it is: past 18:00 the choice is tomorrow's, and says so.
+      title: thisEvening ? 'This evening (18:00)' : 'Tomorrow evening (18:00)',
+      until: thisEvening ? tonight : zonedTime(zone, addDays(today, 1), 18),
     },
     { title: 'Tomorrow morning (09:00)', until: zonedTime(zone, addDays(today, 1), 9) },
     { title: 'Next week (Monday 09:00)', until: zonedTime(zone, nextMonday, 9) },

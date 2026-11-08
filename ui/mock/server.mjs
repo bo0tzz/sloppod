@@ -1431,18 +1431,25 @@ function createHighlight(session, text) {
 const isSnoozed = (highlight) =>
   !highlight.seen_at && !highlight.retracted_at && Boolean(highlight.snoozed_until) && Date.parse(highlight.snoozed_until) > Date.now();
 
+/** Snoozing a highlight again pushes it further out: the timer set for its first time is replaced, not left to fire. */
+const wakeTimers = new Map();
+
 /** The user puts a highlight off until later (#467); nothing waits on them until its time, and the runtime brings it
  * back then, pushing it as it does when the agent highlights something. */
 function snoozeHighlight(highlight, until) {
   highlight.snoozed_until = until;
   broadcastHighlight(highlight);
+  clearTimeout(wakeTimers.get(highlight.id));
   const delay = Date.parse(until) - Date.now();
-  if (delay > 0) setTimeout(() => wakeHighlight(highlight), delay);
+  if (delay > 0) wakeTimers.set(highlight.id, setTimeout(() => wakeHighlight(highlight), delay));
 }
 
 /** Its time has passed: it's in the user's list again, as the runtime's periodic check brings it back. */
 function wakeHighlight(highlight) {
+  wakeTimers.delete(highlight.id);
   if (highlight.seen_at || highlight.retracted_at) return;
+  // The runtime's check only clears what is due; a snooze pushed further out since is left alone.
+  if (!highlight.snoozed_until || Date.parse(highlight.snoozed_until) > Date.now()) return;
   delete highlight.snoozed_until;
   broadcastHighlight(highlight);
 }

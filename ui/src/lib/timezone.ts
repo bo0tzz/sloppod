@@ -28,18 +28,17 @@ export async function adoptBrowserTimezone() {
   }
 }
 
-let known: string | undefined;
-
-/** The user's timezone from Settings, the browser's for a user without one (#253); read once a page load. */
+/**
+ * The user's timezone from Settings, the browser's for a user without one (#253), read when it's needed (#467): a
+ * timezone chosen in Settings afterwards is the one the next choice uses, with no reload.
+ */
 export async function userTimezone(): Promise<string> {
-  if (known !== undefined) return known;
   try {
-    known = (await api.getSettings()).timezone ?? browserTimezone();
+    return (await api.getSettings()).timezone ?? browserTimezone();
   } catch {
-    // Not remembered: a moment without the runtime shouldn't pin the browser's over the user's.
+    // A moment without the runtime shouldn't pin the browser's over the user's.
     return browserTimezone();
   }
-  return known;
 }
 
 /** A date on a zone's calendar. */
