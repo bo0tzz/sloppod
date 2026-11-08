@@ -47,6 +47,10 @@ impl Agents {
     pub fn get(&self, agent: &str) -> Option<&Arc<dyn AgentAdapter>> {
         self.by_name.get(agent)
     }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.by_name.keys().map(String::as_str)
+    }
 }
 
 /// What every agent is told about the session it runs in, in sections that depend on what the session is for
@@ -393,6 +397,18 @@ impl AgentAdapter for ClaudeCode {
                     "ANTHROPIC_DEFAULT_OPUS_MODEL",
                 ] {
                     env.push((name.to_owned(), inference.model.clone()));
+                }
+                // Auto mode would ask the API to classify tool calls on the server, which only Anthropic's API
+                // does; an endpoint answers without a verdict, and Claude Code then warns that the session isn't
+                // eligible for Anthropic's classifier billing. The endpoint's own model classifies instead.
+                env.push(("CLAUDE_CODE_AUTO_MODE_SERVER".to_owned(), "0".to_owned()));
+                // It doesn't know the endpoint's models, so it assumes a default window and compacts against that;
+                // its auto-compact window follows this one. Unknown, it keeps its default, and says so.
+                if let Some(tokens) = inference.context_window {
+                    env.push((
+                        "CLAUDE_CODE_MAX_CONTEXT_TOKENS".to_owned(),
+                        tokens.to_string(),
+                    ));
                 }
             }
             (None, Some(model)) => env.push(("ANTHROPIC_MODEL".to_owned(), model.clone())),
@@ -831,6 +847,7 @@ mod tests {
         on_endpoint.inference = Some(sloppod_contracts::InferenceContext {
             base_url: "http://127.0.0.1:7071/inference".into(),
             model: "qwen3-coder".into(),
+            context_window: Some(262144),
         });
         let env: HashMap<String, String> =
             ClaudeCode.launch(&on_endpoint).env.into_iter().collect();
@@ -847,11 +864,19 @@ mod tests {
         ] {
             assert_eq!(env[name], "qwen3-coder", "{name}");
         }
+        assert_eq!(env["CLAUDE_CODE_AUTO_MODE_SERVER"], "0");
+        assert_eq!(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "262144");
+        // A window the endpoint doesn't say leaves Claude Code's default.
+        on_endpoint.inference.as_mut().unwrap().context_window = None;
+        let env: HashMap<String, String> =
+            ClaudeCode.launch(&on_endpoint).env.into_iter().collect();
+        assert!(!env.contains_key("CLAUDE_CODE_MAX_CONTEXT_TOKENS"));
         // On Claude, it's Claude's API, with its placeholder token.
         let env: HashMap<String, String> = ClaudeCode.launch(&context()).env.into_iter().collect();
         assert_eq!(env["ANTHROPIC_MODEL"], "claude-haiku");
         assert!(
             env.contains_key("CLAUDE_CODE_OAUTH_TOKEN") && !env.contains_key("ANTHROPIC_BASE_URL")
         );
+        assert!(!env.contains_key("CLAUDE_CODE_AUTO_MODE_SERVER"));
     }
 }

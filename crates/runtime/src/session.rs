@@ -326,6 +326,9 @@ pub struct Live {
     transition: Mutex<()>,
     /// Held while the session's egress is written, so writes land in the order they read the session (ADR 11).
     egress: Mutex<()>,
+    /// Held while a model the user picked is recorded or applied (#461), so a pick and its application never overlap and
+    /// one pick isn't applied twice.
+    switching: Mutex<()>,
     /// Notified when something a steer waits for ends: a compaction, a tool call, a permission request, the turn.
     boundary: Notify,
     /// When the agent was last heard from, for telling it the time after a gap; `None` until this runtime knows.
@@ -556,6 +559,7 @@ impl Hub {
                     state: Mutex::default(),
                     transition: Mutex::default(),
                     egress: Mutex::default(),
+                    switching: Mutex::default(),
                     boundary: Notify::new(),
                     heard_at: StdMutex::default(),
                     commands: StdMutex::default(),
@@ -1650,6 +1654,32 @@ impl Hub {
 
     /// Starts a turn, or queues the prompt until the agent is up or the running turn ends; resolves when its
     /// turn ends.
+    /// Whether `params` would be a new message to the session: not one it received, has queued or had taken back,
+    /// which [`Hub::prompt`] answers without running. Read before a model the user picked is moved onto (#461), so a
+    /// UI sending a message again doesn't start the agent again.
+    pub async fn is_new_prompt(&self, id: Uuid, params: &Value) -> Result<bool, RpcError> {
+        let Some(message_id) = client_message_id(params) else {
+            return Ok(true);
+        };
+        let failed = |e: sqlx::Error| RpcError::new(-32603, e.to_string());
+        if self
+            .store
+            .has_message(id, message_id)
+            .await
+            .map_err(failed)?
+            || self
+                .store
+                .message_removed(id, message_id)
+                .await
+                .map_err(failed)?
+        {
+            return Ok(false);
+        }
+        let live = self.live(id);
+        let state = live.state.lock().await;
+        Ok(!has_queued(&state, message_id))
+    }
+
     pub async fn prompt(self: &Arc<Self>, id: Uuid, params: Value) -> Result<Value, RpcError> {
         let blocks = params["prompt"].as_array().cloned().unwrap_or_default();
         let message_id = client_message_id(&params);
@@ -2809,6 +2839,16 @@ impl Hub {
             return Err(e);
         }
         Ok(true)
+    }
+
+    /// Runs `f` while no other pick of the session's model is recorded or applied (#461).
+    pub async fn one_switch_at_a_time<F, T>(&self, id: Uuid, f: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        let live = self.live(id);
+        let _switching = live.switching.lock().await;
+        f.await
     }
 
     /// Moves a session onto another provider's model (#461), under its transition lock and only while nothing is in

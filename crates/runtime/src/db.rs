@@ -35,6 +35,8 @@ pub struct SessionRow {
     pub agent_state: Option<Value>,
     /// The session's current model, used whenever its agent starts.
     pub model: Option<String>,
+    /// A model the user picked that the session moves onto before its next message (#461).
+    pub pending_model: Option<String>,
     /// The repository the session is about, checked out as its working directory (ADR 1).
     pub repo: Option<String>,
     grants: Value,
@@ -75,6 +77,7 @@ impl SessionRow {
             agent_session_id: None,
             agent_state: None,
             model: None,
+            pending_model: None,
             repo: None,
             grants: Value::Array(Vec::new()),
             created_at: Utc::now(),
@@ -155,6 +158,7 @@ impl SessionRow {
             phase: Phase::parse(&self.phase),
             agent: self.agent.clone(),
             model: self.model.clone(),
+            pending_model: self.pending_model.clone(),
             kind: self.kind,
             review: self.review,
             created_at: self.created_at.to_rfc3339(),
@@ -200,7 +204,7 @@ impl SessionRow {
     }
 }
 
-const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, repo, created_at, updated_at, active_at, deleted_at, agent_status, agent_error, parent_id, limited_until, image_nudged, disk_used, disk_size, disk_seen_at, volume_kept, \
+const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, pending_model, repo, created_at, updated_at, active_at, deleted_at, agent_status, agent_error, parent_id, limited_until, image_nudged, disk_used, disk_size, disk_seen_at, volume_kept, \
      coalesce((select jsonb_agg(jsonb_build_object('id', g.id, 'capability', g.capability, 'params', g.params, \
      'created_at', g.created_at, 'expires_at', g.expires_at) order by g.created_at) \
      from session_grants g where g.session_id = sessions.id and (g.expires_at is null or g.expires_at > now())), \
@@ -1485,7 +1489,7 @@ pub async fn set_model_and_endpoint(
     endpoint: Option<&Grant>,
 ) -> sqlx::Result<()> {
     let mut tx = db.begin().await?;
-    sqlx::query("update sessions set model = $2 where id = $1")
+    sqlx::query("update sessions set model = $2, pending_model = null where id = $1")
         .bind(session)
         .bind(model)
         .execute(&mut *tx)
@@ -1499,6 +1503,20 @@ pub async fn set_model_and_endpoint(
         insert_grant(&mut *tx, session, grant, None).await?;
     }
     tx.commit().await
+}
+
+/// Records the model the session moves onto before its next message, or that there's none (#461).
+pub async fn set_pending_model(
+    db: &PgPool,
+    session: Uuid,
+    model: Option<&str>,
+) -> sqlx::Result<()> {
+    sqlx::query("update sessions set pending_model = $2 where id = $1")
+        .bind(session)
+        .bind(model)
+        .execute(db)
+        .await
+        .map(|_| ())
 }
 
 /// Has the session act on `repo` with one of the owner's GitHub tokens (ADR 29), `credential` its id and `login` whose
@@ -1699,12 +1717,21 @@ pub async fn set_user_session_budget(
     .map(|_| ())
 }
 
-/// The agent's state from the owner's most recently active session, for the models it offered.
-pub async fn latest_agent_state(db: &PgPool, owner: &str) -> sqlx::Result<Option<Value>> {
+/// The agent's state from the owner's most recently active session on the agent's own models, for the models it offered.
+/// On an endpoint's model Claude Code offers its aliases with the endpoint's model behind each (#461), which aren't a choice.
+/// With `agent`, from a session of that agent.
+pub async fn latest_agent_state(
+    db: &PgPool,
+    owner: &str,
+    agent: Option<&str>,
+) -> sqlx::Result<Option<Value>> {
     let row: Option<(Option<Value>,)> = sqlx::query_as(
-        "select agent_state from sessions where owner = $1 and agent_state is not null order by updated_at desc limit 1",
+        "select agent_state from sessions where owner = $1 and agent_state is not null \
+         and (model is null or model not like 'endpoint:%') and ($2::text is null or agent = $2) \
+         order by updated_at desc limit 1",
     )
     .bind(owner)
+    .bind(agent)
     .fetch_optional(db)
     .await?;
     Ok(row.and_then(|(state,)| state))

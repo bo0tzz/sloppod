@@ -223,15 +223,27 @@ impl Conn {
                 -32601,
                 "create sessions with POST /api/v1/sessions",
             )),
-            ("session/prompt", Some(session)) => hub.prompt(session, params).await,
+            ("session/prompt", Some(session)) => {
+                // A model the user picked that needs the agent started again is moved onto first (#461), for a new
+                // message: one sent again is answered as before, and moves nothing.
+                let moved = match hub.is_new_prompt(session, &params).await {
+                    Ok(true) => crate::endpoint::apply_pending(&self.state, session).await,
+                    Ok(false) => Ok(()),
+                    Err(e) => Err(e),
+                };
+                match moved {
+                    Ok(()) => hub.prompt(session, params).await,
+                    Err(e) => Err(e),
+                }
+            }
             ("_session/steering", Some(session)) => hub.steer(session, params).await,
             ("_sloppod/steer_queued", Some(session)) => hub.steer_queued(session, params).await,
             ("_sloppod/remove_queued", Some(session)) => hub.remove_queued(session, params).await,
             ("session/set_config_option", Some(session)) => {
-                // To or from an endpoint's model, the runtime moves the session itself (#461).
+                // To or from an endpoint's model, the runtime moves the session itself, at its next message (#461).
                 let endpoint = match (params["configId"].as_str(), params["value"].as_str()) {
                     (Some("model"), Some(value)) => {
-                        crate::endpoint::switch(&self.state, session, value).await
+                        crate::endpoint::choose(&self.state, session, value).await
                     }
                     _ => None,
                 };

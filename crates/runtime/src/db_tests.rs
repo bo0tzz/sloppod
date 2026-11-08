@@ -2850,3 +2850,64 @@ async fn a_proposal_with_changes_requested_is_followed_for_its_next_round_only_w
         )
     );
 }
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_picked_model_waits_until_the_session_moves_onto_it(db: PgPool) {
+    let id = session(&db, "dev").await;
+    let pending = |db: PgPool| async move {
+        db::get_session(&db, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .to_api()
+            .pending_model
+    };
+    db::set_pending_model(&db, id, Some("endpoint:x:qwen3-coder"))
+        .await
+        .unwrap();
+    assert_eq!(
+        pending(db.clone()).await.as_deref(),
+        Some("endpoint:x:qwen3-coder")
+    );
+    // Moving the session takes the pick with it.
+    db::set_model_and_endpoint(&db, id, "endpoint:x:qwen3-coder", None)
+        .await
+        .unwrap();
+    assert_eq!(pending(db.clone()).await, None);
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn the_models_offered_come_from_a_session_on_the_agent_s_own(db: PgPool) {
+    let own = session(&db, "dev").await;
+    let on_endpoint = session(&db, "dev").await;
+    db::set_agent_session(&db, own, "a", &json!({"configOptions": "own"}))
+        .await
+        .unwrap();
+    db::set_agent_session(&db, on_endpoint, "b", &json!({"configOptions": "aliases"}))
+        .await
+        .unwrap();
+    db::set_model_and_endpoint(&db, on_endpoint, "endpoint:x:qwen3-coder", None)
+        .await
+        .unwrap();
+    // The endpoint's session is the latest, but its agent's aliases aren't a choice.
+    assert_eq!(
+        db::latest_agent_state(&db, "dev", None).await.unwrap(),
+        Some(json!({"configOptions": "own"}))
+    );
+    // Another agent's, newer still, isn't Claude Code's.
+    let codex = session(&db, "dev").await;
+    sqlx::query("update sessions set agent = 'codex' where id = $1")
+        .bind(codex)
+        .execute(&db)
+        .await
+        .unwrap();
+    db::set_agent_session(&db, codex, "c", &json!({"configOptions": "codex"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        db::latest_agent_state(&db, "dev", Some("claude-code"))
+            .await
+            .unwrap(),
+        Some(json!({"configOptions": "own"}))
+    );
+}

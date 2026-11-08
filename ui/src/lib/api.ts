@@ -10,6 +10,8 @@ export type Session = {
   agent: string;
   /** The model the agent runs on, if one was chosen rather than the agent's default. */
   model?: string;
+  /** A model picked that needs the agent started again; the session moves onto it before its next message (#461). */
+  pending_model?: string;
   /** 'work', or 'review' for a session that reviews a proposal. */
   kind: string;
   review: ReviewPolicy;
@@ -415,6 +417,8 @@ export type Settings = {
    * cheaper model than the agent's default where it has one (Sonnet for Claude Code). */
   sub_session_model: string | null;
   models: { value: string; name: string }[];
+  /** Each agent's own models, as a session of it last offered them; a session on an endpoint's model offers its agent's (#461). */
+  agent_models?: Record<string, { value: string; name: string }[]>;
   review: ReviewPolicy;
   /** The user's timezone, e.g. `Europe/Amsterdam`, for the times agents are told and their pods' clocks. */
   timezone: string | null;

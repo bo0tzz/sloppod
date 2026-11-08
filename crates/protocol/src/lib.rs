@@ -186,6 +186,10 @@ pub mod api {
         /// The model the agent runs on, if one was chosen rather than the agent's default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub model: Option<String>,
+        /// A model the user picked that needs the agent started again (an endpoint's, or Claude's from one): the session
+        /// moves onto it before its next message is sent (#461).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub pending_model: Option<String>,
         pub kind: SessionKind,
         pub review: ReviewPolicy,
         pub created_at: String,

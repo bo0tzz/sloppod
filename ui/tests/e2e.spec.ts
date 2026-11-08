@@ -1177,7 +1177,7 @@ test("an endpoint added in settings offers its models wherever a model is chosen
     await expect(page.getByRole('option', { name: 'qwen3-coder (litellm)' })).toBeVisible();
     await page.keyboard.press('Escape');
 
-    // A running session can be moved onto one, and back.
+    // A running session can be moved onto one, and back; a move applies at the next message.
     const sent: string[] = [];
     page.on('websocket', (socket) => socket.on('framesent', ({ payload }) => sent.push(String(payload))));
     await createSession(page, 'Try another model in sloppod');
@@ -1185,12 +1185,23 @@ test("an endpoint added in settings offers its models wherever a model is chosen
     await select.getByRole('combobox').click();
     await page.getByRole('option', { name: 'qwen3-coder (litellm)' }).click();
     await expect(select).toContainText('qwen3-coder (litellm)');
+    await expect(page.getByTestId('model-pending')).toHaveText('Applies to your next message');
     expect(sent.some((frame) => frame.includes('"session/set_config_option"') && frame.includes('endpoint:'))).toBe(true);
     await page.reload();
     await expect(page.getByTestId('model-select')).toContainText('qwen3-coder (litellm)');
+    await expect(page.getByTestId('model-pending')).toBeVisible();
+    await page.getByRole('textbox', { name: 'Prompt' }).fill('Now on qwen');
+    await page.keyboard.press('Enter');
+    await expect(page.getByTestId('model-pending')).toHaveCount(0);
+    await expect(page.getByTestId('model-select')).toContainText('qwen3-coder (litellm)');
+
+    // On it, the choices are Claude's models and the endpoints', not Claude's aliases with the endpoint's model behind.
     await page.getByTestId('model-select').getByRole('combobox').click();
+    await expect(page.getByRole('option', { name: 'qwen3-coder (opus)' })).toHaveCount(0);
+    await expect(page.getByRole('option', { name: 'glm-5 (litellm)' })).toBeVisible();
     await page.getByRole('option', { name: 'Opus' }).click();
     await expect(page.getByTestId('model-select')).toContainText('Opus');
+    await expect(page.getByTestId('model-pending')).toBeVisible();
   } finally {
     const listed: { id: string; kind: string }[] = await (await page.request.get('/api/v1/credentials')).json();
     for (const { id } of listed.filter((c) => c.kind === 'endpoint')) await page.request.delete(`/api/v1/credentials/${id}`);
