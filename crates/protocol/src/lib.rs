@@ -319,6 +319,10 @@ pub mod api {
         /// When the user marked it seen; absent while it's open.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub seen_at: Option<String>,
+        /// Until when the user put it off (#467): while that's in the future it stops counting as waiting on them, and
+        /// the runtime brings it back (clears this) when the time passes. Absent when it isn't snoozed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub snoozed_until: Option<String>,
         /// When the agent took it back (it no longer applies, or changed): no longer open, and kept in the chat with
         /// the reason.
         #[serde(default, skip_serializing_if = "Option::is_none")]

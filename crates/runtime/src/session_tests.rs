@@ -3388,6 +3388,7 @@ async fn a_highlight_is_told_to_the_session_and_changes_what_it_waits_on() {
         text: "It's done".into(),
         created_at: START.into(),
         seen_at: None,
+        snoozed_until: None,
         retracted_at: None,
         retraction_reason: None,
     };

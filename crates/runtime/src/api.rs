@@ -47,6 +47,10 @@ pub fn routes() -> Router<AppState> {
             "/sessions/{id}/highlights/{highlight}/seen",
             post(mark_highlight_seen),
         )
+        .route(
+            "/sessions/{id}/highlights/{highlight}/snooze",
+            post(snooze_highlight),
+        )
         .route("/repos", get(repos))
         .route(
             "/credentials",
@@ -1029,6 +1033,34 @@ async fn mark_highlight_seen(
         .await?
         .ok_or_else(not_found)?;
     let row = db::mark_highlight_seen(&state.db, id, highlight)
+        .await?
+        .ok_or_else(not_found)?;
+    let highlight = row.to_api();
+    state.hub.broadcast_highlight(&highlight);
+    Ok(Json(highlight))
+}
+
+#[derive(Deserialize)]
+struct Snooze {
+    /// Until when, as an RFC 3339 time; the UI works out what its choices mean in the user's timezone.
+    until: String,
+}
+
+/// The user puts a highlight off until later (#467): it stops counting as waiting on them and comes back at its time.
+/// Like seen, no turn starts and the agent isn't told, and it stays the agent's to retract.
+async fn snooze_highlight(
+    State(state): State<AppState>,
+    User(user): User,
+    Path((id, highlight)): Path<(Uuid, Uuid)>,
+    Json(body): Json<Snooze>,
+) -> ApiResult<impl IntoResponse> {
+    db::owned_session(&state.db, id, &user)
+        .await?
+        .ok_or_else(not_found)?;
+    let until = chrono::DateTime::parse_from_rfc3339(&body.until)
+        .map_err(|_| bad_request("until must be an RFC 3339 time"))?
+        .with_timezone(&chrono::Utc);
+    let row = db::snooze_highlight(&state.db, id, highlight, until)
         .await?
         .ok_or_else(not_found)?;
     let highlight = row.to_api();
