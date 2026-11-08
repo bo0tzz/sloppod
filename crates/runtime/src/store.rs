@@ -225,6 +225,12 @@ pub mod memory {
         pub gate_removals: std::sync::atomic::AtomicBool,
         pub removal_started: tokio::sync::Notify,
         pub removals_released: tokio::sync::Notify,
+        /// Holds reading a session, with the row it has just read, until `reads_released`; says when one reaches
+        /// it with `read_started`. For how a session is told what happened to it while something else is changing
+        /// what it is (#479).
+        pub gate_reads: std::sync::atomic::AtomicBool,
+        pub read_started: tokio::sync::Notify,
+        pub reads_released: tokio::sync::Notify,
     }
 
     impl MemoryStore {
@@ -246,7 +252,14 @@ pub mod memory {
     #[async_trait]
     impl SessionStore for MemoryStore {
         async fn get_session(&self, id: Uuid) -> sqlx::Result<Option<SessionRow>> {
-            Ok(self.sessions.lock().unwrap().get(&id).cloned())
+            // The row is read before the gate, so a test can hold a session as it was before whatever it lets
+            // happen meanwhile.
+            let row = self.sessions.lock().unwrap().get(&id).cloned();
+            if self.gate_reads.load(std::sync::atomic::Ordering::SeqCst) {
+                self.read_started.notify_one();
+                self.reads_released.notified().await;
+            }
+            Ok(row)
         }
 
         async fn owner_zone(&self, owner: &str) -> sqlx::Result<chrono_tz::Tz> {

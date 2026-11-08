@@ -73,6 +73,12 @@ spec:
             - name: SLOPPOD_SESSION_STORAGE_CLASS
               value: {{ . | quote }}
             {{- end }}
+            - name: SLOPPOD_SESSION_STORAGE_GROW_AT
+              value: {{ .Values.session.storage.growAt | quote }}
+            - name: SLOPPOD_SESSION_STORAGE_GROW_BY
+              value: {{ .Values.session.storage.growBy | quote }}
+            - name: SLOPPOD_SESSION_STORAGE_MAX_SIZE
+              value: {{ .Values.session.storage.maxSize | quote }}
             {{- with .Values.session.cpu }}
             - name: SLOPPOD_SESSION_CPU
               value: {{ . | quote }}

@@ -590,6 +590,26 @@ pub async fn set_disk(db: &PgPool, id: Uuid, used: u64, size: u64) -> sqlx::Resu
     .map(|_| ())
 }
 
+/// Whether the session has been told its workspace volume is full and can't grow any more (#479).
+pub async fn disk_full_told(db: &PgPool, id: Uuid) -> sqlx::Result<bool> {
+    let told: Option<bool> =
+        sqlx::query_scalar("select disk_full_told from sessions where id = $1")
+            .bind(id)
+            .fetch_optional(db)
+            .await?;
+    Ok(told.unwrap_or(false))
+}
+
+/// Records whether the session has been told its workspace volume can't grow any more (#479).
+pub async fn set_disk_full_told(db: &PgPool, id: Uuid, told: bool) -> sqlx::Result<()> {
+    sqlx::query("update sessions set disk_full_told = $2 where id = $1")
+        .bind(id)
+        .bind(told)
+        .execute(db)
+        .await
+        .map(|_| ())
+}
+
 /// Records whether the session's pod-side objects are removed (`true`) or it has been placed again (`false`).
 pub async fn set_released(db: &PgPool, id: Uuid, released: bool) -> sqlx::Result<()> {
     sqlx::query(

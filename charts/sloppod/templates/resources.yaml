@@ -57,10 +57,11 @@ rules:
   - apiGroups: [""]
     resources: [services]
     verbs: [get]
-  # Workspace volume claims: a sweep removes those whose session is gone (#455).
+  # Workspace volume claims: a sweep removes those whose session is gone (#455), and one whose session fills up is
+  # grown (#479).
   - apiGroups: [""]
     resources: [persistentvolumeclaims]
-    verbs: [list, delete]
+    verbs: [get, list, delete, patch]
   - apiGroups: [""]
     resources: [secrets]
     verbs: [create]

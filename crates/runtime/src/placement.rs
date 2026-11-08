@@ -27,29 +27,52 @@ fn claim_session(name: &str) -> Option<&str> {
         .filter(|rest| rest.parse::<uuid::Uuid>().is_ok())
 }
 
-/// A Kubernetes quantity of storage in bytes, e.g. `20Gi`, `10G`, `512Mi` or `1048576`; none for one it can't read.
-fn bytes(quantity: &str) -> Option<u64> {
-    let quantity = quantity.trim();
-    let split = quantity
-        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
-        .unwrap_or(quantity.len());
-    let (number, suffix) = quantity.split_at(split);
-    let number: f64 = number.parse().ok()?;
-    let factor: f64 = match suffix {
-        "" => 1.0,
-        "k" => 1e3,
-        "M" => 1e6,
-        "G" => 1e9,
-        "T" => 1e12,
-        "P" => 1e15,
-        "Ki" => 1024.0,
-        "Mi" => 1024f64.powi(2),
-        "Gi" => 1024f64.powi(3),
-        "Ti" => 1024f64.powi(4),
-        "Pi" => 1024f64.powi(5),
-        _ => return None,
-    };
-    Some((number * factor).round() as u64)
+/// A quantity kube gives, as bytes: none when the claim doesn't give it, or gives one that can't be read.
+fn quantity(
+    quantity: Option<&k8s_openapi::apimachinery::pkg::api::resource::Quantity>,
+) -> Option<u64> {
+    sloppod_contracts::storage_bytes(&quantity?.0)
+}
+
+/// A claim as the runtime sees it (#479): what it asks for, what's provisioned, and whether a resize is under way.
+fn volume_of(claim: &k8s_openapi::api::core::v1::PersistentVolumeClaim) -> Option<Volume> {
+    let name = claim.metadata.name.clone()?;
+    let spec = claim.spec.as_ref();
+    Some(Volume {
+        session_id: claim_session(&name).map(str::to_owned),
+        requested: quantity(
+            spec.and_then(|spec| spec.resources.as_ref())
+                .and_then(|resources| resources.requests.as_ref())
+                .and_then(|requests| requests.get("storage")),
+        ),
+        capacity: quantity(
+            claim
+                .status
+                .as_ref()
+                .and_then(|status| status.capacity.as_ref())
+                .and_then(|capacity| capacity.get("storage")),
+        ),
+        resizing: resizing(claim),
+        name,
+    })
+}
+
+/// Whether the claim says an expansion is on its way: the resizer still provisioning what it asked for, or a
+/// filesystem resize waiting for the pod to be restarted to finish it (#479).
+fn resizing(claim: &k8s_openapi::api::core::v1::PersistentVolumeClaim) -> bool {
+    claim
+        .status
+        .as_ref()
+        .and_then(|status| status.conditions.as_ref())
+        .is_some_and(|conditions| {
+            conditions.iter().any(|condition| {
+                condition.status == "True"
+                    && matches!(
+                        condition.type_.as_str(),
+                        "Resizing" | "FileSystemResizePending"
+                    )
+            })
+        })
 }
 
 pub struct AgentSandbox {
@@ -281,33 +304,34 @@ impl PlacementBackend for AgentSandbox {
         Ok(claims
             .items
             .iter()
-            .filter_map(|claim| {
-                let name = claim.metadata.name.clone()?;
-                // Only sessions' workspace claims: the namespace may hold others.
-                let session_id = claim_session(&name)?.to_owned();
-                // What was provisioned, or else what was asked for.
-                let capacity = claim
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.capacity.as_ref()?.get("storage"))
-                    .or_else(|| {
-                        claim
-                            .spec
-                            .as_ref()?
-                            .resources
-                            .as_ref()?
-                            .requests
-                            .as_ref()?
-                            .get("storage")
-                    })
-                    .and_then(|quantity| bytes(&quantity.0));
-                Some(Volume {
-                    name,
-                    session_id: Some(session_id),
-                    capacity,
-                })
-            })
+            // Only sessions' workspace claims: the namespace may hold others.
+            .filter_map(volume_of)
+            .filter(|volume| volume.session_id.is_some())
             .collect())
+    }
+
+    async fn volume(&self, session_id: &str) -> Result<Option<Volume>> {
+        let claim = self
+            .claims
+            .get_opt(&claim_name(session_id))
+            .await
+            .map_err(err)?;
+        Ok(claim.as_ref().and_then(volume_of))
+    }
+
+    async fn grow_volume(&self, session_id: &str, size: u64) -> Result<()> {
+        // A merge patch, so the claim's other requests survive it. The storage class has to allow expansion, or the
+        // cluster refuses it here.
+        let patch = json!({"spec": {"resources": {"requests": {"storage": size.to_string()}}}});
+        self.claims
+            .patch(
+                &claim_name(session_id),
+                &PatchParams::default(),
+                &Patch::Merge(&patch),
+            )
+            .await
+            .map(|_| ())
+            .map_err(err)
     }
 
     fn unschedulable(&self) -> Vec<Unschedulable> {
@@ -336,16 +360,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_storage_quantities() {
-        assert_eq!(bytes("20Gi"), Some(20 * 1024 * 1024 * 1024));
-        assert_eq!(bytes("10G"), Some(10_000_000_000));
-        assert_eq!(bytes("1.5Gi"), Some(1_610_612_736));
-        assert_eq!(bytes("1048576"), Some(1_048_576));
-        assert_eq!(bytes("lots"), None);
+    fn reads_what_a_claim_is_and_what_it_asks_for() {
+        let claim: k8s_openapi::api::core::v1::PersistentVolumeClaim =
+            serde_json::from_value(json!({
+                "metadata": {"name": "workdir-sloppod-0194f0a2-0000-7000-8000-000000000000"},
+                "spec": {"resources": {"requests": {"storage": "30Gi"}}},
+                "status": {"capacity": {"storage": "20Gi"}},
+            }))
+            .unwrap();
+        let volume = volume_of(&claim).unwrap();
         assert_eq!(
-            claim_session("workdir-sloppod-0194f0a2-0000-7000-8000-000000000000"),
+            volume.session_id.as_deref(),
             Some("0194f0a2-0000-7000-8000-000000000000")
         );
+        assert_eq!(volume.requested, Some(30 << 30));
+        assert_eq!(volume.capacity, Some(20 << 30));
+        assert!(volume.growing());
         assert_eq!(claim_session("data-postgres-0"), None);
+
+        // Waiting for its pod to be restarted before the filesystem can catch up.
+        let claim: k8s_openapi::api::core::v1::PersistentVolumeClaim =
+            serde_json::from_value(json!({
+                "metadata": {"name": "workdir-sloppod-0194f0a2-0000-7000-8000-000000000000"},
+                "spec": {"resources": {"requests": {"storage": "30Gi"}}},
+                "status": {
+                    "capacity": {"storage": "30Gi"},
+                    "conditions": [{"type": "FileSystemResizePending", "status": "True"}],
+                },
+            }))
+            .unwrap();
+        let volume = volume_of(&claim).unwrap();
+        assert_eq!(volume.size(), Some(30 << 30));
+        assert!(volume.growing());
+
+        // A claim of no session, e.g. another workload's in the same namespace.
+        let other: k8s_openapi::api::core::v1::PersistentVolumeClaim =
+            serde_json::from_value(json!({"metadata": {"name": "data-postgres-0"}})).unwrap();
+        assert_eq!(volume_of(&other).unwrap().session_id, None);
     }
 }
