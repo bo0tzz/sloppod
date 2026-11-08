@@ -4291,6 +4291,11 @@ test.describe('in UTC', () => {
       );
     expect(clockIn('Asia/Tokyo')).toBe('09:00');
     expect(clockIn('UTC')).not.toBe('09:00');
+
+    // The card says the same 09:00 the choice meant, in that zone: read in the browser's it would say 00:00.
+    const until = page.getByTestId('highlight-card').filter({ hasText: 'Put the deploy check off' }).getByTestId('highlight-snoozed-until');
+    await expect(until).toContainText('09:00');
+    await expect(until).toHaveAttribute('title', /09:00/);
   });
 });
 

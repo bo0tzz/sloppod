@@ -2,8 +2,9 @@
   import { Button, Icon } from '@immich/ui';
   import { mdiCheck, mdiStarFourPointsOutline } from '@mdi/js';
   import type { Highlight } from '#lib/api.ts';
-  import { absoluteTime, clockTime, timeAgo } from '#lib/format.ts';
+  import { absoluteTime, timeAgo, timeWithDay } from '#lib/format.ts';
   import { isSnoozed } from '#lib/snooze.ts';
+  import { userTimezone } from '#lib/user-timezone.svelte.ts';
   import Markdown from './Markdown.svelte';
   import SnoozeButton from './SnoozeButton.svelte';
 
@@ -57,13 +58,14 @@
     <Icon icon={mdiStarFourPointsOutline} size="1.1em" aria-hidden />
     <span class="font-medium">{retracted ? 'Retracted' : snoozed ? 'Snoozed' : open ? 'For you' : 'Seen'}</span>
     {#if snoozed}
+      {@const until = timeWithDay(highlight.snoozed_until!, userTimezone.value)}
       <time
         class="text-muted"
         datetime={highlight.snoozed_until}
-        title="Snoozed until {absoluteTime(highlight.snoozed_until!)}"
+        title="Snoozed until {until.title}"
         data-testid="highlight-snoozed-until"
       >
-        until {clockTime(highlight.snoozed_until!)}
+        until {until.label}
       </time>
     {:else}
       <time class="text-muted" datetime={highlight.created_at} title={absoluteTime(highlight.created_at)}>
