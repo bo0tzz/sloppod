@@ -733,14 +733,14 @@ async fn a_session_log_reads_back_from_its_latest(db: PgPool) {
     let other = session(&db, "dev").await;
     let mut seqs = Vec::new();
     for n in 0..5 {
-        seqs.push(db::append_event(&db, s, &json!({"n": n})).await.unwrap());
+        seqs.push(db::append_event(&db, s, &json!({"n": n})).await.unwrap().0);
         db::append_event(&db, other, &json!({"other": n}))
             .await
             .unwrap();
     }
     let latest = db::events_before(&db, s, i64::MAX, 2).await.unwrap();
     assert_eq!(
-        latest.iter().map(|e| e.1["n"].clone()).collect::<Vec<_>>(),
+        latest.iter().map(|e| e.2["n"].clone()).collect::<Vec<_>>(),
         [json!(3), json!(4)]
     );
     let older = db::events_before(&db, s, latest[0].0, 10).await.unwrap();
@@ -757,7 +757,7 @@ async fn a_session_log_reads_back_from_its_latest(db: PgPool) {
 async fn a_session_log_has_a_last_event(db: PgPool) {
     let s = session(&db, "dev").await;
     assert_eq!(db::last_event(&db, s).await.unwrap(), 0);
-    let seq = db::append_event(&db, s, &json!({})).await.unwrap();
+    let seq = db::append_event(&db, s, &json!({})).await.unwrap().0;
     db::append_event(&db, session(&db, "dev").await, &json!({}))
         .await
         .unwrap();
@@ -2984,5 +2984,66 @@ async fn a_proposal_with_changes_requested_is_followed_for_its_next_round_only_w
             ProposalStatus::InReview,
             json!({"base": "main"})
         )
+    );
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_picked_model_waits_until_the_session_moves_onto_it(db: PgPool) {
+    let id = session(&db, "dev").await;
+    let pending = |db: PgPool| async move {
+        db::get_session(&db, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .to_api()
+            .pending_model
+    };
+    db::set_pending_model(&db, id, Some("endpoint:x:qwen3-coder"))
+        .await
+        .unwrap();
+    assert_eq!(
+        pending(db.clone()).await.as_deref(),
+        Some("endpoint:x:qwen3-coder")
+    );
+    // Moving the session takes the pick with it.
+    db::set_model_and_endpoint(&db, id, "endpoint:x:qwen3-coder", None)
+        .await
+        .unwrap();
+    assert_eq!(pending(db.clone()).await, None);
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn the_models_offered_come_from_a_session_on_the_agent_s_own(db: PgPool) {
+    let own = session(&db, "dev").await;
+    let on_endpoint = session(&db, "dev").await;
+    db::set_agent_session(&db, own, "a", &json!({"configOptions": "own"}))
+        .await
+        .unwrap();
+    db::set_agent_session(&db, on_endpoint, "b", &json!({"configOptions": "aliases"}))
+        .await
+        .unwrap();
+    db::set_model_and_endpoint(&db, on_endpoint, "endpoint:x:qwen3-coder", None)
+        .await
+        .unwrap();
+    // The endpoint's session is the latest, but its agent's aliases aren't a choice.
+    assert_eq!(
+        db::latest_agent_state(&db, "dev", None).await.unwrap(),
+        Some(json!({"configOptions": "own"}))
+    );
+    // Another agent's, newer still, isn't Claude Code's.
+    let codex = session(&db, "dev").await;
+    sqlx::query("update sessions set agent = 'codex' where id = $1")
+        .bind(codex)
+        .execute(&db)
+        .await
+        .unwrap();
+    db::set_agent_session(&db, codex, "c", &json!({"configOptions": "codex"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        db::latest_agent_state(&db, "dev", Some("claude-code"))
+            .await
+            .unwrap(),
+        Some(json!({"configOptions": "own"}))
     );
 }

@@ -71,7 +71,7 @@ const promptBlocks = ({ text, images = [] }: Outgoing): ContentBlock[] => [
  * be undone by the close of the one before.
  */
 /** An update with its place in the session's log (0 where it has none). */
-type LoggedUpdate = { update: SessionUpdate; seq: number };
+type LoggedUpdate = { update: SessionUpdate; seq: number; at: string | null };
 
 const READ_THROTTLE_MS = 1000;
 const READ_RETRY_MS = 3000;
@@ -307,7 +307,7 @@ export class SessionView {
     switch (method) {
       case 'session/update': {
         const notification = params as SessionNotification;
-        if (notification.sessionId === this.id) this.#applyUpdate(notification.update, notification._meta?.sloppod?.seq);
+        if (notification.sessionId === this.id) this.#applyUpdate(notification.update, notification._meta?.sloppod?.seq, notification._meta?.sloppod?.at);
         break;
       }
       case '_sloppod/session': {
@@ -373,7 +373,7 @@ export class SessionView {
     app.respondError(rpcId, -32601, `Method not found: ${method}`);
   }
 
-  #applyUpdate(update: SessionUpdate, seq = 0) {
+  #applyUpdate(update: SessionUpdate, seq = 0, at: string | null = null) {
     switch (update.sessionUpdate) {
       case 'config_option_update':
         this.configOptions = update.configOptions;
@@ -384,8 +384,8 @@ export class SessionView {
         if (update.title && this.session) this.setSession({ ...this.session, title: update.title });
         return;
     }
-    (this.#replay ?? this.transcript).apply(update, seq);
-    (this.#replayUpdates ?? this.#updates).push({ update, seq });
+    (this.#replay ?? this.transcript).apply(update, seq, at);
+    (this.#replayUpdates ?? this.#updates).push({ update, seq, at });
   }
 
   /** Puts the page of history before what's loaded in front of it. */
@@ -394,7 +394,7 @@ export class SessionView {
     if (before === null || this.loadingHistory || this.#replay) return;
     this.loadingHistory = true;
     try {
-      const page = await app.request<{ updates: SessionUpdate[]; before: number | null }>('_sloppod/history', {
+      const page = await app.request<{ updates: SessionUpdate[]; at?: string[]; before: number | null }>('_sloppod/history', {
         sessionId: this.id,
         before,
       });
@@ -402,8 +402,8 @@ export class SessionView {
       if (this.historyBefore !== before || !page) return;
       const transcript = new Transcript();
       // An older page's events are before whatever was read, as far as the unread marker goes: they have no place.
-      const updates = [...page.updates.map((update) => ({ update, seq: 0 })), ...this.#updates];
-      for (const { update, seq } of updates) transcript.apply(update, seq);
+      const updates = [...page.updates.map((update, index) => ({ update, seq: 0, at: page.at?.[index] ?? null })), ...this.#updates];
+      for (const { update, seq, at } of updates) transcript.apply(update, seq, at);
       this.#updates = updates;
       this.transcript = transcript;
       this.historyBefore = page.before;

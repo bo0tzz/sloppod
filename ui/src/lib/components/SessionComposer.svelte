@@ -48,22 +48,33 @@
   const canSend = $derived(!blockedReason && attaching === 0 && (text.trim().length > 0 || images.length > 0));
 
   const model = $derived(phase === 'stopped' ? undefined : view.model);
-  // The user's endpoints' models (#461), offered next to the agent's own; Claude Code runs on them.
+  // The user's endpoints' models (#461), offered next to the agent's own; Claude Code runs on them. The agent's own, as a
+  // session of it on them offered them, for a session on an endpoint's model: its agent offers its aliases with the
+  // endpoint's model behind each, which aren't a choice.
   let endpointModels = $state<{ value: string; label: string }[]>([]);
+  let ownModels = $state<{ value: string; label: string }[]>([]);
   $effect(() => {
-    if (view.session?.agent !== 'claude-code') return;
-    api.getSettings().then(
-      (settings) =>
-        (endpointModels = settings.models
-          .filter((entry) => entry.value.startsWith('endpoint:'))
-          .map((entry) => ({ value: entry.value, label: entry.name }))),
-      () => {},
-    );
+    const agent = view.session?.agent;
+    if (agent !== 'claude-code') return;
+    api.getSettings().then((settings) => {
+      const options = (models: { value: string; name: string }[]) =>
+        models.map((entry) => ({ value: entry.value, label: entry.name }));
+      endpointModels = options(settings.models).filter((option) => option.value.startsWith('endpoint:'));
+      ownModels = options(settings.agent_models?.[agent] ?? []);
+    }, () => {});
   });
-  const modelOptions = $derived(model?.type === 'select' ? [...configSelectOptions(model.options), ...endpointModels] : []);
+  const onEndpoint = $derived(view.session?.model?.startsWith('endpoint:') ?? false);
+  const modelOptions = $derived(
+    model?.type === 'select'
+      ? [...(onEndpoint ? ownModels : configSelectOptions(model.options)), ...endpointModels]
+      : [],
+  );
+  // A model that needs the agent started again applies to the next message; until then the session says which it is.
+  const pendingModel = $derived(view.session?.pending_model);
   // On an endpoint's model, the agent's own picker doesn't know it: the session says which it is.
   const modelValue = $derived(
-    view.session?.model?.startsWith('endpoint:') ? view.session.model : model?.type === 'select' ? model.currentValue : undefined,
+    pendingModel ??
+      (onEndpoint ? view.session?.model : model?.type === 'select' ? model.currentValue : undefined),
   );
 
   const unusualStops: Record<string, string> = {
@@ -331,6 +342,9 @@
     {#if model?.type === 'select' && modelOptions.length > 0}
       <div class="w-40 shrink-0 sm:w-48" data-testid="model-select">
         <Select size="tiny" options={modelOptions} value={modelValue} onChange={setModel} title={model.name} />
+        {#if pendingModel}
+          <p class="mt-0.5 text-xs text-muted" data-testid="model-pending">Applies to your next message</p>
+        {/if}
       </div>
     {/if}
   {/snippet}

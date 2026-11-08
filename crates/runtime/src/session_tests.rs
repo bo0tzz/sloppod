@@ -501,6 +501,20 @@ async fn a_queued_message_can_be_taken_back() {
             .is_err()
     );
     // A UI that didn't hear it was taken back sends it again; it doesn't run.
+    let resend = |id: &String| json!({"sessionId": h.id, "prompt": [], "_meta": {"sloppod": {"messageId": id}}});
+    assert!(
+        !h.hub
+            .is_new_prompt(h.id, &resend(&queued[1]))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !h.hub
+            .is_new_prompt(h.id, &resend(&queued[0]))
+            .await
+            .unwrap(),
+        "still queued"
+    );
     let resent = h
         .hub
         .prompt(
@@ -842,7 +856,11 @@ async fn a_message_sent_again_does_not_run_twice() {
     h.respond(&request, json!({"stopReason": "end_turn"})).await;
     first.await.unwrap().unwrap();
 
-    // The UI couldn't tell it arrived, e.g. it only loaded the latest of a long history, and sends it again.
+    // The UI couldn't tell it arrived, e.g. it only loaded the latest of a long history, and sends it again. It
+    // isn't a new message, so a model the user picked isn't moved onto for it.
+    assert!(!h.hub.is_new_prompt(h.id, &params).await.unwrap());
+    let other = json!({"sessionId": h.id, "prompt": [], "_meta": {"sloppod": {"messageId": Uuid::new_v4()}}});
+    assert!(h.hub.is_new_prompt(h.id, &other).await.unwrap());
     let again = h.hub.prompt(h.id, params).await.unwrap();
     assert_eq!(again["_meta"]["sloppod"]["alreadyReceived"], true);
     while let Ok(message) = h.to_agent.try_recv() {
@@ -3563,6 +3581,11 @@ async fn an_update_goes_out_with_its_place_in_the_log() {
             } if message["method"] == "session/update" => {
                 // What a UI reports as read is the seq the message carries.
                 assert_eq!(message["params"]["_meta"]["sloppod"]["seq"], seq);
+                // And when it was recorded, as an RFC 3339 time.
+                assert_eq!(
+                    message["params"]["_meta"]["sloppod"]["at"],
+                    "1970-01-01T00:00:01Z"
+                );
                 break seq;
             }
             _ => continue,

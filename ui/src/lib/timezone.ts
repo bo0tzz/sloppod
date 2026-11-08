@@ -1,4 +1,5 @@
 import { api } from './api.ts';
+import { userTimezone } from './user-timezone.svelte.ts';
 
 /** The browser's timezone, e.g. `Europe/Amsterdam`. */
 export const browserTimezone = () => Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -22,7 +23,10 @@ export async function adoptBrowserTimezone() {
   adopted = true;
   try {
     const settings = await api.getSettings();
-    if (settings.timezone === null) await api.updateSettings({ timezone: browserTimezone() });
+    userTimezone.value = settings.timezone;
+    if (settings.timezone === null) {
+      userTimezone.value = (await api.updateSettings({ timezone: browserTimezone() })).timezone;
+    }
   } catch {
     adopted = false;
   }

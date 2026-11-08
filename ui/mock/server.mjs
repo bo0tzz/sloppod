@@ -89,9 +89,10 @@ class MockSession {
     this.startTimer = null;
   }
 
-  emit(update) {
-    // Like the runtime, an update says where it falls in the log, from 1: what a read position counts in.
-    const params = { sessionId: this.data.id, update, _meta: { sloppod: { seq: this.log.length + 1 } } };
+  emit(update, at = now()) {
+    // Like the runtime, an update says where it falls in the log, from 1 (what a read position counts in), and when it
+    // was recorded.
+    const params = { sessionId: this.data.id, update, _meta: { sloppod: { seq: this.log.length + 1, at } } };
     this.log.push(params);
     this.data.active_at = now();
     for (const conn of this.subscribers) conn.notify('session/update', params);
@@ -122,7 +123,10 @@ class MockSession {
         category: 'model',
         type: 'select',
         currentValue: this.model,
-        options: MODELS,
+        // On an endpoint's model Claude Code still lists its aliases, each with the endpoint's model behind it.
+        options: this.data.model?.startsWith('endpoint:')
+          ? MODELS.map(({ value }) => ({ value, name: `${this.data.model.split(':').slice(2).join(':')} (${value})` }))
+          : MODELS,
       },
     ];
   }
@@ -1722,6 +1726,7 @@ function handleCall(conn, message) {
       const start = Math.max(0, end - HISTORY_PAGE);
       conn.respond(id, {
         updates: session.log.slice(start, end).map((entry) => entry.update),
+        at: session.log.slice(start, end).map((entry) => entry._meta.sloppod.at),
         before: start > 0 ? start + 1 : null,
       });
       return;
@@ -1756,6 +1761,13 @@ function handleCall(conn, message) {
         failNextPrompt = false;
         conn.error(id, -32000, 'the runtime refused it');
         return;
+      }
+      // A model picked that needs the agent started again is moved onto first (#461).
+      if (session.data.pending_model) {
+        session.data.model = session.data.pending_model;
+        if (!session.data.model.startsWith('endpoint:')) session.model = session.data.model;
+        delete session.data.pending_model;
+        session.broadcast();
       }
       if (session.data.phase === 'parked') session.setPhase('starting');
       if (session.data.phase === 'starting' || session.data.phase === 'disconnected') {
@@ -1862,15 +1874,16 @@ function handleCall(conn, message) {
 
     case 'session/set_config_option': {
       if (!needLoaded()) return;
-      // To or from an endpoint's model, the runtime moves the session itself and starts its agent again (#461).
+      // To or from an endpoint's model, the runtime moves the session itself, at its next message (#461).
       const onEndpoint = (value) => typeof value === 'string' && value.startsWith('endpoint:');
       if (params.configId === 'model' && (onEndpoint(params.value) || onEndpoint(session.data.model))) {
         if (onEndpoint(params.value) && !endpointModels().some((model) => model.value === params.value)) {
           conn.error(id, -32602, 'that endpoint isn\'t one of yours any more');
           return;
         }
-        session.data.model = params.value;
-        if (!onEndpoint(params.value)) session.model = params.value;
+        // It applies at the next message; picking the current model again takes it back.
+        if (params.value === session.data.model) delete session.data.pending_model;
+        else session.data.pending_model = params.value;
         session.broadcast();
         conn.respond(id, {});
         return;
@@ -1947,7 +1960,7 @@ async function handleApi(req, res, url) {
   }
 
   if (parts[0] === 'settings' && parts.length === 1) {
-    if (method === 'GET') return json(res, 200, { ...settings, models: [...settings.models, ...endpointModels()] });
+    if (method === 'GET') return json(res, 200, { ...settings, models: [...settings.models, ...endpointModels()], agent_models: settings.models.length > 0 ? { 'claude-code': settings.models } : {} });
     if (method === 'PUT') {
       const body = await readBody(req);
       if ('model' in body) {
@@ -2816,7 +2829,8 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/_mock/update' && req.method === 'POST') {
       // Any session update, as the agent might send it, in every session: the body is the update.
       const update = await readBody(req);
-      for (const session of sessions.values()) session.emit(update);
+      // `?at=` says when it was recorded.
+      for (const session of sessions.values()) session.emit(update, url.searchParams.get('at') ?? undefined);
       return json(res, 200, {});
     }
     if (url.pathname === '/_mock/spawn' && req.method === 'POST') {
