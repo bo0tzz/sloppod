@@ -10,6 +10,8 @@ export type Session = {
   agent: string;
   /** The model the agent runs on, if one was chosen rather than the agent's default. */
   model?: string;
+  /** A model picked that needs the agent started again; the session moves onto it before its next message (#461). */
+  pending_model?: string;
   /** 'work', or 'review' for a session that reviews a proposal. */
   kind: string;
   review: ReviewPolicy;

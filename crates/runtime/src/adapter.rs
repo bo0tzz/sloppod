@@ -394,6 +394,10 @@ impl AgentAdapter for ClaudeCode {
                 ] {
                     env.push((name.to_owned(), inference.model.clone()));
                 }
+                // Auto mode would ask the API to classify tool calls on the server, which only Anthropic's API
+                // does; an endpoint answers without a verdict, and Claude Code then warns that the session isn't
+                // eligible for Anthropic's classifier billing. The endpoint's own model classifies instead.
+                env.push(("CLAUDE_CODE_AUTO_MODE_SERVER".to_owned(), "0".to_owned()));
             }
             (None, Some(model)) => env.push(("ANTHROPIC_MODEL".to_owned(), model.clone())),
             (None, None) => {}
@@ -847,11 +851,13 @@ mod tests {
         ] {
             assert_eq!(env[name], "qwen3-coder", "{name}");
         }
+        assert_eq!(env["CLAUDE_CODE_AUTO_MODE_SERVER"], "0");
         // On Claude, it's Claude's API, with its placeholder token.
         let env: HashMap<String, String> = ClaudeCode.launch(&context()).env.into_iter().collect();
         assert_eq!(env["ANTHROPIC_MODEL"], "claude-haiku");
         assert!(
             env.contains_key("CLAUDE_CODE_OAUTH_TOKEN") && !env.contains_key("ANTHROPIC_BASE_URL")
         );
+        assert!(!env.contains_key("CLAUDE_CODE_AUTO_MODE_SERVER"));
     }
 }

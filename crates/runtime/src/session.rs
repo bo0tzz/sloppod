@@ -326,6 +326,9 @@ pub struct Live {
     transition: Mutex<()>,
     /// Held while the session's egress is written, so writes land in the order they read the session (ADR 11).
     egress: Mutex<()>,
+    /// Held while a model the user picked is recorded or applied (#461), so a pick and its application never overlap and
+    /// one pick isn't applied twice.
+    switching: Mutex<()>,
     /// Notified when something a steer waits for ends: a compaction, a tool call, a permission request, the turn.
     boundary: Notify,
     /// When the agent was last heard from, for telling it the time after a gap; `None` until this runtime knows.
@@ -556,6 +559,7 @@ impl Hub {
                     state: Mutex::default(),
                     transition: Mutex::default(),
                     egress: Mutex::default(),
+                    switching: Mutex::default(),
                     boundary: Notify::new(),
                     heard_at: StdMutex::default(),
                     commands: StdMutex::default(),
@@ -2809,6 +2813,16 @@ impl Hub {
             return Err(e);
         }
         Ok(true)
+    }
+
+    /// Runs `f` while no other pick of the session's model is recorded or applied (#461).
+    pub async fn one_switch_at_a_time<F, T>(&self, id: Uuid, f: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        let live = self.live(id);
+        let _switching = live.switching.lock().await;
+        f.await
     }
 
     /// Moves a session onto another provider's model (#461), under its transition lock and only while nothing is in

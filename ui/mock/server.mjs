@@ -122,7 +122,10 @@ class MockSession {
         category: 'model',
         type: 'select',
         currentValue: this.model,
-        options: MODELS,
+        // On an endpoint's model Claude Code still lists its aliases, each with the endpoint's model behind it.
+        options: this.data.model?.startsWith('endpoint:')
+          ? MODELS.map(({ value }) => ({ value, name: `${this.data.model.split(':').slice(2).join(':')} (${value})` }))
+          : MODELS,
       },
     ];
   }
@@ -1710,6 +1713,13 @@ function handleCall(conn, message) {
         conn.error(id, -32000, 'the runtime refused it');
         return;
       }
+      // A model picked that needs the agent started again is moved onto first (#461).
+      if (session.data.pending_model) {
+        session.data.model = session.data.pending_model;
+        if (!session.data.model.startsWith('endpoint:')) session.model = session.data.model;
+        delete session.data.pending_model;
+        session.broadcast();
+      }
       if (session.data.phase === 'parked') session.setPhase('starting');
       if (session.data.phase === 'starting' || session.data.phase === 'disconnected') {
         queuePrompt(
@@ -1815,15 +1825,16 @@ function handleCall(conn, message) {
 
     case 'session/set_config_option': {
       if (!needLoaded()) return;
-      // To or from an endpoint's model, the runtime moves the session itself and starts its agent again (#461).
+      // To or from an endpoint's model, the runtime moves the session itself, at its next message (#461).
       const onEndpoint = (value) => typeof value === 'string' && value.startsWith('endpoint:');
       if (params.configId === 'model' && (onEndpoint(params.value) || onEndpoint(session.data.model))) {
         if (onEndpoint(params.value) && !endpointModels().some((model) => model.value === params.value)) {
           conn.error(id, -32602, 'that endpoint isn\'t one of yours any more');
           return;
         }
-        session.data.model = params.value;
-        if (!onEndpoint(params.value)) session.model = params.value;
+        // It applies at the next message; picking the current model again takes it back.
+        if (params.value === session.data.model) delete session.data.pending_model;
+        else session.data.pending_model = params.value;
         session.broadcast();
         conn.respond(id, {});
         return;
