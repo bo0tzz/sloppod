@@ -86,11 +86,11 @@ export type SessionUpdate =
   | ({ sessionUpdate: 'config_option_update'; configOptions: SessionConfigOption[] } & Meta)
   | ({ sessionUpdate: 'usage_update' } & Meta);
 
-/** `_meta.sloppod.seq` is the update's place in the session's log, what the read position is counted in. */
+/** `_meta.sloppod.seq` is the update's place in the session's log, what the read position is counted in; `at` is when it was recorded. */
 export type SessionNotification = {
   sessionId: string;
   update: SessionUpdate;
-  _meta?: { sloppod?: { seq?: number } } | null;
+  _meta?: { sloppod?: { seq?: number; at?: string } } | null;
 };
 
 export type PermissionOption = {

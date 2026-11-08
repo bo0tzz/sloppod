@@ -434,12 +434,17 @@ fn notification(method: &str, params: Value) -> Value {
     json!({"jsonrpc": "2.0", "method": method, "params": params})
 }
 
+/// When an event was recorded, as a UI is told (`_meta.sloppod.at`).
+pub fn event_time(at: DateTime<Utc>) -> String {
+    at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
 /// An update as the log has it: with its seq, in `_meta.sloppod.seq`, which is what a UI reports as how far it has read
-/// (#48).
-pub fn session_update_at(session: Uuid, seq: i64, update: &Value) -> Value {
+/// (#48), and when it was recorded, in `_meta.sloppod.at`.
+pub fn session_update_at(session: Uuid, seq: i64, at: DateTime<Utc>, update: &Value) -> Value {
     notification(
         "session/update",
-        json!({"sessionId": session, "update": update, "_meta": {"sloppod": {"seq": seq}}}),
+        json!({"sessionId": session, "update": update, "_meta": {"sloppod": {"seq": seq, "at": event_time(at)}}}),
     )
 }
 
@@ -706,11 +711,11 @@ impl Hub {
     pub async fn record(&self, id: Uuid, update: Value) {
         self.heard_at(id).await;
         match self.store.append_event(id, &update).await {
-            Ok(seq) => self.broadcast(
+            Ok((seq, at)) => self.broadcast(
                 id,
                 UiEvent::Notification {
                     seq: Some(seq),
-                    message: session_update_at(id, seq, &update),
+                    message: session_update_at(id, seq, at, &update),
                 },
             ),
             Err(e) => tracing::error!(session = %id, error = %e, "recording event"),
@@ -2309,7 +2314,7 @@ impl Hub {
         id: Uuid,
         before: i64,
         limit: i64,
-    ) -> Result<Vec<(i64, Value)>, sqlx::Error> {
+    ) -> Result<Vec<(i64, DateTime<Utc>, Value)>, sqlx::Error> {
         self.store.events_before(id, before, limit).await
     }
 

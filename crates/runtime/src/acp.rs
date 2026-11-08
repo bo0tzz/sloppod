@@ -7,6 +7,7 @@ use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, header};
 use axum::response::Response;
+use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -14,7 +15,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::link::RpcError;
-use crate::session::{UiEvent, session_update_at};
+use crate::session::{UiEvent, event_time, session_update_at};
 use crate::users::User;
 use crate::{AppState, db, quota};
 
@@ -139,8 +140,9 @@ impl Conn {
             .events_before(session, until + 1, HISTORY_PAGE)
             .await
             .map_err(internal)?;
-        for (seq, update) in &latest {
-            self.send(session_update_at(session, *seq, update)).await;
+        for (seq, at, update) in &latest {
+            self.send(session_update_at(session, *seq, *at, update))
+                .await;
         }
         let replay = self.state.hub.replay(session).await.map_err(internal)?;
         let task = tokio::spawn(self.clone().forward(session, events, until));
@@ -169,8 +171,9 @@ impl Conn {
             .await
             .map_err(internal)?;
         let before = older_than(&page);
-        let updates: Vec<Value> = page.into_iter().map(|(_, update)| update).collect();
-        Ok(json!({"updates": updates, "before": before}))
+        let times: Vec<String> = page.iter().map(|(_, at, _)| event_time(*at)).collect();
+        let updates: Vec<Value> = page.into_iter().map(|(_, _, update)| update).collect();
+        Ok(json!({"updates": updates, "at": times, "before": before}))
     }
 
     async fn handle_request(self: Arc<Self>, id: Value, method: String, params: Value) {
@@ -315,7 +318,7 @@ impl Conn {
 const HISTORY_PAGE: i64 = 2000;
 
 /// Where the page before `page` ends, if there may be one: a full page may have more before it.
-fn older_than(page: &[(i64, Value)]) -> Option<i64> {
+fn older_than(page: &[(i64, DateTime<Utc>, Value)]) -> Option<i64> {
     (page.len() as i64 == HISTORY_PAGE).then(|| page[0].0)
 }
 

@@ -56,7 +56,8 @@ test('creates a session and streams the agent output', async ({ page }) => {
 
   // The first agent message arrives as several chunks and renders as one message.
   const first = agentMessages(page).first();
-  await expect(first).toHaveText("I'll start by reading the connection code to see how reconnects work today.");
+  // What it says, without the time its toolbar has.
+  await expect(first.locator('.markdown').first()).toHaveText("I'll start by reading the connection code to see how reconnects work today.");
   expect(chunkFrames.length).toBeGreaterThan(3);
   await expect(agentMessages(page).filter({ hasText: "I'll start" })).toHaveCount(1);
 
@@ -120,6 +121,62 @@ test("downloads a debug bundle for an agent message's turn", async ({ page }) =>
   expect(bundle.turns.at(-1).model_calls.length).toBeGreaterThan(0);
 
   await expect(userMessages(page).getByRole('link', { name: 'Download debug bundle' })).toHaveCount(0);
+});
+
+test("a message shows when it was made on hover, in the user's timezone", async ({ page }) => {
+  await createSession(page, 'Add backoff to the reconnect logic in sloppod');
+  await finishTurn(page);
+
+  // The user's own message has no toolbar: the time shows in its corner on hover.
+  const mine = userMessages(page).first();
+  const mineTime = mine.getByTestId('message-time');
+  await page.mouse.move(0, 0);
+  await expect(mineTime).toHaveCSS('opacity', '0');
+  // The bubble is at the right of a full-width row, so it's the bubble that's hovered.
+  await mine.locator('> div').hover();
+  await expect(mineTime).toHaveCSS('opacity', '1');
+  await expect(mineTime).toHaveText(/^\d{2}:\d{2}$/);
+  // The full date and time are in its tooltip.
+  await expect(mineTime).toHaveAttribute('title', new RegExp(`${new Date().getFullYear()}`));
+
+  // The agent's go in its toolbar, with copy and the debug bundle.
+  const theirs = agentMessages(page).filter({ hasText: FINAL });
+  await page.mouse.move(0, 0);
+  await theirs.hover();
+  await expect(theirs.getByTestId('message-actions').getByTestId('message-time')).toHaveText(/^\d{2}:\d{2}$/);
+
+  // In the timezone the user has set: the same moment, as Tokyo has it.
+  const settings = await (await page.request.get('/api/v1/settings')).json();
+  await page.request.put('/api/v1/settings', { data: { timezone: 'Asia/Tokyo' } });
+  try {
+    await page.reload();
+    const at = await userMessages(page).first().getByTestId('message-time').getAttribute('datetime');
+    const tokyo = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23', timeZone: 'Asia/Tokyo' }).format(new Date(at!));
+    await expect(userMessages(page).first().getByTestId('message-time')).toHaveText(tokyo);
+  } finally {
+    await page.request.put('/api/v1/settings', { data: { timezone: settings.timezone } });
+  }
+});
+
+test("a message from before today says which day, and one from before the last week the date", async ({ page }) => {
+  await createSession(page, 'Give me a long answer in sloppod');
+  await expect(agentMessages(page).filter({ hasText: 'The end.' })).toBeVisible({ timeout: 20_000 });
+  const chunk = (text: string) => ({ sessionUpdate: 'agent_message_chunk', messageId: text, content: { type: 'text', text } });
+  const ago = (days: number) => new Date(Date.now() - days * 86_400_000).toISOString();
+  await page.request.post(`/_mock/update?at=${ago(2)}`, { data: chunk('Two days ago.') });
+  await page.request.post(`/_mock/update?at=${ago(10)}`, { data: chunk('Ten days ago.') });
+  await page.request.post(`/_mock/update?at=${new Date().toISOString()}`, { data: chunk('Just now.') });
+
+  const time = (text: string) => agentMessages(page).filter({ hasText: text }).getByTestId('message-time');
+  await agentMessages(page).filter({ hasText: 'Two days ago.' }).hover();
+  await expect(time('Two days ago.')).toHaveText(/^[A-Z][a-z]{2} \d{2}:\d{2}$/);
+  await agentMessages(page).filter({ hasText: 'Ten days ago.' }).hover();
+  await expect(time('Ten days ago.')).toHaveText(/^\d{1,2} [A-Z][a-z]{2} \d{2}:\d{2}$/);
+  await agentMessages(page).filter({ hasText: 'Just now.' }).hover();
+  await expect(time('Just now.')).toHaveText(/^\d{2}:\d{2}$/);
+  // After a reload the times come from the log.
+  await page.reload();
+  await expect(time('Ten days ago.')).toHaveText(/^\d{1,2} [A-Z][a-z]{2} \d{2}:\d{2}$/);
 });
 
 test('consecutive tool calls fold into one block between two messages, and expand to every call', async ({ page }) => {

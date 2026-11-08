@@ -32,6 +32,24 @@ export function clockTime(iso: string, now = Date.now()): string {
     : `${date.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' })} ${time}`;
 }
 
+/**
+ * When a message was made, for its hover: the time as HH:mm in `timeZone` (the user's setting; the browser's without
+ * one), led by the weekday when it isn't today ("Thu 14:05") and by the date from a week on ("3 Nov 14:05"). `title`
+ * has the full date and time.
+ */
+export function messageTime(iso: string, timeZone?: string | null, now = Date.now()): { label: string; title: string } {
+  const zone = timeZone || undefined;
+  const at = new Date(iso);
+  const part = (options: Intl.DateTimeFormatOptions, date = at) =>
+    new Intl.DateTimeFormat('en-GB', { ...options, timeZone: zone }).format(date);
+  const time = part({ hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+  const day = (date: Date) => part({ year: 'numeric', month: 'numeric', day: 'numeric' }, date);
+  const days = (Date.parse(day(new Date(now)).split('/').reverse().join('-')) - Date.parse(day(at).split('/').reverse().join('-'))) / 86_400_000;
+  const label =
+    days <= 0 ? time : days < 7 ? `${part({ weekday: 'short' })} ${time}` : `${part({ day: 'numeric', month: 'short' })} ${time}`;
+  return { label, title: part({ dateStyle: 'full', timeStyle: 'long' }) };
+}
+
 /** How long until `iso`, to the minute: "in 1 h 23 min", or "any moment now" once it's less than a minute. */
 export function countdown(iso: string, now = Date.now()): string {
   const minutes = Math.ceil((Date.parse(iso) - now) / 60_000);

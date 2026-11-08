@@ -808,20 +808,24 @@ pub async fn clear_pending_prompt(db: &PgPool, id: Uuid) -> sqlx::Result<()> {
         .map(|_| ())
 }
 
-pub async fn append_event(db: &PgPool, id: Uuid, payload: &Value) -> sqlx::Result<i64> {
-    let seq: i64 = sqlx::query(
-        "insert into session_events (session_id, payload) values ($1, $2) returning seq",
+/// Appends to the session's event log; returns the event's sequence number and when it was recorded.
+pub async fn append_event(
+    db: &PgPool,
+    id: Uuid,
+    payload: &Value,
+) -> sqlx::Result<(i64, DateTime<Utc>)> {
+    let (seq, at): (i64, DateTime<Utc>) = sqlx::query_as(
+        "insert into session_events (session_id, payload) values ($1, $2) returning seq, created_at",
     )
     .bind(id)
     .bind(payload)
     .fetch_one(db)
-    .await?
-    .get(0);
+    .await?;
     sqlx::query("update sessions set updated_at = now(), active_at = now() where id = $1")
         .bind(id)
         .execute(db)
         .await?;
-    Ok(seq)
+    Ok((seq, at))
 }
 
 /// The sequence number of the session's latest event; 0 when it has none.
@@ -912,23 +916,26 @@ pub async fn events_between(
     .await
 }
 
-/// Up to `limit` of the session's latest events before `before`, in order.
+/// Up to `limit` of the session's latest events before `before`, in order, each with when it was recorded.
 pub async fn events_before(
     db: &PgPool,
     id: Uuid,
     before: i64,
     limit: i64,
-) -> sqlx::Result<Vec<(i64, Value)>> {
+) -> sqlx::Result<Vec<(i64, DateTime<Utc>, Value)>> {
     let rows = sqlx::query(
-        "select seq, payload from (select seq, payload from session_events where session_id = $1 and seq < $2 \
-         order by seq desc limit $3) latest order by seq",
+        "select seq, created_at, payload from (select seq, created_at, payload from session_events \
+         where session_id = $1 and seq < $2 order by seq desc limit $3) latest order by seq",
     )
     .bind(id)
     .bind(before)
     .bind(limit)
     .fetch_all(db)
     .await?;
-    Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect())
 }
 
 /// Appends to a transcript if the stored copy is exactly `offset` bytes long; returns whether it was.

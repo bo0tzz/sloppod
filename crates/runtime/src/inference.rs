@@ -379,7 +379,7 @@ const TASK_CHARS: usize = 4000;
 /// The text of the session's last agent message, from its log.
 async fn last_agent_message(state: &AppState, id: Uuid) -> Option<String> {
     let events = state.hub.events_before(id, i64::MAX, 500).await.ok()?;
-    let updates: Vec<Value> = events.into_iter().map(|(_, update)| update).collect();
+    let updates: Vec<Value> = events.into_iter().map(|(_, _, update)| update).collect();
     final_message(&updates)
 }
 

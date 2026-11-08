@@ -3562,6 +3562,11 @@ async fn an_update_goes_out_with_its_place_in_the_log() {
             } if message["method"] == "session/update" => {
                 // What a UI reports as read is the seq the message carries.
                 assert_eq!(message["params"]["_meta"]["sloppod"]["seq"], seq);
+                // And when it was recorded, as an RFC 3339 time.
+                assert_eq!(
+                    message["params"]["_meta"]["sloppod"]["at"],
+                    "1970-01-01T00:00:01Z"
+                );
                 break seq;
             }
             _ => continue,
