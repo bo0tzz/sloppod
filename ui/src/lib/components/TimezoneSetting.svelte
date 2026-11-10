@@ -24,11 +24,13 @@
 
   async function save(event: SubmitEvent) {
     event.preventDefault();
-    if (!changed || saving || chosen === null) return;
+    const submitted = chosen;
+    if (!changed || saving || submitted === null) return;
     saving = true;
     try {
-      timezone = (await api.updateSettings({ timezone: chosen })).timezone;
-      chosen = timezone;
+      timezone = (await api.updateSettings({ timezone: submitted })).timezone;
+      // A zone picked while this saved stays picked, to be saved next.
+      if (chosen === submitted) chosen = timezone;
       userTimezone.value = timezone;
       toastManager.success(`Your timezone is ${timezone}`);
     } catch (e) {

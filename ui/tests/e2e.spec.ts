@@ -4115,6 +4115,16 @@ test('Settings groups its sections, and the nav goes to each', async ({ page }) 
   await expect(page.getByTestId('storage')).toBeInViewport();
   await nav.getByRole('button', { name: 'Defaults' }).click();
   await expect(page.getByTestId('timezone-setting')).toBeInViewport();
+
+  // Keyboard too: focus goes with the navigation, so Tab carries on inside the group (#370).
+  const credentials = nav.getByRole('button', { name: 'Credentials' });
+  await credentials.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.getByTestId('settings-group-credentials-heading')).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect
+    .poll(async () => page.evaluate(() => document.activeElement?.closest('[data-testid="settings-group-credentials"]') !== null))
+    .toBe(true);
 });
 
 test('a token for a capability is added in settings and chosen for the capability', async ({ page }) => {
@@ -4900,6 +4910,24 @@ test.describe('in UTC', () => {
     await expect(setting).toContainText('Asia/Tokyo');
     await setTimezone(page, 'UTC');
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('UTC');
+  });
+
+  test('a zone picked while a save is in flight is kept, to save next', async ({ page }) => {
+    await page.request.post('/_mock/forget-timezone');
+    await page.goto('/settings');
+    const setting = page.getByTestId('timezone-setting').getByRole('combobox', { name: 'Timezone' });
+    await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('UTC');
+
+    // The save is slow, so the pick after it lands while it's in flight (#370).
+    await page.request.post('/_mock/slow-settings?ms=700');
+    await pickTimezone(page, 'Asia/Tokyo');
+    await page.getByTestId('timezone-setting').getByRole('button', { name: 'Save' }).click();
+    await pickTimezone(page, 'UTC');
+
+    // The save landed with Asia/Tokyo, and the later pick is still there, to save next.
+    await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Asia/Tokyo');
+    await expect(setting).toContainText('UTC');
+    await expect(page.getByTestId('timezone-setting').getByRole('button', { name: 'Save' })).toBeEnabled();
   });
 
   test('the snooze choices follow a timezone chosen in Settings, without a reload', async ({ page }) => {

@@ -42,7 +42,13 @@
     { id: 'sessions', label: 'Sessions' },
   ];
 
-  const show = (id: string) => document.getElementById(id)?.scrollIntoView({ block: 'start' });
+  /** Goes to a group, keyboard and all: focus moves to its heading, so Tab carries on inside it rather than walking
+   * the links (#370). */
+  function show(id: string) {
+    const group = document.getElementById(id);
+    group?.scrollIntoView({ block: 'start' });
+    group?.querySelector<HTMLElement>('[tabindex="-1"]')?.focus({ preventScroll: true });
+  }
 </script>
 
 <svelte:head>
@@ -61,7 +67,7 @@
         {/each}
       </nav>
       <section id="defaults" class="flex flex-col gap-8" data-testid="settings-group-defaults">
-        <Heading tag="h2" size="small">Defaults</Heading>
+        <Heading tag="h2" size="small" tabindex={-1} data-testid="settings-group-defaults-heading">Defaults</Heading>
         <SessionDefaults />
         <TimezoneSetting />
         <InstructionsSetting />
@@ -76,7 +82,7 @@
         {/if}
       {:else}
         <section id="credentials" class="flex flex-col gap-8" data-testid="settings-group-credentials">
-          <Heading tag="h2" size="small">Credentials</Heading>
+          <Heading tag="h2" size="small" tabindex={-1} data-testid="settings-group-credentials-heading">Credentials</Heading>
           {#each credentialKinds as spec (spec.kind)}
             <CredentialSection
               {spec}
@@ -86,7 +92,7 @@
           {/each}
         </section>
         <section id="capabilities" class="flex flex-col gap-8" data-testid="settings-group-capabilities">
-          <Heading tag="h2" size="small">Capabilities</Heading>
+          <Heading tag="h2" size="small" tabindex={-1} data-testid="settings-group-capabilities-heading">Capabilities</Heading>
           <CapabilitySection
             tokens={credentials.filter((credential) => credential.kind === 'token')}
             version={credentialsVersion}
@@ -94,7 +100,7 @@
         </section>
       {/if}
       <section id="sessions" class="flex flex-col gap-8" data-testid="settings-group-sessions">
-        <Heading tag="h2" size="small">Sessions</Heading>
+        <Heading tag="h2" size="small" tabindex={-1} data-testid="settings-group-sessions-heading">Sessions</Heading>
         <StorageSection />
         <DeletedSessions />
       </section>
