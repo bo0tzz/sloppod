@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Alert, Button, Field, ModalBody, Select, Text } from '@immich/ui';
   import Dialog from './Dialog.svelte';
+  import Markdown from './Markdown.svelte';
   import { mdiShieldKeyOutline } from '@mdi/js';
   import { onMount } from 'svelte';
   import { api, type Credential, type Grant, type GrantChange, type Session, type WorkGraph, type WorkLevel } from '#lib/api.ts';
@@ -127,7 +128,8 @@
         {#each session.grants as grant, index (grant.id ?? index)}
           <li class="flex flex-col gap-1" data-testid="grant-{grant.capability}">
             <span class="font-mono text-sm font-medium">{grant.capability}</span>
-            <span class="text-sm">{grant.description ?? ''}</span>
+            <!-- The runtime writes it as Markdown, with code in backticks (#292). -->
+            <Markdown text={grant.description ?? ''} class="text-sm" />
             {#if accountKinds[grant.capability]}
               <ol class="flex flex-col gap-1 text-sm" data-testid="grant-accounts">
                 {#each accountsOf(grant) as id, index (id)}
