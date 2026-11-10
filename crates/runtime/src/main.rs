@@ -163,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("installing the rustls crypto provider"))?;
-    let config = Config::parse();
+    let config = Config::parse().without_an_empty_build();
 
     let db = db::connect(&config.database_url)
         .await

@@ -144,7 +144,8 @@ pub struct Config {
     #[arg(long, env = "SLOPPOD_MEMINI_NAMESPACE_PREFIX", default_value = "")]
     pub memini_namespace_prefix: String,
 
-    /// What this runtime was built from (a release tag or commit); agents can read it in their pod.
+    /// What this runtime was built from (a release tag or commit): the image sets it, from the build it was made in
+    /// ([#448](https://github.com/bo0tzz/sloppod/issues/448)). Agents can read it in their pod.
     #[arg(long, env = "SLOPPOD_BUILD")]
     pub build: Option<String>,
 
@@ -173,6 +174,13 @@ pub struct Config {
 }
 
 impl Config {
+    /// The config with an empty build read as none. An image built without a build arg has `SLOPPOD_BUILD=` set, empty
+    /// (the Containerfile sets it from the arg), and that's no name for the runtime to report (#448).
+    pub fn without_an_empty_build(mut self) -> Self {
+        self.build = build_name(self.build.take());
+        self
+    }
+
     /// How session pods reach the runtime.
     pub fn runtime_url(&self) -> String {
         format!(
@@ -195,6 +203,11 @@ impl Config {
     pub fn litellm_namespaces(&self) -> Vec<String> {
         litellm_namespaces(self.litellm_namespaces.as_deref(), &self.namespace)
     }
+}
+
+/// What a runtime was built from, where an empty name is no name.
+fn build_name(build: Option<String>) -> Option<String> {
+    build.filter(|build| !build.is_empty())
 }
 
 /// A fraction of a volume, e.g. `0.85` for 85% full or `0.5` for half again (#479).
@@ -237,5 +250,13 @@ mod tests {
             litellm_namespaces(Some(""), "sloppod").is_empty(),
             "empty turns it off"
         );
+    }
+
+    #[test]
+    fn an_empty_build_is_no_build() {
+        use super::build_name;
+        assert_eq!(build_name(None), None);
+        assert_eq!(build_name(Some(String::new())), None);
+        assert_eq!(build_name(Some("4f1a32e".into())), Some("4f1a32e".into()));
     }
 }
