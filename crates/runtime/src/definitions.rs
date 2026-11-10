@@ -175,13 +175,20 @@ pub async fn proxy(
         Ok(response) => response,
         Err(e) => {
             tracing::warn!(%peer, server = %name, error = %format!("{e:#}"), "proxying to an MCP server");
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("sloppod: the {name} server isn't reachable: {e:#}\n"),
-            )
-                .into_response()
+            unreachable(&name, &e)
         }
     }
+}
+
+/// What a session's MCP client gets when the server it asked for can't be reached (#480): the JSON-RPC error, with
+/// the 502 that says the same to anything that isn't that client.
+fn unreachable(name: &str, error: &anyhow::Error) -> Response {
+    let message = format!("sloppod: the {name} server isn't reachable: {error:#}\n");
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(refusal(StatusCode::BAD_GATEWAY, message)),
+    )
+        .into_response()
 }
 
 fn refuse(status: StatusCode, message: String) -> anyhow::Result<Response> {
@@ -360,6 +367,28 @@ async fn token_header(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The server a session asked for couldn't be reached: the same JSON-RPC error a refusal is, and the 502 that
+    /// says so to anything else (#480). This is the response the proxy's error path builds, not just the helper.
+    #[tokio::test]
+    async fn a_server_that_cant_be_reached_is_a_json_rpc_error() {
+        let response = unreachable("logs", &anyhow::anyhow!("connection refused"));
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert!(body["id"].is_null(), "{body}");
+        assert_eq!(body["error"]["code"].as_i64(), Some(-32603));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("the logs server isn't reachable"),
+            "{body}"
+        );
+    }
 
     /// What a session's MCP client gets when sloppod refuses it: a JSON-RPC error, since the request it made is a
     /// JSON-RPC call, rather than the plain text anything else gets (#480).
