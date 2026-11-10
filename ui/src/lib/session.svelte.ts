@@ -57,6 +57,42 @@ const STALE_QUESTION_GRACE_MS = 10_000;
 /** A message waiting for the running turn to end (`_sloppod/queue`). */
 export type QueuedMessage = { id: string; prompt: ContentBlock[] };
 
+/**
+ * Where the reader was in a session's chat, for showing it to them again where they left it (#93): the rows at the top
+ * of the view by the names they have (#485), the offset the first of them was at, and whether the view was following
+ * the bottom.
+ */
+export type ReaderPlace = { names: string[]; seq: number; offset: number; atBottom: boolean };
+
+/** How many sessions' views are kept for switching back to (#93): the chat then shows at once, without a replay. */
+const RECENT_VIEWS = 4;
+
+/** The views of the sessions opened lately, least recently shown first. */
+const recentViews = new Map<string, SessionView>();
+
+/**
+ * The view of a session: the one it had if it's among those opened lately, so switching back shows its chat at once
+ * (#93), and what it missed is caught up from a load underneath.
+ */
+export function sessionView(id: string): SessionView {
+  const kept = recentViews.get(id);
+  // Only one with its chat already: a session whose load is still on its way has nothing to show, and the load in
+  // flight belongs to the view that asked for it, which a new one waits out (#454).
+  if (kept?.loaded) {
+    // Shown again: last in the map, so the one that goes first is the one left alone longest.
+    recentViews.delete(id);
+    recentViews.set(id, kept);
+    return kept;
+  }
+  const view = new SessionView(id);
+  recentViews.set(id, view);
+  // The oldest goes, so a few sessions' transcripts at most are held in memory.
+  while (recentViews.size > RECENT_VIEWS) {
+    recentViews.delete(recentViews.keys().next().value!);
+  }
+  return view;
+}
+
 export const queuedText = (message: QueuedMessage) =>
   message.prompt.map((block) => (block.type === 'text' ? block.text : '')).join('');
 
@@ -164,6 +200,11 @@ export class SessionView {
   unsent = $state<Outgoing[]>([]);
   /** Messages that couldn't be delivered, kept until the user puts each back or dismisses it. */
   undelivered = $state<Outgoing[]>([]);
+  /**
+   * Where the reader was in the chat, kept up to date while this view is shown and used the next time it is (#93):
+   * showing the session again puts them back there rather than at the bar or the bottom.
+   */
+  place: ReaderPlace | null = null;
 
   constructor(id: string) {
     this.id = id;

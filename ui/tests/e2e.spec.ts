@@ -1815,17 +1815,20 @@ async function openLongHistory(page: Page) {
 }
 
 /**
- * Reads up to the top of the chat. A wheel event scrolls a page at most in some browsers (Firefox), so what the reader's
+ * Scrolls the chat by the reader's wheel. A wheel event scrolls a page at most in some browsers (Firefox), so what the
  * wheel asks for is scrolled here — the chat itself, by as much as the wheel said — rather than left to the browser.
  */
-async function wheelUp(page: Page) {
+async function wheelBy(page: Page, by: number) {
   const scroller = page.getByTestId('transcript-scroller');
   await scroller.hover();
-  await scroller.evaluate((element) => {
-    element.dispatchEvent(new WheelEvent('wheel', { deltaY: -100_000, deltaMode: 0, bubbles: true }));
-    element.scrollTo({ top: 0 });
-  });
+  await scroller.evaluate((element, by) => {
+    element.dispatchEvent(new WheelEvent('wheel', { deltaY: by, deltaMode: 0, bubbles: true }));
+    element.scrollBy(0, by);
+  }, by);
 }
+
+/** Reads up to the top of the chat. */
+const wheelUp = (page: Page) => wheelBy(page, -100_000);
 
 test('reading up brings in the earlier history by itself, with no click', { tag: '@scroll' }, async ({ page }) => {
   const prompt = await openLongHistory(page);
@@ -2028,6 +2031,65 @@ test('an earlier page that could not be loaded offers a retry', { tag: '@scroll'
   await failed.getByRole('button', { name: 'Retry' }).click();
   await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(1);
   await expect(failed).toHaveCount(0);
+});
+
+/**
+ * Two sessions the UI has both opened, with the second on screen (#93): each is one the view keeps, so switching
+ * between them with the session list is switching back to one the UI already has. Both are opened once, since
+ * `createSession` starts from a fresh page and that would drop what the UI holds.
+ */
+async function twoSessionsOpen(page: Page) {
+  const long = await createSession(page, 'Give me a long answer in sloppod');
+  await expect(page.getByText('The end.')).toBeVisible({ timeout: 20_000 });
+  const backoff = await createSession(page, 'Add backoff to the reconnect logic in sloppod');
+  await finishTurn(page);
+
+  // To the first and on to the second, both inside the app: each view is one the UI holds now, and the second is on
+  // screen.
+  const open = (id: string) => page.getByRole('navigation', { name: 'Sessions' }).locator(`a[href$="/sessions/${id}"]`);
+  await open(long).click();
+  await expect(page.getByText('The end.')).toBeVisible();
+  await open(backoff).click();
+  await expect(page.getByText(/Done\. The tests pass/)).toBeVisible();
+  return { long, backoff, open };
+}
+
+test('switching back to a session the UI has shows its chat at once', { tag: '@scroll' }, async ({ page }) => {
+  const { long, open } = await twoSessionsOpen(page);
+  // The load that follows a switch is slow here, so a chat that came only from one wouldn't be there in time, and the
+  // spinner would have shown long before it.
+  await page.request.post('/_mock/slow-loads?for=2000');
+  await open(long).click();
+  await expect(page.getByText('The end.')).toBeVisible({ timeout: 800 });
+  await expect(page.getByTestId('session-loading')).toHaveCount(0);
+  await page.request.post('/_mock/slow-loads?for=0');
+});
+
+test('switching back catches up with what came in meanwhile', { tag: '@scroll' }, async ({ page }) => {
+  const { long, open } = await twoSessionsOpen(page);
+  // In the other session, the first one's agent carries on: its view isn't following, so it misses this, and the load
+  // that follows the switch is what brings it.
+  await page.request.post('/_mock/say?text=Meanwhile%20in%20the%20first.');
+  await open(long).click();
+  await expect(page.getByText('Meanwhile in the first.')).toBeVisible();
+});
+
+test('switching back keeps the reader’s place', { tag: '@scroll' }, async ({ page }) => {
+  const { long, backoff, open } = await twoSessionsOpen(page);
+  await open(long).click();
+  await expect(page.getByText('The end.')).toBeVisible();
+
+  // Up into the long message, where the reader leaves off.
+  await wheelBy(page, -600);
+  const row = page.locator('[data-testid="transcript"] [data-row-names]').first();
+  const left = (await row.boundingBox())!.y;
+
+  // Away and back: the same row sits where they left it, and the chat was there to show them.
+  await open(backoff).click();
+  await expect(page.getByText(/Done\. The tests pass/)).toBeVisible();
+  await open(long).click();
+  await expect(page.getByText('The end.')).toBeVisible();
+  await expect.poll(async () => Math.abs((await row.boundingBox())!.y - left)).toBeLessThan(2);
 });
 
 test('says what the pod is doing while the agent starts, and why a start failed', async ({ page }) => {

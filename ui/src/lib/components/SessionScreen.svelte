@@ -31,7 +31,7 @@
   import { absoluteTime, bytes, clockTime, countdown } from '#lib/format.ts';
   import { toolTitle } from '#lib/presentation.ts';
   import { isSnoozed } from '#lib/snooze.ts';
-  import { SessionView } from '#lib/session.svelte.ts';
+  import { sessionView, type ReaderPlace } from '#lib/session.svelte.ts';
   import { sessionSidebar } from '#lib/session-sidebar.svelte.ts';
   import { sessions } from '#lib/sessions.svelte.ts';
   import AddRepoModal from './AddRepoModal.svelte';
@@ -54,7 +54,7 @@
 
   // The route wraps this component in {#key id}, so capturing the first id is intended.
   // svelte-ignore state_referenced_locally
-  const view = new SessionView(id);
+  const view = sessionView(id);
 
   const session = $derived(view.session);
   const title = $derived(session?.title || 'New session');
@@ -185,6 +185,21 @@
   let content = $state<HTMLElement | null>(null);
   let atBottom = $state(true);
   /**
+   * Whether to show the spinner while the session loads. A session whose view the UI already has shows at once (#93),
+   * so the spinner only appears once the load is slow enough to be worth saying something about.
+   */
+  const SPINNER_AFTER_MS = 300;
+  let showSpinner = $state(false);
+  $effect(() => {
+    if (view.loaded) {
+      showSpinner = false;
+      return;
+    }
+    const timer = setTimeout(() => (showSpinner = true), SPINNER_AFTER_MS);
+    return () => clearTimeout(timer);
+  });
+
+  /**
    * Earlier history loads by itself only once the reader has scrolled — by wheel, touch, key or the scrollbar — and not
    * when the view opens at the top, where the scrolling is the view's own. A reader who only drags the scrollbar has no
    * other way to it, the button that used to be there being gone.
@@ -236,6 +251,9 @@
       atBottom = false;
     }
     if (!resized) settle();
+    // Recorded as it happens: by the time this view is taken down its rows are gone, and switching back shows the chat
+    // where the reader had it (#93).
+    view.place = readerPlace();
     loadEarlierIfNear();
   }
 
@@ -256,6 +274,53 @@
   /** A row's bottom as the content has it: what a page going in above it moves, whatever the reader scrolls. */
   function endOf(row: HTMLElement) {
     return content ? row.getBoundingClientRect().bottom - content.getBoundingClientRect().top : 0;
+  }
+
+  /** The row a view is at the top of: the first whose bottom is below the top of the view. */
+  function topRow() {
+    const top = scroller?.getBoundingClientRect().top;
+    return top === undefined ? undefined : rowElements().find((row) => row.getBoundingClientRect().bottom > top);
+  }
+
+  /** Where the reader is now, for showing them this session's chat here again (#93): the row at the top of the view, by
+   *  the names it has (#485), the offset it sits at, and whether the view is following the bottom. */
+  function readerPlace(): ReaderPlace | null {
+    if (!scroller) return null;
+    const row = topRow();
+    if (atBottom || !row) return { names: [], seq: 0, offset: 0, atBottom };
+    return {
+      names: (row.dataset.rowNames ?? '').split(' ').filter(Boolean),
+      seq: Number(row.dataset.seq),
+      offset: row.getBoundingClientRect().top - scroller.getBoundingClientRect().top,
+      atBottom: false,
+    };
+  }
+
+  /**
+   * Puts the reader back where they were in a session they are switching back to (#93). The rows off screen are laid
+   * out at a guess until they come near (#446), so the place is found again and held over the frames after, as a page
+   * going in is (`loadEarlier`).
+   */
+  async function restorePlace(place: ReaderPlace) {
+    if (!scroller) return;
+    if (place.atBottom) {
+      scrollToBottom();
+      void tick().then(() => scrollToBottom());
+      return;
+    }
+    let still = 0;
+    for (let round = 0; round < 20 && still < 3; round++) {
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      if (pointerHeld || performance.now() - lastUserScroll < 1000) return;
+      const rows = rowElements();
+      const row = place.names.length
+        ? rows.find((row) => (row.dataset.rowNames ?? '').split(' ').some((name) => place.names.includes(name)))
+        : rows.find((row) => Number(row.dataset.seq) === place.seq);
+      if (!row) return;
+      const moved = row.getBoundingClientRect().top - scroller.getBoundingClientRect().top - place.offset;
+      still = Math.abs(moved) < 0.5 ? still + 1 : 0;
+      if (still === 0) scroller.scrollTop += moved;
+    }
   }
 
   /**
@@ -483,8 +548,17 @@
   $effect(() => {
     if (positioned || !view.loaded || !view.session || !scroller) return;
     const read = view.session.read_seq;
+    const place = view.place;
     positioned = true;
     unreadAfter = read ?? 0;
+    // Back in a session the reader was in a moment ago (#93): their place, not the bar or the bottom. The bar is still
+    // drawn where the read position is, so anything that came in while they were away is under it.
+    if (place) {
+      view.place = null;
+      atBottom = place.atBottom;
+      void tick().then(() => restorePlace(place));
+      return;
+    }
     if (read === undefined || !view.transcript.items.some((item) => item.addedSeq > read)) {
       // Nothing read yet is a baseline of 0, so what comes in before the first report is unread if nobody is looking.
       unreadAfter = view.readSeq;
@@ -828,13 +902,16 @@
                 </div>
               {/if}
               {#if !view.loaded}
-                <div class="flex justify-center py-16">
-                  {#if view.connectionError}
+                {#if view.connectionError}
+                  <div class="flex justify-center py-16">
                     <Alert color="danger" size="small" title="Couldn't load the session">{view.connectionError}</Alert>
-                  {:else}
+                  </div>
+                {:else if showSpinner}
+                  <!-- Nothing before it: a session the UI already has shows at once, and this is for what's left (#93). -->
+                  <div class="flex justify-center py-16" data-testid="session-loading">
                     <LoadingSpinner size="large" />
-                  {/if}
-                </div>
+                  </div>
+                {/if}
               {:else}
                 {#if view.transcript.items.length === 0 && session?.phase !== 'starting'}
                   <Text color="muted" class="py-16 text-center">Nothing here yet. Send a message to get going.</Text>
