@@ -233,6 +233,9 @@ pub mod capability {
     pub const WORK: &str = "work";
     /// An Anthropic-compatible endpoint a session's model is on (#461): `{credentials}`, the endpoint credential.
     pub const ENDPOINT: &str = "endpoint";
+    /// Starting sub-sessions of its own (ADR 27, #495). Every top-level session has it; a sub-session only when its
+    /// parent allowed it.
+    pub const SUBSESSIONS: &str = "subsessions";
 }
 
 /// Whether two names are the same GitHub repository: GitHub's names are case-insensitive. Every comparison of

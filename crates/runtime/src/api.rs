@@ -861,7 +861,7 @@ async fn delete_session(
     let mut pending = {
         let _spawning = subsessions::SPAWNING.lock().await;
         db::mark_deleted(&state.db, id).await?;
-        db::live_descendants(&state.db, id).await?
+        db::descendants(&state.db, id).await?
     };
     pending.push(session);
     while let Some(session) = pending.pop() {

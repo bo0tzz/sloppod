@@ -672,7 +672,10 @@ async fn tools(state: &AppState, row: &db::SessionRow) -> Vec<Value> {
             .into_iter()
             .map(|m| m.name)
             .collect();
-        tools.extend(subsessions::tools(&models));
+        tools.extend(subsessions::tools(
+            &models,
+            crate::capabilities::holds(&context, &crate::capabilities::Part::Spawn),
+        ));
     }
     tools.extend(work::agent::tools(&context));
     tools

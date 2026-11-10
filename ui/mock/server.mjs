@@ -339,6 +339,7 @@ const grantable = {
   packages: 'Package registries and tool downloads.',
   docs: 'Library documentation, through Context7.',
   codex: "Codex's API on chatgpt.com, with the first of the owner's ChatGPT logins this grant names.",
+  subsessions: "Start sub-sessions of its own (`spawn_session`), each with its own pod and at most this session's grants.",
 };
 
 
@@ -387,7 +388,11 @@ function actAsToken(grant, token) {
  * and the repository of the first, or the reason it's refused. Model access and docs always come, GitHub with a repository. */
 function buildStartingGrants(wanted, id) {
   const branch = `sloppod/${id.slice(0, 8)}`;
-  const grants = [newGrant('model', {}, grantable.model), newGrant('docs', {}, grantable.docs)];
+  const grants = [
+    newGrant('model', {}, grantable.model),
+    newGrant('docs', {}, grantable.docs),
+    newGrant('subsessions', {}, grantable.subsessions),
+  ];
   const has = (name) => grants.some((g) => g.capability === name);
   let repo = null;
   for (const want of wanted) {
@@ -424,7 +429,7 @@ function buildStartingGrants(wanted, id) {
       grants.push(newGrant(name, { definition: definition.id, description: definition.description }, definition.description));
     }
   }
-  if (repo && !has('github')) grants.splice(2, 0, newGrant('github', {}, grantable.github));
+  if (repo && !has('github')) grants.push(newGrant('github', {}, grantable.github));
   return { grants, repo, branch };
 }
 
@@ -1561,6 +1566,7 @@ function createSession({ prompt, repo, title, capabilities, parent, starting }) 
         : [
             newGrant('model', {}, grantable.model),
             newGrant('docs', {}, grantable.docs),
+            newGrant('subsessions', {}, grantable.subsessions),
             ...['github', 'packages', 'codex'].filter(chosen).map((capability) => newGrant(capability, {}, grantable[capability])),
           ]),
       ...(sessionRepo && !starting

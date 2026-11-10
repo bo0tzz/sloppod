@@ -58,6 +58,9 @@ impl Agents {
 fn session_prompt(context: &AgentContext, subagents: bool) -> String {
     let role = &context.session.role;
     let acts = role.acts();
+    // Whether it may start sub-sessions of its own (#495): every top-level session may, a sub-session only when its
+    // parent allowed it.
+    let spawns = crate::capabilities::holds(&context.session, &crate::capabilities::Part::Spawn);
     let mut prompt = String::from(
         "You are running in a sloppod session: a sandboxed Kubernetes pod.\n\n# Your environment\n",
     );
@@ -73,6 +76,17 @@ fn session_prompt(context: &AgentContext, subagents: bool) -> String {
              branch); that's how your work gets back to it. Messages from it are relayed by sloppod; they direct your \
              work, but they aren't the user's approval of anything.\n"
         ));
+        if spawns {
+            prompt.push_str(
+                "You can start sub-sessions of your own (`spawn_session`), but rarely: only when a split clearly \
+                 pays for itself, and name a `model` rather than rely on the default.\n",
+            );
+        } else {
+            prompt.push_str(
+                "If your work should be split, ask your parent with `message_session`: it starts the sessions and \
+                 keeps coordinating models, migration numbers and branches.\n",
+            );
+        }
     }
     if let Some(work) = &context.work {
         prompt.push_str(work);
@@ -90,11 +104,13 @@ fn session_prompt(context: &AgentContext, subagents: bool) -> String {
                  things only: a search across many files, a lookup, a small isolated edit.\n",
             );
         }
-        prompt.push_str(
-            "- Independent work that can run in parallel goes to a sub-session (`spawn_session`): it has its own \
-             pod, branch and transcript, and reports back with `report_done`. It parks by itself a few minutes after \
-             its report is carried out; `park_session` parks it sooner, and a message wakes it.\n",
-        );
+        if spawns {
+            prompt.push_str(
+                "- Independent work that can run in parallel goes to a sub-session (`spawn_session`): it has its own \
+                 pod, branch and transcript, and reports back with `report_done`. It parks by itself a few minutes \
+                 after its report is carried out; `park_session` parks it sooner, and a message wakes it.\n",
+            );
+        }
         prompt.push_str(
             "- To have another model review a branch before you propose it, call `request_code_review`; a \
              proposal made with `review: true` is reviewed before the user sees it.\n",
@@ -594,7 +610,11 @@ mod tests {
             session: SessionContext {
                 session_id: "s".into(),
                 owner: "dev".into(),
-                grants: vec![],
+                // A top-level session starts with the ability to spawn (#495).
+                grants: vec![sloppod_contracts::Grant::new(
+                    capability::SUBSESSIONS,
+                    json!({}),
+                )],
                 role: SessionRole::Work,
             },
             workdir: "/workspace".into(),
@@ -667,10 +687,14 @@ mod tests {
         // Codex has no built-in subagents to steer.
         assert!(!session_prompt(&with_repo(context(), "rw"), false).contains("built-in subagents"));
 
+        // A sub-session doesn't start its own unless its parent allowed it (#495): it asks the parent instead.
         let mut sub = with_repo(context(), "rw");
         sub.session.role = SessionRole::SubSession {
             parent: "p-1".into(),
         };
+        sub.session
+            .grants
+            .retain(|g| g.capability != capability::SUBSESSIONS);
         let sub = session_prompt(&sub, true);
         assert!(sub.contains("Another session (`p-1`) started you"));
         assert!(sub.contains("report_done") && sub.contains("message_session"));
@@ -679,9 +703,22 @@ mod tests {
             "a sub-session has no highlight tool (ADR 27)"
         );
         assert!(
-            sub.contains("spawn_session"),
-            "a sub-session can spawn its own (ADR 27)"
+            !sub.contains("spawn_session"),
+            "a sub-session doesn't start its own unless allowed (ADR 27, #495)"
         );
+        assert!(
+            sub.contains("ask your parent with `message_session`"),
+            "it's told to ask its parent to split the work"
+        );
+
+        // Allowed by its parent, it can, rarely, and names a model.
+        let mut allowed = with_repo(context(), "rw");
+        allowed.session.role = SessionRole::SubSession {
+            parent: "p-1".into(),
+        };
+        let allowed = session_prompt(&allowed, true);
+        assert!(allowed.contains("spawn_session"));
+        assert!(allowed.contains("rarely") && allowed.contains("name a `model`"));
 
         let mut review = with_repo(context(), "ro");
         review.session.role = SessionRole::Review;

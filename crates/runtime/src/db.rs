@@ -265,7 +265,7 @@ pub async fn deleted_in_line(db: &PgPool, session: Uuid) -> sqlx::Result<bool> {
 }
 
 /// Every sub-session below `session` that isn't deleted, at any depth, also below sub-sessions that are.
-pub async fn live_descendants(db: &PgPool, session: Uuid) -> sqlx::Result<Vec<SessionRow>> {
+pub async fn descendants(db: &PgPool, session: Uuid) -> sqlx::Result<Vec<SessionRow>> {
     sqlx::query_as(AssertSqlSafe(format!(
         "with recursive down as (select id from sessions where parent_id = $1 \
            union all select s.id from sessions s join down on s.parent_id = down.id) \
@@ -274,6 +274,19 @@ pub async fn live_descendants(db: &PgPool, session: Uuid) -> sqlx::Result<Vec<Se
     )))
     .bind(session)
     .fetch_all(db)
+    .await
+}
+
+/// Whether `session` is below `ancestor` at any depth, deleted or not. A session isn't its own descendant.
+pub async fn descendant_of(db: &PgPool, session: Uuid, ancestor: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "with recursive up as (select id, parent_id from sessions where id = $1 \
+           union all select s.id, s.parent_id from sessions s join up on s.id = up.parent_id) \
+         select exists(select 1 from up where id = $2 and id <> $1)",
+    )
+    .bind(session)
+    .bind(ancestor)
+    .fetch_one(db)
     .await
 }
 

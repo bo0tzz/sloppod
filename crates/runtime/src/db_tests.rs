@@ -949,6 +949,86 @@ async fn an_owner_has_one_utility_session_that_isnt_listed(db: PgPool) {
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_parent_can_park_its_descendants_at_any_depth(db: PgPool) {
+    // `list_sessions` shows a parent its grandchildren, so it can park them (#495).
+    let root = session(&db, "alice").await;
+    let child = session(&db, "alice").await;
+    let grandchild = session(&db, "alice").await;
+    let unrelated = session(&db, "alice").await;
+    db::set_parent(&db, child, root).await.unwrap();
+    db::set_parent(&db, grandchild, child).await.unwrap();
+    assert_eq!(
+        crate::subsessions::parkable(&db, root, grandchild)
+            .await
+            .unwrap()
+            .id,
+        grandchild
+    );
+    // Not itself, and not a session outside its subtree.
+    assert!(crate::subsessions::parkable(&db, root, root).await.is_err());
+    assert!(
+        crate::subsessions::parkable(&db, root, unrelated)
+            .await
+            .is_err()
+    );
+    // A child parks its own child, not its parent.
+    assert_eq!(
+        crate::subsessions::parkable(&db, child, grandchild)
+            .await
+            .unwrap()
+            .id,
+        grandchild
+    );
+    assert!(
+        crate::subsessions::parkable(&db, child, root)
+            .await
+            .is_err()
+    );
+    // A deleted one can't be parked.
+    db::mark_deleted(&db, grandchild).await.unwrap();
+    assert!(
+        crate::subsessions::parkable(&db, root, grandchild)
+            .await
+            .is_err()
+    );
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn the_subsessions_grant_is_backfilled_for_top_level_sessions(db: PgPool) {
+    // Sessions that existed before the migration: a top-level work session, a sub-session, a reviewer, a utility
+    // session and a deleted top-level one.
+    let top = session(&db, "alice").await;
+    let child = session(&db, "alice").await;
+    db::set_parent(&db, child, top).await.unwrap();
+    let review = session_of_kind(&db, "alice", SessionKind::Review).await;
+    let utility = session_of_kind(&db, "alice", SessionKind::Utility).await;
+    let deleted = session(&db, "alice").await;
+    db::mark_deleted(&db, deleted).await.unwrap();
+
+    // The migrator already ran it on an empty database; run it again over the sessions above.
+    sqlx::raw_sql(include_str!("../migrations/0047_subsessions_grant.sql"))
+        .execute(&db)
+        .await
+        .unwrap();
+
+    async fn grant(db: &PgPool, id: Uuid) -> Option<Value> {
+        sqlx::query_scalar(
+            "select params from session_grants where session_id = $1 and capability = 'subsessions'",
+        )
+        .bind(id)
+        .fetch_optional(db)
+        .await
+        .unwrap()
+    }
+    // The same shape the starting set writes: no params.
+    assert_eq!(grant(&db, top).await, Some(json!({})));
+    assert_eq!(grant(&db, child).await, None);
+    assert_eq!(grant(&db, review).await, None);
+    assert_eq!(grant(&db, utility).await, None);
+    assert_eq!(grant(&db, deleted).await, None);
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
 async fn a_sessions_first_message_is_its_task(db: PgPool) {
     let id = session(&db, "alice").await;
     assert_eq!(db::first_message(&db, id).await.unwrap(), None);
@@ -973,7 +1053,7 @@ async fn a_sessions_first_message_is_its_task(db: PgPool) {
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
-async fn live_descendants_are_found_below_deleted_ones(db: PgPool) {
+async fn descendants_are_found_below_deleted_ones(db: PgPool) {
     // A → B → C, with B deleted and C restored on its own.
     let a = session(&db, "alice").await;
     let b = session(&db, "alice").await;
@@ -982,8 +1062,32 @@ async fn live_descendants_are_found_below_deleted_ones(db: PgPool) {
     db::set_parent(&db, c, b).await.unwrap();
     db::mark_deleted(&db, b).await.unwrap();
     let ids = |rows: Vec<db::SessionRow>| rows.iter().map(|r| r.id).collect::<Vec<_>>();
-    assert_eq!(ids(db::live_descendants(&db, a).await.unwrap()), [c]);
-    assert!(db::live_descendants(&db, c).await.unwrap().is_empty());
+    assert_eq!(ids(db::descendants(&db, a).await.unwrap()), [c]);
+    assert!(db::descendants(&db, c).await.unwrap().is_empty());
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_sessions_descendants_are_its_whole_subtree(db: PgPool) {
+    // What `list_sessions` shows a parent: its grandchildren too, each with the parent it hangs from (#495).
+    let root = session(&db, "alice").await;
+    let child = session(&db, "alice").await;
+    let grandchild = session(&db, "alice").await;
+    db::set_parent(&db, child, root).await.unwrap();
+    db::set_parent(&db, grandchild, child).await.unwrap();
+    let rows = db::descendants(&db, root).await.unwrap();
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    assert_eq!(ids, [child, grandchild]);
+    assert_eq!(rows[1].parent_id, Some(child));
+    // A child sees its own subtree, not its parent or siblings.
+    assert_eq!(
+        db::descendants(&db, child)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>(),
+        [grandchild]
+    );
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]

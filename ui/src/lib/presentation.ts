@@ -228,6 +228,7 @@ export const capabilityDescriptions: Record<string, string> = {
     "GitHub's API and git: reads of public repositories and the ones granted, pushes to the session's own branches. Other writes go through proposals.",
   packages: 'Package registries and tool downloads (crates.io, npm, PyPI, Go, GitHub releases, mise and others).',
   codex: "Codex's API on chatgpt.com, with your ChatGPT login.",
+  subsessions: 'Start sub-sessions of its own, each with its own pod and at most this session\'s grants.',
 };
 
 export type CredentialKindSpec = {
@@ -377,6 +378,8 @@ export function grantLabel(grant: Grant): string {
       return 'read GitHub';
     case 'packages':
       return 'package registries';
+    case 'subsessions':
+      return 'start sub-sessions';
     case 'repo':
       return param('access') === 'rw'
         ? `push to ${param('branch')} on ${param('repo')}`

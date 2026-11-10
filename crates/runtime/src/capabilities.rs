@@ -50,6 +50,8 @@ pub enum Part {
     Egress,
     /// One of the owner's work graphs, through sloppod's MCP tools (ADR 30).
     Work,
+    /// Starting sub-sessions of its own (ADR 27, #495).
+    Spawn,
 }
 
 /// Whose models a model part reaches.
@@ -91,6 +93,15 @@ pub const BUILTINS: &[Builtin] = &[
         needs: None,
         // Context7's hosted server (#195), used without an API key, so it's rate limited.
         parts: &[Part::Mcp("https://mcp.context7.com/mcp")],
+    },
+    Builtin {
+        name: capability::SUBSESSIONS,
+        // Every top-level session has it; a sub-session only when its parent allowed it (#495).
+        grantable: true,
+        start: Start::Always,
+        always_inherited: false,
+        needs: None,
+        parts: &[Part::Spawn],
     },
     Builtin {
         name: capability::GITHUB,
@@ -256,7 +267,13 @@ mod tests {
         assert!(!holds(&session(&["model"]), &chatgpt));
         assert_eq!(mcp_url("docs"), Some("https://mcp.context7.com/mcp"));
         assert_eq!(mcp_url("github"), None);
-        assert_eq!(always().collect::<Vec<_>>(), ["model", "docs"]);
+        assert_eq!(
+            always().collect::<Vec<_>>(),
+            ["model", "docs", "subsessions"]
+        );
+        // Every top-level session can start sub-sessions; a sub-session only when its parent allows it (#495).
+        assert!(has_part("subsessions", &Part::Spawn));
+        assert!(!always_inherited("subsessions"));
         assert_eq!(offered(|_| false), ["github", "packages"]);
         assert_eq!(
             offered(|kind| kind == CHATGPT),
