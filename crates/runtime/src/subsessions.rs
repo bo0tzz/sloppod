@@ -22,6 +22,32 @@ fn child_name(child: Uuid) -> String {
     child.simple().to_string()[..8].to_owned()
 }
 
+/// Whether a child's workspace starts as a copy of its parent's volume (#478): what the parent asked for, or, asking
+/// nothing, a copy when the child works on the parent's repository and a fresh volume otherwise.
+fn wants_copy(workspace: Option<&str>, on_parents_repo: bool) -> Result<bool, String> {
+    match workspace {
+        Some("copy") => Ok(true),
+        Some("fresh") => Ok(false),
+        None => Ok(on_parents_repo),
+        Some(other) => Err(format!(
+            "`workspace` is \"copy\" or \"fresh\", not \"{other}\""
+        )),
+    }
+}
+
+/// What `spawn_session`'s answer says about the child's workspace (#478): the copy it got, or — when the parent asked
+/// for one and the cluster couldn't make it — the fresh workspace it got instead, so the parent isn't left thinking
+/// the child has its tools and caches.
+fn workspace_said(copied: bool, asked: bool) -> &'static str {
+    match (copied, asked) {
+        (true, _) => {
+            " Its workspace is a copy of yours: your checkout, tools and caches, without your uncommitted work."
+        }
+        (false, true) => " Its workspace is fresh: yours couldn't be copied just now.",
+        (false, false) => "",
+    }
+}
+
 /// A child's grants (ADR 2's attenuation): the parent's, narrowed to the capabilities in `keep` if given. What the
 /// child's agent needs to run (model access) always stays. A repository the parent may push to, the child may push
 /// to on a branch named after the parent's, starting from it, so the parent can integrate and propose its work.
@@ -130,6 +156,21 @@ pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<
         None => parent.repo.clone(),
     };
     let agent = arguments["agent"].as_str().unwrap_or(&parent.agent);
+    // Where the child's workspace starts (#478): a copy of the parent's volume — its checkout, tools, dependencies
+    // and caches — or a fresh one. The parent picks; by default a child working on the parent's repository gets a
+    // copy, and one working elsewhere a fresh workspace, whose own checkout it clones anyway. Either way a copy that
+    // the cluster can't make now falls back to fresh, and the answer says what it got.
+    let on_parents_repo = match (repo.as_deref(), parent.repo.as_deref()) {
+        (Some(child), Some(parent)) => same_repo(child, parent),
+        _ => false,
+    };
+    let wants_copy = wants_copy(arguments["workspace"].as_str(), on_parents_repo)?;
+    let copy = wants_copy
+        && state
+            .placement
+            .can_copy_workspace(&parent.id.to_string())
+            .await
+            .unwrap_or(false);
     let adapter = state
         .agents
         .get(agent)
@@ -204,6 +245,7 @@ pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<
             repo: repo.as_deref(),
             grants: &grants,
             parent: Some(parent.id),
+            workspace_copied_from: copy.then_some(parent.id),
         },
     )
     .await
@@ -224,8 +266,10 @@ pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<
             warnings.push(format!(" Warning: {warning}."));
         }
     }
+    let workspace = workspace_said(copy, wants_copy);
     Ok(format!(
-        "Started sub-session {} \"{}\"{branch}{on}. You're told when it reports; list_sessions shows how it's doing.{}",
+        "Started sub-session {} \"{}\"{branch}{on}.{workspace} You're told when it reports; list_sessions shows how \
+         it's doing.{}",
         child.id,
         child.title,
         warnings.concat()
@@ -430,6 +474,7 @@ pub fn tools(endpoint_models: &[String]) -> Vec<Value> {
                     "grants": {"type": "array", "items": {"type": "string"}, "description": "The capabilities to give it, of yours (e.g. [\"github\", \"repo\", \"docs\"]); defaults to all of yours. Model access always stays"},
                     "agent": {"type": "string", "description": "claude-code or codex; defaults to yours"},
                     "model": {"type": "string", "description": model},
+                    "workspace": {"type": "string", "enum": ["copy", "fresh"], "description": "Where its workspace starts. \"copy\": a copy of your volume — your checkout, tools, dependencies and caches — so it starts quickly, with your uncommitted work left out and your keys and agent state cleared. Pick it for related work on the same repository, which is the default there. \"fresh\": an empty volume, which it clones the repository into and installs tools in; the default for another repository, for an independent task, or to keep a mess of yours out of it (your caches, its own mess)"},
                 },
                 "required": ["task"],
             },
@@ -469,6 +514,23 @@ mod tests {
 
     fn grant(capability: &str, params: Value) -> Grant {
         Grant::new(capability, params)
+    }
+
+    /// Where a child's workspace starts (#478): by default from the parent's volume when it works on the parent's
+    /// repository, and fresh otherwise, with the parent able to ask for either.
+    #[test]
+    fn a_child_copies_its_parents_workspace_unless_asked_otherwise() {
+        assert_eq!(wants_copy(None, true), Ok(true));
+        assert_eq!(wants_copy(None, false), Ok(false));
+        assert_eq!(wants_copy(Some("copy"), false), Ok(true));
+        assert_eq!(wants_copy(Some("fresh"), true), Ok(false));
+        assert!(wants_copy(Some("clone"), true).is_err());
+
+        // What the answer says: the copy it got, or the fresh workspace it got instead of one asked for.
+        assert!(workspace_said(true, true).contains("copy of yours"));
+        assert!(workspace_said(true, false).contains("copy of yours"));
+        assert!(workspace_said(false, true).contains("couldn't be copied"));
+        assert_eq!(workspace_said(false, false), "");
     }
 
     #[test]

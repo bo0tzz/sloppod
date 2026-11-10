@@ -823,6 +823,8 @@ async fn create_session(
             repo: repo.as_deref(),
             grants: &grants,
             parent: None,
+            // A session the user starts isn't a sub-session, so there's no parent's workspace to copy (#478).
+            workspace_copied_from: None,
         },
     )
     .await
