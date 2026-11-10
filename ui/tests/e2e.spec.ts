@@ -3851,7 +3851,10 @@ test('lists the session grants from the session menu', async ({ page }) => {
   await page.getByRole('menuitem', { name: 'Grants' }).click();
   const grants = page.getByTestId('grants');
   await expect(grants.getByText("Claude's API, with the first of the owner's Claude accounts this grant names.")).toBeVisible();
-  await expect(grants.getByText(/^bo0tzz\/sloppod: read, and push the session branch `sloppod\//)).toBeVisible();
+  // The description is Markdown: the branch is code, not backticks (#292).
+  const repo = grants.getByTestId('grant-repo');
+  await expect(repo).toContainText('bo0tzz/sloppod: read, and push the session branch');
+  await expect(repo.locator('code')).toContainText('sloppod/');
 });
 
 async function addCredential(page: Page, kind: string, name: string) {
