@@ -99,8 +99,9 @@ jobs:
           install_args: node
       - run: npm ci
       - run: npx playwright install --with-deps chromium
-      - run: npx vite build
-      - run: npx playwright test --project=e2e --shard=${{ matrix.shard }}/3
+      # The scripts build the page the way the tests expect it — with a build of its own (`SLOPPOD_BUILD=e2e`) — so CI
+      # and a developer's run can't drift (#448).
+      - run: npm run test:e2e -- --shard=${{ matrix.shard }}/3
 
   # The scrolling tests again in Firefox, which the chat is read in: its scroll and resize timing differ from Chromium's.
   e2e-firefox:
@@ -117,8 +118,7 @@ jobs:
           install_args: node
       - run: npm ci
       - run: npx playwright install --with-deps firefox
-      - run: npx vite build
-      - run: npx playwright test --project=firefox
+      - run: npm run test:e2e:firefox
 
   # The one check to require for the UI: it keeps the name `ui`, and passes when the jobs above were skipped.
   ui:
