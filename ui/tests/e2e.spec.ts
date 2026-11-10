@@ -2224,7 +2224,7 @@ test('the new-session page suggests a starting set, and sends the one the user e
   await box.fill('Fix the build in bo0tzz/sloppod');
   const title = card.getByRole('textbox', { name: 'Title' });
   await expect(title).toHaveValue('Fix the build in bo0tzz/sloppod');
-  await expect(card.getByTestId('starting-repos')).toContainText('bo0tzz/sloppod');
+  await expect(card.getByTestId('starting-repo').getByRole('combobox', { name: 'Repository' })).toHaveValue('bo0tzz/sloppod');
   await expect(card.getByTestId('starting-source')).toHaveText('Matched from your message');
 
   // What the user changes stays, whatever a later suggestion says; the rest follows it.
@@ -2232,7 +2232,7 @@ test('the new-session page suggests a starting set, and sends the one the user e
   await card.getByTestId('capability-packages').getByRole('checkbox').click();
   await expect(card.getByTestId('capability-packages').getByRole('checkbox')).not.toBeChecked();
   await box.fill('Fix the build in bo0tzz/memini');
-  await expect(card.getByTestId('starting-repos')).toContainText('bo0tzz/memini');
+  await expect(card.getByTestId('starting-repo').getByRole('combobox', { name: 'Repository' })).toHaveValue('bo0tzz/memini');
   await expect(title).toHaveValue('Mend the build');
   await expect(card.getByTestId('capability-packages').getByRole('checkbox')).not.toBeChecked();
 
@@ -2259,7 +2259,7 @@ test("a session starts acting as one of the user's GitHub tokens on its reposito
     const row = card.getByTestId('starting-repo');
     // The suggestion picks the repository, never a token: it acts as the App until the user says otherwise.
     await expect(row.getByRole('combobox', { name: 'Act as' })).toContainText('The GitHub App');
-    await expect(row.getByRole('combobox', { name: 'Repository' })).toContainText('bo0tzz/sloppod');
+    await expect(row.getByRole('combobox', { name: 'Repository' })).toHaveValue('bo0tzz/sloppod');
     await row.getByRole('combobox', { name: 'Act as' }).click();
     await page.getByRole('option', { name: 'bo0tzz (mine)' }).click();
     await expect(card.getByText('What the session pushes there is attributed to that person.')).toBeVisible();
@@ -2294,7 +2294,7 @@ test("the card starts a session with one of the user's own capabilities, and wit
     // It's offered, and is never in a suggestion.
     await expect(own).not.toBeChecked();
     await page.getByRole('textbox', { name: 'Prompt' }).fill('Fix the build in bo0tzz/sloppod');
-    await expect(card.getByTestId('starting-repos')).toContainText('bo0tzz/sloppod');
+    await expect(card.getByTestId('starting-repo').getByRole('combobox', { name: 'Repository' })).toHaveValue('bo0tzz/sloppod');
     await expect(own).not.toBeChecked();
     await own.click();
     // A second repository, from the App's list less the one the first has.
@@ -2314,6 +2314,21 @@ test("the card starts a session with one of the user's own capabilities, and wit
   } finally {
     await page.request.delete(`/api/v1/capabilities/${made.id}`);
   }
+});
+
+test('the card filters a repository row as you type', async ({ page }) => {
+  await openNewSession(page);
+  const card = page.getByTestId('starting-card');
+  await page.getByRole('textbox', { name: 'Prompt' }).fill('Fix the build in bo0tzz/sloppod');
+  const filter = card.getByTestId('starting-repo').getByRole('combobox', { name: 'Repository' });
+  await expect(filter).toHaveValue('bo0tzz/sloppod');
+
+  await filter.click();
+  await filter.fill('mem');
+  await expect(page.getByRole('option', { name: 'bo0tzz/memini' })).toBeVisible();
+  await expect(page.getByRole('option', { name: 'immich-app/static-pages' })).toHaveCount(0);
+  await filter.press('Enter');
+  await expect(filter).toHaveValue('bo0tzz/memini');
 });
 
 // Holds the suggestion for `prompt` back for `ms`, as a slow runtime does.
@@ -2398,7 +2413,7 @@ test('choosing no repository sends none, though the message names one', async ({
   await openNewSession(page);
   const card = page.getByTestId('starting-card');
   await page.getByRole('textbox', { name: 'Prompt' }).fill('Fix the build in bo0tzz/sloppod');
-  await expect(card.getByTestId('starting-repos')).toContainText('bo0tzz/sloppod');
+  await expect(card.getByTestId('starting-repo').getByRole('combobox', { name: 'Repository' })).toHaveValue('bo0tzz/sloppod');
   await card.getByRole('button', { name: 'Remove repository' }).click();
   await page.getByRole('textbox', { name: 'Prompt' }).press('Enter');
   await expect(page).toHaveURL(/\/sessions\/[0-9a-f-]+$/);
@@ -2434,6 +2449,44 @@ test('adds a repository from the session menu', async ({ page }) => {
   await openPicker();
   await expect(page.getByRole('option', { name: 'bo0tzz/sloppod' })).toBeVisible();
   await expect(page.getByRole('option', { name: 'bo0tzz/memini' })).toHaveCount(0);
+});
+
+test('the repository picker is filtered by typing, and Enter picks what is left', async ({ page }) => {
+  await createSession(page, 'Just chat for now');
+  await page.getByRole('button', { name: 'Session actions' }).click();
+  await page.getByRole('menuitem', { name: 'Add repository…' }).click();
+  const filter = page.getByTestId('add-repo').getByRole('combobox', { name: 'Repository' });
+
+  await filter.click();
+  await expect(page.getByRole('option', { name: 'immich-app/static-pages' })).toBeVisible();
+  await filter.fill('mem');
+  await expect(page.getByRole('option', { name: 'bo0tzz/memini' })).toBeVisible();
+  await expect(page.getByRole('option', { name: 'immich-app/static-pages' })).toHaveCount(0);
+
+  // Enter takes the match the filter leaves, and Enter again adds the repository.
+  await filter.press('Enter');
+  await expect(filter).toHaveValue('bo0tzz/memini');
+  await filter.press('Enter');
+  await expect(page.getByTestId('session-subtitle')).toHaveText('bo0tzz/memini');
+});
+
+test('Enter in the owner/name field adds the repository', async ({ page }) => {
+  await page.request.post('/api/v1/credentials', {
+    data: { kind: 'github-user', name: 'wide', secret: 'github_pat_many', config: {} },
+  });
+  try {
+    await createSession(page, 'Just chat for now');
+    await page.getByRole('button', { name: 'Session actions' }).click();
+    await page.getByRole('menuitem', { name: 'Add repository…' }).click();
+    const picker = page.getByTestId('add-repo');
+    await picker.getByRole('combobox', { name: 'Act as' }).click();
+    await page.getByRole('option', { name: 'bo0tzz (wide)' }).click();
+    await picker.getByTestId('unlisted-repo').fill('someone/else');
+    await picker.getByTestId('unlisted-repo').press('Enter');
+    await expect(page.getByTestId('session-subtitle')).toHaveText('someone/else');
+  } finally {
+    await deleteGitHubTokens(page);
+  }
 });
 
 test("adds a repository as one of the user's GitHub tokens", async ({ page }) => {
@@ -4473,6 +4526,20 @@ test('a session at its usage limit says when it carries on', async ({ page }) =>
   await expect(page.getByTestId('session-limited')).toBeHidden();
 });
 
+/**
+ * Picks a timezone in Settings. The list holds every zone a browser knows, so it scrolls, and until the user scrolls it
+ * the list keeps realigning to the selected zone as its scroll buttons come and go — which moves the option under the
+ * pointer and makes a click land on another one (#492). Scrolling it first, as a user would, settles it.
+ */
+async function chooseTimezone(page: Page, zone: string) {
+  const setting = page.getByTestId('timezone-setting').getByRole('combobox', { name: 'Timezone' });
+  await setting.click();
+  await page.getByRole('listbox').hover();
+  await page.mouse.wheel(0, -20_000);
+  await page.getByRole('option', { name: zone, exact: true }).click();
+  return setting;
+}
+
 test.describe('in Amsterdam', () => {
   test.use({ timezoneId: 'Europe/Amsterdam' });
 
@@ -4483,8 +4550,7 @@ test.describe('in Amsterdam', () => {
     await expect(setting).toContainText('Europe/Amsterdam');
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Europe/Amsterdam');
 
-    await setting.click();
-    await page.getByRole('option', { name: 'Asia/Tokyo', exact: true }).click();
+    await chooseTimezone(page, 'Asia/Tokyo');
     await expect(setting).toContainText('Asia/Tokyo');
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Asia/Tokyo');
 
@@ -4504,11 +4570,9 @@ test.describe('in UTC', () => {
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('UTC');
     await expect(setting).toContainText('UTC');
 
-    await setting.click();
-    await page.getByRole('option', { name: 'Asia/Tokyo', exact: true }).click();
+    await chooseTimezone(page, 'Asia/Tokyo');
     await expect(setting).toContainText('Asia/Tokyo');
-    await setting.click();
-    await page.getByRole('option', { name: 'UTC', exact: true }).click();
+    await chooseTimezone(page, 'UTC');
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('UTC');
   });
 
@@ -4525,8 +4589,7 @@ test.describe('in UTC', () => {
     // Another timezone in Settings, and back to the session without a reload.
     await page.getByRole('link', { name: 'Settings' }).first().click();
     const setting = page.getByTestId('timezone-setting').getByRole('combobox', { name: 'Timezone' });
-    await setting.click();
-    await page.getByRole('option', { name: 'Asia/Tokyo', exact: true }).click();
+    await chooseTimezone(page, 'Asia/Tokyo');
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Asia/Tokyo');
     await page.getByRole('navigation', { name: 'Sessions' }).getByRole('link', { name: /Put the deploy check off/ }).click();
 
