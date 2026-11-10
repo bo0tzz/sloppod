@@ -1347,11 +1347,11 @@ test('follows new output while the reader is at the bottom, across a reconnect',
   // Scrolling up stops the following; new output then leaves the view where it is.
   const scroller = page.getByTestId('transcript-scroller');
   const scrollTop = () => scroller.evaluate((element) => element.scrollTop);
-  await end.hover();
-  await page.mouse.wheel(0, -2000);
+  await wheelUp(page);
   await expect(end).not.toBeInViewport();
-  // Up this far in a long session, the page before comes in by itself, and what it puts above the reader moves the
-  // scroll for a few frames as it settles: both are waited for, so what's measured below is the new output's doing.
+  // This session is longer than one page, and up here the page before comes in by itself; what it puts above the reader
+  // moves the scroll for a few frames as it settles, so both are waited for before what's measured below.
+  console.log('DBG-scroll', await scrollTop(), await scroller.evaluate((element) => `${element.scrollHeight}/${element.clientHeight}`));
   await expect(page.getByTestId('history-start')).toBeVisible();
   const kept = await scroller.evaluate(
     (element) =>
