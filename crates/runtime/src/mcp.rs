@@ -161,6 +161,13 @@ pub struct Headers<'a> {
 
 impl Headers<'_> {
     /// Says what's missing or doesn't match the body, as `HeaderMismatch` words it.
+    ///
+    /// What the real clients send, when this was written (Claude Code 2.1.310 and Codex 0.164.0, run against a
+    /// logging MCP server): Claude probes `server/discover` first and, once that's answered, sends `mcp-method`,
+    /// `mcp-protocol-version` and — for a `tools/call` — `mcp-name`, so it meets these checks; Codex starts with a
+    /// 2025 `initialize` and stays in that era, whose requests it sends with `mcp-protocol-version` and no
+    /// `Mcp-Method`. Neither sends these headers on `initialize` or on a 2025 request, and none of them is asked for
+    /// one here: a request is only validated when it's of the stateless era.
     fn validate(&self, method: &str, params: &Value) -> Result<(), String> {
         let version = params["_meta"][META_VERSION].as_str().unwrap_or_default();
         match self.version {
