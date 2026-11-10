@@ -10,6 +10,8 @@ export type Session = {
   agent: string;
   /** The model the agent runs on, if one was chosen rather than the agent's default. */
   model?: string;
+  /** A model picked that needs the agent started again; the session moves onto it before its next message (#461). */
+  pending_model?: string;
   /** 'work', or 'review' for a session that reviews a proposal. */
   kind: string;
   review: ReviewPolicy;
@@ -81,6 +83,9 @@ export type Highlight = {
   created_at: string;
   /** When the user marked it seen; absent while it's open. */
   seen_at?: string;
+  /** Until when the user put it off (#467): while that's ahead it stops counting as waiting, and the runtime brings it
+   * back (clears it) when the time passes. Absent when it isn't snoozed. */
+  snoozed_until?: string;
   /** When the agent took it back (it was wrong, or no longer applies): no longer open, and kept in the chat with why. */
   retracted_at?: string;
   retraction_reason?: string;
@@ -415,6 +420,8 @@ export type Settings = {
    * cheaper model than the agent's default where it has one (Sonnet for Claude Code). */
   sub_session_model: string | null;
   models: { value: string; name: string }[];
+  /** Each agent's own models, as a session of it last offered them; a session on an endpoint's model offers its agent's (#461). */
+  agent_models?: Record<string, { value: string; name: string }[]>;
   review: ReviewPolicy;
   /** The user's timezone, e.g. `Europe/Amsterdam`, for the times agents are told and their pods' clocks. */
   timezone: string | null;
@@ -544,6 +551,8 @@ export const api = {
   listHighlights: (session: string) => call<Highlight[]>('GET', `/sessions/${encodeURIComponent(session)}/highlights`),
   markHighlightSeen: (session: string, highlight: string) =>
     call<Highlight>('POST', `/sessions/${encodeURIComponent(session)}/highlights/${encodeURIComponent(highlight)}/seen`, {}),
+  snoozeHighlight: (session: string, highlight: string, until: string) =>
+    call<Highlight>('POST', `/sessions/${encodeURIComponent(session)}/highlights/${encodeURIComponent(highlight)}/snooze`, { until }),
   listProposals: (query: { session?: string; status?: ProposalStatus }) => {
     const params = new URLSearchParams();
     if (query.session) params.set('session', query.session);

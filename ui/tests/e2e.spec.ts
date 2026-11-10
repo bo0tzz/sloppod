@@ -56,7 +56,8 @@ test('creates a session and streams the agent output', async ({ page }) => {
 
   // The first agent message arrives as several chunks and renders as one message.
   const first = agentMessages(page).first();
-  await expect(first).toHaveText("I'll start by reading the connection code to see how reconnects work today.");
+  // What it says, without the time its toolbar has.
+  await expect(first.locator('.markdown').first()).toHaveText("I'll start by reading the connection code to see how reconnects work today.");
   expect(chunkFrames.length).toBeGreaterThan(3);
   await expect(agentMessages(page).filter({ hasText: "I'll start" })).toHaveCount(1);
 
@@ -120,6 +121,62 @@ test("downloads a debug bundle for an agent message's turn", async ({ page }) =>
   expect(bundle.turns.at(-1).model_calls.length).toBeGreaterThan(0);
 
   await expect(userMessages(page).getByRole('link', { name: 'Download debug bundle' })).toHaveCount(0);
+});
+
+test("a message shows when it was made on hover, in the user's timezone", async ({ page }) => {
+  await createSession(page, 'Add backoff to the reconnect logic in sloppod');
+  await finishTurn(page);
+
+  // The user's own message has no toolbar: the time shows in its corner on hover.
+  const mine = userMessages(page).first();
+  const mineTime = mine.getByTestId('message-time');
+  await page.mouse.move(0, 0);
+  await expect(mineTime).toHaveCSS('opacity', '0');
+  // The bubble is at the right of a full-width row, so it's the bubble that's hovered.
+  await mine.locator('> div').hover();
+  await expect(mineTime).toHaveCSS('opacity', '1');
+  await expect(mineTime).toHaveText(/^\d{2}:\d{2}$/);
+  // The full date and time are in its tooltip.
+  await expect(mineTime).toHaveAttribute('title', new RegExp(`${new Date().getFullYear()}`));
+
+  // The agent's go in its toolbar, with copy and the debug bundle.
+  const theirs = agentMessages(page).filter({ hasText: FINAL });
+  await page.mouse.move(0, 0);
+  await theirs.hover();
+  await expect(theirs.getByTestId('message-actions').getByTestId('message-time')).toHaveText(/^\d{2}:\d{2}$/);
+
+  // In the timezone the user has set: the same moment, as Tokyo has it.
+  const settings = await (await page.request.get('/api/v1/settings')).json();
+  await page.request.put('/api/v1/settings', { data: { timezone: 'Asia/Tokyo' } });
+  try {
+    await page.reload();
+    const at = await userMessages(page).first().getByTestId('message-time').getAttribute('datetime');
+    const tokyo = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23', timeZone: 'Asia/Tokyo' }).format(new Date(at!));
+    await expect(userMessages(page).first().getByTestId('message-time')).toHaveText(tokyo);
+  } finally {
+    await page.request.put('/api/v1/settings', { data: { timezone: settings.timezone } });
+  }
+});
+
+test("a message from before today says which day, and one from before the last week the date", async ({ page }) => {
+  await createSession(page, 'Give me a long answer in sloppod');
+  await expect(agentMessages(page).filter({ hasText: 'The end.' })).toBeVisible({ timeout: 20_000 });
+  const chunk = (text: string) => ({ sessionUpdate: 'agent_message_chunk', messageId: text, content: { type: 'text', text } });
+  const ago = (days: number) => new Date(Date.now() - days * 86_400_000).toISOString();
+  await page.request.post(`/_mock/update?at=${ago(2)}`, { data: chunk('Two days ago.') });
+  await page.request.post(`/_mock/update?at=${ago(10)}`, { data: chunk('Ten days ago.') });
+  await page.request.post(`/_mock/update?at=${new Date().toISOString()}`, { data: chunk('Just now.') });
+
+  const time = (text: string) => agentMessages(page).filter({ hasText: text }).getByTestId('message-time');
+  await agentMessages(page).filter({ hasText: 'Two days ago.' }).hover();
+  await expect(time('Two days ago.')).toHaveText(/^[A-Z][a-z]{2} \d{2}:\d{2}$/);
+  await agentMessages(page).filter({ hasText: 'Ten days ago.' }).hover();
+  await expect(time('Ten days ago.')).toHaveText(/^\d{1,2} [A-Z][a-z]{2} \d{2}:\d{2}$/);
+  await agentMessages(page).filter({ hasText: 'Just now.' }).hover();
+  await expect(time('Just now.')).toHaveText(/^\d{2}:\d{2}$/);
+  // After a reload the times come from the log.
+  await page.reload();
+  await expect(time('Ten days ago.')).toHaveText(/^\d{1,2} [A-Z][a-z]{2} \d{2}:\d{2}$/);
 });
 
 test('consecutive tool calls fold into one block between two messages, and expand to every call', async ({ page }) => {
@@ -1177,7 +1234,7 @@ test("an endpoint added in settings offers its models wherever a model is chosen
     await expect(page.getByRole('option', { name: 'qwen3-coder (litellm)' })).toBeVisible();
     await page.keyboard.press('Escape');
 
-    // A running session can be moved onto one, and back.
+    // A running session can be moved onto one, and back; a move applies at the next message.
     const sent: string[] = [];
     page.on('websocket', (socket) => socket.on('framesent', ({ payload }) => sent.push(String(payload))));
     await createSession(page, 'Try another model in sloppod');
@@ -1185,12 +1242,23 @@ test("an endpoint added in settings offers its models wherever a model is chosen
     await select.getByRole('combobox').click();
     await page.getByRole('option', { name: 'qwen3-coder (litellm)' }).click();
     await expect(select).toContainText('qwen3-coder (litellm)');
+    await expect(page.getByTestId('model-pending')).toHaveText('Applies to your next message');
     expect(sent.some((frame) => frame.includes('"session/set_config_option"') && frame.includes('endpoint:'))).toBe(true);
     await page.reload();
     await expect(page.getByTestId('model-select')).toContainText('qwen3-coder (litellm)');
+    await expect(page.getByTestId('model-pending')).toBeVisible();
+    await page.getByRole('textbox', { name: 'Prompt' }).fill('Now on qwen');
+    await page.keyboard.press('Enter');
+    await expect(page.getByTestId('model-pending')).toHaveCount(0);
+    await expect(page.getByTestId('model-select')).toContainText('qwen3-coder (litellm)');
+
+    // On it, the choices are Claude's models and the endpoints', not Claude's aliases with the endpoint's model behind.
     await page.getByTestId('model-select').getByRole('combobox').click();
+    await expect(page.getByRole('option', { name: 'qwen3-coder (opus)' })).toHaveCount(0);
+    await expect(page.getByRole('option', { name: 'glm-5 (litellm)' })).toBeVisible();
     await page.getByRole('option', { name: 'Opus' }).click();
     await expect(page.getByTestId('model-select')).toContainText('Opus');
+    await expect(page.getByTestId('model-pending')).toBeVisible();
   } finally {
     const listed: { id: string; kind: string }[] = await (await page.request.get('/api/v1/credentials')).json();
     for (const { id } of listed.filter((c) => c.kind === 'endpoint')) await page.request.delete(`/api/v1/credentials/${id}`);
@@ -2467,6 +2535,128 @@ test('a highlight the agent takes back leaves the for-you list, and its card sta
   await expect(page).toHaveURL(new RegExp(id));
   await expect(page.getByTestId('highlight-card')).toHaveAttribute('data-retracted', 'true');
   await expect(page.getByTestId('highlight-item')).toHaveCount(0);
+});
+
+test('snoozing a highlight moves it to the Snoozed group, out of what waits, and starts no turn', async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1000 });
+  // Its own highlight texts: the session list is one page, and a row is found by its title, so this test's must not
+  // share a prefix with another test's session.
+  await createSession(page, 'Highlight: Snooze the deploy check | Re-run the nightly job');
+  const panel = page.getByTestId('side-panel');
+  await expect(panel.getByTestId('highlight-item')).toHaveCount(2);
+  await expect(phase(page)).toHaveAttribute('title', /2 highlights/);
+  const row = page.getByRole('navigation', { name: 'Sessions' }).getByTestId('session-row').filter({ hasText: 'Snooze the deploy check' });
+
+  const turnsBefore = await agentMessages(page).count();
+  const noticesBefore = await userMessages(page).count();
+  await panel.getByTestId('highlight-item').filter({ hasText: 'Snooze the deploy check' }).getByRole('button', { name: 'Snooze' }).click();
+  await page.getByRole('menuitem', { name: 'In an hour' }).click();
+
+  // Out of what waits on the user, into a group folded away under it.
+  await expect(panel.getByTestId('highlight-item')).toHaveCount(1);
+  await expect(phase(page)).toHaveAttribute('title', /1 highlight/);
+  const toggle = panel.getByTestId('snoozed-toggle');
+  await expect(toggle).toHaveText(/Snoozed \(1\)/);
+  await expect(panel.getByTestId('snoozed-items')).toHaveCount(0);
+  // Its card in the chat says it's put off, and keeps Seen.
+  const card = page.getByTestId('highlight-card').filter({ hasText: 'Snooze the deploy check' });
+  await expect(card).toHaveAttribute('data-snoozed', 'true');
+  await expect(card).toContainText('Snoozed until');
+  await expect(card.getByRole('button', { name: 'Seen' })).toBeVisible();
+
+  // Unfolded: its text, until when, and Seen and Snooze again.
+  await toggle.click();
+  const snoozed = panel.getByTestId('snoozed-item');
+  await expect(snoozed).toHaveCount(1);
+  await expect(snoozed).toContainText('Snooze the deploy check');
+  await expect(snoozed.getByTestId('highlight-snoozed-until')).toContainText('until');
+  await expect(snoozed.getByRole('button', { name: 'Snooze' })).toBeVisible();
+
+  // Put the other off too: nothing waits on the user, and no turn ran for either.
+  await panel.getByTestId('highlight-item').getByRole('button', { name: 'Snooze' }).click();
+  await page.getByRole('menuitem', { name: 'In an hour' }).click();
+  await expect(panel.getByTestId('highlight-item')).toHaveCount(0);
+  await expect(panel.getByTestId('snoozed-toggle')).toHaveText(/Snoozed \(2\)/);
+  await expect(phase(page)).toHaveText('Idle');
+  await expect(row.getByTestId('phase')).toHaveText('Idle');
+  await page.waitForTimeout(500);
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+  expect(await agentMessages(page).count()).toBe(turnsBefore);
+  expect(await userMessages(page).count()).toBe(noticesBefore);
+
+  // Seen from the group is done with it for good, and stays so after a reload.
+  await panel.getByTestId('snoozed-item').filter({ hasText: 'Snooze the deploy check' }).getByRole('button', { name: 'Seen' }).click();
+  await expect(panel.getByTestId('snoozed-toggle')).toHaveText(/Snoozed \(1\)/);
+  await expect(card).toHaveAttribute('data-seen', 'true');
+  await page.reload();
+  await expect(panel.getByTestId('snoozed-toggle')).toHaveText(/Snoozed \(1\)/);
+  await expect(card).toHaveAttribute('data-seen', 'true');
+});
+
+test('a snoozed highlight comes back at its time, without a reload', async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1000 });
+  const id = await createSession(page, 'Highlight: Re-run the nightly job');
+  const panel = page.getByTestId('side-panel');
+  const item = panel.getByTestId('highlight-item');
+  await expect(item).toHaveCount(1);
+
+  // Put off for a moment: the check the UI's choices never need brings it back when its time passes.
+  const [highlight] = await (await page.request.get(`/api/v1/sessions/${id}/highlights`)).json();
+  await page.request.post(`/api/v1/sessions/${id}/highlights/${highlight.id}/snooze`, {
+    data: { until: new Date(Date.now() + 3000).toISOString() },
+  });
+  await expect(item).toHaveCount(0);
+  await expect(panel.getByTestId('snoozed-toggle')).toHaveText(/Snoozed \(1\)/);
+  await expect(phase(page)).toHaveText('Idle');
+
+  // Back among what waits on the user, with nothing reloaded.
+  await expect(item).toHaveCount(1);
+  await expect(panel.getByTestId('snoozed-toggle')).toHaveCount(0);
+  await expect(phase(page)).toHaveText('Waiting on you');
+  await expect(page.getByTestId('highlight-card')).toHaveAttribute('data-snoozed', 'false');
+});
+
+test('snoozing a highlight again pushes it further out, past the first time', async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1000 });
+  const id = await createSession(page, 'Highlight: Check the deploy after the nightly job');
+  const panel = page.getByTestId('side-panel');
+  await expect(panel.getByTestId('highlight-item')).toHaveCount(1);
+  const [highlight] = await (await page.request.get(`/api/v1/sessions/${id}/highlights`)).json();
+  const snoozeFor = (ms: number) =>
+    page.request.post(`/api/v1/sessions/${id}/highlights/${highlight.id}/snooze`, {
+      data: { until: new Date(Date.now() + ms).toISOString() },
+    });
+
+  await snoozeFor(2000);
+  await expect(panel.getByTestId('snoozed-toggle')).toHaveText(/Snoozed \(1\)/);
+  // Pushed a few seconds further out, as Snooze again does: the first time passing doesn't bring it back.
+  await snoozeFor(6000);
+  await page.waitForTimeout(2500);
+  await expect(panel.getByTestId('snoozed-toggle')).toHaveText(/Snoozed \(1\)/);
+  await expect(panel.getByTestId('highlight-item')).toHaveCount(0);
+
+  // And it comes back at the time it was pushed to.
+  await expect(panel.getByTestId('highlight-item')).toHaveCount(1);
+  await expect(panel.getByTestId('snoozed-toggle')).toHaveCount(0);
+});
+
+test('the agent can still take back a highlight the user has snoozed', async ({ page }) => {
+  await page.setViewportSize({ width: 1920, height: 1000 });
+  await createSession(page, 'Highlight: Merge pull request 12 by hand');
+  const panel = page.getByTestId('side-panel');
+  await panel.getByTestId('highlight-item').getByRole('button', { name: 'Snooze' }).click();
+  await page.getByRole('menuitem', { name: 'In an hour' }).click();
+  await expect(panel.getByTestId('snoozed-toggle')).toHaveText(/Snoozed \(1\)/);
+
+  // Snoozing isn't seeing it: the agent takes it back, and it leaves the user's list for good.
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('Retract the highlight: It was pull request 21, not 12');
+  await box.press('Enter');
+  const card = page.getByTestId('highlight-card');
+  await expect(card).toHaveAttribute('data-retracted', 'true');
+  await expect(card.getByTestId('highlight-retraction')).toHaveText('Retracted: It was pull request 21, not 12');
+  await expect(panel.getByTestId('snoozed-toggle')).toHaveCount(0);
+  await expect(panel.getByTestId('snoozed-item')).toHaveCount(0);
 });
 
 test('a question the agent withdraws closes, with a note in the chat, and stops counting as waiting', async ({ page }) => {
@@ -4067,6 +4257,45 @@ test.describe('in UTC', () => {
     await setting.click();
     await page.getByRole('option', { name: 'UTC', exact: true }).click();
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('UTC');
+  });
+
+  test('the snooze choices follow a timezone chosen in Settings, without a reload', async ({ page }) => {
+    await page.setViewportSize({ width: 1920, height: 1000 });
+    await page.request.post('/_mock/forget-timezone');
+    const id = await createSession(page, 'Highlight: Put the deploy check off until the morning');
+    const panel = page.getByTestId('side-panel');
+    // The menu has been open once already, in the browser's own zone.
+    await panel.getByTestId('highlight-item').getByRole('button', { name: 'Snooze' }).click();
+    await expect(page.getByRole('menuitem', { name: 'In an hour' })).toBeVisible();
+    await page.keyboard.press('Escape');
+
+    // Another timezone in Settings, and back to the session without a reload.
+    await page.getByRole('link', { name: 'Settings' }).first().click();
+    const setting = page.getByTestId('timezone-setting').getByRole('combobox', { name: 'Timezone' });
+    await setting.click();
+    await page.getByRole('option', { name: 'Asia/Tokyo', exact: true }).click();
+    await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Asia/Tokyo');
+    await page.getByRole('navigation', { name: 'Sessions' }).getByRole('link', { name: /Put the deploy check off/ }).click();
+
+    // Tomorrow morning is 09:00 in that zone, not in the one the menu was opened in before the change.
+    await panel.getByTestId('highlight-item').getByRole('button', { name: 'Snooze' }).click();
+    await page.getByRole('menuitem', { name: 'Tomorrow morning (09:00)' }).click();
+    await expect.poll(async () => {
+      const [highlight] = await (await page.request.get(`/api/v1/sessions/${id}/highlights`)).json();
+      return highlight.snoozed_until ?? null;
+    }).not.toBeNull();
+    const [highlight] = await (await page.request.get(`/api/v1/sessions/${id}/highlights`)).json();
+    const clockIn = (zone: string) =>
+      new Intl.DateTimeFormat('en-GB', { timeZone: zone, hour: '2-digit', minute: '2-digit', hour12: false }).format(
+        new Date(highlight.snoozed_until),
+      );
+    expect(clockIn('Asia/Tokyo')).toBe('09:00');
+    expect(clockIn('UTC')).not.toBe('09:00');
+
+    // The card says the same 09:00 the choice meant, in that zone: read in the browser's it would say 00:00.
+    const until = page.getByTestId('highlight-card').filter({ hasText: 'Put the deploy check off' }).getByTestId('highlight-snoozed-until');
+    await expect(until).toContainText('09:00');
+    await expect(until).toHaveAttribute('title', /09:00/);
   });
 });
 

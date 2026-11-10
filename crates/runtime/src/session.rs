@@ -327,6 +327,9 @@ pub struct Live {
     transition: Mutex<()>,
     /// Held while the session's egress is written, so writes land in the order they read the session (ADR 11).
     egress: Mutex<()>,
+    /// Held while a model the user picked is recorded or applied (#461), so a pick and its application never overlap and
+    /// one pick isn't applied twice.
+    switching: Mutex<()>,
     /// The session's workspace-volume reports, one at a time and in the order they came in (#479).
     reports: Mutex<Reports>,
     /// Notified when something a steer waits for ends: a compaction, a tool call, a permission request, the turn.
@@ -447,12 +450,17 @@ fn notification(method: &str, params: Value) -> Value {
     json!({"jsonrpc": "2.0", "method": method, "params": params})
 }
 
+/// When an event was recorded, as a UI is told (`_meta.sloppod.at`).
+pub fn event_time(at: DateTime<Utc>) -> String {
+    at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
 /// An update as the log has it: with its seq, in `_meta.sloppod.seq`, which is what a UI reports as how far it has read
-/// (#48).
-pub fn session_update_at(session: Uuid, seq: i64, update: &Value) -> Value {
+/// (#48), and when it was recorded, in `_meta.sloppod.at`.
+pub fn session_update_at(session: Uuid, seq: i64, at: DateTime<Utc>, update: &Value) -> Value {
     notification(
         "session/update",
-        json!({"sessionId": session, "update": update, "_meta": {"sloppod": {"seq": seq}}}),
+        json!({"sessionId": session, "update": update, "_meta": {"sloppod": {"seq": seq, "at": event_time(at)}}}),
     )
 }
 
@@ -569,6 +577,7 @@ impl Hub {
                     state: Mutex::default(),
                     transition: Mutex::default(),
                     egress: Mutex::default(),
+                    switching: Mutex::default(),
                     reports: Mutex::default(),
                     boundary: Notify::new(),
                     heard_at: StdMutex::default(),
@@ -720,11 +729,11 @@ impl Hub {
     pub async fn record(&self, id: Uuid, update: Value) {
         self.heard_at(id).await;
         match self.store.append_event(id, &update).await {
-            Ok(seq) => self.broadcast(
+            Ok((seq, at)) => self.broadcast(
                 id,
                 UiEvent::Notification {
                     seq: Some(seq),
-                    message: session_update_at(id, seq, &update),
+                    message: session_update_at(id, seq, at, &update),
                 },
             ),
             Err(e) => tracing::error!(session = %id, error = %e, "recording event"),
@@ -1664,6 +1673,32 @@ impl Hub {
 
     /// Starts a turn, or queues the prompt until the agent is up or the running turn ends; resolves when its
     /// turn ends.
+    /// Whether `params` would be a new message to the session: not one it received, has queued or had taken back,
+    /// which [`Hub::prompt`] answers without running. Read before a model the user picked is moved onto (#461), so a
+    /// UI sending a message again doesn't start the agent again.
+    pub async fn is_new_prompt(&self, id: Uuid, params: &Value) -> Result<bool, RpcError> {
+        let Some(message_id) = client_message_id(params) else {
+            return Ok(true);
+        };
+        let failed = |e: sqlx::Error| RpcError::new(-32603, e.to_string());
+        if self
+            .store
+            .has_message(id, message_id)
+            .await
+            .map_err(failed)?
+            || self
+                .store
+                .message_removed(id, message_id)
+                .await
+                .map_err(failed)?
+        {
+            return Ok(false);
+        }
+        let live = self.live(id);
+        let state = live.state.lock().await;
+        Ok(!has_queued(&state, message_id))
+    }
+
     pub async fn prompt(self: &Arc<Self>, id: Uuid, params: Value) -> Result<Value, RpcError> {
         let blocks = params["prompt"].as_array().cloned().unwrap_or_default();
         let message_id = client_message_id(&params);
@@ -2362,7 +2397,7 @@ impl Hub {
         id: Uuid,
         before: i64,
         limit: i64,
-    ) -> Result<Vec<(i64, Value)>, sqlx::Error> {
+    ) -> Result<Vec<(i64, DateTime<Utc>, Value)>, sqlx::Error> {
         self.store.events_before(id, before, limit).await
     }
 
@@ -2862,6 +2897,16 @@ impl Hub {
             return Err(e);
         }
         Ok(true)
+    }
+
+    /// Runs `f` while no other pick of the session's model is recorded or applied (#461).
+    pub async fn one_switch_at_a_time<F, T>(&self, id: Uuid, f: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        let live = self.live(id);
+        let _switching = live.switching.lock().await;
+        f.await
     }
 
     /// Moves a session onto another provider's model (#461), under its transition lock and only while nothing is in

@@ -27,8 +27,8 @@ pub trait SessionStore: Send + Sync {
     async fn set_phase(&self, id: Uuid, phase: Phase) -> sqlx::Result<Option<SessionRow>>;
     async fn set_auto_title(&self, id: Uuid, title: &str) -> sqlx::Result<bool>;
     async fn set_session_model(&self, id: Uuid, model: &str) -> sqlx::Result<()>;
-    /// Appends to the session's event log and returns the event's sequence number.
-    async fn append_event(&self, id: Uuid, payload: &Value) -> sqlx::Result<i64>;
+    /// Appends to the session's event log and returns the event's sequence number and when it was recorded.
+    async fn append_event(&self, id: Uuid, payload: &Value) -> sqlx::Result<(i64, DateTime<Utc>)>;
     /// The sequence number of the session's latest event; 0 when it has none.
     async fn last_event(&self, id: Uuid) -> sqlx::Result<i64>;
     /// Whether the session has a user message with this id, as its UI gave it.
@@ -37,13 +37,13 @@ pub trait SessionStore: Send + Sync {
     async fn remove_message(&self, id: Uuid, message_id: Uuid) -> sqlx::Result<()>;
     /// Whether the user took the message with this id back out of the session's queue.
     async fn message_removed(&self, id: Uuid, message_id: Uuid) -> sqlx::Result<bool>;
-    /// Up to `limit` of the session's latest events before `before`, in order.
+    /// Up to `limit` of the session's latest events before `before`, in order, each with when it was recorded.
     async fn events_before(
         &self,
         id: Uuid,
         before: i64,
         limit: i64,
-    ) -> sqlx::Result<Vec<(i64, Value)>>;
+    ) -> sqlx::Result<Vec<(i64, DateTime<Utc>, Value)>>;
     /// Keeps a session's queued messages, `{id, blocks}` each, replacing what was kept; none clears them.
     async fn save_queue(&self, id: Uuid, queue: &[Value]) -> sqlx::Result<()>;
     /// Every session's kept queue, for after a restart.
@@ -108,7 +108,7 @@ impl SessionStore for PgStore {
         db::set_session_model(&self.0, id, model).await
     }
 
-    async fn append_event(&self, id: Uuid, payload: &Value) -> sqlx::Result<i64> {
+    async fn append_event(&self, id: Uuid, payload: &Value) -> sqlx::Result<(i64, DateTime<Utc>)> {
         db::append_event(&self.0, id, payload).await
     }
 
@@ -133,7 +133,7 @@ impl SessionStore for PgStore {
         id: Uuid,
         before: i64,
         limit: i64,
-    ) -> sqlx::Result<Vec<(i64, Value)>> {
+    ) -> sqlx::Result<Vec<(i64, DateTime<Utc>, Value)>> {
         db::events_before(&self.0, id, before, limit).await
     }
 
@@ -233,6 +233,11 @@ pub mod memory {
         pub reads_released: tokio::sync::Notify,
     }
 
+    /// When the memory store says an event was recorded: a second after the one before.
+    fn at(seq: i64) -> DateTime<Utc> {
+        DateTime::UNIX_EPOCH + chrono::Duration::seconds(seq)
+    }
+
     impl MemoryStore {
         pub fn add_session(&self, row: SessionRow) {
             self.sessions.lock().unwrap().insert(row.id, row);
@@ -299,11 +304,15 @@ pub mod memory {
             Ok(())
         }
 
-        async fn append_event(&self, id: Uuid, payload: &Value) -> sqlx::Result<i64> {
+        async fn append_event(
+            &self,
+            id: Uuid,
+            payload: &Value,
+        ) -> sqlx::Result<(i64, DateTime<Utc>)> {
             let mut events = self.events.lock().unwrap();
             let seq = events.len() as i64 + 1;
             events.push((id, seq, payload.clone()));
-            Ok(seq)
+            Ok((seq, at(seq)))
         }
 
         async fn has_message(&self, id: Uuid, message_id: Uuid) -> sqlx::Result<bool> {
@@ -349,14 +358,14 @@ pub mod memory {
             id: Uuid,
             before: i64,
             limit: i64,
-        ) -> sqlx::Result<Vec<(i64, Value)>> {
+        ) -> sqlx::Result<Vec<(i64, DateTime<Utc>, Value)>> {
             let events = self.events.lock().unwrap();
-            let mut latest: Vec<(i64, Value)> = events
+            let mut latest: Vec<(i64, DateTime<Utc>, Value)> = events
                 .iter()
                 .filter(|(s, seq, _)| *s == id && *seq < before)
                 .rev()
                 .take(limit as usize)
-                .map(|(_, seq, p)| (*seq, p.clone()))
+                .map(|(_, seq, p)| (*seq, at(*seq), p.clone()))
                 .collect();
             latest.reverse();
             Ok(latest)

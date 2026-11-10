@@ -705,6 +705,9 @@ pub struct InferenceContext {
     pub base_url: String,
     /// The model's name at the endpoint.
     pub model: String,
+    /// Its context window in tokens, when the endpoint's provider knows it.
+    #[serde(default)]
+    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

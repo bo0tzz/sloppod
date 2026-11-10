@@ -829,8 +829,8 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .filter(|(_, payload)| payload["_meta"]["sloppod"]["notice"] == true)
-            .map(|(_, payload)| payload)
+            .filter(|(_, _, payload)| payload["_meta"]["sloppod"]["notice"] == true)
+            .map(|(_, _, payload)| payload)
             .collect()
     }
 

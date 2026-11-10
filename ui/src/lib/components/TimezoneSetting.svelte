@@ -3,6 +3,7 @@
   import { onMount } from 'svelte';
   import { api } from '#lib/api.ts';
   import { browserTimezone, timezones } from '#lib/timezone.ts';
+  import { userTimezone } from '#lib/user-timezone.svelte.ts';
 
   let timezone = $state<string | null>(null);
   let loadError = $state<string | null>(null);
@@ -22,6 +23,7 @@
     timezone = zone;
     try {
       timezone = (await api.updateSettings({ timezone: zone })).timezone;
+      userTimezone.value = timezone;
       toastManager.success(`Your timezone is ${zone}`);
     } catch (e) {
       timezone = before;

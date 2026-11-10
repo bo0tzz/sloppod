@@ -33,6 +33,8 @@ export type MessageItem = {
   notice: boolean;
   /** A notice's one-line summary (`_meta.sloppod.summary`), e.g. for a message from another session: shown folded. */
   summary: string | null;
+  /** When the message began (the time of its first chunk), as the runtime recorded it; `null` where it didn't say. */
+  at: string | null;
   parts: MessagePart[];
 };
 
@@ -143,12 +145,14 @@ export class Transcript {
   #plan: PlanItem | null = null;
 
   #at = 0;
+  #time: string | null = null;
   /** The place of the latest update applied, for what needs to look again whenever any item changes. */
   seq = $state(0);
 
   /** `seq` is the update's place in the session's log (`_meta.sloppod.seq` on the notification). */
-  apply(update: SessionUpdate, seq = 0) {
+  apply(update: SessionUpdate, seq = 0, at: string | null = null) {
     this.#at = seq;
+    this.#time = at;
     if (seq > this.seq) this.seq = seq;
     switch (update.sessionUpdate) {
       case 'user_message_chunk':
@@ -230,6 +234,7 @@ export class Transcript {
       steering: sloppodMeta?.steering === true,
       notice: sloppodMeta?.notice === true,
       summary: typeof sloppodMeta?.summary === 'string' ? sloppodMeta.summary : null,
+      at: this.#time,
       parts: [part],
     });
   }

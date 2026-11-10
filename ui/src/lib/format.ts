@@ -1,3 +1,5 @@
+import { zonedDate, type Zone } from './timezone.ts';
+
 const units: [Intl.RelativeTimeFormatUnit, number][] = [
   ['year', 365 * 24 * 3600],
   ['month', 30 * 24 * 3600],
@@ -30,6 +32,28 @@ export function clockTime(iso: string, now = Date.now()): string {
   return date.toDateString() === new Date(now).toDateString()
     ? time
     : `${date.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' })} ${time}`;
+}
+
+/**
+ * A time as it reads in `timeZone` (the user's setting; the browser's without one), with the day it is on when that
+ * isn't today: "14:05", "Thu 14:05" within a week either side, "3 Nov 14:05" from a week on. `title` has the full date
+ * and time. A message's hover and a snooze deadline's "until …" both read this way.
+ */
+export function timeWithDay(iso: string, timeZone?: Zone, now = Date.now()): { label: string; title: string } {
+  const zone = timeZone || undefined;
+  const at = new Date(iso);
+  const part = (options: Intl.DateTimeFormatOptions, date = at) =>
+    new Intl.DateTimeFormat('en-GB', { ...options, timeZone: zone }).format(date);
+  const time = part({ hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+  const day = (date: Date) => {
+    const { year, month, day } = zonedDate(zone, date);
+    return Date.UTC(year, month - 1, day);
+  };
+  // Either side of today: a snooze deadline is ahead, a message behind.
+  const days = Math.abs(day(new Date(now)) - day(at)) / 86_400_000;
+  const label =
+    days < 1 ? time : days < 7 ? `${part({ weekday: 'short' })} ${time}` : `${part({ day: 'numeric', month: 'short' })} ${time}`;
+  return { label, title: part({ dateStyle: 'full', timeStyle: 'long' }) };
 }
 
 /** How long until `iso`, to the minute: "in 1 h 23 min", or "any moment now" once it's less than a minute. */

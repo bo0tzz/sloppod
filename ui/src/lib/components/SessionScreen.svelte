@@ -30,6 +30,7 @@
   import { api, type Proposal } from '#lib/api.ts';
   import { absoluteTime, bytes, clockTime, countdown } from '#lib/format.ts';
   import { toolTitle } from '#lib/presentation.ts';
+  import { isSnoozed } from '#lib/snooze.ts';
   import { SessionView } from '#lib/session.svelte.ts';
   import { sessionSidebar } from '#lib/session-sidebar.svelte.ts';
   import { sessions } from '#lib/sessions.svelte.ts';
@@ -72,9 +73,12 @@
   // The runtime pushes the session when questions or permission requests change, but not when a proposal is decided,
   // so the proposals this view already follows give the count (#368).
   const openHighlights = $derived(view.highlights.filter((highlight) => !highlight.seen_at && !highlight.retracted_at));
+  // Put off until later (#467): still open, but not waiting on the user until its time passes.
+  const snoozedHighlights = $derived(openHighlights.filter((highlight) => isSnoozed(highlight)));
+  const waitingHighlights = $derived(openHighlights.filter((highlight) => !isSnoozed(highlight)));
   const waitingOnYou = $derived(
     session?.waiting && view.proposalsLoaded
-      ? { ...session.waiting, proposals: pendingProposals.length, highlights: openHighlights.length }
+      ? { ...session.waiting, proposals: pendingProposals.length, highlights: waitingHighlights.length }
       : session?.waiting,
   );
   const openProposals = $derived(
@@ -145,7 +149,7 @@
   }
 
   const waiting = $derived(
-    view.permissions.length > 0 || view.questions.length > 0 || openProposals.length > 0 || openHighlights.length > 0,
+    view.permissions.length > 0 || view.questions.length > 0 || openProposals.length > 0 || waitingHighlights.length > 0,
   );
   let width = $state(0);
   // Room for the chat at its full width (max-w-3xl and its padding) with the sidebar beside it; otherwise it opens
@@ -162,7 +166,7 @@
   });
   const asking = $derived(view.questions.length > 0 || view.permissions.length > 0);
   // Highlights fold away too: their cards are in the chat, where the user reads them.
-  const folded = $derived(foldChoice ?? (small && (asking || openHighlights.length > 0)));
+  const folded = $derived(foldChoice ?? (small && (asking || waitingHighlights.length > 0)));
   let waitingItemsElement = $state<HTMLElement>();
   /** Unfolds the panel; a question card that was there all along, hidden, takes focus as if it had just appeared. */
   async function unfold() {
@@ -179,7 +183,7 @@
       return { kind: 'permission', text: `Permission needed: ${toolTitle(permission.toolCall.title ?? tool?.title ?? 'a tool call').title}` };
     }
     if (openProposals.length === 0) {
-      const count = openHighlights.length;
+      const count = waitingHighlights.length;
       return { kind: 'highlight', text: `${count} ${count === 1 ? 'highlight' : 'highlights'} for you` };
     }
     const count = pendingProposals.length || openProposals.length;
@@ -499,8 +503,13 @@
 
 {#snippet waitingItems()}
       <!-- What the agent highlighted and the user hasn't marked seen: each stays until they do. -->
-      {#each openHighlights as highlight (highlight.id)}
-        <HighlightCard {highlight} testid="highlight-item" onSeen={(h) => view.markHighlightSeen(h)} />
+      {#each waitingHighlights as highlight (highlight.id)}
+        <HighlightCard
+          {highlight}
+          testid="highlight-item"
+          onSeen={(h) => view.markHighlightSeen(h)}
+          onSnooze={(h, until) => view.snoozeHighlight(h, until)}
+        />
       {/each}
       <!-- One request at a time; the rest wait their turn behind it. -->
       {#each view.questions.slice(0, 1) as question (question.key)}
@@ -553,6 +562,18 @@
           {/if}
         </div>
       {/if}
+{/snippet}
+
+<!-- Put off until later (#467): out of what waits on the user, but still there to be found, and to push further. -->
+{#snippet snoozedItems()}
+  {#each snoozedHighlights as highlight (highlight.id)}
+    <HighlightCard
+      {highlight}
+      testid="snoozed-item"
+      onSeen={(h) => view.markHighlightSeen(h)}
+      onSnooze={(h, until) => view.snoozeHighlight(h, until)}
+    />
+  {/each}
 {/snippet}
 
 {#if view.notFound}
@@ -713,6 +734,7 @@
                   sessionId={id}
                   highlights={view.highlights}
                   onSeen={(highlight) => view.markHighlightSeen(highlight)}
+                  onSnooze={(highlight, until) => view.snoozeHighlight(highlight, until)}
                   onResume={view.unsent.length > 0 ? undefined : resume}
                   awaiting={new Set(view.permissions.map((request) => request.toolCall.toolCallId))}
                   unreadAfter={atBottom && !holdBar && reading ? null : unreadAfter}
@@ -790,6 +812,8 @@
         <SessionSidebar
           waiting={waitingItems}
           hasWaiting={waiting}
+          snoozed={snoozedItems}
+          snoozedCount={snoozedHighlights.length}
           workDone={view.workDone}
           {docked}
           onClose={() => (sessionSidebar.choice = false)}

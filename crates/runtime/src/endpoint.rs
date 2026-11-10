@@ -107,6 +107,16 @@ impl Providers {
         offered
     }
 
+    /// The context window of the endpoint model `value` (its id) in tokens, when its provider knows it: a LiteLLM
+    /// model's `maxInputTokens`, or the one given with an endpoint credential.
+    pub async fn context_window(&self, owner: &str, value: &str) -> Option<u64> {
+        self.offered(owner)
+            .await
+            .into_iter()
+            .find(|m| m.value == value)
+            .and_then(|m| m.info["maxInputTokens"].as_u64())
+    }
+
     /// Which endpoint model `value` is: one named by its id, which has to be offered to the owner, or by its bare
     /// name when exactly one endpoint offered to them serves a model of that name. `None` for any other value, which
     /// is a model of the agent's own; an error, for the user or agent, for one that can't be used.
@@ -297,8 +307,12 @@ impl ModelProvider for OwnEndpoints {
                     }
                     .id(),
                     name: format!("{model} ({})", row.name),
+                    // In LiteLLM's terms, as the operator's models carry it.
+                    info: match row.config["context_windows"][&model].as_u64() {
+                        Some(tokens) => json!({"maxInputTokens": tokens}),
+                        None => Value::Null,
+                    },
                     model,
-                    info: Value::Null,
                 })
             })
             .collect())
@@ -659,116 +673,221 @@ pub async fn undo_provisioning(
 
 /// A change of a session's model that involves an endpoint's (#461), to one or from one: unlike a change between the
 /// agent's own models, the agent can't make it itself, since it's another provider (ADR 20). The model and the
-/// endpoint grant change together, and the agent starts again on a new pod, resuming its conversation. `None` when
-/// neither the old model nor the new is an endpoint's: the agent switches as usual.
-pub async fn switch(
+/// endpoint grant change together, and the agent starts again on a new pod, resuming its conversation. So that a pick
+/// doesn't restart the agent under the user, it's only recorded here, checked as far as it can be, and the session
+/// moves onto it before its next message is sent ([`apply_pending`]). Picking the current model again takes a
+/// recorded pick back. `None` when neither the old model nor the new is an endpoint's: the agent switches as usual,
+/// and a pick that was recorded is dropped.
+pub async fn choose(
     state: &AppState,
     session: Uuid,
     value: &str,
 ) -> Option<Result<Value, crate::link::RpcError>> {
+    state
+        .hub
+        .one_switch_at_a_time(session, async {
+            let row = match session_row(state, session).await {
+                Ok(row) => row,
+                Err(e) => return Some(Err(e)),
+            };
+            let picked = match prepare(state, &row, value).await {
+                Ok(picked) => picked,
+                Err(e) => return Some(Err(e)),
+            };
+            let pending = match &picked {
+                Some(move_to) if Some(&move_to.model) != row.model.as_ref() => {
+                    Some(move_to.model.as_str())
+                }
+                _ => None,
+            };
+            if pending != row.pending_model.as_deref() {
+                if let Err(e) = db::set_pending_model(&state.db, session, pending).await {
+                    return Some(Err(crate::link::RpcError::new(-32603, e.to_string())));
+                }
+                state.hub.broadcast_session(session).await;
+            }
+            picked.map(|_| Ok(json!({})))
+        })
+        .await
+}
+
+/// Moves the session onto the model the user picked, if there's one waiting ([`choose`]), before a message is sent
+/// to it. A session that isn't quiet, with a turn or its queue still running, keeps the pick for its next message. A
+/// move that fails drops the pick, leaves the session on its model and fails the message, so it isn't answered by a
+/// model the user didn't expect.
+pub async fn apply_pending(state: &AppState, session: Uuid) -> Result<(), crate::link::RpcError> {
     use crate::link::RpcError;
-    let row = match db::get_session(&state.db, session).await {
-        Ok(Some(row)) => row,
-        Ok(None) => return Some(Err(RpcError::new(-32602, "no such session"))),
-        Err(e) => return Some(Err(RpcError::new(-32603, e.to_string()))),
+    state
+        .hub
+        .one_switch_at_a_time(session, async {
+            let row = session_row(state, session).await?;
+            let Some(pending) = row.pending_model.clone() else {
+                return Ok(());
+            };
+            let moved = match prepare(state, &row, &pending).await {
+                Ok(Some(move_to)) => move_to
+                    .apply(state, &row)
+                    .await
+                    .map_err(|e| format!("{e:#}")),
+                Ok(None) => Ok(true),
+                Err(e) => Err(e.message),
+            };
+            match moved {
+                Ok(false) => Ok(()),
+                Ok(true) => {
+                    // A move clears the pick with the model; one there was nothing to do for is cleared here.
+                    db::set_pending_model(&state.db, session, None)
+                        .await
+                        .map_err(|e| RpcError::new(-32603, e.to_string()))
+                }
+                Err(why) => {
+                    if let Err(e) = db::set_pending_model(&state.db, session, None).await {
+                        tracing::warn!(%session, error = %e, "dropping a model pick that failed");
+                    }
+                    state.hub.broadcast_session(session).await;
+                    Err(RpcError::new(
+                        -32603,
+                        format!(
+                            "the message wasn't sent: the switch to {pending} failed, and the session stays on {}: {why}",
+                            row.model.as_deref().unwrap_or("its model")
+                        ),
+                    ))
+                }
+            }
+        })
+        .await
+}
+
+async fn session_row(
+    state: &AppState,
+    session: Uuid,
+) -> Result<db::SessionRow, crate::link::RpcError> {
+    use crate::link::RpcError;
+    match db::get_session(&state.db, session).await {
+        Ok(Some(row)) => Ok(row),
+        Ok(None) => Err(RpcError::new(-32602, "no such session")),
+        Err(e) => Err(RpcError::new(-32603, e.to_string())),
+    }
+}
+
+/// A move of a session onto another provider's model, checked: the model as the session will record it, and the
+/// endpoint grant it needs.
+struct MoveTo {
+    model: String,
+    grant: Option<Grant>,
+}
+
+/// What `value` would move the session onto, if it involves an endpoint's model, checked against what the session
+/// would need there; `None` when neither its model nor `value` is an endpoint's.
+async fn prepare(
+    state: &AppState,
+    row: &db::SessionRow,
+    value: &str,
+) -> Result<Option<MoveTo>, crate::link::RpcError> {
+    use crate::link::RpcError;
+    let Some(adapter) = state.agents.get(&row.agent) else {
+        return Ok(None);
     };
-    let adapter = state.agents.get(&row.agent)?;
-    let resolved = match chosen(&state.providers, &row.owner, adapter.as_ref(), Some(value)).await {
-        Ok(resolved) => resolved,
-        Err(e) => return Some(Err(RpcError::new(-32603, e.to_string()))),
-    };
+    let resolved = chosen(&state.providers, &row.owner, adapter.as_ref(), Some(value))
+        .await
+        .map_err(|e| RpcError::new(-32603, e.to_string()))?;
     let was = EndpointModel::parse(row.model.as_deref().unwrap_or_default());
     let model = match resolved {
         Ok(Some(model)) => model,
         Ok(None) => value.to_owned(),
-        Err(why) => return Some(Err(RpcError::new(-32602, why))),
+        Err(why) => return Err(RpcError::new(-32602, why)),
     };
     let to = EndpointModel::parse(&model);
     if was.is_none() && to.is_none() {
-        return None;
+        return Ok(None);
     }
     // Off an endpoint, onto the agent's own provider: the session needs a usable account there, by its own grant.
     if to.is_none() {
         match own_provider_ready(&state.credentials, &row.context(), adapter.as_ref(), &model).await
         {
             Ok(Ok(())) => {}
-            Ok(Err(why)) => return Some(Err(RpcError::new(-32602, why))),
-            Err(e) => return Some(Err(RpcError::new(-32603, e.to_string()))),
+            Ok(Err(why)) => return Err(RpcError::new(-32602, why)),
+            Err(e) => return Err(RpcError::new(-32603, e.to_string())),
         }
     }
-    let new_grant = match &to {
+    let grant = match &to {
         Some(to) => match session_grant(state, &row.owner, to).await {
             Ok(Ok(grant)) => Some(grant),
-            Ok(Err(why)) => return Some(Err(RpcError::new(-32602, why))),
-            Err(e) => return Some(Err(RpcError::new(-32603, format!("{e:#}")))),
+            Ok(Err(why)) => return Err(RpcError::new(-32602, why)),
+            Err(e) => return Err(RpcError::new(-32603, format!("{e:#}"))),
         },
         None => None,
     };
-    let old_grant = row
-        .grants()
-        .into_iter()
-        .find(|g| g.capability == capability::ENDPOINT);
-    let old_model = row.model.clone().unwrap_or_default();
-    let id = session.to_string();
-    // The session as it'll be, for provisioning its new grant (a key minted for it, say) before its agent starts, and
-    // as it was, for putting it back.
-    let old_context = row.context();
-    let mut moved_context = row.context();
-    follow_model(&mut moved_context.grants, new_grant.clone());
-    let moved = state
-        .hub
-        .switch_provider(
-            session,
-            || async {
-                db::set_model_and_endpoint(&state.db, session, &model, new_grant.as_ref()).await?;
-                state.providers.provision(&moved_context).await?;
-                Ok(())
-            },
-            || async {
-                state.placement.replace_pod(&id).await?;
-                Ok(())
-            },
-            || async {
-                db::set_model_and_endpoint(&state.db, session, &old_model, old_grant.as_ref())
-                    .await?;
-                undo_provisioning(
-                    &state.providers,
-                    &old_context,
-                    old_grant.as_ref(),
-                    new_grant.as_ref(),
-                )
-                .await
-            },
-        )
-        .await;
-    match moved {
-        Ok(true) => {
-            // What the old grant had made is no longer needed, unless the new one is on the same endpoint. A release
-            // that fails is left to the sweep.
-            // What the old key spent since the last read, before it goes.
-            if old_grant.is_some() && !same_endpoint(old_grant.as_ref(), new_grant.as_ref()) {
-                crate::spend::read_last(state, &old_context).await;
-            }
-            if let Some(old) = &old_grant
-                && !same_endpoint(Some(old), new_grant.as_ref())
-                && let Err(e) = state
-                    .providers
-                    .release(&id, std::slice::from_ref(old))
+    Ok(Some(MoveTo { model, grant }))
+}
+
+impl MoveTo {
+    /// Moves the session: its model and endpoint grant change together, and its agent starts again on a new pod. Says
+    /// whether it moved; `false` when the session isn't quiet, and nothing changed. If any part fails, all of it is
+    /// put back.
+    async fn apply(self, state: &AppState, row: &db::SessionRow) -> anyhow::Result<bool> {
+        let MoveTo {
+            model,
+            grant: new_grant,
+        } = self;
+        let session = row.id;
+        let old_grant = row
+            .grants()
+            .into_iter()
+            .find(|g| g.capability == capability::ENDPOINT);
+        let old_model = row.model.clone().unwrap_or_default();
+        let id = session.to_string();
+        // The session as it'll be, for provisioning its new grant (a key minted for it, say) before its agent starts,
+        // and as it was, for putting it back.
+        let old_context = row.context();
+        let mut moved_context = row.context();
+        follow_model(&mut moved_context.grants, new_grant.clone());
+        let moved = state
+            .hub
+            .switch_provider(
+                session,
+                || async {
+                    db::set_model_and_endpoint(&state.db, session, &model, new_grant.as_ref())
+                        .await?;
+                    state.providers.provision(&moved_context).await?;
+                    Ok(())
+                },
+                || async {
+                    state.placement.replace_pod(&id).await?;
+                    Ok(())
+                },
+                || async {
+                    db::set_model_and_endpoint(&state.db, session, &old_model, old_grant.as_ref())
+                        .await?;
+                    undo_provisioning(
+                        &state.providers,
+                        &old_context,
+                        old_grant.as_ref(),
+                        new_grant.as_ref(),
+                    )
                     .await
+                },
+            )
+            .await?;
+        if !moved {
+            return Ok(false);
+        }
+        // What the old grant had made is no longer needed, unless the new one is on the same endpoint: what its key
+        // spent since the last read is read first, and a release that fails is left to the sweep.
+        if let Some(old) = &old_grant
+            && !same_endpoint(Some(old), new_grant.as_ref())
+        {
+            crate::spend::read_last(state, &old_context).await;
+            if let Err(e) = state
+                .providers
+                .release(&id, std::slice::from_ref(old))
+                .await
             {
                 tracing::warn!(%session, error = %format!("{e:#}"), "releasing a session's old endpoint key; the sweep tries again");
             }
-            state.hub.broadcast_session(session).await;
-            Some(Ok(json!({})))
         }
-        Ok(false) => Some(Err(RpcError::new(
-            -32602,
-            "switching to or from an endpoint's model starts the agent again, so it waits until the session is quiet: no turn, nothing queued, no open question and none of its commands running",
-        ))),
-        Err(e) => Some(Err(RpcError::new(
-            -32603,
-            format!("the session stays on its model: {e:#}"),
-        ))),
+        state.hub.broadcast_session(session).await;
+        Ok(true)
     }
 }
 

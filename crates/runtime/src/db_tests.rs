@@ -733,14 +733,14 @@ async fn a_session_log_reads_back_from_its_latest(db: PgPool) {
     let other = session(&db, "dev").await;
     let mut seqs = Vec::new();
     for n in 0..5 {
-        seqs.push(db::append_event(&db, s, &json!({"n": n})).await.unwrap());
+        seqs.push(db::append_event(&db, s, &json!({"n": n})).await.unwrap().0);
         db::append_event(&db, other, &json!({"other": n}))
             .await
             .unwrap();
     }
     let latest = db::events_before(&db, s, i64::MAX, 2).await.unwrap();
     assert_eq!(
-        latest.iter().map(|e| e.1["n"].clone()).collect::<Vec<_>>(),
+        latest.iter().map(|e| e.2["n"].clone()).collect::<Vec<_>>(),
         [json!(3), json!(4)]
     );
     let older = db::events_before(&db, s, latest[0].0, 10).await.unwrap();
@@ -757,7 +757,7 @@ async fn a_session_log_reads_back_from_its_latest(db: PgPool) {
 async fn a_session_log_has_a_last_event(db: PgPool) {
     let s = session(&db, "dev").await;
     assert_eq!(db::last_event(&db, s).await.unwrap(), 0);
-    let seq = db::append_event(&db, s, &json!({})).await.unwrap();
+    let seq = db::append_event(&db, s, &json!({})).await.unwrap().0;
     db::append_event(&db, session(&db, "dev").await, &json!({}))
         .await
         .unwrap();
@@ -2399,6 +2399,142 @@ async fn an_agent_takes_back_a_highlight_the_user_has_not_seen(db: PgPool) {
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_snoozed_highlight_stops_counting_as_waiting_until_its_time(db: PgPool) {
+    let s = session(&db, "dev").await;
+    let other = session(&db, "dev").await;
+    let later = db::insert_highlight(&db, s, "Re-run the job")
+        .await
+        .unwrap();
+    let now = db::insert_highlight(&db, s, "Anytime").await.unwrap();
+    db::insert_highlight(&db, other, "Another session's")
+        .await
+        .unwrap();
+    assert_eq!(db::open_highlights(&db, s).await.unwrap(), 2);
+
+    // Put off until later: it stops counting, and the row says until when.
+    let snoozed = db::snooze_highlight(&db, s, later.id, Utc::now() + Duration::hours(2))
+        .await
+        .unwrap()
+        .expect("the session's open highlight");
+    assert!(snoozed.snoozed_until.is_some());
+    assert_eq!(db::open_highlights(&db, s).await.unwrap(), 1);
+    assert_eq!(db::open_highlights(&db, other).await.unwrap(), 1);
+
+    // Its time passed (the runtime hasn't run its check yet): it counts again on its own.
+    db::snooze_highlight(&db, s, later.id, Utc::now() - Duration::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(db::open_highlights(&db, s).await.unwrap(), 2);
+
+    // Seen or taken back isn't the user's to snooze, and neither is another session's highlight.
+    db::mark_highlight_seen(&db, s, now.id).await.unwrap();
+    assert!(
+        db::snooze_highlight(&db, s, now.id, Utc::now() + Duration::hours(1))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        db::snooze_highlight(&db, other, later.id, Utc::now() + Duration::hours(1))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let retracted = db::insert_highlight(&db, s, "Wrong").await.unwrap();
+    db::retract_highlight(&db, s, retracted.id, "wrong")
+        .await
+        .unwrap();
+    assert!(
+        db::snooze_highlight(&db, s, retracted.id, Utc::now() + Duration::hours(1))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_highlight_whose_snooze_has_run_out_comes_back(db: PgPool) {
+    let s = session(&db, "dev").await;
+    let due = db::insert_highlight(&db, s, "Re-run the job")
+        .await
+        .unwrap();
+    let later = db::insert_highlight(&db, s, "Review the draft")
+        .await
+        .unwrap();
+    db::snooze_highlight(&db, s, due.id, Utc::now() - Duration::minutes(1))
+        .await
+        .unwrap();
+    db::snooze_highlight(&db, s, later.id, Utc::now() + Duration::hours(2))
+        .await
+        .unwrap();
+
+    // Only the one whose time has passed comes back, and its snooze is cleared, so the UIs are told it's waiting again.
+    let woken = db::due_highlights(&db).await.unwrap();
+    assert_eq!(
+        woken.iter().map(|h| h.id).collect::<Vec<_>>(),
+        [due.id],
+        "the one still put off stays so"
+    );
+    assert!(woken[0].snoozed_until.is_none());
+    // The list shows it too: the one that came back has no time, the other keeps its.
+    let listed = db::list_highlights(&db, s).await.unwrap();
+    let snooze_of = |id: Uuid| {
+        listed
+            .iter()
+            .find(|h| h.id == id)
+            .expect("listed")
+            .snoozed_until
+    };
+    assert!(snooze_of(due.id).is_none());
+    assert!(snooze_of(later.id).is_some());
+    // Nothing left due: the check does nothing until another time passes.
+    assert!(db::due_highlights(&db).await.unwrap().is_empty());
+
+    // A highlight the user has seen, or the agent took back, isn't brought back.
+    let seen = db::insert_highlight(&db, s, "Seen and put off")
+        .await
+        .unwrap();
+    db::snooze_highlight(&db, s, seen.id, Utc::now() - Duration::minutes(1))
+        .await
+        .unwrap();
+    db::mark_highlight_seen(&db, s, seen.id).await.unwrap();
+    let retracted = db::insert_highlight(&db, s, "Taken back and put off")
+        .await
+        .unwrap();
+    db::snooze_highlight(&db, s, retracted.id, Utc::now() - Duration::minutes(1))
+        .await
+        .unwrap();
+    db::retract_highlight(&db, s, retracted.id, "wrong")
+        .await
+        .unwrap();
+    assert!(db::due_highlights(&db).await.unwrap().is_empty());
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn the_agent_can_take_back_a_highlight_the_user_has_snoozed(db: PgPool) {
+    let s = session(&db, "dev").await;
+    let put_off = db::insert_highlight(&db, s, "Merge pull request 12")
+        .await
+        .unwrap();
+    db::snooze_highlight(&db, s, put_off.id, Utc::now() + Duration::hours(2))
+        .await
+        .unwrap();
+    assert_eq!(db::open_highlights(&db, s).await.unwrap(), 0);
+
+    // Snoozing isn't seeing it: the agent can still take it back, and it leaves the user's list for good.
+    let retracted = match db::retract_highlight(&db, s, put_off.id, "It was pull request 21")
+        .await
+        .unwrap()
+    {
+        db::Retraction::Retracted(row) => row,
+        _ => panic!("a snoozed highlight counts as not seen"),
+    };
+    assert!(retracted.retracted_at.is_some());
+    assert_eq!(db::open_highlights(&db, s).await.unwrap(), 0);
+    assert!(db::due_highlights(&db).await.unwrap().is_empty());
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
 async fn sessions_that_could_make_room_are_the_quiet_idle_ones(db: PgPool) {
     let make = |kind: SessionKind, phase: Phase, minutes_ago: i64| {
         let db = db.clone();
@@ -2848,5 +2984,66 @@ async fn a_proposal_with_changes_requested_is_followed_for_its_next_round_only_w
             ProposalStatus::InReview,
             json!({"base": "main"})
         )
+    );
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_picked_model_waits_until_the_session_moves_onto_it(db: PgPool) {
+    let id = session(&db, "dev").await;
+    let pending = |db: PgPool| async move {
+        db::get_session(&db, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .to_api()
+            .pending_model
+    };
+    db::set_pending_model(&db, id, Some("endpoint:x:qwen3-coder"))
+        .await
+        .unwrap();
+    assert_eq!(
+        pending(db.clone()).await.as_deref(),
+        Some("endpoint:x:qwen3-coder")
+    );
+    // Moving the session takes the pick with it.
+    db::set_model_and_endpoint(&db, id, "endpoint:x:qwen3-coder", None)
+        .await
+        .unwrap();
+    assert_eq!(pending(db.clone()).await, None);
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn the_models_offered_come_from_a_session_on_the_agent_s_own(db: PgPool) {
+    let own = session(&db, "dev").await;
+    let on_endpoint = session(&db, "dev").await;
+    db::set_agent_session(&db, own, "a", &json!({"configOptions": "own"}))
+        .await
+        .unwrap();
+    db::set_agent_session(&db, on_endpoint, "b", &json!({"configOptions": "aliases"}))
+        .await
+        .unwrap();
+    db::set_model_and_endpoint(&db, on_endpoint, "endpoint:x:qwen3-coder", None)
+        .await
+        .unwrap();
+    // The endpoint's session is the latest, but its agent's aliases aren't a choice.
+    assert_eq!(
+        db::latest_agent_state(&db, "dev", None).await.unwrap(),
+        Some(json!({"configOptions": "own"}))
+    );
+    // Another agent's, newer still, isn't Claude Code's.
+    let codex = session(&db, "dev").await;
+    sqlx::query("update sessions set agent = 'codex' where id = $1")
+        .bind(codex)
+        .execute(&db)
+        .await
+        .unwrap();
+    db::set_agent_session(&db, codex, "c", &json!({"configOptions": "codex"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        db::latest_agent_state(&db, "dev", Some("claude-code"))
+            .await
+            .unwrap(),
+        Some(json!({"configOptions": "own"}))
     );
 }

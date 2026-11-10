@@ -1,4 +1,5 @@
 import { api } from './api.ts';
+import { userTimezone } from './user-timezone.svelte.ts';
 
 /** The browser's timezone, e.g. `Europe/Amsterdam`. */
 export const browserTimezone = () => Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -22,8 +23,69 @@ export async function adoptBrowserTimezone() {
   adopted = true;
   try {
     const settings = await api.getSettings();
-    if (settings.timezone === null) await api.updateSettings({ timezone: browserTimezone() });
+    userTimezone.value = settings.timezone;
+    if (settings.timezone === null) {
+      userTimezone.value = (await api.updateSettings({ timezone: browserTimezone() })).timezone;
+    }
   } catch {
     adopted = false;
   }
+}
+
+/** A date on a zone's calendar. */
+export type CalendarDate = { year: number; month: number; day: number };
+
+/** A zone to work in: an IANA name, or none for the browser's, as a user's setting that isn't read yet is. */
+export type Zone = string | null | undefined;
+
+/** What a zone's clock reads at `at`. */
+function zonedFields(zone: Zone, at: Date) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: zone ?? undefined,
+    hour12: false,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).formatToParts(at);
+  const value = (type: string) => Number(parts.find((part) => part.type === type)?.value);
+  // Some engines read midnight as hour 24.
+  return { year: value('year'), month: value('month'), day: value('day'), hour: value('hour') % 24, minute: value('minute'), second: value('second') };
+}
+
+/** How far ahead of UTC a zone's clock is at `at`. */
+function offsetAt(zone: Zone, at: Date): number {
+  const { year, month, day, hour, minute, second } = zonedFields(zone, at);
+  return Date.UTC(year, month - 1, day, hour, minute, second) - (at.getTime() - at.getMilliseconds());
+}
+
+/** The date a zone's clock is on at `at`. */
+export function zonedDate(zone: Zone, at: Date): CalendarDate {
+  const { year, month, day } = zonedFields(zone, at);
+  return { year, month, day };
+}
+
+/** `days` on from a date. */
+export function addDays(date: CalendarDate, days: number): CalendarDate {
+  const at = new Date(Date.UTC(date.year, date.month - 1, date.day + days));
+  return { year: at.getUTCFullYear(), month: at.getUTCMonth() + 1, day: at.getUTCDate() };
+}
+
+/** A date's weekday: 0 Sunday … 6 Saturday. */
+export function weekday(date: CalendarDate): number {
+  return new Date(Date.UTC(date.year, date.month - 1, date.day)).getUTCDay();
+}
+
+/**
+ * The instant at which a zone's clock reads a wall-clock time there. A time a daylight-saving change skips or repeats
+ * resolves the way the browser resolves the zone's own: two rounds of converting settle the offset, which differs
+ * either side of the change.
+ */
+export function zonedTime(zone: Zone, date: CalendarDate, hour: number, minute = 0): Date {
+  const wall = Date.UTC(date.year, date.month - 1, date.day, hour, minute);
+  let at = wall;
+  for (let round = 0; round < 2; round++) at = wall - offsetAt(zone, new Date(at));
+  return new Date(at);
 }

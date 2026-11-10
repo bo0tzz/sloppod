@@ -7,6 +7,7 @@ use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, header};
 use axum::response::Response;
+use chrono::{DateTime, Utc};
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -14,7 +15,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::link::RpcError;
-use crate::session::{UiEvent, session_update_at};
+use crate::session::{UiEvent, event_time, session_update_at};
 use crate::users::User;
 use crate::{AppState, db, quota};
 
@@ -139,8 +140,9 @@ impl Conn {
             .events_before(session, until + 1, HISTORY_PAGE)
             .await
             .map_err(internal)?;
-        for (seq, update) in &latest {
-            self.send(session_update_at(session, *seq, update)).await;
+        for (seq, at, update) in &latest {
+            self.send(session_update_at(session, *seq, *at, update))
+                .await;
         }
         let replay = self.state.hub.replay(session).await.map_err(internal)?;
         let task = tokio::spawn(self.clone().forward(session, events, until));
@@ -169,8 +171,9 @@ impl Conn {
             .await
             .map_err(internal)?;
         let before = older_than(&page);
-        let updates: Vec<Value> = page.into_iter().map(|(_, update)| update).collect();
-        Ok(json!({"updates": updates, "before": before}))
+        let times: Vec<String> = page.iter().map(|(_, at, _)| event_time(*at)).collect();
+        let updates: Vec<Value> = page.into_iter().map(|(_, _, update)| update).collect();
+        Ok(json!({"updates": updates, "at": times, "before": before}))
     }
 
     async fn handle_request(self: Arc<Self>, id: Value, method: String, params: Value) {
@@ -223,15 +226,27 @@ impl Conn {
                 -32601,
                 "create sessions with POST /api/v1/sessions",
             )),
-            ("session/prompt", Some(session)) => hub.prompt(session, params).await,
+            ("session/prompt", Some(session)) => {
+                // A model the user picked that needs the agent started again is moved onto first (#461), for a new
+                // message: one sent again is answered as before, and moves nothing.
+                let moved = match hub.is_new_prompt(session, &params).await {
+                    Ok(true) => crate::endpoint::apply_pending(&self.state, session).await,
+                    Ok(false) => Ok(()),
+                    Err(e) => Err(e),
+                };
+                match moved {
+                    Ok(()) => hub.prompt(session, params).await,
+                    Err(e) => Err(e),
+                }
+            }
             ("_session/steering", Some(session)) => hub.steer(session, params).await,
             ("_sloppod/steer_queued", Some(session)) => hub.steer_queued(session, params).await,
             ("_sloppod/remove_queued", Some(session)) => hub.remove_queued(session, params).await,
             ("session/set_config_option", Some(session)) => {
-                // To or from an endpoint's model, the runtime moves the session itself (#461).
+                // To or from an endpoint's model, the runtime moves the session itself, at its next message (#461).
                 let endpoint = match (params["configId"].as_str(), params["value"].as_str()) {
                     (Some("model"), Some(value)) => {
-                        crate::endpoint::switch(&self.state, session, value).await
+                        crate::endpoint::choose(&self.state, session, value).await
                     }
                     _ => None,
                 };
@@ -315,7 +330,7 @@ impl Conn {
 const HISTORY_PAGE: i64 = 2000;
 
 /// Where the page before `page` ends, if there may be one: a full page may have more before it.
-fn older_than(page: &[(i64, Value)]) -> Option<i64> {
+fn older_than(page: &[(i64, DateTime<Utc>, Value)]) -> Option<i64> {
     (page.len() as i64 == HISTORY_PAGE).then(|| page[0].0)
 }
 

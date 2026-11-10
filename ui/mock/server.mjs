@@ -70,7 +70,7 @@ class MockSession {
           proposals: [...proposals.values()].filter((p) => p.session_id === data.id && p.status === 'pending').length,
           questions: pending.filter((p) => p.method === 'elicitation/create').length,
           permissions: pending.filter((p) => p.method !== 'elicitation/create').length,
-          highlights: [...highlights.values()].filter((h) => h.session_id === data.id && !h.seen_at && !h.retracted_at).length,
+          highlights: [...highlights.values()].filter((h) => h.session_id === data.id && !h.seen_at && !h.retracted_at && !isSnoozed(h)).length,
         };
       },
     });
@@ -89,9 +89,10 @@ class MockSession {
     this.startTimer = null;
   }
 
-  emit(update) {
-    // Like the runtime, an update says where it falls in the log, from 1: what a read position counts in.
-    const params = { sessionId: this.data.id, update, _meta: { sloppod: { seq: this.log.length + 1 } } };
+  emit(update, at = now()) {
+    // Like the runtime, an update says where it falls in the log, from 1 (what a read position counts in), and when it
+    // was recorded.
+    const params = { sessionId: this.data.id, update, _meta: { sloppod: { seq: this.log.length + 1, at } } };
     this.log.push(params);
     this.data.active_at = now();
     for (const conn of this.subscribers) conn.notify('session/update', params);
@@ -122,7 +123,10 @@ class MockSession {
         category: 'model',
         type: 'select',
         currentValue: this.model,
-        options: MODELS,
+        // On an endpoint's model Claude Code still lists its aliases, each with the endpoint's model behind it.
+        options: this.data.model?.startsWith('endpoint:')
+          ? MODELS.map(({ value }) => ({ value, name: `${this.data.model.split(':').slice(2).join(':')} (${value})` }))
+          : MODELS,
       },
     ];
   }
@@ -835,6 +839,26 @@ async function agentScript(session, turn, prompt) {
     await say('Done.');
     return;
   }
+  // With `Retract the highlight: <reason>` the agent takes back the session's open highlight (`retract_highlight`), as
+  // it may while the user has put it off (#467): snoozing isn't seeing it.
+  if (/^retract the highlight:/i.test(prompt)) {
+    const reason = prompt.replace(/^retract the highlight:\s*/i, '').trim();
+    const open = [...highlights.values()].filter((h) => h.session_id === session.data.id && !h.seen_at && !h.retracted_at).at(-1);
+    const retractId = randomUUID();
+    tool({ toolCallId: retractId, title: 'mcp__sloppod__retract_highlight', kind: 'other', status: 'pending', rawInput: { id: open?.id, reason } });
+    await step(1);
+    if (open) {
+      open.retracted_at = now();
+      open.retraction_reason = reason;
+      broadcastHighlight(open);
+    }
+    update(retractId, {
+      status: open ? 'completed' : 'failed',
+      content: [{ type: 'content', content: { type: 'text', text: open ? "Retracted: it leaves the user's list." : 'no such highlight of yours' } }],
+    });
+    await say('Done.');
+    return;
+  }
   // With `Withdraw the question: <reason>` the agent asks a question, then takes it back (`withdraw_question`): it closes
   // without an answer, nothing is sent to the agent, and the chat says so.
   if (/^withdraw the question:/i.test(prompt)) {
@@ -1407,6 +1431,33 @@ function createHighlight(session, text) {
   return highlight;
 }
 
+/** Whether a highlight is put off until later (#467): open, with a time still ahead of it. */
+const isSnoozed = (highlight) =>
+  !highlight.seen_at && !highlight.retracted_at && Boolean(highlight.snoozed_until) && Date.parse(highlight.snoozed_until) > Date.now();
+
+/** Snoozing a highlight again pushes it further out: the timer set for its first time is replaced, not left to fire. */
+const wakeTimers = new Map();
+
+/** The user puts a highlight off until later (#467); nothing waits on them until its time, and the runtime brings it
+ * back then, pushing it as it does when the agent highlights something. */
+function snoozeHighlight(highlight, until) {
+  highlight.snoozed_until = until;
+  broadcastHighlight(highlight);
+  clearTimeout(wakeTimers.get(highlight.id));
+  const delay = Date.parse(until) - Date.now();
+  if (delay > 0) wakeTimers.set(highlight.id, setTimeout(() => wakeHighlight(highlight), delay));
+}
+
+/** Its time has passed: it's in the user's list again, as the runtime's periodic check brings it back. */
+function wakeHighlight(highlight) {
+  wakeTimers.delete(highlight.id);
+  if (highlight.seen_at || highlight.retracted_at) return;
+  // The runtime's check only clears what is due; a snooze pushed further out since is left alone.
+  if (!highlight.snoozed_until || Date.parse(highlight.snoozed_until) > Date.now()) return;
+  delete highlight.snoozed_until;
+  broadcastHighlight(highlight);
+}
+
 function broadcastHighlight(highlight) {
   const session = sessions.get(highlight.session_id);
   for (const conn of session?.subscribers ?? []) conn.notify('_sloppod/highlight', { highlight });
@@ -1675,6 +1726,7 @@ function handleCall(conn, message) {
       const start = Math.max(0, end - HISTORY_PAGE);
       conn.respond(id, {
         updates: session.log.slice(start, end).map((entry) => entry.update),
+        at: session.log.slice(start, end).map((entry) => entry._meta.sloppod.at),
         before: start > 0 ? start + 1 : null,
       });
       return;
@@ -1709,6 +1761,13 @@ function handleCall(conn, message) {
         failNextPrompt = false;
         conn.error(id, -32000, 'the runtime refused it');
         return;
+      }
+      // A model picked that needs the agent started again is moved onto first (#461).
+      if (session.data.pending_model) {
+        session.data.model = session.data.pending_model;
+        if (!session.data.model.startsWith('endpoint:')) session.model = session.data.model;
+        delete session.data.pending_model;
+        session.broadcast();
       }
       if (session.data.phase === 'parked') session.setPhase('starting');
       if (session.data.phase === 'starting' || session.data.phase === 'disconnected') {
@@ -1815,15 +1874,16 @@ function handleCall(conn, message) {
 
     case 'session/set_config_option': {
       if (!needLoaded()) return;
-      // To or from an endpoint's model, the runtime moves the session itself and starts its agent again (#461).
+      // To or from an endpoint's model, the runtime moves the session itself, at its next message (#461).
       const onEndpoint = (value) => typeof value === 'string' && value.startsWith('endpoint:');
       if (params.configId === 'model' && (onEndpoint(params.value) || onEndpoint(session.data.model))) {
         if (onEndpoint(params.value) && !endpointModels().some((model) => model.value === params.value)) {
           conn.error(id, -32602, 'that endpoint isn\'t one of yours any more');
           return;
         }
-        session.data.model = params.value;
-        if (!onEndpoint(params.value)) session.model = params.value;
+        // It applies at the next message; picking the current model again takes it back.
+        if (params.value === session.data.model) delete session.data.pending_model;
+        else session.data.pending_model = params.value;
         session.broadcast();
         conn.respond(id, {});
         return;
@@ -1900,7 +1960,7 @@ async function handleApi(req, res, url) {
   }
 
   if (parts[0] === 'settings' && parts.length === 1) {
-    if (method === 'GET') return json(res, 200, { ...settings, models: [...settings.models, ...endpointModels()] });
+    if (method === 'GET') return json(res, 200, { ...settings, models: [...settings.models, ...endpointModels()], agent_models: settings.models.length > 0 ? { 'claude-code': settings.models } : {} });
     if (method === 'PUT') {
       const body = await readBody(req);
       if ('model' in body) {
@@ -2023,6 +2083,15 @@ async function handleApi(req, res, url) {
       // The user's alone: no turn starts and the agent isn't told.
       highlight.seen_at ??= now();
       broadcastHighlight(highlight);
+      return json(res, 200, highlight);
+    }
+    if (parts.length === 5 && parts[2] === 'highlights' && parts[4] === 'snooze' && method === 'POST') {
+      const highlight = highlights.get(parts[3]);
+      if (!highlight || highlight.session_id !== session.data.id) return json(res, 404, { error: 'not found' });
+      const { until } = await readBody(req);
+      if (typeof until !== 'string' || Number.isNaN(Date.parse(until))) return json(res, 400, { error: 'until must be an RFC 3339 time' });
+      // Like seen: no turn starts and the agent isn't told; it stays the agent's to retract.
+      snoozeHighlight(highlight, until);
       return json(res, 200, highlight);
     }
     if (parts.length === 3 && parts[2] === 'debug-bundle' && method === 'GET') {
@@ -2760,7 +2829,8 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/_mock/update' && req.method === 'POST') {
       // Any session update, as the agent might send it, in every session: the body is the update.
       const update = await readBody(req);
-      for (const session of sessions.values()) session.emit(update);
+      // `?at=` says when it was recorded.
+      for (const session of sessions.values()) session.emit(update, url.searchParams.get('at') ?? undefined);
       return json(res, 200, {});
     }
     if (url.pathname === '/_mock/spawn' && req.method === 'POST') {

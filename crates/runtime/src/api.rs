@@ -47,6 +47,10 @@ pub fn routes() -> Router<AppState> {
             "/sessions/{id}/highlights/{highlight}/seen",
             post(mark_highlight_seen),
         )
+        .route(
+            "/sessions/{id}/highlights/{highlight}/snooze",
+            post(snooze_highlight),
+        )
         .route("/repos", get(repos))
         .route(
             "/credentials",
@@ -144,7 +148,7 @@ fn offered_models(agent_state: &serde_json::Value) -> Vec<serde_json::Value> {
 
 async fn settings(state: &AppState, user: &str) -> ApiResult<serde_json::Value> {
     let model = db::user_model(&state.db, user).await?;
-    let mut models = db::latest_agent_state(&state.db, user)
+    let mut models = db::latest_agent_state(&state.db, user, None)
         .await?
         .map(|s| offered_models(&s))
         .unwrap_or_default();
@@ -162,8 +166,15 @@ async fn settings(state: &AppState, user: &str) -> ApiResult<serde_json::Value> 
     let sub_session_model = db::user_sub_session_model(&state.db, user).await?;
     let instructions = db::user_instructions(&state.db, user).await?;
     let session_budget = db::user_session_budget(&state.db, user).await?;
+    // Each agent's own models, from a session of it: a session on an endpoint's model offers its agent's (#461).
+    let mut agent_models = serde_json::Map::new();
+    for agent in state.agents.names() {
+        if let Some(agent_state) = db::latest_agent_state(&state.db, user, Some(agent)).await? {
+            agent_models.insert(agent.to_owned(), offered_models(&agent_state).into());
+        }
+    }
     Ok(
-        json!({"model": model, "sub_session_model": sub_session_model, "models": models, "review": review, "timezone": timezone, "instructions": instructions, "session_budget": session_budget}),
+        json!({"model": model, "sub_session_model": sub_session_model, "models": models, "agent_models": agent_models, "review": review, "timezone": timezone, "instructions": instructions, "session_budget": session_budget}),
     )
 }
 
@@ -1029,6 +1040,34 @@ async fn mark_highlight_seen(
         .await?
         .ok_or_else(not_found)?;
     let row = db::mark_highlight_seen(&state.db, id, highlight)
+        .await?
+        .ok_or_else(not_found)?;
+    let highlight = row.to_api();
+    state.hub.broadcast_highlight(&highlight);
+    Ok(Json(highlight))
+}
+
+#[derive(Deserialize)]
+struct Snooze {
+    /// Until when, as an RFC 3339 time; the UI works out what its choices mean in the user's timezone.
+    until: String,
+}
+
+/// The user puts a highlight off until later (#467): it stops counting as waiting on them and comes back at its time.
+/// Like seen, no turn starts and the agent isn't told, and it stays the agent's to retract.
+async fn snooze_highlight(
+    State(state): State<AppState>,
+    User(user): User,
+    Path((id, highlight)): Path<(Uuid, Uuid)>,
+    Json(body): Json<Snooze>,
+) -> ApiResult<impl IntoResponse> {
+    db::owned_session(&state.db, id, &user)
+        .await?
+        .ok_or_else(not_found)?;
+    let until = chrono::DateTime::parse_from_rfc3339(&body.until)
+        .map_err(|_| bad_request("until must be an RFC 3339 time"))?
+        .with_timezone(&chrono::Utc);
+    let row = db::snooze_highlight(&state.db, id, highlight, until)
         .await?
         .ok_or_else(not_found)?;
     let highlight = row.to_api();

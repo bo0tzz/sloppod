@@ -196,6 +196,51 @@ fn endpoint_models(config: &serde_json::Map<String, Value>) -> Vec<String> {
     }
     models
 }
+/// The context windows an endpoint credential is given for its models, in tokens (#461): an object, or one string of
+/// `model=tokens` pairs separated by commas or whitespace, as a form sends them. Each names one of `models`.
+fn endpoint_context_windows(
+    config: &serde_json::Map<String, Value>,
+    models: &[String],
+) -> Result<serde_json::Map<String, Value>, String> {
+    let pairs: Vec<(String, Option<u64>)> = match config.get("context_windows") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Object(windows)) => windows
+            .iter()
+            .map(|(model, tokens)| (model.clone(), tokens.as_u64()))
+            .collect(),
+        Some(Value::String(windows)) => windows
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|pair| !pair.is_empty())
+            .map(|pair| match pair.rsplit_once('=') {
+                Some((model, tokens)) => (model.trim().to_owned(), tokens.trim().parse().ok()),
+                None => (pair.to_owned(), None),
+            })
+            .collect(),
+        Some(_) => {
+            return Err("context windows are model=tokens pairs, e.g. qwen3-coder=262144".into());
+        }
+    };
+    let mut windows = serde_json::Map::new();
+    for (model, tokens) in pairs {
+        if !models.contains(&model) {
+            return Err(format!(
+                "{model} has a context window but isn't one of the endpoint's models"
+            ));
+        }
+        match tokens {
+            Some(tokens) if tokens >= 1000 => {
+                windows.insert(model, tokens.into());
+            }
+            _ => {
+                return Err(format!(
+                    "{model}'s context window is a number of tokens (at least 1000), e.g. {model}=262144"
+                ));
+            }
+        }
+    }
+    Ok(windows)
+}
+
 /// The repository a `github-user` token reaches that's `wanted`, as GitHub names it: one it listed when it was added,
 /// or, when it listed more than were read, any well-formed name, which GitHub then decides on when it's used.
 pub fn token_reaches(row: &CredentialRow, wanted: &str) -> Option<String> {
@@ -368,7 +413,15 @@ impl Credentials {
                         "name at least one model the endpoint serves, e.g. qwen3-coder".into(),
                     )));
                 }
-                serde_json::json!({"url": url, "models": models})
+                match endpoint_context_windows(&new.config, &models) {
+                    Ok(windows) if windows.is_empty() => {
+                        serde_json::json!({"url": url, "models": models})
+                    }
+                    Ok(windows) => {
+                        serde_json::json!({"url": url, "models": models, "context_windows": windows})
+                    }
+                    Err(why) => return Ok(Err(Invalid(why))),
+                }
             }
             TOKEN => match config("header") {
                 "" => serde_json::json!({}),
@@ -1500,6 +1553,35 @@ mod tests {
             json!({"url": "http://litellm.ai.svc.cluster.local:4000", "models": ["qwen3-coder", "glm-5"]})
         );
         assert_eq!(credentials.reveal(&row).unwrap(), "sk-key");
+
+        // Context windows, optional, name its models with a number of tokens.
+        let with_windows = |windows: &str| {
+            let mut new = endpoint("http://litellm:4000", json!("deepseek-v4, glm-5"));
+            new.config.insert("context_windows".into(), json!(windows));
+            new
+        };
+        for (windows, why) in [
+            ("qwen3=131072", "isn't one of the endpoint's models"),
+            ("glm-5", "number of tokens"),
+            ("glm-5=lots", "number of tokens"),
+            ("glm-5=12", "at least 1000"),
+        ] {
+            let refused = credentials
+                .create("dev", with_windows(windows))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(refused.0.contains(why), "{windows}: {}", refused.0);
+        }
+        let row = credentials
+            .create("dev", with_windows("deepseek-v4=1000000"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.config["context_windows"],
+            json!({"deepseek-v4": 1000000})
+        );
     }
 
     #[sqlx::test]
