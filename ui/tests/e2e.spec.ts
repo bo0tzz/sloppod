@@ -4089,6 +4089,34 @@ test("adds a capability of one's own, grants it to a session, and deletes it", a
   await expect(section).toContainText('No capability of your own yet.');
 });
 
+test('an Add form comes into view, with its name focused, and Esc leaves it', async ({ page }) => {
+  // On a phone, a form that opens below the fold looks like the tap did nothing (#370).
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/settings');
+  const section = page.getByTestId('credentials-claude');
+  await section.getByRole('button', { name: 'Add Claude account' }).click();
+  const form = section.locator('form');
+  await expect(form).toBeInViewport();
+  await expect(form.getByRole('textbox', { name: 'Name' })).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(form).toHaveCount(0);
+  await expect(section.getByRole('button', { name: 'Add Claude account' })).toBeVisible();
+});
+
+test('Settings groups its sections, and the nav goes to each', async ({ page }) => {
+  await page.goto('/settings');
+  const nav = page.getByTestId('settings-nav');
+  await expect(page.getByTestId('settings-group-defaults')).toContainText('Defaults for new sessions');
+  await nav.getByRole('button', { name: 'Credentials' }).click();
+  await expect(page.getByTestId('credentials-claude')).toBeInViewport();
+  await nav.getByRole('button', { name: 'Capabilities' }).click();
+  await expect(page.getByTestId('capabilities')).toBeInViewport();
+  await nav.getByRole('button', { name: 'Sessions' }).click();
+  await expect(page.getByTestId('storage')).toBeInViewport();
+  await nav.getByRole('button', { name: 'Defaults' }).click();
+  await expect(page.getByTestId('timezone-setting')).toBeInViewport();
+});
+
 test('a token for a capability is added in settings and chosen for the capability', async ({ page }) => {
   await page.goto('/settings');
   const tokens = page.getByTestId('credentials-token');
@@ -4813,16 +4841,24 @@ test('a session at its usage limit says when it carries on', async ({ page }) =>
 });
 
 /**
- * Picks a timezone in Settings. The list holds every zone a browser knows, so it scrolls, and until the user scrolls it
- * the list keeps realigning to the selected zone as its scroll buttons come and go — which moves the option under the
- * pointer and makes a click land on another one (#492). Scrolling it first, as a user would, settles it.
+ * Picks a timezone in Settings, without saving it. The list holds every zone a browser knows, so it scrolls, and until
+ * the user scrolls it the list keeps realigning to the selected zone as its scroll buttons come and go — which moves
+ * the option under the pointer and makes a click land on another one (#492). Scrolling it first, as a user would,
+ * settles it.
  */
-async function chooseTimezone(page: Page, zone: string) {
+async function pickTimezone(page: Page, zone: string) {
   const setting = page.getByTestId('timezone-setting').getByRole('combobox', { name: 'Timezone' });
   await setting.click();
   await page.getByRole('listbox').hover();
   await page.mouse.wheel(0, -20_000);
   await page.getByRole('option', { name: zone, exact: true }).click();
+  return setting;
+}
+
+/** Picks a timezone and saves it, as Settings asks: its sections save with a button (#370). */
+async function setTimezone(page: Page, zone: string) {
+  const setting = await pickTimezone(page, zone);
+  await page.getByTestId('timezone-setting').getByRole('button', { name: 'Save' }).click();
   return setting;
 }
 
@@ -4836,8 +4872,12 @@ test.describe('in Amsterdam', () => {
     await expect(setting).toContainText('Europe/Amsterdam');
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Europe/Amsterdam');
 
-    await chooseTimezone(page, 'Asia/Tokyo');
+    // Picking one isn't saving it: this section saves with a button, like the others here (#370).
+    await pickTimezone(page, 'Asia/Tokyo');
     await expect(setting).toContainText('Asia/Tokyo');
+    await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Europe/Amsterdam');
+
+    await page.getByTestId('timezone-setting').getByRole('button', { name: 'Save' }).click();
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Asia/Tokyo');
 
     // Once set, it's kept, whatever the browser's.
@@ -4856,9 +4896,9 @@ test.describe('in UTC', () => {
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('UTC');
     await expect(setting).toContainText('UTC');
 
-    await chooseTimezone(page, 'Asia/Tokyo');
+    await setTimezone(page, 'Asia/Tokyo');
     await expect(setting).toContainText('Asia/Tokyo');
-    await chooseTimezone(page, 'UTC');
+    await setTimezone(page, 'UTC');
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('UTC');
   });
 
@@ -4875,7 +4915,7 @@ test.describe('in UTC', () => {
     // Another timezone in Settings, and back to the session without a reload.
     await page.getByRole('link', { name: 'Settings' }).first().click();
     const setting = page.getByTestId('timezone-setting').getByRole('combobox', { name: 'Timezone' });
-    await chooseTimezone(page, 'Asia/Tokyo');
+    await setTimezone(page, 'Asia/Tokyo');
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Asia/Tokyo');
     await page.getByRole('navigation', { name: 'Sessions' }).getByRole('link', { name: /Put the deploy check off/ }).click();
 
