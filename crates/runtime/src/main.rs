@@ -10,6 +10,8 @@ mod db;
 mod db_tests;
 mod debug_bundle;
 mod definitions;
+#[cfg(test)]
+mod elicitation_tests;
 mod endpoint;
 mod enforcer;
 mod github;

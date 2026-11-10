@@ -43,12 +43,14 @@ export type PendingQuestion = ElicitationRequest & {
 let unidentified = 0;
 
 /**
- * What tells a question apart, across reconnects too: an `ask_user` question's own id, or the agent's tool call. A
- * question with neither gets a key of its own for this page, never matched with another; request ids can't serve,
- * since every connection numbers them from 1.
+ * What tells a question apart, across reconnects too: the id sloppod gives it — an `ask_user` question's, or a tool's
+ * question's own (`cardId`, which is sloppod's because a server's `elicitationId` isn't unique: two servers can choose
+ * the same one) — then the agent's tool call. A question with none gets a key of its own for this page, never matched
+ * with another; request ids can't serve, since every connection numbers them from 1.
  */
 export function questionKey(question: ElicitationRequest): { key: string; stable: boolean } {
-  const stable = question._meta?.sloppod?.questionId ?? question.toolCallId;
+  const stable =
+    question._meta?.sloppod?.questionId ?? question._meta?.sloppod?.cardId ?? question.elicitationId ?? question.toolCallId;
   return stable ? { key: stable, stable: true } : { key: `unidentified:${++unidentified}`, stable: false };
 }
 
@@ -469,7 +471,12 @@ export class SessionView {
     if (method === 'elicitation/create') {
       const request = params as ElicitationRequest;
       if (request.sessionId === this.id) {
-        if (request.mode !== 'form') {
+        // A URL elicitation the agent couldn't represent at all: asked to open nothing.
+        if (request.mode === 'url' && !request.url) {
+          app.respondError(rpcId, -32602, 'A URL elicitation without a URL');
+          return;
+        }
+        if (request.mode !== 'form' && request.mode !== 'url') {
           app.respondError(rpcId, -32602, `Unsupported elicitation mode: ${request.mode}`);
           return;
         }
