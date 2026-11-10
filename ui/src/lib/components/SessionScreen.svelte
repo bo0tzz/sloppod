@@ -251,6 +251,8 @@
       atBottom = false;
     }
     if (!resized) settle();
+    // The reader has taken the view where they want it: nothing to hold them to any more (#93).
+    if (pointerHeld || performance.now() - lastUserScroll < 1000) kept = null;
     // Recorded as it happens: by the time this view is taken down its rows are gone, and switching back shows the chat
     // where the reader had it (#93).
     view.place = readerPlace();
@@ -275,6 +277,18 @@
   function endOf(row: HTMLElement) {
     return content ? row.getBoundingClientRect().bottom - content.getBoundingClientRect().top : 0;
   }
+
+  /**
+   * Where the reader is being kept while they are back in a session the UI had (#93). The load that catches it up
+   * replaces the transcript when it lands, which moves what they are looking at, so their place is put back over the
+   * frames after that too — and dropped the moment they scroll themselves.
+   */
+  let kept: ReaderPlace | null = null;
+  $effect(() => {
+    const transcript = view.transcript;
+    if (!kept || !positioned || !transcript) return;
+    void restorePlace(kept);
+  });
 
   /** The row a view is at the top of: the first whose bottom is below the top of the view. */
   function topRow() {
@@ -556,6 +570,7 @@
     if (place) {
       view.place = null;
       atBottom = place.atBottom;
+      kept = place;
       void tick().then(() => restorePlace(place));
       return;
     }
@@ -595,6 +610,11 @@
       else if (atBottom && !holdingPlace) scrollToBottom();
       settle();
       scheduleRead();
+      // Rows settling move what the reader is looking at, so where they are is read again here: what was recorded as
+      // they scrolled can be a layout behind (#93, #446).
+      view.place = readerPlace();
+      // And a session being shown again, and the load catching it up, move it too: their place is put back as it does.
+      if (kept) void restorePlace(kept);
       // A page shorter than the room above it leaves the reader near the top still: the next one is due as well.
       loadEarlierIfNear();
     });

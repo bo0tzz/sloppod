@@ -252,7 +252,9 @@ export class SessionView {
     // A load still on its way ends with the close instead, or it would install what the close removed. Meanwhile
     // the barrier is up, so a view that comes back to the session waits for both.
     if (this.#loading) {
-      reserve(this.id, new Promise<void>((resolve) => (this.#lifted = resolve)));
+      // One reservation per load, not one per stop: leaving the session again while the same load is still on its way
+      // mustn't replace the promise the earlier waiters hold, or the first of them waits forever (#93).
+      if (!this.#lifted) reserve(this.id, new Promise<void>((resolve) => (this.#lifted = resolve)));
     } else if (this.loaded) {
       void this.#close();
     }
@@ -329,9 +331,23 @@ export class SessionView {
         await this.#close();
         return;
       }
-      this.transcript = this.#replay;
-      this.#updates = this.#replayUpdates;
-      this.historyBefore = (response?._meta?.sloppod as { historyBefore?: number | null } | undefined)?.historyBefore ?? null;
+      const before = (response?._meta?.sloppod as { historyBefore?: number | null } | undefined)?.historyBefore ?? null;
+      const replay = this.#replayUpdates;
+      // A session this view already had is caught up rather than started over (#93): the replay is the latest page, so
+      // what it doesn't cover goes in front of it — the older pages the reader read into (which carry no seqs of their
+      // own) and the part of its last page that has since fallen off the end. Its own boundary is still the one to ask
+      // for the page before, since the log only grows.
+      const catchingUp = this.#updates.length > 0;
+      const kept = catchingUp
+        ? this.#updates.filter((u) => u.seq === 0 || (before !== null && u.seq < before))
+        : [];
+      const updates = [...kept, ...replay];
+      // Nothing kept is the usual case: the replay is the transcript, as it was built.
+      const transcript = kept.length === 0 ? this.#replay! : new Transcript();
+      if (kept.length > 0) for (const { update, seq, at } of updates) transcript.apply(update, seq, at);
+      this.transcript = transcript;
+      this.#updates = updates;
+      if (!catchingUp) this.historyBefore = before;
       this.historyError = null;
       this.configOptions = response?.configOptions ?? [];
     } finally {

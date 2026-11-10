@@ -1351,20 +1351,7 @@ test('follows new output while the reader is at the bottom, across a reconnect',
   // This session is longer than one page, and up here the page before comes in by itself; what it puts above the reader
   // moves the scroll for a few frames as it settles, so both are waited for before what's measured below.
   await expect(page.getByTestId('history-start')).toBeVisible();
-  const kept = await scroller.evaluate(
-    (element) =>
-      new Promise<number>((resolve) => {
-        let last = element.scrollTop;
-        let still = 0;
-        const frame = () => {
-          still = element.scrollTop === last ? still + 1 : 0;
-          last = element.scrollTop;
-          if (still >= 6) return resolve(last);
-          requestAnimationFrame(frame);
-        };
-        requestAnimationFrame(frame);
-      }),
-  );
+  const kept = await settledScroll(page);
   await page.request.post('/_mock/say?text=One%20more%20thing.');
   await expect(page.getByText('One more thing.')).toBeAttached();
   expect(await scrollTop()).toBe(kept);
@@ -1830,6 +1817,31 @@ async function wheelBy(page: Page, by: number) {
 /** Reads up to the top of the chat. */
 const wheelUp = (page: Page) => wheelBy(page, -100_000);
 
+/**
+ * The chat's scroll position once it has stopped moving: a page landing above the reader, rows settling as they come
+ * near (#446), or a session being shown again all move it for a few frames (#485, #93).
+ */
+async function settledScroll(page: Page) {
+  const scroller = page.getByTestId('transcript-scroller');
+  return scroller.evaluate(
+    (element) =>
+      new Promise<number>((resolve) => {
+        let last = element.scrollTop;
+        let height = element.scrollHeight;
+        let still = 0;
+        const frame = () => {
+          const same = element.scrollTop === last && element.scrollHeight === height;
+          still = same ? still + 1 : 0;
+          last = element.scrollTop;
+          height = element.scrollHeight;
+          if (still >= 6) return resolve(last);
+          requestAnimationFrame(frame);
+        };
+        requestAnimationFrame(frame);
+      }),
+  );
+}
+
 test('reading up brings in the earlier history by itself, with no click', { tag: '@scroll' }, async ({ page }) => {
   const prompt = await openLongHistory(page);
   await expect(page.getByRole('button', { name: 'Load earlier messages' })).toHaveCount(0);
@@ -2072,6 +2084,47 @@ test('switching back catches up with what came in meanwhile', { tag: '@scroll' }
   await page.request.post('/_mock/say?text=Meanwhile%20in%20the%20first.');
   await open(long).click();
   await expect(page.getByText('Meanwhile in the first.')).toBeVisible();
+});
+
+test('switching back keeps the reader’s place in history they had read into', { tag: '@scroll' }, async ({ page }) => {
+  const { long, backoff, open } = await twoSessionsOpen(page);
+  await open(long).click();
+  await expect(page.getByText('The end.')).toBeVisible();
+  // The read position is reported a moment after the reader reads, and where the Unread bar goes follows it: waited for
+  // here so that the bar is in the same place either side of the switch, and what's measured is the reader's place.
+  await readPosition(page, long);
+
+  // Read up into the page before the one it opened with (#485), where the reader leaves off: the row at the top of the
+  // view is one of that older page's.
+  await wheelUp(page);
+  await expect(userMessages(page).filter({ hasText: 'long answer' })).toHaveCount(1);
+  // The page landing above moves the scroll as it settles, so where the reader is is read once it has.
+  await settledScroll(page);
+  const shown = page.locator('[data-testid="transcript"] [data-row-names]').first();
+  /** How far below the top of the chat the row sits: where the reader is, whatever the page around it does. */
+  const held = () =>
+    shown.evaluate((element) =>
+      Math.round(element.getBoundingClientRect().top - element.closest('[data-testid="transcript-scroller"]')!.getBoundingClientRect().top),
+    );
+  const left = await held();
+
+  await open(backoff).click();
+  await expect(page.getByText(/Done\. The tests pass/)).toBeVisible();
+  // Something for the catch-up to bring, and a load slow enough to look at the place before it lands.
+  await page.request.post('/_mock/say?text=After%20the%20switch.');
+  await page.request.post('/_mock/slow-loads?for=1500');
+  await open(long).click();
+  // Before it lands: the same row, from what the UI had.
+  await expect(shown).toBeVisible({ timeout: 800 });
+  // Within the height of what sits above the top row — the "Start of the session" marker and the Unread bar — whose
+  // presence differs between being read and being read again. The place held is the reader's row, not the chrome.
+  expect(Math.abs((await held()) - left)).toBeLessThan(60);
+  // And once it has: the row is still there, in the same place, with what came in meanwhile under it — and the older
+  // page it belongs to hasn't been dropped by the load.
+  await expect(page.getByText('After the switch.')).toBeVisible();
+  await expect(userMessages(page).filter({ hasText: 'long answer' })).toHaveCount(1);
+  await expect.poll(async () => Math.abs((await held()) - left)).toBeLessThan(60);
+  await page.request.post('/_mock/slow-loads?for=0');
 });
 
 test('switching back keeps the reader’s place', { tag: '@scroll' }, async ({ page }) => {
@@ -4290,6 +4343,36 @@ test('a session left and entered again while its load is on its way is loaded on
   await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
   expect(methods().slice(before)).toEqual(['session/load', 'session/close', 'session/load']);
   // And the session is live on the socket: a message runs a turn.
+  const box = page.getByRole('textbox', { name: 'Prompt' });
+  await box.fill('And once more, back again');
+  await box.press('Enter');
+  await expect(permissionCard(page)).toBeVisible();
+});
+
+test('a session left and entered again over and over while its load is slow catches up afterwards', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  const first = 'Say something, left and returned to while loading';
+  const other = 'Say something, alongside the slow one';
+  await createSession(page, first);
+  await finishTurn(page);
+  await createSession(page, other);
+  await finishTurn(page);
+  const nav = page.getByRole('navigation', { name: 'Sessions' });
+  const row = (prompt: string) => nav.getByTestId('session-row').filter({ hasText: prompt });
+
+  // In and out of the first session several times while its load is on its way: each stop is one the load's barrier has
+  // to answer, and each entry after the first shows the chat the UI kept (#93).
+  await page.request.post('/_mock/slow-loads?for=3000');
+  for (let round = 0; round < 3; round++) {
+    await row(first).click();
+    await row(other).click();
+  }
+  await page.request.post('/_mock/slow-loads?for=0');
+
+  // Going back in loads it: nothing is left waiting on a barrier that never comes down.
+  await row(first).click();
+  await expect(agentMessages(page).filter({ hasText: FINAL })).toBeVisible({ timeout: 20_000 });
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
   const box = page.getByRole('textbox', { name: 'Prompt' });
   await box.fill('And once more, back again');
   await box.press('Enter');
