@@ -904,6 +904,15 @@ test('files issues, leaving one out and editing another', async ({ page }) => {
   ]);
 });
 
+test('the sidebar does not scroll sideways', async ({ page }) => {
+  await createSession(page, 'Just chat for now');
+  const sidebar = page.getByTestId('sidebar');
+  // The nav fills the sidebar's content box, so there's nothing to scroll sideways (#292).
+  await expect
+    .poll(async () => sidebar.evaluate((nav) => nav.parentElement!.scrollWidth <= nav.parentElement!.clientWidth))
+    .toBe(true);
+});
+
 test('the right sidebar stays up beside the chat, and folds away', async ({ page }) => {
   await page.setViewportSize({ width: 1920, height: 1000 });
   const id = await createSession(page, 'Give me a long answer in sloppod');
@@ -2450,6 +2459,8 @@ test('the new-session page suggests a starting set, and sends the one the user e
   await expect(title).toHaveValue('Fix the build in bo0tzz/sloppod');
   await expect(card.getByTestId('starting-repo').getByRole('combobox', { name: 'Repository' })).toHaveValue('bo0tzz/sloppod');
   await expect(card.getByTestId('starting-source')).toHaveText('Matched from your message');
+  // The rows' own "Repository" labels say what they are: no "Repositories" heading above them (#292).
+  await expect(card.getByText('Repositories', { exact: true })).toHaveCount(0);
 
   // What the user changes stays, whatever a later suggestion says; the rest follows it.
   await title.fill('Mend the build');
@@ -3960,6 +3971,8 @@ test('grants, narrows, times and revokes the grants of a running session', async
   await expect(codex).not.toContainText("Doesn't run out");
 
   const repo = grants.getByTestId('grant-repo');
+  // The description is Markdown: the branch shows as code, not as backticks (#292).
+  await expect(repo.locator('code').first()).toContainText('sloppod/');
   await repo.getByRole('button', { name: 'Make read only' }).click();
   await expect(repo).toContainText('bo0tzz/sloppod: read only.');
   await expect(repo.getByRole('button', { name: 'Make read only' })).toHaveCount(0);

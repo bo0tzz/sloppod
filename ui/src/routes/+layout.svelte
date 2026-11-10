@@ -51,7 +51,7 @@
     {#if showSidebar}
       <AppShellSidebar open={sidebar.open} class="md:absolute lg:relative">
         <nav
-          class="flex h-full w-64 flex-col"
+          class="flex h-full w-full flex-col"
           aria-label="Sessions"
           aria-hidden={!sidebar.open}
           inert={!sidebar.open}

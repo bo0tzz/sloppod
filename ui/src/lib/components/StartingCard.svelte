@@ -85,7 +85,6 @@
   </Field>
 
   <div class="flex flex-col gap-2" data-testid="starting-repos">
-    <Text size="small" class="font-medium">Repositories</Text>
     {#each rows as row (row.id)}
       {@const token = tokenOf(row)}
       <div class="flex flex-wrap items-end gap-2" data-testid="starting-repo">
