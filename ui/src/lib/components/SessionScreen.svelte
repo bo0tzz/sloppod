@@ -244,28 +244,6 @@
 
   /** Fetches the page before while the reader is reading up into it, as any chat does; never on opening at the top. */
   function loadEarlierIfNear() {
-    if (scroller && positioned && userScrolled && scroller.scrollTop <= EARLIER_WITHIN_SCREENS * scroller.clientHeight) {
-      // TEMP diagnostics: what the guards see when the reader is up near the top.
-      console.log(
-        'DBG-history',
-        JSON.stringify({
-          top: Math.round(scroller.scrollTop),
-          client: scroller.clientHeight,
-          height: Math.round(scroller.scrollHeight),
-          content: Math.round(content?.getBoundingClientRect().height ?? 0),
-          rows: rowElements().length,
-          firstRow: Math.round(rowElements()[0]?.getBoundingClientRect().height ?? 0),
-          positioned,
-          scrolled: userScrolled,
-          asked: askedEarlier,
-          atBottom,
-          loading: view.loadingHistory,
-          err: view.historyError,
-          before: view.historyBefore,
-          cv: typeof CSS !== 'undefined' && CSS.supports('content-visibility', 'auto'),
-        }),
-      );
-    }
     if (!scroller || !positioned || !userScrolled) return;
     // Being at the bottom says nothing when the page fits the view and there is nowhere below to be: what the reader
     // asked for above them is what is fetched, and being able to see the bottom doesn't make that not so.

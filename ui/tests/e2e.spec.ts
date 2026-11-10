@@ -1334,7 +1334,6 @@ test('queues messages while the agent starts', async ({ page }) => {
 });
 
 test('follows new output while the reader is at the bottom, across a reconnect', { tag: '@scroll' }, async ({ page }) => {
-  showChatLog(page);
   await page.setViewportSize({ width: 1000, height: 500 });
   await createSession(page, 'Give me a long answer in sloppod');
   const end = page.getByText('The end.');
@@ -1351,7 +1350,6 @@ test('follows new output while the reader is at the bottom, across a reconnect',
   await expect(end).not.toBeInViewport();
   // This session is longer than one page, and up here the page before comes in by itself; what it puts above the reader
   // moves the scroll for a few frames as it settles, so both are waited for before what's measured below.
-  console.log('DBG-scroll', await scrollTop(), await scroller.evaluate((element) => `${element.scrollHeight}/${element.clientHeight}`));
   await expect(page.getByTestId('history-start')).toBeVisible();
   const kept = await scroller.evaluate(
     (element) =>
@@ -1804,16 +1802,8 @@ test('sending a message scrolls the chat to it, and so does scrolling the sessio
   await expect(userMessages(page).filter({ hasText: message })).toBeInViewport();
 });
 
-/** TEMP: prints the chat's own diagnostics, which a browser console doesn't put in the test's output. */
-function showChatLog(page: Page) {
-  page.on('console', (message) => {
-    if (message.text().startsWith('DBG-history')) console.log(message.text());
-  });
-}
-
 /** Opens a session whose log is longer than one page of history: the latest in the transcript, the rest below it. */
 async function openLongHistory(page: Page) {
-  showChatLog(page);
   await page.setViewportSize({ width: 1000, height: 500 });
   const prompt = 'Write a long history in sloppod';
   await createSession(page, prompt);
@@ -1913,7 +1903,6 @@ test('the reader’s place holds when the row they are at is written to as the p
  * nothing to scroll. The turn is waited out first, so that what opens is the whole log's latest page.
  */
 async function openUnscrollablePage(page: Page) {
-  showChatLog(page);
   await page.setViewportSize({ width: 1000, height: 800 });
   const prompt = 'Write a short log with many tool updates in sloppod';
   await createSession(page, prompt);
