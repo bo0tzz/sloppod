@@ -1027,6 +1027,42 @@ test('replays the history once after a page reload', async ({ page }) => {
   await expect(page.getByTestId('proposal-card')).toHaveCount(1);
 });
 
+/** The chat as it reads, message for message, for comparing what one load's transcript shows with another's. */
+async function chatText(page: Page) {
+  return {
+    user: await userMessages(page).allTextContents(),
+    agent: await agentMessages(page).allTextContents(),
+    tools: await toolCallsInTranscript(page),
+  };
+}
+
+test('a reconnect is sent only what it missed', { tag: '@scroll' }, async ({ page }) => {
+  const prompt = 'Reconnect me in sloppod';
+  await createSession(page, prompt);
+  await finishTurn(page);
+  await expectTranscriptOnce(page, prompt);
+  // Where this view's own copy ends, which the load after the drop says it has (#449).
+  const at = Number(await page.locator('[data-testid="transcript"] [data-seq]').last().getAttribute('data-seq'));
+
+  await page.request.delete('/_mock/loads');
+  await page.request.post('/_mock/drop?for=3000');
+  await expect(page.getByTestId('reconnecting')).toBeVisible();
+  // Output while it is away: this is what the reconnect is for, and all it should bring.
+  await page.request.post('/_mock/say?text=While%20you%20were%20away.&count=3');
+  await expect(page.getByTestId('reconnecting')).toBeHidden({ timeout: 15_000 });
+  await expect(page.getByText('While you were away. 2')).toBeVisible();
+
+  const loads = await (await page.request.get('/_mock/loads')).json();
+  expect(loads.at(-1)).toMatchObject({ resumed: true, updates: 3, after: at });
+
+  // And what it shows is what a full load of the session shows, message for message — where a UI that joined the
+  // updates wrongly would come apart.
+  const shown = await chatText(page);
+  await page.reload();
+  await expect(page.getByText('While you were away. 2')).toBeVisible();
+  expect(await chatText(page)).toEqual(shown);
+});
+
 test('reconnects after the socket drops without duplicating history', async ({ page }) => {
   const prompt = 'Reconnect me in sloppod';
   await createSession(page, prompt);
@@ -2108,9 +2144,13 @@ test('switching back catches up with what came in meanwhile', { tag: '@scroll' }
   const { long, open } = await twoSessionsOpen(page);
   // In the other session, the first one's agent carries on: its view isn't following, so it misses this, and the load
   // that follows the switch is what brings it.
+  await page.request.delete('/_mock/loads');
   await page.request.post('/_mock/say?text=Meanwhile%20in%20the%20first.');
   await open(long).click();
   await expect(page.getByText('Meanwhile in the first.')).toBeVisible();
+  // The view still had the session, so the load was sent only what came in meanwhile, not the page again (#449).
+  const loads = await (await page.request.get('/_mock/loads')).json();
+  expect(loads.at(-1)).toMatchObject({ session: long, resumed: true, updates: 1 });
 });
 
 test('switching back keeps the reader’s place in history they had read into', { tag: '@scroll' }, async ({ page }) => {

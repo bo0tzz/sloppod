@@ -1058,6 +1058,40 @@ pub async fn events_before(
         .collect())
 }
 
+/// Whether the session's log still holds the event with this sequence number: what a `session/load` resuming from a
+/// UI's own place asks, since events below it may have been dropped (#449).
+pub async fn has_event(db: &PgPool, id: Uuid, seq: i64) -> sqlx::Result<bool> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "select seq from session_events where session_id = $1 and seq = $2",
+    )
+    .bind(id)
+    .bind(seq)
+    .fetch_optional(db)
+    .await?
+    .is_some())
+}
+
+/// Up to `limit` of the session's events after `after` and before `before`, oldest first, each with when it was
+/// recorded.
+pub async fn events_after(
+    db: &PgPool,
+    id: Uuid,
+    after: i64,
+    before: i64,
+    limit: i64,
+) -> sqlx::Result<Vec<(i64, DateTime<Utc>, Value)>> {
+    sqlx::query_as(
+        "select seq, created_at, payload from session_events where session_id = $1 and seq > $2 and seq < $3 \
+         order by seq limit $4",
+    )
+    .bind(id)
+    .bind(after)
+    .bind(before)
+    .bind(limit)
+    .fetch_all(db)
+    .await
+}
+
 /// Appends to a transcript if the stored copy is exactly `offset` bytes long; returns whether it was.
 pub async fn append_transcript(
     db: &PgPool,
