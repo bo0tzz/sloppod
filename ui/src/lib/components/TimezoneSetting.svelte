@@ -1,33 +1,42 @@
 <script lang="ts">
-  import { Alert, Field, Heading, LoadingSpinner, Select, Text, toastManager } from '@immich/ui';
+  import { Alert, Button, Field, Heading, LoadingSpinner, Select, Text, toastManager } from '@immich/ui';
   import { onMount } from 'svelte';
   import { api } from '#lib/api.ts';
   import { browserTimezone, timezones } from '#lib/timezone.ts';
   import { userTimezone } from '#lib/user-timezone.svelte.ts';
 
+  /** What the runtime has, and what's chosen but not saved yet: like the other settings, it's saved by its button. */
   let timezone = $state<string | null>(null);
+  let chosen = $state<string | null>(null);
+  let saving = $state(false);
   let loadError = $state<string | null>(null);
 
   const options = $derived(timezones(timezone).map((zone) => ({ value: zone, label: zone.replaceAll('_', ' ') })));
+  const changed = $derived(chosen !== null && chosen !== timezone);
 
   onMount(async () => {
     try {
-      timezone = (await api.getSettings()).timezone ?? browserTimezone();
+      timezone = chosen = (await api.getSettings()).timezone ?? browserTimezone();
     } catch (e) {
       loadError = e instanceof Error ? e.message : String(e);
     }
   });
 
-  async function choose(zone: string) {
-    const before = timezone;
-    timezone = zone;
+  async function save(event: SubmitEvent) {
+    event.preventDefault();
+    const submitted = chosen;
+    if (!changed || saving || submitted === null) return;
+    saving = true;
     try {
-      timezone = (await api.updateSettings({ timezone: zone })).timezone;
+      timezone = (await api.updateSettings({ timezone: submitted })).timezone;
+      // A zone picked while this saved stays picked, to be saved next.
+      if (chosen === submitted) chosen = timezone;
       userTimezone.value = timezone;
-      toastManager.success(`Your timezone is ${zone}`);
+      toastManager.success(`Your timezone is ${timezone}`);
     } catch (e) {
-      timezone = before;
       toastManager.danger({ title: "Couldn't save", description: e instanceof Error ? e.message : String(e) });
+    } finally {
+      saving = false;
     }
   }
 </script>
@@ -44,10 +53,15 @@
   {:else if timezone === null}
     <div class="flex py-4"><LoadingSpinner /></div>
   {:else}
-    <div class="max-w-sm">
-      <Field label="Timezone">
-        <Select {options} value={timezone} onChange={(value) => void choose(value)} />
-      </Field>
-    </div>
+    <form class="flex flex-col gap-3" onsubmit={save}>
+      <div class="max-w-sm">
+        <Field label="Timezone">
+          <Select {options} value={chosen ?? timezone} onChange={(value) => (chosen = value)} />
+        </Field>
+      </div>
+      <div>
+        <Button type="submit" shape="round" loading={saving} disabled={!changed}>Save</Button>
+      </div>
+    </form>
   {/if}
 </section>

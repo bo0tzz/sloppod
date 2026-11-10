@@ -2035,6 +2035,11 @@ async function handleApi(req, res, url) {
     if (method === 'GET') return json(res, 200, { ...settings, models: [...settings.models, ...endpointModels()], agent_models: settings.models.length > 0 ? { 'claude-code': settings.models } : {} });
     if (method === 'PUT') {
       const body = await readBody(req);
+      // A settings change the mock was asked to make slow, once (#370).
+      if (settingsDelay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, settingsDelay));
+        settingsDelay = 0;
+      }
       if ('model' in body) {
         if (body.model !== null && typeof body.model !== 'string') return json(res, 400, { error: 'model must be a string or null' });
         settings.model = body.model || null;
@@ -2847,6 +2852,11 @@ const server = http.createServer(async (req, res) => {
       proposalDetailDelay = Number(url.searchParams.get('ms') ?? 0);
       return json(res, 200, {});
     }
+    if (url.pathname === '/_mock/slow-settings' && req.method === 'POST') {
+      // The next settings change waits `?ms=`, as a slow runtime does, so a UI can be seen mid-save (#370).
+      settingsDelay = Number(url.searchParams.get('ms') ?? 0);
+      return json(res, 200, {});
+    }
     if (url.pathname === '/_mock/models' && req.method === 'POST') {
       // `?offered=0` forgets the models the agent offered, as before a user's first session; otherwise they're back.
       if (url.searchParams.get('offered') === '0') settings.models = [];
@@ -3044,6 +3054,8 @@ let refuseConnectionsUntil = 0;
 let slowSessionsUntil = 0;
 /** Set by `/_mock/slow-proposals?ms=<ms>`: how long reading a proposal's detail takes, as a slow GitHub's diff does. */
 let proposalDetailDelay = 0;
+/** Set by `/_mock/slow-settings?ms=<ms>`: how long one settings change takes, as a slow runtime's does (#370). */
+let settingsDelay = 0;
 let slowLoadsUntil = 0;
 let failLoadsUntil = 0;
 /** Every `session/load`, oldest first: what it resumed from and how much it replayed (#449). */

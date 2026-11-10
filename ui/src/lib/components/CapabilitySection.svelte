@@ -2,6 +2,7 @@
   import { Alert, Button, Field, Heading, IconButton, Input, Select, Text, modalManager, toastManager } from '@immich/ui';
   import { mdiPlus, mdiTrashCanOutline } from '@mdi/js';
   import { api, type Credential, type Definition } from '#lib/api.ts';
+  import { opensForAdding } from '#lib/forms.ts';
 
   /** The user's `token` credentials, which a definition can attach to its requests; `version` changes when they do, which
    * can detach one from a definition (deleting a token does). */
@@ -130,7 +131,7 @@
   {/if}
 
   {#if adding}
-    <form class="border-light-200 bg-light-50 flex flex-col gap-3 rounded-2xl border p-4" onsubmit={save}>
+    <form use:opensForAdding={reset} class="border-light-200 bg-light-50 flex flex-col gap-3 rounded-2xl border p-4" onsubmit={save}>
       <Heading tag="h3" size="tiny">New capability</Heading>
       <Field
         label="Name"
