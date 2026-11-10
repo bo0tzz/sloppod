@@ -417,4 +417,47 @@ mod tests {
             serde_json::from_value(json!({"metadata": {"name": "data-postgres-0"}})).unwrap();
         assert_eq!(volume_of(&other).unwrap().session_id, None);
     }
+
+    /// What a session is placed as: its claim asks for the clone when it starts as a copy of another session's
+    /// volume, and for nothing else otherwise (#478).
+    #[test]
+    fn a_copied_workspace_clones_the_claim_it_starts_from() {
+        let spec = |clone_from: Option<&str>| PlacementSpec {
+            session_id: "0194f0a2-0000-7000-8000-000000000000".into(),
+            image: "session:1".into(),
+            labels: Default::default(),
+            env: Vec::new(),
+            cpu: None,
+            memory: None,
+            storage_size: "30Gi".into(),
+            storage_class: Some("standard".into()),
+            clone_from: clone_from.map(str::to_owned),
+        };
+        let claim = |spec: &PlacementSpec| {
+            sandbox(spec, "session", "IfNotPresent")["spec"]["volumeClaimTemplates"][0]["spec"]
+                .clone()
+        };
+        let copied = claim(&spec(Some("0194f0a2-0000-7000-8000-0000000000aa")));
+        assert_eq!(
+            copied["dataSource"],
+            json!({
+                "kind": "PersistentVolumeClaim",
+                "name": "workdir-sloppod-0194f0a2-0000-7000-8000-0000000000aa",
+            })
+        );
+        assert_eq!(copied["resources"]["requests"]["storage"], json!("30Gi"));
+        assert_eq!(copied["storageClassName"], json!("standard"));
+
+        // A workspace of its own copies nothing, and asks for no storage class when none is configured.
+        let fresh = claim(&spec(None));
+        assert_eq!(fresh.get("dataSource"), None);
+        assert_eq!(
+            claim(&PlacementSpec {
+                storage_class: None,
+                ..spec(None)
+            })
+            .get("storageClassName"),
+            None
+        );
+    }
 }

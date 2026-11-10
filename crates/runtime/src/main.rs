@@ -346,6 +346,8 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 every.tick().await;
                 lifecycle::sweep_expired_grants(&state).await;
+                // A workspace copied from another session's that never provisioned is placed fresh (#478).
+                lifecycle::sweep_copied_workspaces(&state).await;
                 storage::release_unused(&state).await;
                 reviews::sweep_kept_reviewers(&state).await;
             }
