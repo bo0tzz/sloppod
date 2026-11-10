@@ -35,7 +35,16 @@
   import { diffStats, diffTexts, parseUnifiedDiff } from '#lib/diff.ts';
   import { readStored, writeStored } from '#lib/storage.ts';
   import { absoluteTime } from '#lib/format.ts';
-  import { actingAs, planChanges, planChangeText, proposalKinds, proposalStatus, proposalSummary } from '#lib/presentation.ts';
+  import {
+    actingAs,
+    planChanges,
+    planChangeText,
+    proposalKinds,
+    proposalStatus,
+    proposalSummary,
+    updateChanges,
+    updateHref,
+  } from '#lib/presentation.ts';
   import DiffView from './DiffView.svelte';
   import Markdown from './Markdown.svelte';
   import PullRequestChanges from './PullRequestChanges.svelte';
@@ -98,8 +107,6 @@
   const issueUpdates = $derived(
     shown.kind === 'github.issue.update' || shown.kind === 'github.pr.update' ? (shown.payload as IssueUpdatesPayload) : null,
   );
-  const closeReasons = { completed: 'completed', not_planned: 'not planned', duplicate: 'a duplicate' };
-  const closing = (close: NonNullable<IssueUpdate['close']>) => (close === true ? 'close' : `close as ${closeReasons[close]}`);
   const filing = $derived(drafts.filter((draft) => draft.file).length);
   /** What's typed into each issue draft's "add a label" field, by its position (#108). */
   let labelDrafts = $state<Record<number, string>>({});
@@ -355,6 +362,8 @@
             <span class="text-muted min-w-0 font-mono text-xs break-all">{pr.repo}: {pr.head} → {pr.base}</span>
           {:else if issues}
             <span class="text-muted min-w-0 font-mono text-xs break-all">{issues.repo}</span>
+          {:else if issueUpdates}
+            <span class="text-muted min-w-0 font-mono text-xs break-all">{issueUpdates.repo}</span>
           {:else if stack}
             <span class="text-muted min-w-0 font-mono text-xs break-all">{stack.repo}: {stack.pull_requests.length} pull requests → {stack.base}</span>
           {/if}
@@ -428,10 +437,14 @@
               >
                 <div class="flex items-center justify-between gap-2">
                   <Text fontWeight="semi-bold">
-                    #{update.number}
-                    {#if update.close}<span class="text-muted font-normal">· {closing(update.close)}</span>{/if}
-                    {#if update.reopen}<span class="text-muted font-normal">· reopen</span>{/if}
-                    {#if update.ready}<span class="text-muted font-normal">· mark ready for review</span>{/if}
+                    <a
+                      class="underline"
+                      href={updateHref(issueUpdates.repo, update.number, shown.kind === 'github.pr.update' ? 'pull_request' : 'issue')}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      data-testid="issue-update-link"
+                      >#{update.number}{current ? ` ${current.title}` : ''}</a
+                    >
                   </Text>
                   {#if pending}
                     <label class="text-muted flex shrink-0 items-center gap-2 text-xs">
@@ -440,14 +453,16 @@
                     </label>
                   {/if}
                 </div>
+                <!-- What it changes, each named, in the order it's carried out (#289). -->
+                <ul class="text-muted flex flex-col text-xs" data-testid="issue-update-changes">
+                  {#each updateChanges(update, shown.kind === 'github.pr.update' ? 'pull_request' : 'issue') as change, index (index)}
+                    <li>{change}</li>
+                  {/each}
+                </ul>
                 {#if update.title && current}
                   <Text size="small" data-testid="issue-update-title">Title: <s class="text-muted">{current.title}</s> → {update.title}</Text>
                 {:else if update.title}
                   <Text size="small" data-testid="issue-update-title">New title: {update.title}</Text>
-                {/if}
-                {#if update.add_labels?.length}<Text size="small">Add labels: {update.add_labels.join(', ')}</Text>{/if}
-                {#if update.remove_labels?.length}
-                  <Text size="small">Remove labels: {update.remove_labels.join(', ')}</Text>
                 {/if}
                 {#if editing && update.make}
                   <Field label="Comment">

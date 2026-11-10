@@ -4237,10 +4237,18 @@ test('reviews and approves updates to existing issues', async ({ page }) => {
   await card.getByRole('button', { name: 'Review' }).click();
   const updates = page.getByTestId('issue-update');
   await expect(updates).toHaveCount(3);
-  await expect(updates.nth(0)).toContainText('#100');
-  await expect(updates.nth(0)).toContainText('close as completed');
-  await expect(updates.nth(0)).toContainText('Remove labels: priority');
-  await expect(updates.nth(1)).toContainText('close as a duplicate');
+  // Each update names the issue it touches, links to it, and says what it changes (#289).
+  const first = updates.nth(0).getByTestId('issue-update-link');
+  await expect(first).toHaveText('#100 Reconnect drops the session');
+  await expect(first).toHaveAttribute('href', 'https://github.com/bo0tzz/sloppod/issues/100');
+  await expect(updates.nth(0).getByTestId('issue-update-changes').getByRole('listitem')).toHaveText([
+    'Adds a comment',
+    'Removes labels: priority',
+    'Closes as completed',
+  ]);
+  await expect(updates.nth(1).getByTestId('issue-update-link')).toHaveText('#65 Double notices about the same proposal');
+  await expect(updates.nth(1)).toContainText('Closes as a duplicate');
+  await expect(page.getByTestId('proposal-detail')).toContainText('bo0tzz/sloppod');
   // A rewrite shows against what the issue says now.
   await expect(updates.nth(2).getByTestId('issue-update-title')).toHaveText(
     'Title: Startup failures are only in the logs → Startup failures show in the UI',
@@ -4266,6 +4274,26 @@ test('reviews and approves updates to existing issues', async ({ page }) => {
   expect(made.payload.updates[0].comment).toBe('Fixed by #148, closing.');
 });
 
+test('an issue update reads as what it does, on the card and in the review', async ({ page }) => {
+  await createSession(page, 'Tidy one issue in sloppod');
+  const card = page.getByTestId('proposal-card');
+  await expect(card).toHaveAttribute('data-kind', 'github.issue.update');
+  // The card says which issue, and what the update does to it (#289).
+  await expect(card.getByTestId('proposal-card-title')).toHaveText('#65 · Adds a comment, Closes as a duplicate');
+
+  await card.getByRole('button', { name: 'Review' }).click();
+  const update = page.getByTestId('issue-update');
+  await expect(update).toHaveCount(1);
+  await expect(page.getByTestId('proposal-detail')).toContainText('bo0tzz/sloppod');
+  const link = update.getByTestId('issue-update-link');
+  await expect(link).toHaveText('#65 Double notices about the same proposal');
+  await expect(link).toHaveAttribute('href', 'https://github.com/bo0tzz/sloppod/issues/65');
+  await expect(update.getByTestId('issue-update-changes').getByRole('listitem')).toHaveText([
+    'Adds a comment',
+    'Closes as a duplicate',
+  ]);
+});
+
 test('reviews and approves updates to open pull requests', async ({ page }) => {
   await createSession(page, 'Tidy the pull requests in sloppod');
   const card = page.getByTestId('proposal-card');
@@ -4274,11 +4302,21 @@ test('reviews and approves updates to open pull requests', async ({ page }) => {
   await card.getByRole('button', { name: 'Review' }).click();
   const updates = page.getByTestId('issue-update');
   await expect(updates).toHaveCount(2);
-  await expect(updates.nth(0)).toContainText('#96');
-  await expect(updates.nth(0)).toContainText('· close');
+  // Named and linked like an issue update, to the pull request's page (#289).
+  const first = updates.nth(0).getByTestId('issue-update-link');
+  await expect(first).toHaveText('#96 Rework the pod failure messages');
+  await expect(first).toHaveAttribute('href', 'https://github.com/bo0tzz/sloppod/pull/96');
+  await expect(updates.nth(0)).toContainText('Closes it');
   await expect(updates.nth(0)).not.toContainText('close as');
-  await expect(updates.nth(0)).toContainText('Remove labels: wip');
-  await expect(updates.nth(1)).toContainText('mark ready for review');
+  await expect(updates.nth(0)).toContainText('Removes labels: wip');
+  await expect(updates.nth(1)).toContainText('Marks it ready for review');
+  // Named in the order they're carried out: reopening and marking ready come before the text is patched (#289).
+  await expect(updates.nth(1).getByTestId('issue-update-changes').getByRole('listitem')).toHaveText([
+    'Reopens it',
+    'Marks it ready for review',
+    'Changes the title',
+    'Rewrites the body',
+  ]);
   // A rewrite shows against what the pull request says now.
   await expect(updates.nth(1).getByTestId('issue-update-title')).toHaveText('Title: WIP: pod failures → Show why a pod fails to start');
   const bodyDiff = updates.nth(1).getByTestId('diff');

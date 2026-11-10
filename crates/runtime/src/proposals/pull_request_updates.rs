@@ -150,7 +150,7 @@ impl ProposalKind for PullRequestUpdates {
 
     async fn detail(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
         let repo = payload["repo"].as_str().unwrap_or_default();
-        let numbers = updates::rewritten(payload);
+        let numbers = updates::touched(payload);
         if numbers.is_empty() {
             return Ok(json!({}));
         }

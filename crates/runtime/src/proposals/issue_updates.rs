@@ -150,7 +150,7 @@ impl ProposalKind for IssueUpdates {
 
     async fn detail(&self, session: &SessionContext, payload: &Value) -> Result<Value> {
         let repo = payload["repo"].as_str().unwrap_or_default();
-        let numbers = updates::rewritten(payload);
+        let numbers = updates::touched(payload);
         if numbers.is_empty() {
             return Ok(json!({}));
         }
@@ -267,18 +267,19 @@ mod tests {
     }
 
     #[test]
-    fn finds_the_issues_whose_text_is_replaced() {
+    fn finds_every_issue_the_updates_touch() {
         let payload = json!({"repo": "a/one", "updates": [
             {"number": 9, "body": "New"},
             {"number": 3, "comment": "Only a comment"},
             {"number": 4, "title": "Clearer"},
             {"number": 9, "body": ""},
         ]});
-        assert_eq!(updates::rewritten(&payload), [4, 9]);
-        assert!(
-            updates::rewritten(&json!({"updates": [{"number": 1, "close": "completed"}]}))
-                .is_empty()
+        assert_eq!(updates::touched(&payload), [3, 4, 9]);
+        assert_eq!(
+            updates::touched(&json!({"updates": [{"number": 1, "close": "completed"}]})),
+            [1]
         );
+        assert!(updates::touched(&json!({"updates": []})).is_empty());
     }
 
     #[test]
