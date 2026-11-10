@@ -57,6 +57,45 @@ const STALE_QUESTION_GRACE_MS = 10_000;
 /** A message waiting for the running turn to end (`_sloppod/queue`). */
 export type QueuedMessage = { id: string; prompt: ContentBlock[] };
 
+/**
+ * Where the reader was in a session's chat, for showing it to them again where they left it (#93): the rows at the top
+ * of the view by the names they have (#485), the offset the first of them was at, and whether the view was following
+ * the bottom.
+ */
+export type ReaderPlace = { names: string[]; seq: number; offset: number; atBottom: boolean };
+
+/** How many sessions' views are kept for switching back to (#93): the chat then shows at once, without a replay. */
+const RECENT_VIEWS = 4;
+
+/** How many pages of history catching a view up fills in before starting it over instead (#93). */
+const GAP_PAGES = 10;
+
+/** The views of the sessions opened lately, least recently shown first. */
+const recentViews = new Map<string, SessionView>();
+
+/**
+ * The view of a session: the one it had if it's among those opened lately, so switching back shows its chat at once
+ * (#93), and what it missed is caught up from a load underneath.
+ */
+export function sessionView(id: string): SessionView {
+  const kept = recentViews.get(id);
+  // Only one with its chat already: a session whose load is still on its way has nothing to show, and the load in
+  // flight belongs to the view that asked for it, which a new one waits out (#454).
+  if (kept?.loaded) {
+    // Shown again: last in the map, so the one that goes first is the one left alone longest.
+    recentViews.delete(id);
+    recentViews.set(id, kept);
+    return kept;
+  }
+  const view = new SessionView(id);
+  recentViews.set(id, view);
+  // The oldest goes, so a few sessions' transcripts at most are held in memory.
+  while (recentViews.size > RECENT_VIEWS) {
+    recentViews.delete(recentViews.keys().next().value!);
+  }
+  return view;
+}
+
 export const queuedText = (message: QueuedMessage) =>
   message.prompt.map((block) => (block.type === 'text' ? block.text : '')).join('');
 
@@ -113,6 +152,11 @@ export class SessionView {
   #stopped = false;
   /** A `session/load` is on its way over the shared connection. */
   #loading = false;
+  /**
+   * Which showing of this session the view is on: a load started for an earlier one is abandoned where it stands rather
+   * than installing what the view has moved past (#93). Counted by `start`.
+   */
+  #generation = 0;
   /** Lifts the barrier a stop put up for a load that was still on its way. */
   #lifted: (() => void) | undefined;
 
@@ -164,6 +208,11 @@ export class SessionView {
   unsent = $state<Outgoing[]>([]);
   /** Messages that couldn't be delivered, kept until the user puts each back or dismisses it. */
   undelivered = $state<Outgoing[]>([]);
+  /**
+   * Where the reader was in the chat, kept up to date while this view is shown and used the next time it is (#93):
+   * showing the session again puts them back there rather than at the bar or the bottom.
+   */
+  place: ReaderPlace | null = null;
 
   constructor(id: string) {
     this.id = id;
@@ -192,6 +241,7 @@ export class SessionView {
 
   start() {
     this.#stopped = false;
+    this.#generation += 1;
     void this.refresh();
     this.#unregister = app.register(this.#consumer);
   }
@@ -211,7 +261,9 @@ export class SessionView {
     // A load still on its way ends with the close instead, or it would install what the close removed. Meanwhile
     // the barrier is up, so a view that comes back to the session waits for both.
     if (this.#loading) {
-      reserve(this.id, new Promise<void>((resolve) => (this.#lifted = resolve)));
+      // One reservation per load, not one per stop: leaving the session again while the same load is still on its way
+      // mustn't replace the promise the earlier waiters hold, or the first of them waits forever (#93).
+      if (!this.#lifted) reserve(this.id, new Promise<void>((resolve) => (this.#lifted = resolve)));
     } else if (this.loaded) {
       void this.#close();
     }
@@ -271,9 +323,12 @@ export class SessionView {
   }
 
   async #onReady() {
+    const generation = this.#generation;
     // Back on a session just left: its close has to be through, or it could land after this load and end it.
     await closing.get(this.id);
-    if (this.#stopped) return;
+    // Left and shown again while that was waiting: the load this call was for isn't this view's any more, and starting
+    // one here would run beside the one that is (#93).
+    if (this.#stopped || generation !== this.#generation) return;
     this.#replay = new Transcript();
     this.#replayUpdates = [];
     this.#loading = true;
@@ -288,22 +343,75 @@ export class SessionView {
         await this.#close();
         return;
       }
-      this.transcript = this.#replay;
-      this.#updates = this.#replayUpdates;
-      this.historyBefore = (response?._meta?.sloppod as { historyBefore?: number | null } | undefined)?.historyBefore ?? null;
+      if (generation !== this.#generation) return;
+      const before = (response?._meta?.sloppod as { historyBefore?: number | null } | undefined)?.historyBefore ?? null;
+      const replay = this.#replayUpdates;
+      // A session this view already had is caught up rather than started over (#93): the replay is the latest page, so
+      // what it doesn't cover goes in front of it — the older pages the reader read into (which carry no seqs of their
+      // own) and the part of its last page that has since fallen off the end. Its own boundary is still the one to ask
+      // for the page before, since the log only grows.
+      const catchingUp = this.#updates.length > 0;
+      const top = this.#updates.reduce((top, u) => Math.max(top, u.seq), 0);
+      // The log can grow past this view by more than a page: then the replay starts beyond what it has, and what lies
+      // between is fetched before the two are joined, or the conversation would show a hole it could never fill. A
+      // session's log only grows, so the run is whole; more than a few pages of it is more than this is worth, and the
+      // view starts over from the replay instead.
+      let between: LoggedUpdate[] = [];
+      let ask = before;
+      for (let page = 0; catchingUp && ask !== null && ask > top + 1 && page < GAP_PAGES; page++) {
+        const fetched = await this.#historyPage(ask);
+        // The page's own sequence numbers, which have gaps in them — one sequence serves every session — so the part of
+        // it the view doesn't already have is everything above its own top. Nothing is worked out from the count.
+        const piece: LoggedUpdate[] = fetched.updates.map((update, index) => ({
+          update,
+          seq: fetched.seqs[index],
+          at: fetched.at?.[index] ?? null,
+        }));
+        between = [...piece.filter((u) => u.seq > top), ...between];
+        ask = fetched.before;
+      }
+      // Left while those pages were on their way: the close ends this load, as it does above, and a newer showing's
+      // load is the one to go on (#93).
+      if (this.#stopped) {
+        await this.#close();
+        return;
+      }
+      if (generation !== this.#generation) return;
+      const joined = ask === null || ask <= top + 1;      const kept = catchingUp && joined
+        ? this.#updates.filter((u) => u.seq === 0 || (before !== null && u.seq < before))
+        : [];
+      const updates = [...kept, ...(joined ? between : []), ...replay];
+      // Nothing kept is the usual case: the replay is the transcript, as it was built.
+      const transcript = kept.length === 0 && between.length === 0 ? this.#replay! : new Transcript();
+      if (transcript !== this.#replay) for (const { update, seq, at } of updates) transcript.apply(update, seq, at);      this.transcript = transcript;
+      this.#updates = updates;
+      if (!catchingUp || !joined) this.historyBefore = before;
       this.historyError = null;
       this.configOptions = response?.configOptions ?? [];
     } finally {
-      this.#loading = false;
+      // What this call was going to install isn't the view's any more if it was left and shown again meanwhile: its
+      // barrier still comes down, so whoever waits on that goes on, but the fields are the newer load's (#93).
+      if (generation === this.#generation) {
+        this.#loading = false;
+        this.#replay = null;
+        this.#replayUpdates = null;
+      }
       this.#lifted?.();
       this.#lifted = undefined;
-      this.#replay = null;
-      this.#replayUpdates = null;
     }
+    if (generation !== this.#generation) return;
     this.loaded = true;
     // Fetched again only now that `session/load` has subscribed this socket: a proposal made since the last fetch
     // then comes one way or the other, where fetching alongside the load could miss it (#423).
     await this.refresh();
+  }
+
+  /** A page of the session's history before `before`, as `session/load`'s boundary says to ask for it. */
+  async #historyPage(before: number) {
+    return app.request<{ updates: SessionUpdate[]; at?: string[]; seqs: number[]; before: number | null }>('_sloppod/history', {
+      sessionId: this.id,
+      before,
+    });
   }
 
   #onNotification(method: string, params: unknown) {
@@ -401,15 +509,16 @@ export class SessionView {
     this.loadingHistory = true;
     this.historyError = null;
     try {
-      const page = await app.request<{ updates: SessionUpdate[]; at?: string[]; before: number | null }>('_sloppod/history', {
-        sessionId: this.id,
-        before,
-      });
+      const page = await this.#historyPage(before);
       // A reload meanwhile has replaced what this page goes in front of.
       if (this.historyBefore !== before || !page) return;
       const transcript = new Transcript();
-      // An older page's events are before whatever was read, as far as the unread marker goes: they have no place.
-      const updates = [...page.updates.map((update, index) => ({ update, seq: 0, at: page.at?.[index] ?? null })), ...this.#updates];
+      // Their own sequence numbers, as the page gives them: they are before whatever was read, so they count as read
+      // all the same, and a row of one can still be told apart by where it is (#48, #485, #93).
+      const updates = [
+        ...page.updates.map((update, index) => ({ update, seq: page.seqs[index], at: page.at?.[index] ?? null })),
+        ...this.#updates,
+      ];
       for (const { update, seq, at } of updates) transcript.apply(update, seq, at);
       this.#updates = updates;
       this.transcript = transcript;
