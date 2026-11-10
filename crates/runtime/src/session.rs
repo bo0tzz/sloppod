@@ -1,6 +1,6 @@
 //! Live session state between the agent (over the supervisor link) and any number of UIs (over `/acp`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -215,6 +215,11 @@ struct Permission {
     method: String,
     params: Value,
     asker: Asker,
+    /// Whether the server finishing its own elicitation may settle this request (#481). The agent's
+    /// `elicitation/complete` names only the server's `elicitationId` and says nothing about which server that is, so
+    /// a request with no such id (an `ask_user` question), or one whose id another of the session's open questions
+    /// shares (two servers are free to choose the same), is the user's to answer rather than a guess.
+    completable: bool,
 }
 
 /// Who waits on a permission request or question.
@@ -241,8 +246,9 @@ struct LiveState {
     /// compaction's own end never came.
     compacting: bool,
     /// The agent's tool calls that have started and not yet completed or failed, by id; notices wait for them. A
-    /// turn's end ends them too.
-    tools: HashSet<String>,
+    /// turn's end ends them too. The value is the MCP server the call went to, when it is one: an elicitation that
+    /// arrives while it runs is one of that server's questions (#481).
+    tools: HashMap<String, Option<String>>,
     /// How many turns the hub sent have ended, and how the last one did. A watcher compares the count with the one it
     /// saw, so no turn's end is missed between its looks.
     turns_ended: u64,
@@ -1550,7 +1556,12 @@ impl Hub {
         self.resolve_permissions(id, resolved);
     }
 
-    pub async fn on_agent_notification(&self, id: Uuid, message: Value) {
+    pub async fn on_agent_notification(self: &Arc<Self>, id: Uuid, message: Value) {
+        // A URL elicitation the server has finished with, which the agent passes on as it heard (#481).
+        if message["method"] == "elicitation/complete" {
+            self.completed_elicitation(id, &message["params"]).await;
+            return;
+        }
         if message["method"] != "session/update" {
             tracing::debug!(session = %id, method = %message["method"], "ignoring agent notification");
             return;
@@ -1584,15 +1595,15 @@ impl Hub {
             if let Some(tool) = update["toolCallId"].as_str() {
                 match update["status"].as_str() {
                     Some("completed" | "failed") => {
-                        if state.tools.remove(tool) {
+                        if state.tools.remove(tool).is_some() {
                             live.boundary.notify_waiters();
                         }
                     }
                     Some("pending" | "in_progress") => {
-                        state.tools.insert(tool.to_owned());
+                        track_tool(&mut state.tools, tool, &update);
                     }
                     _ if update["sessionUpdate"] == "tool_call" => {
-                        state.tools.insert(tool.to_owned());
+                        track_tool(&mut state.tools, tool, &update);
                     }
                     _ => {}
                 }
@@ -1639,6 +1650,37 @@ impl Hub {
                 );
                 return;
             }
+            // What the UIs are told about a request of the agent's own, alongside the agent's `_meta` (#481): which
+            // MCP server asked, as far as that can be told, and an id of the request's own — the agent's
+            // `elicitationId` is the server's to choose, and two servers can choose the same one, so it isn't one a
+            // UI can tell a request sent again (after a reconnect) from a new one by. Kept with the request itself,
+            // so it's the same every time it's sent.
+            if method == "elicitation/create" {
+                let mut meta = params["_meta"].clone();
+                if !meta.is_object() {
+                    meta = json!({});
+                }
+                if !meta["sloppod"].is_object() {
+                    meta["sloppod"] = json!({});
+                }
+                meta["sloppod"]["cardId"] = json!(Uuid::new_v4().to_string());
+                if let Some(server) = eliciting_server(&state.tools, &params) {
+                    meta["sloppod"]["server"] = json!(server);
+                }
+                params["_meta"] = meta;
+            }
+            // A URL elicitation the server's own completion could settle, unless another open question answers to
+            // the same server-chosen id: then neither is, for as long as they're open (#481).
+            let mut completable =
+                method == "elicitation/create" && params["elicitationId"].is_string();
+            if let Some(elicitation_id) = params["elicitationId"].as_str() {
+                for open in state.permissions.values_mut() {
+                    if open.params["elicitationId"].as_str() == Some(elicitation_id) {
+                        open.completable = false;
+                        completable = false;
+                    }
+                }
+            }
             state.next_permission += 1;
             let pid = state.next_permission;
             state.permissions.insert(
@@ -1650,6 +1692,7 @@ impl Hub {
                         request_id,
                         agent: agent.clone(),
                     },
+                    completable,
                 },
             );
             live.sync_asks(&state);
@@ -1665,6 +1708,50 @@ impl Hub {
             },
         );
         self.broadcast_session(id).await;
+    }
+
+    /// The server's own URL elicitation is done — the user opened the link and finished what it asked for there — as
+    /// the agent passes on with `elicitation/complete` (#481): the card closes for every UI and the question stops
+    /// counting as waiting, the request the agent may still be holding is answered as the user having accepted it
+    /// (they did, through the link), and the chat is told, so a card that goes isn't the only sign.
+    async fn completed_elicitation(self: &Arc<Self>, id: Uuid, params: &Value) {
+        let Some(elicitation_id) = params["elicitationId"].as_str() else {
+            tracing::debug!(session = %id, "an elicitation completed without naming itself");
+            return;
+        };
+        let open = {
+            let live = self.live(id);
+            let state = live.state.lock().await;
+            state
+                .permissions
+                .iter()
+                .find(|(_, p)| p.params["elicitationId"].as_str() == Some(elicitation_id))
+                .map(|(pid, p)| (*pid, p.completable))
+        };
+        // One that isn't open any more: answered meanwhile, or never shown here.
+        let Some((pid, completable)) = open else {
+            tracing::debug!(session = %id, elicitation = %elicitation_id, "an elicitation completed that wasn't open");
+            return;
+        };
+        // The id is the server's to choose and the notification says nothing else, so when another of the session's
+        // open questions answers to it too, this would be a guess at which server finished: it stays the user's to
+        // answer (#481).
+        if !completable {
+            tracing::debug!(session = %id, elicitation = %elicitation_id, "an elicitation completed whose id is shared; leaving it to the user");
+            return;
+        }
+        self.answer_permission(id, pid, Ok(json!({"action": "accept"})), "the server")
+            .await;
+        self.record(
+            id,
+            json!({
+                "sessionUpdate": "notice",
+                "severity": "info",
+                "title": "Link completed",
+                "description": "The server finished what it asked for through the link.",
+            }),
+        )
+        .await;
     }
 
     /// The first answer to a permission request wins; later ones are ignored. `by` says who answered, for the log.
@@ -2708,6 +2795,9 @@ impl Hub {
                     method: "elicitation/create".into(),
                     params: params.clone(),
                     asker: Asker::Tool { key, questions },
+                    // An `ask_user` question has no server behind it to finish it: the agent answers it, or the user
+                    // never does (#481).
+                    completable: false,
                 },
             );
             live.sync_asks(&state);
@@ -3317,4 +3407,141 @@ fn tool_call_id(params: &Value) -> Option<String> {
         .as_str()
         .or(params["toolCallId"].as_str())
         .map(str::to_owned)
+}
+
+/// Notes a tool call as running, with the MCP server it went to when this says so. A call's first update names it; a
+/// later one of the same call often says nothing about it, and keeps what was noted.
+fn track_tool(tools: &mut HashMap<String, Option<String>>, tool: &str, update: &Value) {
+    let server = mcp_server(update);
+    let known = tools.entry(tool.to_owned()).or_default();
+    if server.is_some() {
+        *known = server;
+    }
+}
+
+/// The MCP server a tool call went to, when it is one: the call's own `_meta` (claude-agent-acp names it there,
+/// since it's the config key as authored, which is the user's text rather than the agent's), the call's `rawInput`
+/// (codex-acp), or a title naming one. Nothing for a call that isn't an MCP server's.
+fn mcp_server(update: &Value) -> Option<String> {
+    if let Some(name) = update["_meta"]["claudeCode"]["mcpServer"]["name"].as_str() {
+        return Some(name.to_owned());
+    }
+    if let Some(name) = update["rawInput"]["server"].as_str()
+        && update["rawInput"]["tool"].is_string()
+    {
+        return Some(name.to_owned());
+    }
+    let title = update["title"].as_str().unwrap_or_default();
+    // `mcp__<server>__<tool>` from Claude Code, `mcp.<server>.<tool>` from Codex.
+    let (rest, separator) = match title.strip_prefix("mcp__") {
+        Some(rest) => (rest, "__"),
+        None => (title.strip_prefix("mcp.")?, "."),
+    };
+    let name = rest.split(separator).next().unwrap_or_default();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// Which MCP server asked the user something, as far as that can be told (#481): the tool call the request names, or
+/// the one MCP tool call in flight while none is named. Nothing when it can't be — a question shown as one from a
+/// tool rather than one credited to the wrong server. `tools` maps the agent's tool calls to their MCP server, if any.
+fn eliciting_server(tools: &HashMap<String, Option<String>>, params: &Value) -> Option<String> {
+    // A request that names a call is about that call: nothing when it isn't one of the session's any more, rather
+    // than another call's server.
+    if let Some(call) = tool_call_id(params) {
+        return tools.get(&call).cloned().flatten();
+    }
+    let mut servers = tools.values().flatten();
+    let only = servers.next()?;
+    servers.next().is_none().then(|| only.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tool_call_names_its_mcp_server_where_it_can() {
+        // claude-agent-acp, which carries it in `_meta`: the config key as the user authored it.
+        assert_eq!(
+            mcp_server(&json!({"_meta": {"claudeCode": {"mcpServer": {"name": "docs"}}}}))
+                .as_deref(),
+            Some("docs")
+        );
+        // codex-acp, whose server calls carry it in their input.
+        assert_eq!(
+            mcp_server(&json!({"rawInput": {"server": "logs", "tool": "search", "arguments": {}}}))
+                .as_deref(),
+            Some("logs")
+        );
+        // And the titles the two adapters give such a call.
+        assert_eq!(
+            mcp_server(&json!({"title": "mcp__docs__search"})).as_deref(),
+            Some("docs")
+        );
+        assert_eq!(
+            mcp_server(&json!({"title": "mcp.logs.search"})).as_deref(),
+            Some("logs")
+        );
+        // A call that isn't a server's: nothing, rather than something read out of it.
+        assert_eq!(mcp_server(&json!({"title": "npm test -- reconnect"})), None);
+        assert_eq!(
+            mcp_server(&json!({"rawInput": {"command": "ls", "server": "not a server call"}})),
+            None
+        );
+    }
+
+    #[test]
+    fn a_later_update_of_a_call_keeps_the_server_the_call_named() {
+        let mut tools = HashMap::new();
+        track_tool(
+            &mut tools,
+            "call-1",
+            &json!({"sessionUpdate": "tool_call", "title": "mcp__docs__search"}),
+        );
+        assert_eq!(tools["call-1"].as_deref(), Some("docs"));
+        // A progress update, which says nothing about where the call went.
+        track_tool(
+            &mut tools,
+            "call-1",
+            &json!({"sessionUpdate": "tool_call_update", "status": "in_progress", "content": []}),
+        );
+        assert_eq!(tools["call-1"].as_deref(), Some("docs"));
+    }
+
+    #[test]
+    fn an_elicitation_is_credited_to_the_call_it_names_or_the_only_one_running() {
+        let tools = HashMap::from([
+            ("call-1".to_owned(), Some("docs".to_owned())),
+            ("call-2".to_owned(), None),
+        ]);
+        // The call the request names, when it names one.
+        assert_eq!(
+            eliciting_server(&tools, &json!({"toolCallId": "call-1"})).as_deref(),
+            Some("docs")
+        );
+        // One that isn't a server's, or isn't running any more: nothing, and not the other call's server either.
+        assert_eq!(
+            eliciting_server(&tools, &json!({"toolCallId": "call-2"})),
+            None
+        );
+        assert_eq!(
+            eliciting_server(&tools, &json!({"toolCallId": "call-9"})),
+            None
+        );
+        // Nothing named: the one server's call in flight, whether or not other calls are running.
+        assert_eq!(
+            eliciting_server(&tools, &json!({})).as_deref(),
+            Some("docs")
+        );
+        // Two of them: no guessing between servers, and none at all when no call is a server's.
+        let two = HashMap::from([
+            ("call-1".to_owned(), Some("docs".to_owned())),
+            ("call-3".to_owned(), Some("logs".to_owned())),
+        ]);
+        assert_eq!(eliciting_server(&two, &json!({})), None);
+        assert_eq!(
+            eliciting_server(&HashMap::from([("call-2".to_owned(), None)]), &json!({})),
+            None
+        );
+    }
 }

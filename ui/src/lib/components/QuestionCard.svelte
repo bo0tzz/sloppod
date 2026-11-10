@@ -20,6 +20,24 @@
 
   const PREVIEW_KEY = '_claude/askUserQuestionOption';
 
+  /**
+   * A tool's question, which the agent waits on, rather than one the agent asked with `ask_user` and carried on from
+   * (#481). Only the former is marked with a question id of sloppod's.
+   */
+  const elicitation = $derived(!request._meta?.sloppod?.questionId);
+  /** Who asks, as far as the runtime could tell: the MCP server the question is from, or just a tool. */
+  const asker = $derived(request._meta?.sloppod?.server ? `${request._meta.sloppod.server} asks` : 'A tool asks');
+  const url = $derived(request.mode === 'url' ? request.url : undefined);
+  /** The link's host, which is what the user is really being sent to: the rest of the URL is the server's to choose. */
+  const host = $derived.by(() => {
+    if (!url) return '';
+    try {
+      return new URL(url).host;
+    } catch {
+      return url;
+    }
+  });
+
   const fields = $derived(Object.entries(request.requestedSchema?.properties ?? {}));
   const required = $derived(new Set(request.requestedSchema?.required ?? []));
   /** One question per step: a field, with its "Other" field (`<key>_custom`) if it has one. */
@@ -49,7 +67,8 @@
       ),
   );
   $effect(() => {
-    if (stable) saveAnswer(request.sessionId, key, { values: $state.snapshot(values), step: current });
+    // Only a form has an answer to keep: a URL elicitation is answered by opening the link.
+    if (stable && fields.length > 0) saveAnswer(request.sessionId, key, { values: $state.snapshot(values), step: current });
   });
 
   /** Answers or skips the question, and forgets the answer kept for it. */
@@ -64,7 +83,7 @@
   type Kind = 'single' | 'multi' | 'select' | 'text' | 'number' | 'boolean' | 'other';
 
   function kindOf(key: string, field: ElicitationField): Kind {
-    if (key.endsWith('_custom') && request.requestedSchema.properties[key.slice(0, -'_custom'.length)]) return 'other';
+    if (key.endsWith('_custom') && request.requestedSchema?.properties[key.slice(0, -'_custom'.length)]) return 'other';
     if (field.type === 'string' && field.oneOf?.length) return 'single';
     if (field.type === 'string' && field.enum?.length) return 'select';
     if (field.type === 'array') return 'multi';
@@ -123,7 +142,8 @@
   const missingRequired = $derived(fields.some(([key]) => missing(key)));
   const stepMissing = $derived((steps[current] ?? []).some(([key]) => missing(key)));
 
-  const answer = () => respond({ action: 'accept', content: content() });
+  // A URL elicitation has nothing to answer with: opening the link was the answer.
+  const answer = () => respond(url ? { action: 'accept' } : { action: 'accept', content: content() });
 
   /** Enter moves on to the next question, and on the last one sends the answers. */
   function submitOnEnter(event: KeyboardEvent) {
@@ -143,7 +163,7 @@
     : ''}"
   data-testid="question-card"
   data-stale={request.stale || undefined}
-  aria-label="Question from the agent"
+  aria-label={elicitation ? 'Question from a tool' : 'Question from the agent'}
   tabindex="-1"
   use:claimsFocus
 >
@@ -154,6 +174,30 @@
       <span class="text-muted shrink-0 text-xs" data-testid="question-step">Question {current + 1} of {steps.length}</span>
     {/if}
   </header>
+
+  <!-- A tool's question holds the agent's turn until it's answered, where one the agent asked itself doesn't (#481). -->
+  {#if elicitation}
+    <p class="text-muted -mt-1.5 text-xs" data-testid="question-asker">
+      {asker}. The agent’s turn is held until you answer.
+    </p>
+  {/if}
+
+  {#if url}
+    <!-- Where the link really goes, spelled out: the URL comes from the server, and only its host is worth trusting. -->
+    <div class="flex flex-col gap-1" data-testid="question-url">
+      <div class="flex flex-wrap items-center gap-2">
+        <span class="text-sm font-semibold break-all" data-testid="question-url-host">{host}</span>
+        <a
+          class="border-light-200 hover:bg-light-100 shrink-0 rounded-xl border px-3 py-1 text-sm font-medium"
+          href={url}
+          target="_blank"
+          rel="noopener noreferrer"
+          data-testid="question-url-open">Open</a
+        >
+      </div>
+      <span class="text-muted text-xs break-all">{url}</span>
+    </div>
+  {/if}
 
   {#each steps[current] ?? [] as [key, field] (key)}
     {@const kind = kindOf(key, field)}
@@ -271,13 +315,13 @@
         </span>
       {/if}
       <Button size="small" shape="round" variant="outline" color="secondary" disabled={request.stale} onclick={() => respond({ action: 'decline' })}>
-        Skip
+        {url ? 'Decline' : 'Skip'}
       </Button>
       {#if current > 0}
         <Button size="small" shape="round" variant="outline" onclick={() => current--}>Back</Button>
       {/if}
       {#if last}
-        <Button size="small" shape="round" disabled={missingRequired || request.stale} onclick={answer}>Answer</Button>
+        <Button size="small" shape="round" disabled={missingRequired || request.stale} onclick={answer}>{url ? 'Done' : 'Answer'}</Button>
       {:else}
         <Button size="small" shape="round" disabled={stepMissing} onclick={() => current++}>Next</Button>
       {/if}

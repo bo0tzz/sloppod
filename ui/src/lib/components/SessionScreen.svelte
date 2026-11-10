@@ -167,7 +167,11 @@
   }
   const waitingSummary = $derived.by((): { kind: 'question' | 'permission' | 'proposal' | 'highlight'; text: string } => {
     const question = view.questions[0];
-    if (question) return { kind: 'question', text: `The agent asks: ${question.message.split('\n')[0]}` };
+    if (question) {
+      // A tool's question is an MCP server's, named when the runtime could tell (#481); the agent's own is the agent's.
+      const from = question._meta?.sloppod?.questionId ? 'The agent' : (question._meta?.sloppod?.server ?? 'A tool');
+      return { kind: 'question', text: `${from} asks: ${question.message.split('\n')[0]}` };
+    }
     const permission = view.permissions[0];
     if (permission) {
       const tool = view.transcript.tool(permission.toolCall.toolCallId);

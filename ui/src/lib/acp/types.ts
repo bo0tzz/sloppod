@@ -123,16 +123,25 @@ export type ElicitationField = {
 
 export type ElicitationRequest = {
   sessionId: string;
-  mode: 'form';
+  mode: 'form' | 'url';
   message: string;
-  requestedSchema: { type: 'object'; properties: Record<string, ElicitationField>; required?: string[] };
+  /** A form elicitation's fields. A URL elicitation has none: the user opens a link and comes back. */
+  requestedSchema?: { type: 'object'; properties: Record<string, ElicitationField>; required?: string[] };
+  url?: string;
+  /** A URL elicitation's own id, which the server completes it under; the same each time it's sent. */
+  elicitationId?: string;
   toolCallId?: string;
-  /** `sloppod.questionId`: an `ask_user` question's own id, the same each time the runtime sends it. */
-  _meta?: { sloppod?: { questionId?: string } };
+  /**
+   * `sloppod.questionId`: an `ask_user` question's own id, the same each time the runtime sends it — a question the
+   * agent asked without waiting. `sloppod.cardId`: the same for a tool's question, which the runtime makes unique in
+   * the session (a server's `elicitationId` isn't: two servers can choose the same). `sloppod.server`: the MCP server
+   * the question is from, when the runtime can tell.
+   */
+  _meta?: { sloppod?: { questionId?: string; cardId?: string; server?: string } };
 };
 
 export type ElicitationResponse =
-  | { action: 'accept'; content: Record<string, unknown> }
+  | { action: 'accept'; content?: Record<string, unknown> }
   | { action: 'decline' }
   | { action: 'cancel' };
 

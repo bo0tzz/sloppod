@@ -494,8 +494,9 @@ impl AgentAdapter for ClaudeCode {
                 "fs": {"readTextFile": false, "writeTextFile": false},
                 "terminal": false,
                 "session": {"compaction": {}},
-                // Lets the agent ask the user questions (AskUserQuestion) as form elicitations.
-                "elicitation": {"form": {}},
+                // Lets an MCP server's questions reach the user (#481): a form to fill in, and a link to open
+                // (Claude Code's own AskUserQuestion comes through the same door).
+                "elicitation": {"form": {}, "url": {}},
             }),
             // Sessions always run in the agent's auto mode; the sandbox and grants bound what it can do.
             mode: Some("auto".into()),
@@ -582,6 +583,9 @@ impl AgentAdapter for Codex {
             client_capabilities: json!({
                 "fs": {"readTextFile": false, "writeTextFile": false},
                 "terminal": false,
+                // codex-acp forwards an MCP server's questions as ACP elicitations only for what the client
+                // advertises here, and falls back to a permission prompt otherwise (#481).
+                "elicitation": {"form": {}, "url": {}},
             }),
             mode: Some(CODEX_MODE.into()),
         }
@@ -638,6 +642,26 @@ mod tests {
             json!({"repo": "o/r", "access": access, "branch": "sloppod/s"}),
         ));
         context
+    }
+
+    #[test]
+    fn every_agent_is_told_it_can_show_a_servers_questions() {
+        // Both adapters forward an MCP server's question only for what the client advertises here, and answer the
+        // server themselves otherwise (#481): a form to fill in, and a link to open.
+        for (agent, launch) in [
+            ("Claude Code", ClaudeCode.launch(&context())),
+            ("Codex", Codex.launch(&context())),
+        ] {
+            let capabilities = &launch.client_capabilities;
+            assert!(
+                capabilities["elicitation"]["form"].is_object(),
+                "{agent} is told nothing about form elicitations: {capabilities}"
+            );
+            assert!(
+                capabilities["elicitation"]["url"].is_object(),
+                "{agent} is told nothing about URL elicitations: {capabilities}"
+            );
+        }
     }
 
     #[test]

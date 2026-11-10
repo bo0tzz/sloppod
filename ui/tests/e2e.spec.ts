@@ -3011,6 +3011,137 @@ test('a question asked with ask_user outlives the turn and a stop', async ({ pag
   await expect(agentMessages(page).filter({ hasText: 'Thanks, going with that. Backoff: Exponential, capped.' })).toBeVisible();
 });
 
+test("an MCP server's question is a question card, and its answer reaches it", async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  const prompt = 'An MCP server asks me something in sloppod';
+  const id = await createSession(page, prompt);
+  await finishTurn(page);
+  await page.request.delete('/_mock/answers');
+  const sidebar = page.getByRole('navigation', { name: 'Sessions' });
+  // By href, since other tests' sessions are in the list too.
+  const row = sidebar.locator(`a[href$="/sessions/${id}"]`);
+
+  // The server asks while its tool call runs, as an agent forwards it: blocking, so the session waits on it (#481).
+  await page.request.post(`/_mock/elicit?session=${id}&server=docs`);
+  const card = questionCard(page);
+  await expect(card).toBeVisible();
+  await expect(card.getByTestId('question-asker')).toHaveText('docs asks. The agent’s turn is held until you answer.');
+  // The same waiting as an ask_user question: the same count, and the same place in the list. The badge shows the
+  // phase a blocking request puts the session in, as it does for a permission request.
+  await expect(phase(page)).toHaveAttribute('data-phase', 'waiting');
+  await expect(page.getByTestId('activity')).toHaveText('Waiting for your answer');
+  const [asking] = ((await (await page.request.get('/api/v1/sessions')).json()) as { id: string; waiting: { questions: number } }[]).filter(
+    (candidate) => candidate.id === id,
+  );
+  expect(asking.waiting.questions).toBe(1);
+  await expect(page.getByTestId('session-group').filter({ hasText: 'Waiting on you' })).toHaveCount(1);
+  await expect(row.getByTestId('phase')).toHaveText('Waiting');
+  await expect(page.getByTestId('tool-call').filter({ hasText: 'docs' })).toHaveCount(1);
+
+  await questionField(page, 'question_0').getByRole('radio', { name: 'production' }).check();
+  await card.getByRole('button', { name: 'Answer' }).click();
+  await expect(card).toBeHidden();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+
+  // What reached the server is what the user picked.
+  const answers = await (await page.request.get('/_mock/answers')).json();
+  expect(answers.at(-1)).toMatchObject({ server: 'docs', mode: 'form' });
+  expect(answers.at(-1).result).toMatchObject({ action: 'accept', content: { question_0: 'production' } });
+
+  // A question the runtime couldn't tell a server for stays generic, rather than naming one it guessed.
+  await page.request.post(`/_mock/elicit?session=${id}&server=-`);
+  await expect(card.getByTestId('question-asker')).toHaveText('A tool asks. The agent’s turn is held until you answer.');
+  await card.getByRole('button', { name: 'Skip' }).click();
+  await expect(card).toBeHidden();
+
+  // An ask_user question is the agent's own, and carries nothing about a tool: the card says nothing extra either.
+  await page.request.post(`/_mock/ask?session=${id}`);
+  await expect(card).toBeVisible();
+  await expect(card.getByTestId('question-asker')).toHaveCount(0);
+});
+
+test('a URL elicitation shows where the link goes, and Done or Decline answers it', async ({ page }) => {
+  await page.setViewportSize({ width: 1400, height: 900 });
+  const id = await createSession(page, 'An MCP server asks me to open a link');
+  await finishTurn(page);
+  await page.request.delete('/_mock/answers');
+  const link = 'https://logs.example.com/oauth/authorize?state=xyz';
+  await page.request.post(`/_mock/elicit?session=${id}&server=victorialogs&mode=url&link=${encodeURIComponent(link)}`);
+
+  const card = questionCard(page);
+  await expect(card).toBeVisible();
+  await expect(card.getByTestId('question-asker')).toContainText('victorialogs asks');
+  // The host is what the user is really being sent to, and the whole URL is there to be read before they go.
+  await expect(card.getByTestId('question-url-host')).toHaveText('logs.example.com');
+  await expect(card.getByTestId('question-url-open')).toHaveAttribute('href', link);
+  await expect(card.getByTestId('question-url-open')).toHaveAttribute('target', '_blank');
+  await expect(card).toContainText(link);
+
+  await card.getByRole('button', { name: 'Decline' }).click();
+  await expect(card).toBeHidden();
+  await page.request.post(`/_mock/elicit?session=${id}&server=victorialogs&mode=url&link=${encodeURIComponent(link)}`);
+  await expect(questionCard(page).getByTestId('question-url-host')).toHaveText('logs.example.com');
+  await questionCard(page).getByRole('button', { name: 'Done' }).click();
+  await expect(questionCard(page)).toBeHidden();
+
+  const answers: { result: unknown }[] = await (await page.request.get('/_mock/answers')).json();
+  expect(answers.map((answer) => answer.result)).toEqual([{ action: 'decline' }, { action: 'accept' }]);
+});
+
+test('two servers\' URL questions named the same are both the user\'s to answer', async ({ page }) => {
+  const id = await createSession(page, 'Two servers want a link from me in sloppod');
+  await finishTurn(page);
+  await page.request.delete('/_mock/answers');
+  // Each server names its own elicitation, and both pick the same one: what tells them apart is sloppod's own id for
+  // each request, so the UI holds both rather than the second replacing the first (#481).
+  for (const server of ['logs', 'docs']) {
+    await page.request.post(`/_mock/elicit?session=${id}&mode=url&server=${server}&id=login`);
+  }
+
+  const card = questionCard(page);
+  await expect(card.getByTestId('question-asker')).toContainText('logs asks');
+  await expect(card.getByTestId('questions-queued')).toContainText('One more request after this');
+  // A completion names the shared id and nothing about which server asked it: settling either would be a guess, so
+  // both are still the user's to answer (#481).
+  expect((await page.request.post(`/_mock/complete?session=${id}&id=login`)).status()).toBe(409);
+  await expect(card.getByTestId('question-asker')).toContainText('logs asks');
+  await card.getByRole('button', { name: 'Done' }).click();
+  // The other is still there to answer: keyed on the server's own id, it was dropped when the second arrived.
+  await expect(card.getByTestId('question-asker')).toContainText('docs asks');
+  await card.getByRole('button', { name: 'Done' }).click();
+  await expect(card).toBeHidden();
+
+  const answers: { server: string; result: unknown }[] = await (await page.request.get('/_mock/answers')).json();
+  expect(answers.map((answer) => [answer.server, answer.result])).toEqual([
+    ['logs', { action: 'accept' }],
+    ['docs', { action: 'accept' }],
+  ]);
+});
+
+test('a URL question the server finishes itself closes the card, and the chat says so', async ({ page }) => {
+  const id = await createSession(page, 'A server finishes its link in sloppod');
+  await finishTurn(page);
+  await page.request.delete('/_mock/answers');
+  await page.request.post(`/_mock/elicit?session=${id}&mode=url&server=logs&id=login`);
+  const card = questionCard(page);
+  await expect(card).toBeVisible();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'waiting');
+
+  // The user opened the link and finished there: the server says so and the agent passes it on, so there's nothing
+  // left to answer — the card goes, nothing waits on the user, and the chat says what happened (#481).
+  await page.request.post(`/_mock/complete?session=${id}&id=login`);
+  await expect(card).toBeHidden();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+  // A notice in the chat, as `withdraw_question`'s is: the card going isn't the only sign it was done.
+  const notice = page.getByTestId('notice');
+  await expect(notice).toContainText('Link completed');
+  await expect(notice).toContainText('The server finished what it asked for through the link.');
+
+  // And the request the agent was holding is answered as the user having completed it.
+  const answers: { server: string; mode: string; result: unknown }[] = await (await page.request.get('/_mock/answers')).json();
+  expect(answers).toEqual([{ server: 'logs', mode: 'url', question: expect.any(String), result: { action: 'accept' } }]);
+});
+
 test('a highlight shows as a card in the chat and in the for-you list, and is still there after a reload', async ({ page }) => {
   await page.setViewportSize({ width: 1920, height: 1000 });
   const prompt = 'Highlight: Your question about mise tools: use `mise use`, see https://mise.jdx.dev';
@@ -5089,7 +5220,9 @@ test.describe('on a phone', () => {
     await createSession(page, 'Please ask me how to do it');
     const panel = page.getByTestId('waiting-panel');
     const summary = page.getByTestId('waiting-summary');
-    await expect(summary).toContainText('The agent asks: Please answer the following questions.');
+    // This one comes in as a tool's question — a blocking one, which is what the mock's "ask me" asks (#481) — so the
+    // summary names it that way; what this test is about is the folded layout.
+    await expect(summary).toContainText('A tool asks: Please answer the following questions.');
     await expect(questionCard(page)).toBeHidden();
     expect((await panel.boundingBox())!.height).toBeLessThan(80);
     // Folded, it still takes focus the way the card would (#365), so a stray Esc keeps the questions.
