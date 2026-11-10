@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::link::RpcError;
-use crate::session::{UiEvent, event_time, session_update_at};
+use crate::session::{Hub, UiEvent, event_time, session_update_at};
 use crate::users::User;
 use crate::{AppState, db, quota};
 
@@ -121,6 +121,7 @@ impl Conn {
     async fn load(
         self: &Arc<Self>,
         session: Uuid,
+        after: Option<i64>,
     ) -> Result<(Value, Vec<(u64, String, Value)>, Value), RpcError> {
         if db::owned_session(&self.state.db, session, &self.user)
             .await
@@ -133,11 +134,7 @@ impl Conn {
         let events = self.state.hub.subscribe(session);
         // Up to the end of the log as it is now; what's recorded meanwhile comes from the subscription.
         let until = self.state.hub.last_event(session).await.map_err(internal)?;
-        // Only the latest of it; the UI asks for older pages (`_sloppod/history`) as they're scrolled to.
-        let latest = self
-            .state
-            .hub
-            .events_before(session, until + 1, HISTORY_PAGE)
+        let (latest, resumed) = replay_page(&self.state.hub, session, until, after)
             .await
             .map_err(internal)?;
         for (seq, at, update) in &latest {
@@ -151,10 +148,14 @@ impl Conn {
         }
         let mut response = replay.agent_state;
         if let Some(response) = response.as_object_mut() {
-            response.insert(
-                "_meta".into(),
-                json!({"sloppod": {"historyBefore": older_than(&latest)}}),
-            );
+            // Resumed: what was sent begins where the UI's own copy ends, so the boundary for older pages is still
+            // the one it holds, not the one a page would give it (#449).
+            let meta = if resumed {
+                json!({"resumed": true})
+            } else {
+                json!({"resumed": false, "historyBefore": older_than(&latest)})
+            };
+            response.insert("_meta".into(), json!({"sloppod": meta}));
         }
         Ok((response, replay.permissions, replay.queue))
     }
@@ -185,7 +186,10 @@ impl Conn {
             .and_then(|s| s.parse::<Uuid>().ok());
         let hub = &self.state.hub;
         if let ("session/load" | "session/resume", Some(session)) = (method.as_str(), session) {
-            match self.load(session).await {
+            // How far the UI's own copy goes (`_meta.sloppod.after`), when it has one: it's sent only what it missed
+            // rather than the latest page again (#449).
+            let after = params["_meta"]["sloppod"]["after"].as_i64();
+            match self.load(session, after).await {
                 Ok((state, permissions, queue)) => {
                     // The queue before the response, so a UI that finished loading knows what's waiting, e.g. to
                     // tell whether a message it sent before reconnecting arrived.
@@ -337,6 +341,33 @@ fn older_than(page: &[(i64, DateTime<Utc>, Value)]) -> Option<i64> {
     (page.len() as i64 == HISTORY_PAGE).then(|| page[0].0)
 }
 
+/// What a load sends: only what came after the sequence the UI already has, when the log still holds that point and
+/// what came after it fits in a page; otherwise the latest page, whole. Whether it's the former, so the UI knows to
+/// join the updates onto what it has rather than start over — and that the boundary for older pages is still its own
+/// (#449). A page is bounded by `until`, what the log held when the connection subscribed, so nothing is sent twice.
+async fn replay_page(
+    hub: &Hub,
+    session: Uuid,
+    until: i64,
+    after: Option<i64>,
+) -> Result<(Vec<(i64, DateTime<Utc>, Value)>, bool), sqlx::Error> {
+    if let Some(after) = after
+        // A sequence the log doesn't hold — an older one that was dropped, or one that was never this session's —
+        // can't be resumed from: what lies between it and the log's start is gone (#449).
+        && hub.has_event(session, after).await?
+    {
+        let missed = hub
+            .events_after(session, after, until + 1, HISTORY_PAGE + 1)
+            .await?;
+        // Further behind than a page: the UI is better served by the latest page than by a catch-up of any length.
+        if missed.len() as i64 <= HISTORY_PAGE {
+            return Ok((missed, true));
+        }
+    }
+    let latest = hub.events_before(session, until + 1, HISTORY_PAGE).await?;
+    Ok((latest, false))
+}
+
 fn internal(e: impl std::fmt::Display) -> RpcError {
     RpcError::new(-32603, e.to_string())
 }
@@ -477,4 +508,97 @@ async fn run(state: AppState, user: String, agent: String, socket: WebSocket) {
     sessions.abort();
     writer.abort();
     tracing::info!(connection = %conn.id, "UI disconnected");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::SessionStore;
+    use crate::store::memory::MemoryStore;
+
+    /// Records `count` updates in a session's log and gives back their sequence numbers.
+    async fn record(store: &MemoryStore, session: Uuid, count: usize) -> Vec<i64> {
+        let mut seqs = Vec::new();
+        for n in 0..count {
+            let (seq, _) = store
+                .append_event(
+                    session,
+                    &json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": n.to_string()}}),
+                )
+                .await
+                .unwrap();
+            seqs.push(seq);
+        }
+        seqs
+    }
+
+    #[tokio::test]
+    async fn a_load_after_a_sequence_replays_only_what_came_after_it() {
+        let store = Arc::new(MemoryStore::default());
+        let hub = Hub::new(store.clone());
+        let session = Uuid::new_v4();
+        // Another session's events in between, as the log's one sequence leaves a session's own numbers with gaps.
+        let other = record(&store, Uuid::new_v4(), 2).await;
+        let seqs = record(&store, session, 5).await;
+
+        let (replayed, resumed) = replay_page(&hub, session, seqs[4], Some(seqs[2]))
+            .await
+            .unwrap();
+
+        assert!(resumed);
+        let replayed: Vec<i64> = replayed.iter().map(|(seq, _, _)| *seq).collect();
+        // This session's own newer events, and nothing of the other session's in between.
+        assert_eq!(replayed, seqs[3..]);
+        assert!(!replayed.contains(&other[1]));
+    }
+
+    #[tokio::test]
+    async fn a_load_after_the_last_sequence_replays_nothing() {
+        let store = Arc::new(MemoryStore::default());
+        let hub = Hub::new(store.clone());
+        let session = Uuid::new_v4();
+        let seqs = record(&store, session, 3).await;
+
+        let (replayed, resumed) = replay_page(&hub, session, seqs[2], Some(seqs[2]))
+            .await
+            .unwrap();
+
+        assert!(resumed);
+        assert!(replayed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_load_after_a_sequence_the_log_does_not_hold_replays_the_latest_page() {
+        let store = Arc::new(MemoryStore::default());
+        let hub = Hub::new(store.clone());
+        let session = Uuid::new_v4();
+        // Recorded before this session's own events, so the point is one the log never held for it — what a UI
+        // resuming from a sequence the log has dropped says (#449).
+        let dropped = record(&store, Uuid::new_v4(), 2).await;
+        let seqs = record(&store, session, 4).await;
+
+        let (replayed, resumed) = replay_page(&hub, session, seqs[3], Some(dropped[0]))
+            .await
+            .unwrap();
+
+        assert!(!resumed);
+        let replayed: Vec<i64> = replayed.iter().map(|(seq, _, _)| *seq).collect();
+        assert_eq!(replayed, seqs);
+    }
+
+    #[tokio::test]
+    async fn a_load_further_behind_than_a_page_replays_the_latest_page() {
+        let store = Arc::new(MemoryStore::default());
+        let hub = Hub::new(store.clone());
+        let session = Uuid::new_v4();
+        let seqs = record(&store, session, HISTORY_PAGE as usize + 2).await;
+
+        let (replayed, resumed) = replay_page(&hub, session, *seqs.last().unwrap(), Some(seqs[0]))
+            .await
+            .unwrap();
+
+        assert!(!resumed);
+        assert_eq!(replayed.len() as i64, HISTORY_PAGE);
+        assert_eq!(replayed[0].0, seqs[2]);
+    }
 }

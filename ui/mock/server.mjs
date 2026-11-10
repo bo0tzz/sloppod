@@ -1746,16 +1746,25 @@ function handleCall(conn, message) {
         return;
       }
       // Like the runtime: only the latest of the log, with where to ask for older pages — by sequence number, which is
-      // one sequence across every session.
-      const start = Math.max(0, session.log.length - HISTORY_PAGE);
+      // one sequence across every session. A UI that says how far its own copy reaches (`_meta.sloppod.after`) is sent
+      // only what came after that instead, when the log still holds the point and what follows fits in a page (#449).
+      const after = params._meta?.sloppod?.after;
+      const point = typeof after === 'number' ? session.log.findIndex((entry) => entry._meta.sloppod.seq === after) : -1;
+      const resumed = point !== -1 && session.log.length - point - 1 <= HISTORY_PAGE;
+      const start = resumed ? point + 1 : Math.max(0, session.log.length - HISTORY_PAGE);
       for (const entry of session.log.slice(start)) conn.notify('session/update', entry);
+      // Every load as it happens, so a test can see what a reconnect was sent (`/_mock/loads`).
+      loads.push({ session: session.data.id, after: after ?? null, resumed, updates: session.log.length - start });
       session.subscribers.add(conn);
       conn.loaded.add(session.data.id);
       // Like the runtime: the queue before the response.
       broadcastQueue(session, [conn]);
       conn.respond(id, {
         configOptions: session.configOptions(),
-        _meta: { sloppod: { historyBefore: start > 0 ? session.log[start]._meta.sloppod.seq : null } },
+        // A resumed one has no boundary of its own to give: the UI's own still holds.
+        _meta: {
+          sloppod: resumed ? { resumed: true } : { resumed: false, historyBefore: start > 0 ? session.log[start]._meta.sloppod.seq : null },
+        },
       });
       for (const pending of session.pending.values()) sendPending(session, pending, conn);
       return;
@@ -2964,6 +2973,12 @@ const server = http.createServer(async (req, res) => {
       failLoadsUntil = Date.now() + Number(url.searchParams.get('for') ?? 0);
       return json(res, 200, {});
     }
+    // The loads so far, oldest first: `{session, after, resumed, updates}`; `DELETE` starts over (#449).
+    if (url.pathname === '/_mock/loads') {
+      const seen = loads;
+      if (req.method === 'DELETE') loads = [];
+      return json(res, 200, seen);
+    }
     // A highlight appears in an existing session with nothing else happening in it: it asks for the user, and no turn runs.
     if (url.pathname === '/_mock/highlight' && req.method === 'POST') {
       const session = sessions.get(url.searchParams.get('session') ?? '');
@@ -3025,6 +3040,8 @@ let slowSessionsUntil = 0;
 let proposalDetailDelay = 0;
 let slowLoadsUntil = 0;
 let failLoadsUntil = 0;
+/** Every `session/load`, oldest first: what it resumed from and how much it replayed (#449). */
+let loads = [];
 /** Set by `/_mock/fail-history`: the next ask for an older page of history fails, as a runtime that can't read it does. */
 let failHistory = false;
 /** Set by `/_mock/hold-history`: the next ask for an older page waits for `/_mock/release-history`. */

@@ -765,6 +765,50 @@ async fn a_session_log_has_a_last_event(db: PgPool) {
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_session_log_reads_back_from_after_a_sequence(db: PgPool) {
+    let s = session(&db, "dev").await;
+    let other = session(&db, "dev").await;
+    let mut seqs = Vec::new();
+    for n in 0..3 {
+        seqs.push(db::append_event(&db, s, &json!({"n": n})).await.unwrap().0);
+        db::append_event(&db, other, &json!({"other": n}))
+            .await
+            .unwrap();
+    }
+    // What came after it, in order, and only this session's: the other session's events are numbered in between.
+    let after = db::events_after(&db, s, seqs[0], i64::MAX, 10)
+        .await
+        .unwrap();
+    assert_eq!(after.iter().map(|e| e.0).collect::<Vec<_>>(), seqs[1..]);
+    // Up to the limit, and with `before` exclusive, as it is everywhere else.
+    assert_eq!(
+        db::events_after(&db, s, seqs[0], i64::MAX, 1)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        db::events_after(&db, s, seqs[0], seqs[1], 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // A load resumes only from a sequence the log still holds: not one of another session's, and not one that has
+    // been dropped from the session's own history (#449).
+    assert!(db::has_event(&db, s, seqs[1]).await.unwrap());
+    assert!(!db::has_event(&db, other, seqs[0]).await.unwrap());
+    sqlx::query("delete from session_events where session_id = $1 and seq <= $2")
+        .bind(s)
+        .bind(seqs[1])
+        .execute(&db)
+        .await
+        .unwrap();
+    assert!(!db::has_event(&db, s, seqs[1]).await.unwrap());
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
 async fn a_pull_requests_fingerprint_is_found_by_repository_and_number(db: PgPool) {
     let s = session(&db, "dev").await;
     for (repo, number, fingerprint) in [("O/R", 7, Some("abc")), ("o/r", 8, None)] {
