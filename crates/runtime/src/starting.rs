@@ -406,11 +406,18 @@ mod tests {
         assert_eq!(repo.as_deref(), Some("bo0tzz/private"));
         assert_eq!(
             names(&grants),
-            ["model", "docs", "repo", "victorialogs", "github"]
+            [
+                "model",
+                "docs",
+                "subsessions",
+                "repo",
+                "victorialogs",
+                "github"
+            ]
         );
-        assert_eq!(grants[2].param("as"), Some("bo0tzz"));
+        assert_eq!(grants[3].param("as"), Some("bo0tzz"));
         assert_eq!(
-            grants[2].param("credential"),
+            grants[3].param("credential"),
             Some(Uuid::from_u128(1).to_string().as_str())
         );
 
@@ -423,9 +430,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             names(&grants),
-            ["model", "docs", "repo", "packages", "github"]
+            ["model", "docs", "subsessions", "repo", "packages", "github"]
         );
-        assert_eq!(grants[2].param("credential"), None);
+        assert_eq!(grants[3].param("credential"), None);
 
         for (wanted, why) in [
             (
@@ -467,22 +474,22 @@ mod tests {
         };
         assert_eq!(
             capabilities(grants(DEFAULTS, None, None, id).unwrap()),
-            ["model", "docs", "github", "packages"]
+            ["model", "docs", "subsessions", "github", "packages"]
         );
-        // Model access and docs come whatever's chosen, even nothing.
+        // Model access, docs and the ability to spawn come whatever's chosen, even nothing.
         assert_eq!(
             capabilities(grants(DEFAULTS, Some(&[]), None, id).unwrap()),
-            ["model", "docs"]
+            ["model", "docs", "subsessions"]
         );
         let packages = ["packages".to_owned()];
         assert_eq!(
             capabilities(grants(DEFAULTS, Some(&packages), None, id).unwrap()),
-            ["model", "docs", "packages"]
+            ["model", "docs", "subsessions", "packages"]
         );
         // A repository needs GitHub, so it comes along.
         assert_eq!(
             capabilities(grants(DEFAULTS, Some(&packages), Some("o/r"), id).unwrap()),
-            ["model", "docs", "github", "packages", "repo"]
+            ["model", "docs", "subsessions", "github", "packages", "repo"]
         );
         let more = ["memory".to_owned()];
         assert!(grants(DEFAULTS, Some(&more), None, id).is_err());

@@ -265,7 +265,7 @@ pub async fn deleted_in_line(db: &PgPool, session: Uuid) -> sqlx::Result<bool> {
 }
 
 /// Every sub-session below `session` that isn't deleted, at any depth, also below sub-sessions that are.
-pub async fn live_descendants(db: &PgPool, session: Uuid) -> sqlx::Result<Vec<SessionRow>> {
+pub async fn descendants(db: &PgPool, session: Uuid) -> sqlx::Result<Vec<SessionRow>> {
     sqlx::query_as(AssertSqlSafe(format!(
         "with recursive down as (select id from sessions where parent_id = $1 \
            union all select s.id from sessions s join down on s.parent_id = down.id) \

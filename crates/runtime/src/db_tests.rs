@@ -973,7 +973,7 @@ async fn a_sessions_first_message_is_its_task(db: PgPool) {
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
-async fn live_descendants_are_found_below_deleted_ones(db: PgPool) {
+async fn descendants_are_found_below_deleted_ones(db: PgPool) {
     // A → B → C, with B deleted and C restored on its own.
     let a = session(&db, "alice").await;
     let b = session(&db, "alice").await;
@@ -982,8 +982,32 @@ async fn live_descendants_are_found_below_deleted_ones(db: PgPool) {
     db::set_parent(&db, c, b).await.unwrap();
     db::mark_deleted(&db, b).await.unwrap();
     let ids = |rows: Vec<db::SessionRow>| rows.iter().map(|r| r.id).collect::<Vec<_>>();
-    assert_eq!(ids(db::live_descendants(&db, a).await.unwrap()), [c]);
-    assert!(db::live_descendants(&db, c).await.unwrap().is_empty());
+    assert_eq!(ids(db::descendants(&db, a).await.unwrap()), [c]);
+    assert!(db::descendants(&db, c).await.unwrap().is_empty());
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_sessions_descendants_are_its_whole_subtree(db: PgPool) {
+    // What `list_sessions` shows a parent: its grandchildren too, each with the parent it hangs from (#495).
+    let root = session(&db, "alice").await;
+    let child = session(&db, "alice").await;
+    let grandchild = session(&db, "alice").await;
+    db::set_parent(&db, child, root).await.unwrap();
+    db::set_parent(&db, grandchild, child).await.unwrap();
+    let rows = db::descendants(&db, root).await.unwrap();
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    assert_eq!(ids, [child, grandchild]);
+    assert_eq!(rows[1].parent_id, Some(child));
+    // A child sees its own subtree, not its parent or siblings.
+    assert_eq!(
+        db::descendants(&db, child)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>(),
+        [grandchild]
+    );
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]

@@ -78,6 +78,9 @@ pub fn describe(grant: &Grant) -> String {
         capability::DOCS => "Library documentation, searched by library and topic, through Context7's MCP server (the `docs` \
                    tools)."
             .into(),
+        capability::SUBSESSIONS => "Start sub-sessions of its own (`spawn_session`), each with its own pod and at most \
+                   this session's grants."
+            .into(),
         capability::MEMORY => match grant.param("namespace") {
             Some(namespace) => format!("Long-term memory (memini), in the namespace {namespace}."),
             None => "Long-term memory (memini).".into(),

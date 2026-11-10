@@ -3,7 +3,7 @@
 
 use serde_json::{Value, json};
 use sloppod_contracts::{Grant, READ_WRITE, capability, operation, same_repo};
-use sloppod_protocol::api::{Phase, ProposalStatus, SessionKind};
+use sloppod_protocol::api::{Phase, ProposalStatus, Session, SessionKind};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -51,8 +51,18 @@ fn workspace_said(copied: bool, asked: bool) -> &'static str {
 /// A child's grants (ADR 2's attenuation): the parent's, narrowed to the capabilities in `keep` if given. What the
 /// child's agent needs to run (model access) always stays. A repository the parent may push to, the child may push
 /// to on a branch named after the parent's, starting from it, so the parent can integrate and propose its work.
-fn child_grants(parent: &[Grant], keep: Option<&[String]>, child: Uuid) -> Vec<Grant> {
+/// Starting sub-sessions is the exception (#495): a child doesn't get it unless its parent names it in `keep` or
+/// passes `may_spawn`, so a tree's fan-out stays the parent's to coordinate.
+fn child_grants(
+    parent: &[Grant],
+    keep: Option<&[String]>,
+    child: Uuid,
+    may_spawn: bool,
+) -> Vec<Grant> {
     let kept = |capability: &str| {
+        if capability == capability::SUBSESSIONS {
+            return may_spawn || keep.is_some_and(|keep| keep.iter().any(|k| k == capability));
+        }
         crate::capabilities::always_inherited(capability)
             || keep.is_none_or(|keep| keep.iter().any(|k| k == capability))
     };
@@ -129,14 +139,18 @@ pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<
     if parent.kind != SessionKind::Work {
         return Err("only work sessions can spawn sub-sessions".into());
     }
+    if !crate::capabilities::holds(&parent.context(), &crate::capabilities::Part::Spawn) {
+        return Err("this session can't start sub-sessions".into());
+    }
     let keep: Option<Vec<String>> = arguments["grants"].as_array().map(|grants| {
         grants
             .iter()
             .filter_map(|g| g.as_str().map(str::to_owned))
             .collect()
     });
+    let may_spawn = arguments["may_spawn"].as_bool().unwrap_or(false);
     let id = Uuid::new_v4();
-    let grants = child_grants(&parent.grants(), keep.as_deref(), id);
+    let grants = child_grants(&parent.grants(), keep.as_deref(), id, may_spawn);
     // A child works where its parent can push, so the parent can integrate what it does.
     let repo = match arguments["repo"].as_str() {
         Some(wanted) => Some(
@@ -292,21 +306,27 @@ pub(crate) fn doing(phase: Phase, commands: Option<usize>, unschedulable: Option
     }
 }
 
-/// `list_sessions`: the session's children, and how each is doing.
+/// `list_sessions`: the session's whole subtree, and how each is doing.
 pub async fn list(state: &AppState, parent: Uuid) -> Result<String, String> {
-    let children = db::children(&state.db, parent)
+    let descendants = db::descendants(&state.db, parent)
         .await
         .map_err(|e| e.to_string())?;
     let mut listed = Vec::new();
-    for child in &children {
+    for child in &descendants {
         let api = state.hub.session_api(child).await;
-        listed.push(json!({
-                "id": child.id, "title": child.title, "phase": child.phase, "model": child.model, "repo": api.repo,
-                "branch": api.branch, "doing": doing(api.phase, api.commands, api.unschedulable.as_deref()), "commands": api.commands,
-                "command_lines": api.command_lines,
-            }));
+        listed.push(listed_session(child, &api));
     }
     Ok(Value::Array(listed).to_string())
+}
+
+/// One entry of `list_sessions`: what the session is, whose it is, and what it's doing.
+fn listed_session(child: &db::SessionRow, api: &Session) -> Value {
+    json!({
+        "id": child.id, "parent_id": child.parent_id, "title": child.title, "phase": child.phase,
+        "model": child.model, "repo": api.repo, "branch": api.branch,
+        "doing": doing(api.phase, api.commands, api.unschedulable.as_deref()),
+        "commands": api.commands, "command_lines": api.command_lines,
+    })
 }
 
 /// `message_session`: a message from `from` to its parent or one of its children, delivered as a notice. A parked
@@ -456,15 +476,18 @@ pub async fn park_finished(state: &AppState) {
     }
 }
 
-pub fn tools(endpoint_models: &[String]) -> Vec<Value> {
+pub fn tools(endpoint_models: &[String], may_spawn: bool) -> Vec<Value> {
     let model = match endpoint_models {
         [] => "defaults to the user's setting for sub-sessions, by default a cheaper model than yours where the agent has one (Sonnet for claude-code); name a model to give a hard task a bigger one".to_owned(),
         models => format!("defaults to the user's setting for sub-sessions, by default a cheaper model than yours where the agent has one (Sonnet for claude-code); name a model to give a hard task a bigger one. The user's own endpoints serve these, for claude-code: {} (name one by the model before the parentheses)", models.join(", ")),
     };
-    vec![
-        json!({
+    let mut tools = Vec::new();
+    // Only a session holding the `subsessions` grant starts its own (#495): a sub-session gets it only when its
+    // parent allowed it, so the tree's fan-out stays the parent's to coordinate.
+    if may_spawn {
+        tools.push(json!({
             "name": "spawn_session",
-            "description": format!("Start a sub-session for a piece of your work that can run on its own: a session with its own pod and agent, linked to yours. It starts with your grants, or fewer (a repository you act on as the user, it acts on as them only to read and push its own branch; proposals there stay yours), and works on a branch named after yours, starting from your branch as pushed (push first), so you can merge, rebase or propose what it does. At most {MAX_RUNNING} run at once. Returns its id and branch."),
+            "description": format!("Start a sub-session for a piece of your work that can run on its own: a session with its own pod and agent, linked to yours. It starts with your grants, or fewer (a repository you act on as the user, it acts on as them only to read and push its own branch; proposals there stay yours), and works on a branch named after yours, starting from your branch as pushed (push first), so you can merge, rebase or propose what it does. At most {MAX_RUNNING} run at once. Returns its id and branch. Use it rarely, only when a split clearly pays for itself, and name a `model` rather than rely on the default."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -475,10 +498,13 @@ pub fn tools(endpoint_models: &[String]) -> Vec<Value> {
                     "agent": {"type": "string", "description": "claude-code or codex; defaults to yours"},
                     "model": {"type": "string", "description": model},
                     "workspace": {"type": "string", "enum": ["copy", "fresh"], "description": "Where its workspace starts. \"copy\": a copy of your volume — your checkout, tools, dependencies and caches — so it starts quickly, with your uncommitted work left out and your keys and agent state cleared. Pick it for related work on the same repository, which is the default there. \"fresh\": an empty volume, which it clones the repository into and installs tools in; the default for another repository, for an independent task, or to keep a mess of yours out of it (your caches, its own mess)"},
+                    "may_spawn": {"type": "boolean", "description": "Whether the child may start sub-sessions of its own. Off by default: a child asks you with `message_session` if its work should be split, so you start the sessions and keep coordinating models, migration numbers and branches. Turn it on only when the child clearly needs to fan out itself."},
                 },
                 "required": ["task"],
             },
-        }),
+        }));
+    }
+    tools.extend([
         json!({
             "name": "message_session",
             "description": "Send a message to your parent session or one of your sub-sessions, by id. It arrives as a notice between its tool calls, and wakes it if it's parked.",
@@ -502,10 +528,11 @@ pub fn tools(endpoint_models: &[String]) -> Vec<Value> {
         }),
         json!({
             "name": "list_sessions",
-            "description": "Your sub-sessions: each one's id, title, phase, model, repository and branch, and what it's doing (`doing`): an idle one with commands running (`commands`, their `command_lines`) is waiting on them, not done.",
+            "description": "Your whole subtree of sub-sessions, at any depth: each one's id, `parent_id`, title, phase, model, repository and branch, and what it's doing (`doing`): an idle one with commands running (`commands`, their `command_lines`) is waiting on them, not done.",
             "inputSchema": {"type": "object", "properties": {}},
         }),
-    ]
+    ]);
+    tools
 }
 
 #[cfg(test)]
@@ -598,7 +625,7 @@ mod tests {
         ];
         let child = Uuid::parse_str("0123456789abcdef0123456789abcdef").unwrap();
 
-        let all = child_grants(&parent, None, child);
+        let all = child_grants(&parent, None, child, false);
         assert_eq!(all.len(), parent.len());
         assert_eq!(
             all[5].param("level"),
@@ -617,33 +644,33 @@ mod tests {
         assert_eq!(all[4].params["operations"], json!(["read", "push"]));
         assert_eq!(all[3].params.get("operations"), None);
         // A grandchild keeps its parent's narrowing, and gets no more.
-        let grandchild = child_grants(&all, None, child);
+        let grandchild = child_grants(&all, None, child, false);
         assert_eq!(grandchild[4].params["operations"], json!(["read", "push"]));
         assert_eq!(grandchild[5].param("level"), Some("track"));
         // A parent grant that lists `propose` doesn't pass it on; one narrower than read and push stays narrower.
         let mut listed = parent.clone();
         listed[4].params["operations"] = json!(["read", "push", "propose"]);
         assert_eq!(
-            child_grants(&listed, None, child)[4].params["operations"],
+            child_grants(&listed, None, child, false)[4].params["operations"],
             json!(["read", "push"])
         );
         listed[4].params["operations"] = json!(["read", "propose"]);
         assert_eq!(
-            child_grants(&listed, None, child)[4].params["operations"],
+            child_grants(&listed, None, child, false)[4].params["operations"],
             json!(["read"])
         );
 
         // A grant that runs out runs out for the child too.
         let mut expiring = parent.clone();
         expiring[2].expires_at = Some("2026-10-28T22:00:00Z".to_owned());
-        let inherited = child_grants(&expiring, None, child);
+        let inherited = child_grants(&expiring, None, child, false);
         assert_eq!(
             inherited[2].expires_at.as_deref(),
             Some("2026-10-28T22:00:00Z")
         );
 
         // Narrowed: only what's kept, and model access always.
-        let narrow = child_grants(&parent, Some(&["docs".to_owned()]), child);
+        let narrow = child_grants(&parent, Some(&["docs".to_owned()]), child, false);
         let names: Vec<&str> = narrow.iter().map(|g| g.capability.as_str()).collect();
         assert_eq!(names, ["model", "docs"]);
         // Nothing the parent doesn't have.
@@ -651,8 +678,78 @@ mod tests {
             &parent,
             Some(&["memory".to_owned(), "github".to_owned()]),
             child,
+            false,
         );
         let names: Vec<&str> = asked.iter().map(|g| g.capability.as_str()).collect();
         assert_eq!(names, ["model", "github"]);
+    }
+
+    /// A child starts its own sub-sessions only when its parent allows it (#495): by naming the capability in
+    /// `grants`, or with `may_spawn`. Otherwise it's dropped, even when the parent keeps all of its grants.
+    #[test]
+    fn a_child_starts_its_own_only_when_its_parent_allows_it() {
+        let parent = [
+            grant(capability::MODEL, json!({})),
+            grant(capability::SUBSESSIONS, json!({})),
+            grant(capability::DOCS, json!({})),
+        ];
+        let child = Uuid::parse_str("0123456789abcdef0123456789abcdef").unwrap();
+        let names =
+            |grants: Vec<Grant>| grants.into_iter().map(|g| g.capability).collect::<Vec<_>>();
+
+        // All of the parent's grants, but not the ability to spawn.
+        assert_eq!(
+            names(child_grants(&parent, None, child, false)),
+            ["model", "docs"]
+        );
+        // Allowed explicitly.
+        assert_eq!(
+            names(child_grants(&parent, None, child, true)),
+            ["model", "subsessions", "docs"]
+        );
+        // Or named in `grants`, which narrows to it.
+        assert_eq!(
+            names(child_grants(
+                &parent,
+                Some(&["subsessions".to_owned()]),
+                child,
+                false
+            )),
+            ["model", "subsessions"]
+        );
+        // A parent that doesn't hold it can't pass it on.
+        let without = [grant(capability::MODEL, json!({}))];
+        assert_eq!(names(child_grants(&without, None, child, true)), ["model"]);
+    }
+
+    /// A listed session says whose it is and which model it runs, so a parent can see and park its grandchildren
+    /// (#495).
+    #[test]
+    fn a_listed_session_says_whose_it_is_and_its_model() {
+        let parent = Uuid::new_v4();
+        let mut row = db::SessionRow::for_test(Uuid::new_v4(), "dev");
+        row.parent_id = Some(parent);
+        row.model = Some("sonnet".into());
+        let listed = listed_session(&row, &row.to_api());
+        assert_eq!(listed["parent_id"], json!(parent));
+        assert_eq!(listed["model"], "sonnet");
+        assert_eq!(listed["id"], json!(row.id));
+    }
+
+    /// The tool is offered only to a session holding the ability (#495).
+    #[test]
+    fn only_a_session_that_may_spawn_is_offered_the_tool() {
+        let names = |may_spawn: bool| {
+            tools(&[], may_spawn)
+                .into_iter()
+                .map(|t| t["name"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(!names(false).contains(&"spawn_session".to_owned()));
+        assert!(names(true).contains(&"spawn_session".to_owned()));
+        // The rest of the sub-session tools stay either way.
+        for tool in ["message_session", "park_session", "list_sessions"] {
+            assert!(names(false).contains(&tool.to_owned()), "{tool}");
+        }
     }
 }
