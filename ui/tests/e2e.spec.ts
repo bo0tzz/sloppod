@@ -4499,6 +4499,20 @@ test('a session at its usage limit says when it carries on', async ({ page }) =>
   await expect(page.getByTestId('session-limited')).toBeHidden();
 });
 
+/**
+ * Picks a timezone in Settings. The list holds every zone a browser knows, so it scrolls, and until the user scrolls it
+ * the list keeps realigning to the selected zone as its scroll buttons come and go — which moves the option under the
+ * pointer and makes a click land on another one (#492). Scrolling it first, as a user would, settles it.
+ */
+async function chooseTimezone(page: Page, zone: string) {
+  const setting = page.getByTestId('timezone-setting').getByRole('combobox', { name: 'Timezone' });
+  await setting.click();
+  await page.getByRole('listbox').hover();
+  await page.mouse.wheel(0, -20_000);
+  await page.getByRole('option', { name: zone, exact: true }).click();
+  return setting;
+}
+
 test.describe('in Amsterdam', () => {
   test.use({ timezoneId: 'Europe/Amsterdam' });
 
@@ -4509,8 +4523,7 @@ test.describe('in Amsterdam', () => {
     await expect(setting).toContainText('Europe/Amsterdam');
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Europe/Amsterdam');
 
-    await setting.click();
-    await page.getByRole('option', { name: 'Asia/Tokyo', exact: true }).click();
+    await chooseTimezone(page, 'Asia/Tokyo');
     await expect(setting).toContainText('Asia/Tokyo');
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Asia/Tokyo');
 
@@ -4530,11 +4543,9 @@ test.describe('in UTC', () => {
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('UTC');
     await expect(setting).toContainText('UTC');
 
-    await setting.click();
-    await page.getByRole('option', { name: 'Asia/Tokyo', exact: true }).click();
+    await chooseTimezone(page, 'Asia/Tokyo');
     await expect(setting).toContainText('Asia/Tokyo');
-    await setting.click();
-    await page.getByRole('option', { name: 'UTC', exact: true }).click();
+    await chooseTimezone(page, 'UTC');
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('UTC');
   });
 
@@ -4551,8 +4562,7 @@ test.describe('in UTC', () => {
     // Another timezone in Settings, and back to the session without a reload.
     await page.getByRole('link', { name: 'Settings' }).first().click();
     const setting = page.getByTestId('timezone-setting').getByRole('combobox', { name: 'Timezone' });
-    await setting.click();
-    await page.getByRole('option', { name: 'Asia/Tokyo', exact: true }).click();
+    await chooseTimezone(page, 'Asia/Tokyo');
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Asia/Tokyo');
     await page.getByRole('navigation', { name: 'Sessions' }).getByRole('link', { name: /Put the deploy check off/ }).click();
 
