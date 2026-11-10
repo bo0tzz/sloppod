@@ -52,15 +52,6 @@
 
   let { id }: { id: string } = $props();
 
-  /** Calls `action` whenever the element scrolls into view. */
-  function whenVisible(node: HTMLElement, action: () => void) {
-    const observer = new IntersectionObserver((entries) => {
-      if (entries.some((entry) => entry.isIntersecting)) action();
-    });
-    observer.observe(node);
-    return { destroy: () => observer.disconnect() };
-  }
-
   // The route wraps this component in {#key id}, so capturing the first id is intended.
   // svelte-ignore state_referenced_locally
   const view = new SessionView(id);
@@ -193,8 +184,24 @@
   let scroller = $state<HTMLElement | null>(null);
   let content = $state<HTMLElement | null>(null);
   let atBottom = $state(true);
-  /** Earlier history loads by itself only once the reader has scrolled, not when the view starts out at the top. */
+  /**
+   * Earlier history loads by itself only once the reader has scrolled — by wheel, touch, key or the scrollbar — and not
+   * when the view opens at the top, where the scrolling is the view's own. A reader who only drags the scrollbar has no
+   * other way to it, the button that used to be there being gone.
+   */
   let userScrolled = false;
+  /**
+   * Which way the reader last asked the view to go: `true` for what's above. A page shorter than the view has nowhere to
+   * scroll, so its wheel, swipe and keys leave no scroll event behind, and being at the bottom of it says nothing about
+   * whether there is anything above — only they can.
+   */
+  let askedEarlier = false;
+  /**
+   * Set while a page of older history is on its way in. The page's rows are laid out as it lands, and a view that looks
+   * like it has nothing below it for a moment is not one the reader has gone to the bottom of: following that would
+   * take them away from where they were reading, the one thing the page must not do.
+   */
+  let holdingPlace = false;
 
   onMount(() => {
     loadAutoApprovals().catch(() => {});
@@ -223,12 +230,91 @@
     scheduleRead();
     if (holdBar) return;
     const resized = viewResized();
-    if (bottomGap() < 80) {
+    if (!holdingPlace && bottomGap() < 80) {
       atBottom = true;
     } else if (!resized && (pointerHeld || performance.now() - lastUserScroll < 1000)) {
       atBottom = false;
     }
     if (!resized) settle();
+    loadEarlierIfNear();
+  }
+
+  /** How far up the reader gets before the page before is fetched: two screens, so it's usually there before they are. */
+  const EARLIER_WITHIN_SCREENS = 2;
+
+  /** Fetches the page before while the reader is reading up into it, as any chat does; never on opening at the top. */
+  function loadEarlierIfNear() {
+    if (!scroller || !positioned || !userScrolled) return;
+    // Being at the bottom says nothing when the page fits the view and there is nowhere below to be: what the reader
+    // asked for above them is what is fetched, and being able to see the bottom doesn't make that not so.
+    if (atBottom && !askedEarlier) return;
+    if (view.historyBefore === null || view.loadingHistory || view.historyError) return;
+    if (scroller.scrollTop > EARLIER_WITHIN_SCREENS * scroller.clientHeight) return;
+    void loadEarlier();
+  }
+
+  /** A row's bottom as the content has it: what a page going in above it moves, whatever the reader scrolls. */
+  function endOf(row: HTMLElement) {
+    return content ? row.getBoundingClientRect().bottom - content.getBoundingClientRect().top : 0;
+  }
+
+  /**
+   * Loads the page of history before, keeping the reader's place. The page goes in above the row at the top of the view,
+   * so scrolling by as much as that row has been pushed down holds it there — measured, and measured again over the
+   * frames after, the rows off screen being laid out at a guess until they come near (#446). The row's end and not its
+   * start is what's held: where the page continues a message the reader is in, what it adds is above them too.
+   */
+  async function loadEarlier() {
+    const rows = rowElements();
+    const at = rows.findIndex((row) => row.getBoundingClientRect().bottom > (scroller?.getBoundingClientRect().top ?? 0));
+    // Where the reader is while the page is on its way, not only where they were when they asked: the rows that come
+    // near settle as they read (#446), and that settling is no part of the page that then goes in above them.
+    const page = view.loadEarlier();
+    holdingPlace = true;
+    let held = at < 0 ? undefined : endOf(rows[at]);
+    // The reader's row by the names it holds — a message's id, a tool call's — which a page going in above it leaves
+    // alone, as an update of a live turn to that row does; rows of an earlier page have no name, and there the rows
+    // that went in above them are counted instead. Every name a fold holds is kept: the page before can widen it.
+    const names = (rows[at]?.dataset.rowNames ?? '').split(' ').filter(Boolean);
+    try {
+      while (view.loadingHistory && held !== undefined) {
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+        // The page once it lands is not the reader's place any more: the rows are its own by then.
+        if (!view.loadingHistory) break;
+        const row = rowElements()[at];
+        if (row) held = endOf(row);
+      }
+      await page;
+      if (held === undefined || !scroller) return;
+      const scrolledBy = lastUserScroll;
+      let scrolled = 0;
+      let still = 0;
+      for (let round = 0; round < 20 && still < 3; round++) {
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+        // Scrolling on themselves, the reader has taken the view where they want it: what a page did above them is
+        // theirs to scroll past as well, and holding them back would be the jump.
+        if (pointerHeld || lastUserScroll !== scrolledBy) return;
+        // A row holding any of those names is the reader's: a fold widened by the page above it holds the tool call the
+        // reader was at still, under a name of its own from an older page.
+        const now = rowElements();
+        const row = names.length
+          ? now.find((candidate) => (candidate.dataset.rowNames ?? '').split(' ').some((name) => names.includes(name)))
+          : now[at + (now.length - rows.length)];
+        // Past the end: what's here isn't the transcript this page went into, so there's no place to hold.
+        if (!row) return;
+        // What has gone in above the reader so far; scrolling there doesn't move it, and where it couldn't be scrolled
+        // (a view too short to hold it yet) it is tried again.
+        const drift = endOf(row) - held - scrolled;
+        still = Math.abs(drift) < 0.5 ? still + 1 : 0;
+        if (still === 0) {
+          const from = scroller.scrollTop;
+          scroller.scrollTop += drift;
+          scrolled += scroller.scrollTop - from;
+        }
+      }
+    } finally {
+      holdingPlace = false;
+    }
   }
 
   // Only the reader stops the view following new output. The browser scrolls by itself too, e.g. to keep what's on
@@ -238,24 +324,62 @@
   let pointerHeld = false;
   $effect(() => {
     if (!scroller) return;
-    const scrolling = () => {
+    const scrolling = (event: Event) => {
       lastUserScroll = performance.now();
       holdBar = false;
+      userScrolled = true;
+      // Which way they asked to go is kept here, and not read off the scrolling: a page that fits the view says nothing,
+      // having no scroll event to come of a wheel or a key, and what's above it is reached only by asking for it.
+      const up = asksForEarlier(event);
+      if (up !== null) askedEarlier = up;
+      loadEarlierIfNear();
     };
     const press = () => (pointerHeld = true);
     const release = () => (pointerHeld = false);
+    // A finger's direction only means anything within the gesture it started: a gesture beginning where the last ended
+    // would read as going back the way it came.
+    const touchStart = (event: TouchEvent) => (lastTouchY = event.touches[0]?.clientY ?? null);
+    const touchEnd = () => (lastTouchY = null);
     const events = ['wheel', 'touchmove', 'keydown', 'pointerdown'] as const;
     for (const event of events) scroller.addEventListener(event, scrolling, { passive: true });
     scroller.addEventListener('pointerdown', press);
+    scroller.addEventListener('touchstart', touchStart, { passive: true });
+    scroller.addEventListener('touchend', touchEnd);
+    scroller.addEventListener('touchcancel', touchEnd);
     window.addEventListener('pointerup', release);
     window.addEventListener('pointercancel', release);
     return () => {
       events.forEach((event) => scroller?.removeEventListener(event, scrolling));
       scroller?.removeEventListener('pointerdown', press);
+      scroller?.removeEventListener('touchstart', touchStart);
+      scroller?.removeEventListener('touchend', touchEnd);
+      scroller?.removeEventListener('touchcancel', touchEnd);
       window.removeEventListener('pointerup', release);
       window.removeEventListener('pointercancel', release);
     };
   });
+
+  /**
+   * Where the finger was last seen in the gesture it is in, for telling which way it is going: a swipe down is a reader
+   * asking for what's above. The gesture's own start sets it and its end clears it, so one that begins where the last
+   * one stopped isn't read as going back the way it came.
+   */
+  let lastTouchY: number | null = null;
+  const EARLIER_KEYS = new Set(['PageUp', 'Home', 'ArrowUp']);
+  const LATER_KEYS = new Set(['PageDown', 'End', 'ArrowDown']);
+
+  /** Which way a wheel, touch or key asks the view to go: `true` for what's above, `false` for what's below, `null` for neither. */
+  function asksForEarlier(event: Event): boolean | null {
+    if (event instanceof WheelEvent) return event.deltaY === 0 ? null : event.deltaY < 0;
+    if (event instanceof KeyboardEvent) return EARLIER_KEYS.has(event.key) ? true : LATER_KEYS.has(event.key) ? false : null;
+    if (event instanceof TouchEvent) {
+      const at = event.touches[0]?.clientY ?? null;
+      const was = lastTouchY;
+      lastTouchY = at;
+      return at === null || was === null || at === was ? null : at > was;
+    }
+    return null;
+  }
 
   function scrollToBottom(behavior: ScrollBehavior = 'instant') {
     scroller?.scrollTo({ top: scroller.scrollHeight, behavior });
@@ -385,14 +509,6 @@
     });
   }
 
-  $effect(() => {
-    if (!scroller) return;
-    const scrolled = () => (userScrolled = true);
-    const events = ['wheel', 'touchmove', 'keydown'] as const;
-    for (const event of events) scroller.addEventListener(event, scrolled, { passive: true });
-    return () => events.forEach((event) => scroller?.removeEventListener(event, scrolled));
-  });
-
   // Follow new output while the reader is at the bottom, but leave them alone when they scrolled up.
   $effect(() => {
     if (!content || !scroller) return;
@@ -402,9 +518,11 @@
       if (settled.height > 0 && viewResized() && settled.gap < 80) atBottom = true;
       // Rows off screen are laid out at a guess until they come near, so the bar's place keeps moving as they do.
       if (holdBar) scrollToBar();
-      else if (atBottom) scrollToBottom();
+      else if (atBottom && !holdingPlace) scrollToBottom();
       settle();
       scheduleRead();
+      // A page shorter than the room above it leaves the reader near the top still: the next one is due as well.
+      loadEarlierIfNear();
     });
     observer.observe(content);
     observer.observe(scroller);
@@ -721,12 +839,14 @@
                 {#if view.transcript.items.length === 0 && session?.phase !== 'starting'}
                   <Text color="muted" class="py-16 text-center">Nothing here yet. Send a message to get going.</Text>
                 {/if}
-                {#if view.historyBefore !== null}
-                  <div class="flex justify-center py-2" use:whenVisible={() => userScrolled && view.loadEarlier()}>
-                    <Button size="small" variant="ghost" loading={view.loadingHistory} onclick={() => view.loadEarlier()}>
-                      Load earlier messages
-                    </Button>
+                {#if view.historyError}
+                  <!-- The one place the reader is asked anything: a page that didn't arrive, and only they can say again. -->
+                  <div class="flex items-center justify-center gap-2 py-1" data-testid="history-error">
+                    <Text color="muted" size="small" title={view.historyError}>Couldn't load earlier messages</Text>
+                    <Button size="tiny" variant="ghost" onclick={loadEarlier}>Retry</Button>
                   </div>
+                {:else if view.historyBefore === null && view.transcript.items.length > 0}
+                  <div class="text-muted py-1 text-center text-xs" data-testid="history-start">Start of the session</div>
                 {/if}
                 <TranscriptView
                   items={view.transcript.items}
@@ -748,6 +868,12 @@
               {/if}
             </div>
           </div>
+          {#if view.loadingHistory}
+            <!-- Over the top of the chat rather than in it: a page on its way moves nothing the reader is looking at. -->
+            <div class="pointer-events-none absolute inset-x-0 top-2 flex justify-center" data-testid="loading-earlier">
+              <LoadingSpinner size="tiny" />
+            </div>
+          {/if}
           {#if !atBottom}
             <div class="absolute end-4 bottom-3">
               <IconButton

@@ -688,6 +688,42 @@ async function agentScript(session, turn, prompt) {
     return;
   }
 
+  if (/many tool updates/i.test(prompt)) {
+    // More updates than one page, every one of them to the same tool call: the page that opens renders shorter than the
+    // view, so there is nothing to scroll and older history can only be reached by asking for what's above.
+    const toolCallId = randomUUID();
+    tool({ toolCallId, title: 'Shell', kind: 'execute', status: 'pending', rawInput: { command: 'npm test' } });
+    for (let i = 0; i < HISTORY_PAGE - 1; i++) update(toolCallId, { status: 'in_progress' });
+    return;
+  }
+
+  if (/long log with a run of tool calls/i.test(prompt)) {
+    // More updates than one page, whose latest page begins inside a run of tool calls, with a long message after it: the
+    // page before continues the run, which folds the row a reader is at under a tool call from the older page.
+    const [first, second, third] = [randomUUID(), randomUUID(), randomUUID()];
+    tool({ toolCallId: first, title: 'Shell', kind: 'execute', status: 'pending', rawInput: { command: 'npm run check' } });
+    tool({ toolCallId: second, title: 'Shell', kind: 'execute', status: 'pending', rawInput: { command: 'npm run build' } });
+    tool({ toolCallId: third, title: 'Shell', kind: 'execute', status: 'pending', rawInput: { command: 'npm test' } });
+    for (let i = 0; i < HISTORY_PAGE - 3; i++) update(third, { status: 'in_progress' });
+    const messageId = randomUUID();
+    session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `word ${'word '.repeat(1200)}` }, messageId });
+    session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'The end.' }, messageId });
+    return;
+  }
+
+  if (/long log with a tool call/i.test(prompt)) {
+    // More updates than one page, and the latest page begins at a tool call: the row at the top of what a reader has is
+    // then one a live turn can still write to, while the page before it is on its way.
+    const toolCallId = randomUUID();
+    tool({ toolCallId, title: 'Shell', kind: 'execute', status: 'pending', rawInput: { command: 'npm test' } });
+    const messageId = randomUUID();
+    for (let i = 0; i < HISTORY_PAGE - 2; i++) {
+      session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'word ' }, messageId });
+    }
+    await say('The end.');
+    return;
+  }
+
   if (/ask me/i.test(prompt)) {
     await step(2);
     await say('Before I start, a couple of questions.');
@@ -1722,6 +1758,18 @@ function handleCall(conn, message) {
 
     case '_sloppod/history': {
       if (!needLoaded()) return;
+      if (failHistory) {
+        failHistory = false;
+        conn.error(id, -32000, 'the session log could not be read');
+        return;
+      }
+      // Held, the reader waiting on it; released, this call is handled then, as the runtime would have answered it.
+      if (holdHistory && !holdHistory.taken) {
+        const { held } = holdHistory;
+        holdHistory.taken = true;
+        held.then(() => handleCall(conn, message));
+        return;
+      }
       const end = Math.max(0, Math.min(session.log.length, Number(params.before) - 1));
       const start = Math.max(0, end - HISTORY_PAGE);
       conn.respond(id, {
@@ -2911,6 +2959,20 @@ const server = http.createServer(async (req, res) => {
       session.setPhase(url.searchParams.get('phase') ?? 'idle');
       return json(res, 200, session.data);
     }
+    if (url.pathname === '/_mock/fail-history' && req.method === 'POST') {
+      failHistory = true;
+      return json(res, 200, {});
+    }
+    if (url.pathname === '/_mock/hold-history' && req.method === 'POST') {
+      let release = () => {};
+      const held = new Promise((resolve) => (release = resolve));
+      holdHistory = { held, release, taken: false };
+      return json(res, 200, {});
+    }
+    if (url.pathname === '/_mock/release-history' && req.method === 'POST') {
+      holdHistory?.release();
+      return json(res, 200, {});
+    }
     if (url.pathname === '/_mock/slow-loads' && req.method === 'POST') {
       slowLoadsUntil = Date.now() + Number(url.searchParams.get('for') ?? 0);
       return json(res, 200, {});
@@ -2945,6 +3007,10 @@ let slowSessionsUntil = 0;
 let proposalDetailDelay = 0;
 let slowLoadsUntil = 0;
 let failLoadsUntil = 0;
+/** Set by `/_mock/fail-history`: the next ask for an older page of history fails, as a runtime that can't read it does. */
+let failHistory = false;
+/** Set by `/_mock/hold-history`: the next ask for an older page waits for `/_mock/release-history`. */
+let holdHistory = null;
 
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
