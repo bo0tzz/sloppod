@@ -9,6 +9,7 @@
 <script lang="ts">
   import { Button, Checkbox, Field, IconButton, Input, LoadingSpinner, Select, Text } from '@immich/ui';
   import { mdiClose, mdiPlus } from '@mdi/js';
+  import RepoPicker from './RepoPicker.svelte';
   import { capabilityDescriptions } from '#lib/presentation.ts';
 
   let {
@@ -100,14 +101,12 @@
           </div>
         {/if}
         <div class="min-w-48 grow">
-          <Field label="Repository">
-            <Select
-              options={choices(row)}
-              value={listed(row) ? row.repo : undefined}
-              placeholder="Choose a repository"
-              onChange={(value) => onRepo(row.id, value)}
-            />
-          </Field>
+          <RepoPicker
+            label="Repository"
+            options={choices(row)}
+            value={listed(row) ? row.repo : undefined}
+            onChange={(value) => onRepo(row.id, value)}
+          />
         </div>
         {#if token?.more}
           <div class="min-w-40 grow">

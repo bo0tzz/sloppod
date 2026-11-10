@@ -21,6 +21,7 @@
   },
   "dependencies": {
     "@immich/ui": "^0.91.0",
+    "bits-ui": "^2.20.2",
     "@mdi/js": "^7.4.47",
     "diff": "^9.0.0",
     "dompurify": "^3.4.17",

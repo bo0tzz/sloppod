@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Alert, Button, Field, Input, LoadingSpinner, ModalBody, ModalFooter, Select, Text } from '@immich/ui';
   import Dialog from './Dialog.svelte';
+  import RepoPicker from './RepoPicker.svelte';
   import { mdiSourceRepository } from '@mdi/js';
   import { onMount } from 'svelte';
   import { api, type GitHubUserConfig, type Session } from '#lib/api.ts';
@@ -12,6 +13,8 @@
   }: { session: Session; onAdded: (session: Session, repo: string) => void; onClose: () => void } = $props();
 
   const APP = 'app';
+  /** The body's form, so the footer's Add button submits it (Enter in a field does too). */
+  const form = 'add-repository';
 
   let repos = $state<string[] | null>(null);
   let tokens = $state<{ id: string; label: string; repositories: string[]; more: boolean }[]>([]);
@@ -82,7 +85,16 @@
 
 <Dialog title="Add repository" icon={mdiSourceRepository} size="small" {onClose}>
   <ModalBody>
-    <div class="flex flex-col gap-3 pb-4" data-testid="add-repo">
+    <!-- A form, so Enter in any field adds the repository rather than doing nothing (#371). -->
+    <form
+      id={form}
+      class="flex flex-col gap-3 pb-4"
+      data-testid="add-repo"
+      onsubmit={(event) => {
+        event.preventDefault();
+        void add();
+      }}
+    >
       <Text color="muted" size="small">The session gets write access to its own branch in the repository.</Text>
       {#if tokens.length > 0}
         <Field label="Act as">
@@ -103,9 +115,7 @@
           <a href="/settings" class="text-primary underline">Check your {token ? 'GitHub account' : 'GitHub App'} in settings</a>.
         </Text>
       {:else if available.length > 0}
-        <Field label="Repository">
-          <Select options={available} bind:value={repo} placeholder="Choose a repository" />
-        </Field>
+        <RepoPicker label="Repository" options={available} bind:value={repo} />
       {/if}
       {#if unlisted}
         <Field label={available.length > 0 ? 'Or another repository' : 'Repository'}>
@@ -116,12 +126,12 @@
       {#if error}
         <Alert color="danger" size="small">{error}</Alert>
       {/if}
-    </div>
+    </form>
   </ModalBody>
   <ModalFooter>
     <div class="flex w-full justify-end gap-2">
       <Button color="secondary" variant="ghost" shape="round" onclick={onClose}>Cancel</Button>
-      <Button shape="round" disabled={!wanted} loading={saving} onclick={add}>Add</Button>
+      <Button type="submit" form={form} shape="round" disabled={!wanted} loading={saving}>Add</Button>
     </div>
   </ModalFooter>
 </Dialog>
