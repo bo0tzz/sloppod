@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Mutex as StdMutex;
 
 use axum::Json;
@@ -9,6 +10,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
+use futures::{Stream, StreamExt};
 use serde_json::{Value, json};
 use sloppod_contracts::SessionRole;
 use sloppod_protocol::api::{ProposalStatus, SessionKind};
@@ -17,43 +19,379 @@ use uuid::Uuid;
 
 use crate::{AppState, db, proposals, reviews, subsessions, work};
 
+/// Every protocol version the endpoint serves, newest first. The first is the stateless era (2026-07-28: every request
+/// carries its version and client capabilities in `_meta`); the others are the era of `initialize`.
+/// The versions sloppod serves, newest first: `[0]` is the stateless one, the rest are served with the handshake.
+/// `2024-11-05` is still offered by clients, and its requests are the same 2025 shape ones. A handshake client asking
+/// for a version that isn't here is answered with `[1]` — the newest of that era — rather than refused, which is what
+/// the 2025 spec's lifecycle says a server does, and the client decides whether it can go on with it.
+const SUPPORTED: [&str; 5] = [
+    "2026-07-28",
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+];
+const STATELESS: &str = "2026-07-28";
+const DEFAULT_LEGACY: &str = "2025-06-18";
+
+const META_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+const META_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+const META_CLIENT_INFO: &str = "io.modelcontextprotocol/clientInfo";
+const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
+const META_SUBSCRIPTION: &str = "io.modelcontextprotocol/subscriptionId";
+
+const INSTRUCTIONS: &str = "sloppod's tools for this session: proposals of outward actions (a person reviews them before sloppod carries them out), questions to the user, what the session is granted, and, for work sessions, sub-sessions. Each tool says what it does.";
+
+/// What the protocol layer needs of the session on the other end: its tools and the tool-list changes of #323. The
+/// runtime implements it over the database; tests, over a list they set.
+pub trait Session: Sync {
+    /// The build, for `serverInfo`.
+    fn version(&self) -> &str;
+    /// The tools the session has now; an error says why it has none.
+    fn tools(&self) -> impl Future<Output = Result<Vec<Value>, String>> + Send;
+    /// Runs a `tools/call`'s params and returns its result.
+    fn call(&self, params: &Value) -> impl Future<Output = Value> + Send;
+    /// Notes the list the client was given.
+    fn listed(&self, tools: &[Value]);
+    fn subscribe(&self) -> broadcast::Receiver<()>;
+    /// Whether the client was given a list other than `tools`.
+    fn stale(&self, tools: &[Value]) -> bool;
+}
+
+struct RuntimeSession<'a> {
+    state: &'a AppState,
+    id: Uuid,
+}
+
+impl Session for RuntimeSession<'_> {
+    fn version(&self) -> &str {
+        self.state
+            .config
+            .build
+            .as_deref()
+            .unwrap_or(env!("CARGO_PKG_VERSION"))
+    }
+
+    async fn tools(&self) -> Result<Vec<Value>, String> {
+        let row = session_kind(self.state, self.id).await?;
+        Ok(tools(self.state, &row).await)
+    }
+
+    async fn call(&self, params: &Value) -> Value {
+        call(self.state, self.id, params).await
+    }
+
+    fn listed(&self, tools: &[Value]) {
+        self.state.tool_streams.listed(self.id, tools);
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<()> {
+        self.state.tool_streams.subscribe(self.id)
+    }
+
+    fn stale(&self, tools: &[Value]) -> bool {
+        self.state.tool_streams.stale(self.id, tools)
+    }
+}
+
+type Messages = Pin<Box<dyn Stream<Item = Value> + Send>>;
+
+/// What a POST to `/mcp` is answered with.
+pub enum Outcome {
+    /// A notification, which gets no reply.
+    Accepted,
+    Reply(StatusCode, Value),
+    /// The messages of a response that stays open.
+    Listen(Messages),
+}
+
+fn rpc(id: Value, result: Result<Value, Value>) -> Value {
+    match result {
+        Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        Err(error) => json!({"jsonrpc": "2.0", "id": id, "error": error}),
+    }
+}
+
+fn error(code: i64, message: impl Into<String>) -> Value {
+    json!({"code": code, "message": message.into()})
+}
+
+fn unsupported_version(requested: &str) -> Value {
+    json!({
+        "code": -32022,
+        "message": "Unsupported protocol version",
+        "data": {"supported": SUPPORTED, "requested": requested},
+    })
+}
+
+fn server_info(session: &impl Session) -> Value {
+    json!({"name": "sloppod", "version": session.version()})
+}
+
+/// A result of the stateless era: it says it's complete, and who answered.
+fn complete(session: &impl Session, mut result: Value) -> Value {
+    result["resultType"] = json!("complete");
+    result["_meta"][META_SERVER_INFO] = server_info(session);
+    result
+}
+
+/// Whether a request is of the stateless era: its `_meta` has the era's keys, or its header names the era, which
+/// with no `_meta` is then an error. Any other request is of the era of `initialize`, whose later requests carry
+/// neither.
+fn stateless(params: &Value, headers: &Headers<'_>) -> bool {
+    let meta = &params["_meta"];
+    [META_VERSION, META_CAPABILITIES, META_CLIENT_INFO]
+        .iter()
+        .any(|key| meta.get(key).is_some())
+        || headers.version == Some(STATELESS)
+}
+
+/// The standard headers of a POST to `/mcp` that the stateless era mirrors from the body, for the server to check
+/// against it: what a proxy routing on a header sees must be what the server runs.
+#[derive(Default, Clone, Copy)]
+pub struct Headers<'a> {
+    /// `MCP-Protocol-Version`
+    pub version: Option<&'a str>,
+    /// `Mcp-Method`
+    pub method: Option<&'a str>,
+    /// `Mcp-Name`, possibly in its Base64 sentinel form
+    pub name: Option<&'a str>,
+}
+
+impl Headers<'_> {
+    /// Says what's missing or doesn't match the body, as `HeaderMismatch` words it.
+    ///
+    /// What the real clients send, when this was written (Claude Code 2.1.310 and Codex 0.164.0, run against a
+    /// logging MCP server): Claude probes `server/discover` first and, once that's answered, sends `mcp-method`,
+    /// `mcp-protocol-version` and — for a `tools/call` — `mcp-name`, so it meets these checks; Codex starts with a
+    /// 2025 `initialize` and stays in that era, whose requests it sends with `mcp-protocol-version` and no
+    /// `Mcp-Method`. Neither sends these headers on `initialize` or on a 2025 request, and none of them is asked for
+    /// one here: a request is only validated when it's of the stateless era.
+    fn validate(&self, method: &str, params: &Value) -> Result<(), String> {
+        let version = params["_meta"][META_VERSION].as_str().unwrap_or_default();
+        match self.version {
+            None => return Err("Header mismatch: MCP-Protocol-Version header is missing".into()),
+            Some(header) if header != version => {
+                return Err(format!(
+                    "Header mismatch: MCP-Protocol-Version header value '{header}' does not match body value '{version}'"
+                ));
+            }
+            Some(_) => {}
+        }
+        match self.method {
+            None => return Err("Header mismatch: Mcp-Method header is missing".into()),
+            Some(header) if header != method => {
+                return Err(format!(
+                    "Header mismatch: Mcp-Method header value '{header}' does not match body value '{method}'"
+                ));
+            }
+            Some(_) => {}
+        }
+        if method == "tools/call" {
+            let name = params["name"].as_str().unwrap_or_default();
+            let Some(header) = self.name else {
+                return Err("Header mismatch: Mcp-Name header is missing".into());
+            };
+            let decoded = decode_name(header)
+                .ok_or("Header mismatch: Mcp-Name header is not valid Base64 of UTF-8")?;
+            if decoded != name {
+                return Err(format!(
+                    "Header mismatch: Mcp-Name header value '{decoded}' does not match body value '{name}'"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A header value that may carry the `=?base64?...?=` sentinel for a name that isn't plain ASCII.
+fn decode_name(header: &str) -> Option<String> {
+    use base64::Engine;
+    match header
+        .strip_prefix("=?base64?")
+        .and_then(|rest| rest.strip_suffix("?="))
+    {
+        Some(encoded) => {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()?;
+            String::from_utf8(bytes).ok()
+        }
+        None => Some(header.to_owned()),
+    }
+}
+
+/// Answers one JSON-RPC message of a POST to `/mcp`.
+pub async fn serve(session: &impl Session, message: Value, headers: &Headers<'_>) -> Outcome {
+    let Some(id) = message.get("id").cloned() else {
+        return Outcome::Accepted;
+    };
+    let method = message["method"].as_str().unwrap_or_default();
+    let params = &message["params"];
+    if method != "initialize" && stateless(params, headers) {
+        return serve_stateless(session, id, method, params, headers).await;
+    }
+    let result = match method {
+        "initialize" => {
+            // A version it doesn't serve gets its newest of the era instead, and the client decides whether it can go on.
+            let requested = params["protocolVersion"].as_str().unwrap_or(DEFAULT_LEGACY);
+            let version = SUPPORTED[1..]
+                .iter()
+                .find(|v| **v == requested)
+                .unwrap_or(&SUPPORTED[1]);
+            Ok(json!({
+                "protocolVersion": version,
+                "capabilities": {"tools": {"listChanged": true}},
+                "serverInfo": server_info(session),
+                "instructions": INSTRUCTIONS,
+            }))
+        }
+        "ping" => Ok(json!({})),
+        "tools/list" => list_tools(session).await,
+        "tools/call" => Ok(session.call(params).await),
+        _ => Err(error(-32601, format!("{method} is not supported"))),
+    };
+    Outcome::Reply(StatusCode::OK, rpc(id, result))
+}
+
+async fn list_tools(session: &impl Session) -> Result<Value, Value> {
+    match session.tools().await {
+        Ok(tools) => {
+            session.listed(&tools);
+            Ok(json!({"tools": tools}))
+        }
+        Err(e) => Err(error(-32603, e)),
+    }
+}
+
+async fn serve_stateless(
+    session: &impl Session,
+    id: Value,
+    method: &str,
+    params: &Value,
+    headers: &Headers<'_>,
+) -> Outcome {
+    let meta = &params["_meta"];
+    let refuse = |status, error| Outcome::Reply(status, rpc(id.clone(), Err(error)));
+    match meta[META_VERSION].as_str() {
+        Some(STATELESS) => {}
+        Some(other) => {
+            return refuse(StatusCode::BAD_REQUEST, unsupported_version(other));
+        }
+        None => {
+            return refuse(
+                StatusCode::BAD_REQUEST,
+                error(-32602, format!("_meta.{META_VERSION} is required")),
+            );
+        }
+    }
+    if !meta[META_CAPABILITIES].is_object() {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            error(-32602, format!("_meta.{META_CAPABILITIES} is required")),
+        );
+    }
+    if let Err(mismatch) = headers.validate(method, params) {
+        return refuse(StatusCode::BAD_REQUEST, error(-32020, mismatch));
+    }
+    let result = match method {
+        "server/discover" => Ok(json!({
+            "supportedVersions": SUPPORTED,
+            "capabilities": {"tools": {"listChanged": true}},
+            "instructions": INSTRUCTIONS,
+        })),
+        "tools/list" => list_tools(session).await,
+        "tools/call" => Ok(session.call(params).await),
+        "subscriptions/listen" => return Outcome::Listen(listen(session, id, params).await),
+        _ => {
+            return refuse(
+                StatusCode::NOT_FOUND,
+                error(-32601, format!("{method} is not supported")),
+            );
+        }
+    };
+    Outcome::Reply(
+        StatusCode::OK,
+        rpc(id, result.map(|result| complete(session, result))),
+    )
+}
+
+/// `subscriptions/listen`: acknowledges, then sends what the request asked to hear of, each tagged with the request's
+/// id. Only tool-list changes exist here.
+async fn listen(session: &impl Session, id: Value, params: &Value) -> Messages {
+    let tools_changed = params["notifications"]["toolsListChanged"] == json!(true);
+    let granted = if tools_changed {
+        json!({"toolsListChanged": true})
+    } else {
+        json!({})
+    };
+    let acknowledged = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/subscriptions/acknowledged",
+        "params": {"notifications": granted},
+    });
+    let notices = if tools_changed {
+        tool_notices(session).await
+    } else {
+        Box::pin(futures::stream::pending())
+    };
+    let messages = futures::stream::once(std::future::ready(acknowledged)).chain(notices);
+    Box::pin(messages.map(move |mut message| {
+        message["params"]["_meta"][META_SUBSCRIPTION] = id.clone();
+        message
+    }))
+}
+
+/// The `notifications/tools/list_changed` for the session's client: one at once if it missed a change, and one for
+/// each after.
+async fn tool_notices(session: &impl Session) -> Messages {
+    // Subscribed before it's checked, so a change in between is either sent on the stream or found stale here.
+    let changed = session.subscribe();
+    let missed = session.stale(&session.tools().await.unwrap_or_default());
+    let notice = || json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"});
+    let notices = futures::stream::unfold(changed, move |mut changed| async move {
+        // A lagged receiver missed only repeats of the same notice.
+        if let Err(broadcast::error::RecvError::Closed) = changed.recv().await {
+            return None;
+        }
+        Some((notice(), changed))
+    });
+    Box::pin(futures::stream::iter(missed.then(notice)).chain(notices))
+}
+
+fn sse(messages: Messages) -> Response {
+    let events = messages.map(|message| {
+        Ok::<_, std::convert::Infallible>(
+            Event::default().event("message").data(message.to_string()),
+        )
+    });
+    Sse::new(events)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
 pub async fn handler(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
     Json(message): Json<Value>,
 ) -> Response {
-    let Some(session) = crate::identity::calling_session(&state, &headers, peer.ip()).await else {
+    let Some(id) = crate::identity::calling_session(&state, &headers, peer.ip()).await else {
         return (StatusCode::FORBIDDEN, "not a session pod").into_response();
     };
-    let Some(id) = message.get("id").cloned() else {
-        return StatusCode::ACCEPTED.into_response();
+    let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
+    let headers = Headers {
+        version: header("mcp-protocol-version"),
+        method: header("mcp-method"),
+        name: header("mcp-name"),
     };
-    let method = message["method"].as_str().unwrap_or_default();
-    let result = match method {
-        "initialize" => Ok(json!({
-            "protocolVersion": message["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
-            "capabilities": {"tools": {"listChanged": true}},
-            "serverInfo": {"name": "sloppod", "version": state.config.build.as_deref().unwrap_or(env!("CARGO_PKG_VERSION"))},
-            "instructions": "sloppod's tools for this session: proposals of outward actions (a person reviews them before sloppod carries them out), questions to the user, what the session is granted, and, for work sessions, sub-sessions. Each tool says what it does.",
-        })),
-        "ping" => Ok(json!({})),
-        "tools/list" => match session_kind(&state, session).await {
-            Ok(row) => {
-                let tools = tools(&state, &row).await;
-                state.tool_streams.listed(session, &tools);
-                Ok(json!({"tools": tools}))
-            }
-            Err(e) => Err(json!({"code": -32603, "message": e})),
-        },
-        "tools/call" => Ok(call(&state, session, &message["params"]).await),
-        _ => Err(json!({"code": -32601, "message": format!("{method} is not supported")})),
-    };
-    let body = match result {
-        Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-        Err(error) => json!({"jsonrpc": "2.0", "id": id, "error": error}),
-    };
-    Json(body).into_response()
+    let session = RuntimeSession { state: &state, id };
+    match serve(&session, message, &headers).await {
+        Outcome::Accepted => StatusCode::ACCEPTED.into_response(),
+        Outcome::Reply(status, body) => (status, Json(body)).into_response(),
+        Outcome::Listen(messages) => sse(messages),
+    }
 }
 
 /// What each session's agent was last told its tools are, and the streams it listens on for a change to them (#323).
@@ -150,38 +488,18 @@ async fn current_tools(state: &AppState, session: Uuid) -> Vec<Value> {
     }
 }
 
-/// `GET /mcp`: the stream the server sends the agent's MCP client notifications on (MCP's streamable HTTP). The only
-/// one sent is `notifications/tools/list_changed`.
+/// `GET /mcp`: the stream the server sends the agent's MCP client notifications on (MCP's streamable HTTP until
+/// 2026-07-28, whose clients listen with `subscriptions/listen` instead). The only one sent is
+/// `notifications/tools/list_changed`.
 pub async fn stream(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let Some(session) = crate::identity::calling_session(&state, &headers, peer.ip()).await else {
+    let Some(id) = crate::identity::calling_session(&state, &headers, peer.ip()).await else {
         return (StatusCode::FORBIDDEN, "not a session pod").into_response();
     };
-    // Subscribed before it's checked, so a change in between is either sent on the stream or found stale here.
-    let changed = state.tool_streams.subscribe(session);
-    let missed = state
-        .tool_streams
-        .stale(session, &current_tools(&state, session).await);
-    let notice = || {
-        let notice = json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"});
-        Ok::<_, std::convert::Infallible>(
-            Event::default().event("message").data(notice.to_string()),
-        )
-    };
-    let notices = futures::stream::unfold(changed, move |mut changed| async move {
-        // A lagged receiver missed only repeats of the same notice.
-        if let Err(broadcast::error::RecvError::Closed) = changed.recv().await {
-            return None;
-        }
-        Some((notice(), changed))
-    });
-    let missed = futures::stream::iter(missed.then(notice));
-    Sse::new(futures::StreamExt::chain(missed, notices))
-        .keep_alive(KeepAlive::default())
-        .into_response()
+    sse(tool_notices(&RuntimeSession { state: &state, id }).await)
 }
 
 /// Which tools a session gets depends on its kind, so a session that can't be loaded gets none.
@@ -710,5 +1028,460 @@ mod tests {
             grant_list(&[], &SessionRole::Review),
             "Anything else is refused."
         );
+    }
+
+    /// A session whose tools a test sets, with the runtime's own change tracking.
+    struct Fake {
+        id: Uuid,
+        streams: ToolStreams,
+        tools: StdMutex<Vec<Value>>,
+    }
+
+    impl Fake {
+        fn new() -> Self {
+            Self {
+                id: Uuid::new_v4(),
+                streams: ToolStreams::default(),
+                tools: StdMutex::new(vec![json!({"name": "ask_user"})]),
+            }
+        }
+
+        /// What a grant change does: the session has another tool, and its agent is told.
+        fn grant(&self) -> bool {
+            let mut tools = self.tools.lock().unwrap();
+            tools.push(json!({"name": "list_work"}));
+            self.streams.changed(self.id, &tools)
+        }
+    }
+
+    impl Session for Fake {
+        fn version(&self) -> &str {
+            "test"
+        }
+
+        async fn tools(&self) -> Result<Vec<Value>, String> {
+            Ok(self.tools.lock().unwrap().clone())
+        }
+
+        async fn call(&self, params: &Value) -> Value {
+            text(
+                format!("called {}", params["name"].as_str().unwrap()),
+                false,
+            )
+        }
+
+        fn listed(&self, tools: &[Value]) {
+            self.streams.listed(self.id, tools);
+        }
+
+        fn subscribe(&self) -> broadcast::Receiver<()> {
+            self.streams.subscribe(self.id)
+        }
+
+        fn stale(&self, tools: &[Value]) -> bool {
+            self.streams.stale(self.id, tools)
+        }
+    }
+
+    const KEY_INFO: &str = META_SERVER_INFO;
+
+    fn modern_meta(version: &str) -> Value {
+        json!({
+            META_VERSION: version,
+            META_CAPABILITIES: {},
+            META_CLIENT_INFO: {"name": "test", "version": "1"},
+        })
+    }
+
+    fn request(id: impl Into<Value>, method: &str, params: Value) -> Value {
+        json!({"jsonrpc": "2.0", "id": id.into(), "method": method, "params": params})
+    }
+
+    /// Posts as a client does: the stateless era's headers say what the body does, the version being `version` where
+    /// it's given.
+    async fn post(session: &Fake, message: Value, version: Option<&str>) -> (StatusCode, Value) {
+        let text = |v: &Value| v.as_str().map(str::to_owned);
+        let meta_version = text(&message["params"]["_meta"][META_VERSION]);
+        let (method, name) = (text(&message["method"]), text(&message["params"]["name"]));
+        let headers = Headers {
+            version: version.or(meta_version.as_deref()),
+            method: method.as_deref(),
+            name: name.as_deref(),
+        };
+        match serve(session, message, &headers).await {
+            Outcome::Reply(status, body) => (status, body),
+            _ => panic!("expected a reply"),
+        }
+    }
+
+    async fn listening(session: &Fake, message: Value) -> Messages {
+        let headers = Headers {
+            version: Some(STATELESS),
+            method: Some("subscriptions/listen"),
+            name: None,
+        };
+        match serve(session, message, &headers).await {
+            Outcome::Listen(messages) => messages,
+            _ => panic!("expected a stream"),
+        }
+    }
+
+    async fn next(messages: &mut Messages) -> Value {
+        tokio::time::timeout(std::time::Duration::from_secs(1), messages.next())
+            .await
+            .expect("a message")
+            .expect("the stream is open")
+    }
+
+    #[tokio::test]
+    async fn a_2025_client_initializes_lists_and_calls_and_hears_of_a_change_on_the_get_stream() {
+        let session = Fake::new();
+        let (status, body) = post(
+            &session,
+            request(1, "initialize", json!({"protocolVersion": "2025-11-25"})),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let result = &body["result"];
+        assert_eq!(result["protocolVersion"], "2025-11-25");
+        assert_eq!(result["serverInfo"]["name"], "sloppod");
+        assert_eq!(result["capabilities"]["tools"]["listChanged"], true);
+        assert!(result.get("resultType").is_none(), "{result}");
+        // The 2025 client also sends no `_meta` afterwards.
+        let (_, body) = post(&session, request(2, "ping", json!({})), Some("2025-11-25")).await;
+        assert_eq!(body["result"], json!({}));
+        let (_, body) = post(&session, request(3, "tools/list", json!({})), None).await;
+        assert_eq!(body["result"], json!({"tools": [{"name": "ask_user"}]}));
+        let (_, body) = post(
+            &session,
+            request(4, "tools/call", json!({"name": "ask_user"})),
+            None,
+        )
+        .await;
+        assert_eq!(body["result"]["content"][0]["text"], "called ask_user");
+        assert!(body["result"].get("resultType").is_none(), "{body}");
+
+        let mut stream = tool_notices(&session).await;
+        assert!(session.grant());
+        assert_eq!(
+            next(&mut stream).await,
+            json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_2026_client_discovers_lists_and_calls_and_hears_of_a_change_on_subscriptions_listen()
+    {
+        let session = Fake::new();
+        let meta = modern_meta(STATELESS);
+        let (status, body) = post(
+            &session,
+            request(1, "server/discover", json!({"_meta": meta})),
+            Some(STATELESS),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let result = &body["result"];
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["supportedVersions"], json!(SUPPORTED));
+        assert_eq!(result["capabilities"]["tools"]["listChanged"], true);
+        assert_eq!(result["_meta"][KEY_INFO]["name"], "sloppod");
+        assert!(result["instructions"].is_string());
+
+        let (_, body) = post(
+            &session,
+            request(2, "tools/list", json!({"_meta": meta})),
+            None,
+        )
+        .await;
+        assert_eq!(body["result"]["resultType"], "complete");
+        assert_eq!(body["result"]["tools"], json!([{"name": "ask_user"}]));
+        assert_eq!(body["result"]["_meta"][KEY_INFO]["version"], "test");
+        let (_, body) = post(
+            &session,
+            request(3, "tools/call", json!({"_meta": meta, "name": "ask_user"})),
+            None,
+        )
+        .await;
+        assert_eq!(body["result"]["resultType"], "complete");
+        assert_eq!(body["result"]["content"][0]["text"], "called ask_user");
+
+        let mut stream = listening(
+            &session,
+            request(
+                7,
+                "subscriptions/listen",
+                json!({"_meta": meta, "notifications": {"toolsListChanged": true}}),
+            ),
+        )
+        .await;
+        let acknowledged = next(&mut stream).await;
+        assert_eq!(
+            acknowledged["method"],
+            "notifications/subscriptions/acknowledged"
+        );
+        assert_eq!(
+            acknowledged["params"]["notifications"],
+            json!({"toolsListChanged": true})
+        );
+        assert_eq!(acknowledged["params"]["_meta"][META_SUBSCRIPTION], 7);
+        assert!(session.grant());
+        let notice = next(&mut stream).await;
+        assert_eq!(notice["method"], "notifications/tools/list_changed");
+        assert_eq!(notice["params"]["_meta"][META_SUBSCRIPTION], 7);
+    }
+
+    #[tokio::test]
+    async fn a_listener_is_told_of_a_change_it_missed_after_the_acknowledgment() {
+        let session = Fake::new();
+        let meta = modern_meta(STATELESS);
+        post(
+            &session,
+            request(1, "tools/list", json!({"_meta": meta})),
+            None,
+        )
+        .await;
+        // No stream is open, so nobody hears of it.
+        assert!(!session.grant());
+        let listen = request(
+            "l",
+            "subscriptions/listen",
+            json!({"_meta": meta, "notifications": {"toolsListChanged": true}}),
+        );
+        let mut stream = listening(&session, listen).await;
+        let acknowledged = next(&mut stream).await;
+        assert_eq!(
+            acknowledged["method"],
+            "notifications/subscriptions/acknowledged"
+        );
+        assert_eq!(acknowledged["params"]["_meta"][META_SUBSCRIPTION], "l");
+        let notice = next(&mut stream).await;
+        assert_eq!(notice["method"], "notifications/tools/list_changed");
+        assert_eq!(notice["params"]["_meta"][META_SUBSCRIPTION], "l");
+    }
+
+    #[tokio::test]
+    async fn a_listener_that_asked_for_no_notifications_is_acknowledged_and_told_nothing() {
+        let session = Fake::new();
+        let listen = request(
+            1,
+            "subscriptions/listen",
+            json!({"_meta": modern_meta(STATELESS)}),
+        );
+        let mut stream = listening(&session, listen).await;
+        assert_eq!(
+            next(&mut stream).await["params"]["notifications"],
+            json!({})
+        );
+        session.streams.listed(session.id, &[]);
+        session.grant();
+        let more = tokio::time::timeout(std::time::Duration::from_millis(100), stream.next()).await;
+        assert!(more.is_err(), "{more:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_protocol_version_is_refused_in_the_stateless_era_and_negotiated_in_the_other()
+     {
+        let session = Fake::new();
+        let expected = json!({
+            "message": "Unsupported protocol version",
+            "data": {"supported": SUPPORTED, "requested": "1900-01-01"},
+        });
+        let (status, body) = post(
+            &session,
+            request(1, "tools/list", json!({"_meta": modern_meta("1900-01-01")})),
+            Some("1900-01-01"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], -32022);
+        assert_eq!(body["error"]["message"], expected["message"]);
+        assert_eq!(body["error"]["data"], expected["data"]);
+        assert_eq!(body["id"], 1);
+
+        // A handshake client asking for a version it doesn't serve is told the newest the era has, and decides itself.
+        for requested in ["1900-01-01", STATELESS] {
+            let (status, body) = post(
+                &session,
+                request(2, "initialize", json!({"protocolVersion": requested})),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["result"]["protocolVersion"], "2025-11-25");
+        }
+        // The oldest a client still offers is served as itself, not negotiated away from it.
+        for asked in ["2025-03-26", "2024-11-05"] {
+            let (_, body) = post(
+                &session,
+                request(3, "initialize", json!({"protocolVersion": asked})),
+                None,
+            )
+            .await;
+            assert_eq!(body["result"]["protocolVersion"], asked);
+        }
+        // A 2025 client's version isn't a version of the stateless era either.
+        let (status, body) = post(
+            &session,
+            request(4, "tools/list", json!({"_meta": modern_meta("2025-11-25")})),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], -32022);
+    }
+
+    #[tokio::test]
+    async fn a_2026_request_missing_its_meta_is_invalid_and_a_2026_ping_is_unknown() {
+        let session = Fake::new();
+        let (status, body) = post(
+            &session,
+            request(1, "tools/list", json!({})),
+            Some(STATELESS),
+        )
+        .await;
+        assert_eq!(
+            (status, &body["error"]["code"]),
+            (StatusCode::BAD_REQUEST, &json!(-32602))
+        );
+        let (status, body) = post(
+            &session,
+            request(
+                2,
+                "tools/list",
+                json!({"_meta": {META_CLIENT_INFO: {"name": "x", "version": "1"}}}),
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(
+            (status, &body["error"]["code"]),
+            (StatusCode::BAD_REQUEST, &json!(-32602))
+        );
+        let (status, body) = post(
+            &session,
+            request(3, "tools/list", json!({"_meta": {META_VERSION: STATELESS}})),
+            None,
+        )
+        .await;
+        assert_eq!(
+            (status, &body["error"]["code"]),
+            (StatusCode::BAD_REQUEST, &json!(-32602))
+        );
+
+        let (status, body) = post(
+            &session,
+            request(4, "ping", json!({"_meta": modern_meta(STATELESS)})),
+            None,
+        )
+        .await;
+        assert_eq!(
+            (status, &body["error"]["code"]),
+            (StatusCode::NOT_FOUND, &json!(-32601))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_2026_request_whose_headers_dont_match_its_body_is_refused_before_it_runs() {
+        let session = Fake::new();
+        let call = || {
+            request(
+                1,
+                "tools/call",
+                json!({"_meta": modern_meta(STATELESS), "name": "ask_user"}),
+            )
+        };
+        let good = Headers {
+            version: Some(STATELESS),
+            method: Some("tools/call"),
+            name: Some("ask_user"),
+        };
+        let Outcome::Reply(status, body) = serve(&session, call(), &good).await else {
+            panic!("expected a reply");
+        };
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["content"][0]["text"], "called ask_user");
+        // The name may come Base64-encoded.
+        let encoded = Headers {
+            name: Some("=?base64?YXNrX3VzZXI=?="),
+            ..good
+        };
+        assert!(matches!(
+            serve(&session, call(), &encoded).await,
+            Outcome::Reply(StatusCode::OK, _)
+        ));
+
+        let cases = [
+            (
+                Headers {
+                    version: None,
+                    ..good
+                },
+                "MCP-Protocol-Version header is missing",
+            ),
+            (
+                Headers {
+                    version: Some("2025-11-25"),
+                    ..good
+                },
+                "MCP-Protocol-Version header value '2025-11-25'",
+            ),
+            (
+                Headers {
+                    method: None,
+                    ..good
+                },
+                "Mcp-Method header is missing",
+            ),
+            (
+                Headers {
+                    method: Some("tools/list"),
+                    ..good
+                },
+                "Mcp-Method header value 'tools/list'",
+            ),
+            (Headers { name: None, ..good }, "Mcp-Name header is missing"),
+            (
+                Headers {
+                    name: Some("list_work"),
+                    ..good
+                },
+                "Mcp-Name header value 'list_work'",
+            ),
+            (
+                Headers {
+                    name: Some("=?base64?bGlzdF93b3Jr?="),
+                    ..good
+                },
+                "Mcp-Name header value 'list_work'",
+            ),
+            (
+                Headers {
+                    name: Some("=?base64?!!?="),
+                    ..good
+                },
+                "not valid Base64",
+            ),
+        ];
+        for (headers, why) in cases {
+            let Outcome::Reply(status, body) = serve(&session, call(), &headers).await else {
+                panic!("expected a reply");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{why}");
+            assert_eq!(body["error"]["code"], -32020, "{why}");
+            let message = body["error"]["message"].as_str().unwrap();
+            assert!(message.contains(why), "{message} should say {why}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_notification_gets_no_reply() {
+        let session = Fake::new();
+        let notification = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        assert!(matches!(
+            serve(&session, notification, &Headers::default()).await,
+            Outcome::Accepted
+        ));
     }
 }
