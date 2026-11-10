@@ -13,8 +13,8 @@
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "mock": "node mock/server.mjs",
-    "test:e2e": "vite build && playwright test --project=e2e",
-    "test:e2e:firefox": "vite build && playwright test --project=firefox",
+    "test:e2e": "SLOPPOD_BUILD=e2e vite build && playwright test --project=e2e",
+    "test:e2e:firefox": "SLOPPOD_BUILD=e2e vite build && playwright test --project=firefox",
     "screenshots": "vite build && playwright test --project=screenshots",
     "icons": "node scripts/icons.mjs",
     "test:real": "vite build && playwright test -c playwright.real.config.ts"

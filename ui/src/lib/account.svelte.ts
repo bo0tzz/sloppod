@@ -14,6 +14,15 @@ class Account {
   #watching = false;
   #inFlight = false;
 
+  /**
+   * Whether the runtime has been redeployed since this page was built (#448): the JavaScript running here is older
+   * than what the runtime would serve now, and a reload picks the new bundle up. Neither side naming a build, or the
+   * two naming the same one, is not a mismatch.
+   */
+  get outdated(): boolean {
+    return pageBuild !== '' && this.build !== null && this.build !== pageBuild;
+  }
+
   /** Reads it unless it has been read already, and rereads it whenever the page becomes visible again. */
   load() {
     if (!this.#watching) {
@@ -42,6 +51,10 @@ class Account {
 }
 
 export const account = new Account();
+
+/** The commit or tag this page's bundle was built from: the `SLOPPOD_BUILD` the Containerfile built it with, the same
+ * value the runtime takes its own `build` from. Empty for a build that didn't name one. */
+export const pageBuild: string = __SLOPPOD_BUILD__;
 
 const SOURCE = 'https://github.com/bo0tzz/sloppod';
 

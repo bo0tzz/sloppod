@@ -25,7 +25,10 @@ WORKDIR /ui
 COPY ui/package.json ui/package-lock.json ./
 RUN npm ci
 COPY ui/ ./
-RUN npm run build
+# The build the UI is baked with, so a page can tell when the runtime it reaches has been redeployed since (#448).
+# publish.yml passes the same value the chart sets as the runtime's SLOPPOD_BUILD.
+ARG SLOPPOD_BUILD=
+RUN SLOPPOD_BUILD="$SLOPPOD_BUILD" npm run build
 
 FROM debian:trixie-slim AS runtime-headless
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
