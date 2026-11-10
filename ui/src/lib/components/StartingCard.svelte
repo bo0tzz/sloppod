@@ -1,15 +1,17 @@
 <script module lang="ts">
   /** A repository the new session gets write access to, and who it acts as there: the GitHub App, or one of the user's tokens. */
   export type RepoRow = { id: number; repo: string; credential: string | null };
-  /** One of the user's GitHub tokens, with the repositories it reaches (`more`: it reaches others it doesn't list). */
-  export type TokenChoice = { id: string; label: string; repositories: string[]; more: boolean };
+  /** One of the user's GitHub tokens, with the repositories it reaches (`more`: it reaches others it doesn't list) and
+   * which of them it can push to (`writable`, absent on a credential added before the runtime kept it). */
+  export type TokenChoice = { id: string; label: string; repositories: string[]; writable?: string[]; more: boolean };
   export type OwnCapability = { name: string; description: string };
 </script>
 
 <script lang="ts">
   import { Button, Checkbox, Field, IconButton, Input, LoadingSpinner, Select, Text } from '@immich/ui';
   import { mdiClose, mdiPlus } from '@mdi/js';
-  import RepoPicker from './RepoPicker.svelte';
+  import RepoPicker, { type RepoOption } from './RepoPicker.svelte';
+  import { offeredRepositories } from '#lib/repos.ts';
   import { capabilityDescriptions } from '#lib/presentation.ts';
 
   let {
@@ -59,10 +61,15 @@
     ...tokens.map((token) => ({ value: token.id, label: token.label })),
   ]);
   const tokenOf = (row: RepoRow) => tokens.find((token) => token.id === row.credential);
-  /** What a row can choose from: what its identity reaches, less what the other rows already have. */
-  function choices(row: RepoRow): string[] {
+  /** What a row can choose from: what its identity reaches, less what the other rows already have, the token's
+   * writable repositories first and the rest marked (#352). */
+  function choices(row: RepoRow): RepoOption[] {
     const taken = new Set(rows.filter((other) => other.id !== row.id).map((other) => other.repo));
-    return (tokenOf(row)?.repositories ?? repos).filter((name) => !taken.has(name));
+    const token = tokenOf(row);
+    return offeredRepositories(
+      (token?.repositories ?? repos).filter((name) => !taken.has(name)),
+      token?.writable,
+    );
   }
   const listed = (row: RepoRow) => (tokenOf(row)?.repositories ?? repos).includes(row.repo);
 </script>

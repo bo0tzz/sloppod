@@ -390,6 +390,7 @@ impl Credentials {
                     "login": token.login,
                     "expires_at": token.expires_at.map(|at| at.to_rfc3339()),
                     "repositories": token.repositories,
+                    "writable": token.writable,
                     "more_repositories": token.more_repositories,
                 })
             }

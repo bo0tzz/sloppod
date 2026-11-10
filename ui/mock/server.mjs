@@ -2639,6 +2639,9 @@ function inspectUserToken(secret) {
       login: secret.includes('work') ? 'bo0tzz-work' : 'bo0tzz',
       expires_at: new Date(Date.now() + days * 24 * 3600_000).toISOString(),
       repositories: ['bo0tzz/sloppod', 'bo0tzz/dotfiles'],
+      // What the token can push to (#352). A token added before the runtime kept that (a secret with "older" in it)
+      // has none, as the runtime's own credentials from before #352 do.
+      ...(secret.includes('older') ? {} : { writable: ['bo0tzz/dotfiles'] }),
       more_repositories: secret.includes('many'),
     },
   };

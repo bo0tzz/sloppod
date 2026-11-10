@@ -2487,8 +2487,10 @@ test("a session starts acting as one of the user's GitHub tokens on its reposito
     await row.getByRole('combobox', { name: 'Act as' }).click();
     await page.getByRole('option', { name: 'bo0tzz (mine)' }).click();
     await expect(card.getByText('What the session pushes there is attributed to that person.')).toBeVisible();
-    // What the token reaches is offered, and a repository from the App's list that it doesn't isn't.
+    // What the token reaches is offered, and a repository from the App's list that it doesn't isn't. What it can push
+    // to comes first, and the rest is marked (#352).
     await row.getByRole('combobox', { name: 'Repository' }).click();
+    await expect(page.getByTestId('repo-options').getByRole('option')).toHaveText(['bo0tzz/dotfiles', 'bo0tzz/sloppod (read-only)']);
     await expect(page.getByRole('option', { name: 'bo0tzz/memini' })).toHaveCount(0);
     await page.getByRole('option', { name: 'bo0tzz/dotfiles' }).click();
 
@@ -2759,6 +2761,47 @@ test("adds a repository as one of the user's GitHub tokens", async ({ page }) =>
   await expect(page.getByRole('option', { name: 'bo0tzz/dotfiles' })).toHaveCount(0);
 
   await deleteGitHubTokens(page);
+});
+
+test("a token's writable repositories come first, and the rest are marked", async ({ page }) => {
+  await page.request.post('/api/v1/credentials', {
+    data: { kind: 'github-user', name: 'mine', secret: 'github_pat_x', config: {} },
+  });
+  try {
+    await createSession(page, 'Just chat for now');
+    await page.getByRole('button', { name: 'Session actions' }).click();
+    await page.getByRole('menuitem', { name: 'Add repository…' }).click();
+    const picker = page.getByTestId('add-repo');
+    await picker.getByRole('combobox', { name: 'Act as' }).click();
+    await page.getByRole('option', { name: 'bo0tzz (mine)' }).click();
+    await picker.getByRole('combobox', { name: 'Repository' }).click();
+    // What the token can push to is offered first; what it can't is marked, and still offered: the session can read it.
+    await expect(page.getByTestId('repo-options').getByRole('option')).toHaveText(['bo0tzz/dotfiles', 'bo0tzz/sloppod (read-only)']);
+    await page.getByRole('option', { name: 'bo0tzz/sloppod (read-only)' }).click();
+    await page.getByRole('button', { name: 'Add', exact: true }).click();
+    await expect(page.getByTestId('session-subtitle')).toHaveText('bo0tzz/sloppod');
+  } finally {
+    await deleteGitHubTokens(page);
+  }
+});
+
+test('a token added before its writable repositories were kept offers them unmarked', async ({ page }) => {
+  await page.request.post('/api/v1/credentials', {
+    data: { kind: 'github-user', name: 'older', secret: 'github_pat_older', config: {} },
+  });
+  try {
+    await createSession(page, 'Just chat for now');
+    await page.getByRole('button', { name: 'Session actions' }).click();
+    await page.getByRole('menuitem', { name: 'Add repository…' }).click();
+    const picker = page.getByTestId('add-repo');
+    await picker.getByRole('combobox', { name: 'Act as' }).click();
+    await page.getByRole('option', { name: 'bo0tzz (older)' }).click();
+    await picker.getByRole('combobox', { name: 'Repository' }).click();
+    // Nothing is marked, and the order is GitHub's, as before #352.
+    await expect(page.getByTestId('repo-options').getByRole('option')).toHaveText(['bo0tzz/sloppod', 'bo0tzz/dotfiles']);
+  } finally {
+    await deleteGitHubTokens(page);
+  }
 });
 
 test('a token that reaches more repositories than it lists can add one that is not listed', async ({ page }) => {

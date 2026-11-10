@@ -224,7 +224,7 @@ type Definition = {
 
 A `token` credential is a secret such a server takes: sent as `Authorization: Bearer <token>`, or, with `config.header`, as that header's value.
 
-A `github-user` credential is the user's own GitHub identity, for acting as them where they grant it ([ADR 28](adr/0028-acting-as-the-owner.md), [ADR 29](adr/0029-grants-name-their-credential.md)): a session's repository grant can name one (`POST /api/v1/sessions/{id}/repos` with `credential`). Only fine-grained tokens (`github_pat_…`) are taken: a classic one (`ghp_…`) reaches everything its user can, so it's refused. When one is added, the runtime asks GitHub whose it is (`GET /user`), when it expires (the `github-authentication-token-expiration` header; `expires_at` is `null` for one that doesn't), and which repositories it reaches (`GET /user/repos`, the first thousand, with `more_repositories` when there are more), and keeps that as its config. A token GitHub refuses gets `400`. Like the other secrets, the token stays in the runtime, sealed (ADR 21).
+A `github-user` credential is the user's own GitHub identity, for acting as them where they grant it ([ADR 28](adr/0028-acting-as-the-owner.md), [ADR 29](adr/0029-grants-name-their-credential.md)): a session's repository grant can name one (`POST /api/v1/sessions/{id}/repos` with `credential`). Only fine-grained tokens (`github_pat_…`) are taken: a classic one (`ghp_…`) reaches everything its user can, so it's refused. When one is added, the runtime asks GitHub whose it is (`GET /user`), when it expires (the `github-authentication-token-expiration` header; `expires_at` is `null` for one that doesn't), and which repositories it reaches (`GET /user/repos`, the first thousand, with `more_repositories` when there are more) and which of those it can push to (`permissions.push`, kept as `writable`; `/user/repos` reports the user's role, so where a fine-grained token narrows further than that, it's an upper bound — a repository not in it can't be pushed to either way), and keeps that as its config. A token GitHub refuses gets `400`. Like the other secrets, the token stays in the runtime, sealed (ADR 21).
 
 ```
 GET    /api/v1/credentials                -> Credential[]
@@ -239,7 +239,7 @@ type CredentialKind =
   | "github-app"         // secret: the app's private key (PEM); config: {app_id: string}
   | "memini"             // secret: a memini admin key; config: {url: string, home?: string} (home: your personal namespace)
   | "chatgpt"            // secret: the auth.json of a `codex login` only sloppod uses; config: {account_id} (derived)
-  | "github-user"        // secret: a fine-grained GitHub personal access token; config: {login, expires_at, repositories, more_repositories} (derived)
+  | "github-user"        // secret: a fine-grained GitHub personal access token; config: {login, expires_at, repositories, writable, more_repositories} (derived)
   | "token"              // secret: a token an own capability's server takes; config: {header?: string} (sent as that header, else as a bearer token)
   | "endpoint";          // secret: the key of an Anthropic-compatible endpoint (#461); config: {url: string, models: string[], context_windows?: {[model]: number}} (models given as a list, or one string of names separated by commas or spaces; context_windows, each of its models' window in tokens, at least 1000, as an object or one string of `model=tokens` pairs; 400 for one that names no model of its or isn't a number)
 
