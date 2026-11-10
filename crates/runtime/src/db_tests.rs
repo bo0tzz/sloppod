@@ -994,6 +994,41 @@ async fn a_parent_can_park_its_descendants_at_any_depth(db: PgPool) {
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
+async fn the_subsessions_grant_is_backfilled_for_top_level_sessions(db: PgPool) {
+    // Sessions that existed before the migration: a top-level work session, a sub-session, a reviewer, a utility
+    // session and a deleted top-level one.
+    let top = session(&db, "alice").await;
+    let child = session(&db, "alice").await;
+    db::set_parent(&db, child, top).await.unwrap();
+    let review = session_of_kind(&db, "alice", SessionKind::Review).await;
+    let utility = session_of_kind(&db, "alice", SessionKind::Utility).await;
+    let deleted = session(&db, "alice").await;
+    db::mark_deleted(&db, deleted).await.unwrap();
+
+    // The migrator already ran it on an empty database; run it again over the sessions above.
+    sqlx::raw_sql(include_str!("../migrations/0047_subsessions_grant.sql"))
+        .execute(&db)
+        .await
+        .unwrap();
+
+    async fn grant(db: &PgPool, id: Uuid) -> Option<Value> {
+        sqlx::query_scalar(
+            "select params from session_grants where session_id = $1 and capability = 'subsessions'",
+        )
+        .bind(id)
+        .fetch_optional(db)
+        .await
+        .unwrap()
+    }
+    // The same shape the starting set writes: no params.
+    assert_eq!(grant(&db, top).await, Some(json!({})));
+    assert_eq!(grant(&db, child).await, None);
+    assert_eq!(grant(&db, review).await, None);
+    assert_eq!(grant(&db, utility).await, None);
+    assert_eq!(grant(&db, deleted).await, None);
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
 async fn a_sessions_first_message_is_its_task(db: PgPool) {
     let id = session(&db, "alice").await;
     assert_eq!(db::first_message(&db, id).await.unwrap(), None);
