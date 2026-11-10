@@ -500,43 +500,96 @@ fn copy_stuck(
     }
 }
 
-/// Gives up on a session's copied workspace (#478) and says whether it did: the copy is forgotten — first, so that a
-/// placement that goes wrong doesn't ask for it again — and the session's objects are removed, the Sandbox taking the
-/// unprovisioned claim with it. The caller places the session fresh.
+/// Gives up on a session's copied workspace (#478) and gives back the session as it now is — its row asks for no
+/// copy, so the placement that follows asks for a fresh volume — or nothing when there's nothing to give up on. Its
+/// objects are removed, the Sandbox taking the unprovisioned claim with it; a removal that fails is tried again by
+/// the next sweep, since the session waits for a fresh placement either way.
 async fn drop_copy(
     placement: &dyn sloppod_contracts::PlacementBackend,
     db: &sqlx::PgPool,
     session: &db::SessionRow,
     now: chrono::DateTime<chrono::Utc>,
-) -> bool {
+) -> Option<db::SessionRow> {
     let id = session.id;
     let volume = match placement.volume(&id.to_string()).await {
         Ok(volume) => volume,
         Err(e) => {
             tracing::warn!(session = %id, error = %e, "reading a copied workspace's volume");
-            return false;
+            return None;
         }
     };
     if !copy_stuck(session.created_at, now, volume.as_ref()) {
-        return false;
+        return None;
     }
     tracing::warn!(
         session = %id, from = ?session.workspace_copied_from,
         "a copied workspace never provisioned; placing a fresh one"
     );
-    if let Err(e) = db::clear_workspace_copied_from(db, id).await {
-        tracing::warn!(session = %id, error = %e, "forgetting a workspace copy that never provisioned");
-        return false;
+    if let Err(e) = db::drop_workspace_copy(db, id).await {
+        tracing::warn!(session = %id, error = %e, "giving up on a workspace copy that never provisioned");
+        return None;
     }
     if let Err(e) = placement.delete(&id.to_string()).await {
-        tracing::warn!(session = %id, error = %e, "removing a copied session's objects to place it fresh");
-        return false;
+        tracing::warn!(session = %id, error = %e, "removing a copied session's objects; the next sweep tries again");
     }
-    true
+    // Read back rather than handed on: the row is what says what the next placement asks for.
+    match db::get_session(db, id).await {
+        Ok(Some(row)) => Some(row),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(session = %id, error = %e, "reading a session after giving up on its copied workspace");
+            None
+        }
+    }
 }
 
-/// Places fresh the sessions whose copied workspace never provisioned (#478) — the storage class doesn't clone, or the
-/// clone keeps failing — and tells them: better a fresh workspace they know about than a pod that never starts.
+/// Places a session whose copied workspace was given up on fresh (#478) and says whether it's done with the
+/// fallback. Nothing happens while what the copy left is still there — the claim is removed again, and the next
+/// sweep looks — and a placement that fails leaves the session waiting for one too, rather than with no objects and
+/// nothing looking for it.
+async fn place_fresh<F, Fut>(
+    placement: &dyn sloppod_contracts::PlacementBackend,
+    db: &sqlx::PgPool,
+    session: &db::SessionRow,
+    place: F,
+) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    let id = session.id;
+    match placement.volume(&id.to_string()).await {
+        // Still there: the removal didn't take. It's asked for again, and the next sweep places the session.
+        Ok(Some(_)) => {
+            if let Err(e) = placement.delete(&id.to_string()).await {
+                tracing::warn!(session = %id, error = %e, "removing what a copied workspace left");
+            }
+            return false;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(session = %id, error = %e, "reading what a copied workspace left");
+            return false;
+        }
+    }
+    if let Err(e) = place().await {
+        tracing::warn!(session = %id, error = %e, "placing a session whose workspace copy was given up on");
+        return false;
+    }
+    match db::finish_workspace_fresh(db, id).await {
+        Ok(()) => true,
+        Err(e) => {
+            // Placed, but the row still waits: the next sweep places it again, which the placement takes.
+            tracing::warn!(session = %id, error = %e, "finishing a fresh placement after a dropped workspace copy");
+            false
+        }
+    }
+}
+
+/// Gives up on the copies that never provisioned (#478) — the storage class doesn't clone, or the clone keeps
+/// failing — and places those sessions fresh, telling them: better a fresh workspace they know about than a pod that
+/// never starts. Each step is retried until it lands, so a removal or a placement that fails doesn't leave a session
+/// with no objects and nothing looking for it.
 pub async fn sweep_copied_workspaces(state: &AppState) {
     let copied = match db::copied_workspaces(&state.db).await {
         Ok(copied) => copied,
@@ -550,14 +603,33 @@ pub async fn sweep_copied_workspaces(state: &AppState) {
         let Ok(Some(session)) = db::get_session(&state.db, id).await else {
             continue;
         };
-        if !drop_copy(&*state.placement, &state.db, &session, now).await {
+        if drop_copy(&*state.placement, &state.db, &session, now)
+            .await
+            .is_some()
+        {
+            tracing::info!(session = %id, "gave up on a copied workspace that never provisioned");
+        }
+    }
+    // Read after the pass above, so a copy dropped just now is placed in this same sweep.
+    let waiting = match db::copies_awaiting_fresh(&state.db).await {
+        Ok(waiting) => waiting,
+        Err(e) => {
+            tracing::warn!(error = %e, "listing sessions waiting to be placed fresh");
+            return;
+        }
+    };
+    for id in waiting {
+        let Ok(Some(session)) = db::get_session(&state.db, id).await else {
+            continue;
+        };
+        if !place_fresh(&*state.placement, &state.db, &session, || {
+            place(state, &session)
+        })
+        .await
+        {
             continue;
         }
         tracing::info!(session = %id, "placed a session fresh: its copied workspace never provisioned");
-        if let Err(e) = place(state, &session).await {
-            tracing::warn!(session = %id, error = %e, "placing a session whose workspace copy failed");
-            continue;
-        }
         state
             .hub
             .notify_or_record(
@@ -808,15 +880,14 @@ mod tests {
         }
     }
 
-    /// A copied workspace the cluster never provisions is given up on — the copy forgotten and the session's objects
-    /// removed so it can be placed fresh — while one that has provisioned, one whose claim is still on its way, and a
-    /// session that has only just started are left alone (#478).
-    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
-    async fn a_copied_workspace_that_never_arrives_is_given_up_on(db: sqlx::PgPool) {
-        let parent = uuid::Uuid::new_v4();
-        let child = uuid::Uuid::now_v7();
+    /// A session whose workspace is a copy of `parent`'s, for the sweeps that place it fresh (#478).
+    async fn copied_session(
+        db: &sqlx::PgPool,
+        child: uuid::Uuid,
+        parent: uuid::Uuid,
+    ) -> crate::db::SessionRow {
         crate::db::insert_session(
-            &db,
+            db,
             crate::db::NewSessionRow {
                 id: child,
                 owner: "dev",
@@ -833,10 +904,20 @@ mod tests {
         )
         .await
         .unwrap();
-        crate::db::set_workspace_copied_from(&db, child, parent)
+        crate::db::set_workspace_copied_from(db, child, parent)
             .await
             .unwrap();
-        let row = crate::db::get_session(&db, child).await.unwrap().unwrap();
+        crate::db::get_session(db, child).await.unwrap().unwrap()
+    }
+
+    /// A copied workspace the cluster never provisions is given up on — the copy forgotten and the session's objects
+    /// removed so it can be placed fresh — while one that has provisioned, one whose claim is still on its way, and a
+    /// session that has only just started are left alone (#478).
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_copied_workspace_that_never_arrives_is_given_up_on(db: sqlx::PgPool) {
+        let parent = uuid::Uuid::new_v4();
+        let child = uuid::Uuid::now_v7();
+        let row = copied_session(&db, child, parent).await;
         let claim = |capacity: Option<u64>| sloppod_contracts::Volume {
             name: format!("workdir-sloppod-{child}"),
             session_id: Some(child.to_string()),
@@ -851,13 +932,14 @@ mod tests {
             deleted: Default::default(),
         };
         assert!(
-            !super::drop_copy(
+            super::drop_copy(
                 &waiting,
                 &db,
                 &row,
                 row.created_at + chrono::Duration::seconds(30)
             )
             .await
+            .is_none()
         );
         assert!(waiting.deleted.lock().unwrap().is_empty());
         assert_eq!(
@@ -879,16 +961,13 @@ mod tests {
                 row.created_at + chrono::Duration::minutes(5)
             )
             .await
+            .is_some()
         );
         assert_eq!(waiting.deleted.lock().unwrap().len(), 1);
-        assert_eq!(
-            crate::db::get_session(&db, child)
-                .await
-                .unwrap()
-                .unwrap()
-                .workspace_copied_from,
-            None
-        );
+        // The row it gives back is the one to place from: no copy on it, and a fresh placement waited for instead.
+        let waiting_row = crate::db::get_session(&db, child).await.unwrap().unwrap();
+        assert_eq!(waiting_row.workspace_copied_from, None);
+        assert!(waiting_row.workspace_fresh);
 
         // A claim the cluster did provision, however old the session: left alone.
         let provisioned = Claims {
@@ -896,13 +975,14 @@ mod tests {
             deleted: Default::default(),
         };
         assert!(
-            !super::drop_copy(
+            super::drop_copy(
                 &provisioned,
                 &db,
                 &row,
                 row.created_at + chrono::Duration::hours(1)
             )
             .await
+            .is_none()
         );
         assert!(provisioned.deleted.lock().unwrap().is_empty());
 
@@ -912,13 +992,100 @@ mod tests {
             deleted: Default::default(),
         };
         assert!(
-            !super::drop_copy(
+            super::drop_copy(
                 &none,
                 &db,
                 &row,
                 row.created_at + chrono::Duration::hours(1)
             )
             .await
+            .is_none()
+        );
+    }
+
+    /// A session waiting for a fresh placement after its copy was given up on keeps waiting until everything lands:
+    /// what the copy left is removed again and the placement is tried again, sweep after sweep, rather than the
+    /// session being left with no objects and nothing looking for it (#478).
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn a_given_up_copy_is_retried_until_the_session_is_placed_fresh(db: sqlx::PgPool) {
+        let parent = uuid::Uuid::new_v4();
+        let child = uuid::Uuid::now_v7();
+        let row = copied_session(&db, child, parent).await;
+        let volume = |capacity| sloppod_contracts::Volume {
+            name: format!("workdir-sloppod-{child}"),
+            session_id: Some(child.to_string()),
+            capacity,
+            requested: Some(20 << 30),
+            resizing: false,
+        };
+
+        // The copy never provisioned and the sweep gives up on it: the copy is forgotten, a fresh placement
+        // is waited for, and what the copy left is asked for.
+        let left = Claims {
+            volume: Some(volume(None)),
+            deleted: Default::default(),
+        };
+        let dropped = super::drop_copy(
+            &left,
+            &db,
+            &row,
+            row.created_at + chrono::Duration::minutes(5),
+        )
+        .await
+        .expect("a copy that never provisioned is given up on");
+        assert_eq!(dropped.workspace_copied_from, None);
+        assert!(dropped.workspace_fresh);
+        assert_eq!(left.deleted.lock().unwrap().len(), 1);
+
+        // The claim is still there: nothing is placed, and it's asked for again.
+        assert!(
+            !super::place_fresh(&left, &db, &dropped, || async { Ok(()) }).await,
+            "a session whose claim is still there isn't placed yet"
+        );
+        assert_eq!(left.deleted.lock().unwrap().len(), 2);
+        assert!(
+            crate::db::get_session(&db, child)
+                .await
+                .unwrap()
+                .unwrap()
+                .workspace_fresh
+        );
+
+        // The claim is gone and the placement fails: still waiting, so the next sweep tries again.
+        let gone = Claims {
+            volume: None,
+            deleted: Default::default(),
+        };
+        assert!(
+            !super::place_fresh(&gone, &db, &dropped, || async {
+                anyhow::bail!("the cluster wouldn't place it")
+            })
+            .await
+        );
+        assert!(
+            crate::db::get_session(&db, child)
+                .await
+                .unwrap()
+                .unwrap()
+                .workspace_fresh
+        );
+
+        // And it lands: the session is placed fresh and stops waiting.
+        let placed = std::sync::atomic::AtomicBool::new(false);
+        assert!(
+            super::place_fresh(&gone, &db, &dropped, || async {
+                placed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+        );
+        assert!(placed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !crate::db::get_session(&db, child)
+                .await
+                .unwrap()
+                .unwrap()
+                .workspace_fresh
         );
     }
 

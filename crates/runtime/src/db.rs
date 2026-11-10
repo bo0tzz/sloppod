@@ -63,6 +63,8 @@ pub struct SessionRow {
     /// The session whose workspace volume this session's started as a copy of (#478), until the copy has been taken
     /// over; null for a workspace of its own.
     pub workspace_copied_from: Option<Uuid>,
+    /// Whether the session is waiting for a fresh placement after a copy of its workspace was given up on (#478).
+    pub workspace_fresh: bool,
 }
 
 impl SessionRow {
@@ -97,6 +99,7 @@ impl SessionRow {
             disk_seen_at: None,
             volume_kept: false,
             workspace_copied_from: None,
+            workspace_fresh: false,
         }
     }
 
@@ -208,7 +211,7 @@ impl SessionRow {
     }
 }
 
-const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, pending_model, repo, created_at, updated_at, active_at, deleted_at, agent_status, agent_error, parent_id, limited_until, image_nudged, disk_used, disk_size, disk_seen_at, volume_kept, workspace_copied_from, \
+const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, pending_model, repo, created_at, updated_at, active_at, deleted_at, agent_status, agent_error, parent_id, limited_until, image_nudged, disk_used, disk_size, disk_seen_at, volume_kept, workspace_copied_from, workspace_fresh, \
      coalesce((select jsonb_agg(jsonb_build_object('id', g.id, 'capability', g.capability, 'params', g.params, \
      'created_at', g.created_at, 'expires_at', g.expires_at) order by g.created_at) \
      from session_grants g where g.session_id = sessions.id and (g.expires_at is null or g.expires_at > now())), \
@@ -697,6 +700,38 @@ pub async fn set_workspace_copied_from(db: &PgPool, id: Uuid, from: Uuid) -> sql
         .execute(db)
         .await
         .map(|_| ())
+}
+
+/// Gives up on a copied workspace (#478): the copy is forgotten, and the session starts waiting for a fresh
+/// placement — one update, so a deletion or a placement that fails after it is still found by the next sweep.
+pub async fn drop_workspace_copy(db: &PgPool, id: Uuid) -> sqlx::Result<()> {
+    sqlx::query(
+        "update sessions set workspace_copied_from = null, workspace_fresh = true where id = $1",
+    )
+    .bind(id)
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
+/// The session has been placed fresh, so it's done with a copy that was given up on (#478).
+pub async fn finish_workspace_fresh(db: &PgPool, id: Uuid) -> sqlx::Result<()> {
+    sqlx::query("update sessions set workspace_fresh = false where id = $1")
+        .bind(id)
+        .execute(db)
+        .await
+        .map(|_| ())
+}
+
+/// The sessions whose workspace copy was given up on and are waiting to be placed fresh (#478), for a sweep to keep
+/// trying until their objects are gone and the placement lands.
+pub async fn copies_awaiting_fresh(db: &PgPool) -> sqlx::Result<Vec<Uuid>> {
+    let rows: Vec<(Uuid,)> = sqlx::query_as(
+        "select id from sessions where workspace_fresh and deleted_at is null order by created_at",
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
 /// Forgets that the session's workspace was copied (#478): the copy has been taken over, or it was never made, and
