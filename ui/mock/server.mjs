@@ -688,6 +688,29 @@ async function agentScript(session, turn, prompt) {
     return;
   }
 
+  if (/many tool updates/i.test(prompt)) {
+    // More updates than one page, every one of them to the same tool call: the page that opens renders shorter than the
+    // view, so there is nothing to scroll and older history can only be reached by asking for what's above.
+    const toolCallId = randomUUID();
+    tool({ toolCallId, title: 'Shell', kind: 'execute', status: 'pending', rawInput: { command: 'npm test' } });
+    for (let i = 0; i < HISTORY_PAGE - 1; i++) update(toolCallId, { status: 'in_progress' });
+    return;
+  }
+
+  if (/long log with a run of tool calls/i.test(prompt)) {
+    // More updates than one page, whose latest page begins inside a run of tool calls, with a long message after it: the
+    // page before continues the run, which folds the row a reader is at under a tool call from the older page.
+    const [first, second, third] = [randomUUID(), randomUUID(), randomUUID()];
+    tool({ toolCallId: first, title: 'Shell', kind: 'execute', status: 'pending', rawInput: { command: 'npm run check' } });
+    tool({ toolCallId: second, title: 'Shell', kind: 'execute', status: 'pending', rawInput: { command: 'npm run build' } });
+    tool({ toolCallId: third, title: 'Shell', kind: 'execute', status: 'pending', rawInput: { command: 'npm test' } });
+    for (let i = 0; i < HISTORY_PAGE - 3; i++) update(third, { status: 'in_progress' });
+    const messageId = randomUUID();
+    session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `word ${'word '.repeat(1200)}` }, messageId });
+    session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'The end.' }, messageId });
+    return;
+  }
+
   if (/long log with a tool call/i.test(prompt)) {
     // More updates than one page, and the latest page begins at a tool call: the row at the top of what a reader has is
     // then one a live turn can still write to, while the page before it is on its way.

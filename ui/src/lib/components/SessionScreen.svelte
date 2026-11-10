@@ -191,6 +191,12 @@
    */
   let userScrolled = false;
   /**
+   * Which way the reader last asked the view to go: `true` for what's above. A page shorter than the view has nowhere to
+   * scroll, so its wheel, swipe and keys leave no scroll event behind, and being at the bottom of it says nothing about
+   * whether there is anything above — only they can.
+   */
+  let askedEarlier = false;
+  /**
    * Set while a page of older history is on its way in. The page's rows are laid out as it lands, and a view that looks
    * like it has nothing below it for a moment is not one the reader has gone to the bottom of: following that would
    * take them away from where they were reading, the one thing the page must not do.
@@ -222,9 +228,6 @@
   function onScroll() {
     if (!scroller || !positioned) return;
     scheduleRead();
-    // A scrollbar drag scrolls as much as a wheel does, and counts the same; the view's own scrolling and its opening
-    // position come with neither a pointer down nor a wheel, touch or key before them.
-    if (pointerHeld || performance.now() - lastUserScroll < 1000) userScrolled = true;
     if (holdBar) return;
     const resized = viewResized();
     if (!holdingPlace && bottomGap() < 80) {
@@ -241,7 +244,10 @@
 
   /** Fetches the page before while the reader is reading up into it, as any chat does; never on opening at the top. */
   function loadEarlierIfNear() {
-    if (!scroller || !positioned || !userScrolled || atBottom) return;
+    if (!scroller || !positioned || !userScrolled) return;
+    // Being at the bottom says nothing when the page fits the view and there is nowhere below to be: what the reader
+    // asked for above them is what is fetched, and being able to see the bottom doesn't make that not so.
+    if (atBottom && !askedEarlier) return;
     if (view.historyBefore === null || view.loadingHistory || view.historyError) return;
     if (scroller.scrollTop > EARLIER_WITHIN_SCREENS * scroller.clientHeight) return;
     void loadEarlier();
@@ -266,10 +272,10 @@
     const page = view.loadEarlier();
     holdingPlace = true;
     let held = at < 0 ? undefined : endOf(rows[at]);
-    // The reader's row by the name it has of its own — a message's id, a tool call's — which a page going in above it
-    // leaves alone, as an update of a live turn to that row does; rows of an earlier page have no name, and there the
-    // rows that went in above them are counted instead.
-    const name = rows[at]?.dataset.rowName ?? '';
+    // The reader's row by the names it holds — a message's id, a tool call's — which a page going in above it leaves
+    // alone, as an update of a live turn to that row does; rows of an earlier page have no name, and there the rows
+    // that went in above them are counted instead. Every name a fold holds is kept: the page before can widen it.
+    const names = (rows[at]?.dataset.rowNames ?? '').split(' ').filter(Boolean);
     try {
       while (view.loadingHistory && held !== undefined) {
         await new Promise((resolve) => requestAnimationFrame(resolve));
@@ -288,8 +294,12 @@
         // Scrolling on themselves, the reader has taken the view where they want it: what a page did above them is
         // theirs to scroll past as well, and holding them back would be the jump.
         if (pointerHeld || lastUserScroll !== scrolledBy) return;
+        // A row holding any of those names is the reader's: a fold widened by the page above it holds the tool call the
+        // reader was at still, under a name of its own from an older page.
         const now = rowElements();
-        const row = name ? now.find((row) => row.dataset.rowName === name) : now[at + (now.length - rows.length)];
+        const row = names.length
+          ? now.find((candidate) => (candidate.dataset.rowNames ?? '').split(' ').some((name) => names.includes(name)))
+          : now[at + (now.length - rows.length)];
         // Past the end: what's here isn't the transcript this page went into, so there's no place to hold.
         if (!row) return;
         // What has gone in above the reader so far; scrolling there doesn't move it, and where it couldn't be scrolled
@@ -314,9 +324,15 @@
   let pointerHeld = false;
   $effect(() => {
     if (!scroller) return;
-    const scrolling = () => {
+    const scrolling = (event: Event) => {
       lastUserScroll = performance.now();
       holdBar = false;
+      userScrolled = true;
+      // Which way they asked to go is kept here, and not read off the scrolling: a page that fits the view says nothing,
+      // having no scroll event to come of a wheel or a key, and what's above it is reached only by asking for it.
+      const up = asksForEarlier(event);
+      if (up !== null) askedEarlier = up;
+      loadEarlierIfNear();
     };
     const press = () => (pointerHeld = true);
     const release = () => (pointerHeld = false);
@@ -332,6 +348,24 @@
       window.removeEventListener('pointercancel', release);
     };
   });
+
+  /** A last touch position, for telling which way a finger is going: a swipe down is a reader asking for what's above. */
+  let lastTouchY: number | null = null;
+  const EARLIER_KEYS = new Set(['PageUp', 'Home', 'ArrowUp']);
+  const LATER_KEYS = new Set(['PageDown', 'End', 'ArrowDown']);
+
+  /** Which way a wheel, touch or key asks the view to go: `true` for what's above, `false` for what's below, `null` for neither. */
+  function asksForEarlier(event: Event): boolean | null {
+    if (event instanceof WheelEvent) return event.deltaY === 0 ? null : event.deltaY < 0;
+    if (event instanceof KeyboardEvent) return EARLIER_KEYS.has(event.key) ? true : LATER_KEYS.has(event.key) ? false : null;
+    if (event instanceof TouchEvent) {
+      const at = event.touches[0]?.clientY ?? null;
+      const was = lastTouchY;
+      lastTouchY = at;
+      return at === null || was === null || at === was ? null : at > was;
+    }
+    return null;
+  }
 
   function scrollToBottom(behavior: ScrollBehavior = 'instant') {
     scroller?.scrollTo({ top: scroller.scrollHeight, behavior });

@@ -87,17 +87,18 @@
   });
 
   const rowItems = (row: Row) => ('fold' in row ? row.fold : [row.item]);
-  /**
-   * What a row is, where it has a name the rows of an older page don't share: a message's id or a tool call's. A page
-   * going in above the chat leaves it alone, and the updates a live turn adds to a row don't change it, so a row can be
-   * found again by it once the chat's history has grown above it.
-   */
-  const rowName = (row: Row) => {
-    const first = rowItems(row)[0];
-    if (first.type === 'user' || first.type === 'agent') return first.messageId ? `message:${first.messageId}` : '';
-    if (first.type === 'tool') return `tool:${first.toolCallId}`;
+  /** What an item is called, where it has a name the rows of an older page don't share: a message's id or a tool call's. */
+  const nameOf = (item: TranscriptItem) => {
+    if (item.type === 'user' || item.type === 'agent') return item.messageId ? `message:${item.messageId}` : '';
+    if (item.type === 'tool') return `tool:${item.toolCallId}`;
     return '';
   };
+  /**
+   * What a row holds, for finding it again once the chat's history has grown above it: a page going in there leaves
+   * these alone, and the updates a live turn adds to a row don't change them. A fold carries every tool call it folds,
+   * not only the first: a page from before it can widen the fold to older calls.
+   */
+  const rowNames = (row: Row) => rowItems(row).map(nameOf).filter(Boolean);
   /** The last event that touched the row, the first one that made an item in it, and the last that added to one: the bar goes above the first row with something added after the read position. */
   const rowSeq = (row: Row) => Math.max(...rowItems(row).map((item) => item.seq));
   const rowFirstSeq = (row: Row) => Math.min(...rowItems(row).map((item) => item.firstSeq));
@@ -141,7 +142,7 @@
       class="[contain-intrinsic-size:auto_4rem] [content-visibility:auto]"
       data-seq={rowSeq(row)}
       data-first-seq={rowFirstSeq(row)}
-      data-row-name={rowName(row) || undefined}
+      data-row-names={rowNames(row).join(' ') || undefined}
     >
       {#if 'fold' in row}
         <ToolFold items={row.fold} />

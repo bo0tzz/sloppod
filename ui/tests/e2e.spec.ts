@@ -1861,7 +1861,7 @@ test('the reader’s place holds when the row they are at is written to as the p
   // The page that opens holds the latest of the log, which begins at the tool call: at the top of the chat, that row
   // is the reader's.
   await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(0);
-  const row = page.locator('[data-testid="transcript"] [data-row-name^="tool:"]');
+  const row = page.locator('[data-testid="transcript"] [data-row-names^="tool:"]');
   await expect(row).toHaveCount(1);
 
   await page.request.post('/_mock/hold-history');
@@ -1874,7 +1874,7 @@ test('the reader’s place holds when the row they are at is written to as the p
   await page.request.post('/_mock/update', {
     data: {
       sessionUpdate: 'tool_call_update',
-      toolCallId: (await row.getAttribute('data-row-name'))!.replace('tool:', ''),
+      toolCallId: (await row.getAttribute('data-row-names'))!.split(' ')[0].replace('tool:', ''),
       status: 'in_progress',
     },
   });
@@ -1889,6 +1889,54 @@ test('the reader’s place holds when the row they are at is written to as the p
   await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(1);
   // The page that went in above is all that moved the row, and the view was scrolled by as much: the reader's place is
   // where it was, the tool call's own update having been theirs to see rather than something to compensate for.
+  await expect.poll(async () => Math.abs((await end()) - held)).toBeLessThan(2);
+});
+
+test('older history comes in when the page that opens cannot scroll', { tag: '@scroll' }, async ({ page }) => {
+  await page.setViewportSize({ width: 1000, height: 800 });
+  const prompt = 'Write a short log with many tool updates in sloppod';
+  await createSession(page, prompt);
+  const scroller = page.getByTestId('transcript-scroller');
+  await page.reload();
+  await expect(page.locator('[data-testid="transcript"] [data-row-names]')).toHaveCount(1);
+  await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(0);
+  // The page fits the view: there is nothing to scroll, and so no scroll event for anything to be read from.
+  expect(await scroller.evaluate((element) => element.scrollHeight <= element.clientHeight)).toBe(true);
+
+  // Asking to go up is what reaches the rest of the session, viewport or not.
+  await scroller.hover();
+  await page.mouse.wheel(0, -200);
+  await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(1);
+});
+
+test('the reader’s place holds when the page before widens a fold they are at', { tag: '@scroll' }, async ({ page }) => {
+  await page.setViewportSize({ width: 1000, height: 500 });
+  const prompt = 'Write a long log with a run of tool calls in sloppod';
+  await createSession(page, prompt);
+  await expect(page.getByText('The end.')).toBeVisible({ timeout: 20_000 });
+  await page.reload();
+  await expect(page.getByText('The end.')).toBeVisible();
+  await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(0);
+  // The row at the top of what the reader has is the run of tool calls the page began in: one call of it, so far.
+  const row = page.locator('[data-testid="transcript"] [data-row-names^="tool:"]');
+  await expect(row).toHaveCount(1);
+  const was = (await row.getAttribute('data-row-names'))!;
+  expect(was.split(' ')).toHaveLength(1);
+
+  await page.request.post('/_mock/hold-history');
+  await wheelUp(page);
+  await expect(page.getByTestId('loading-earlier')).toBeVisible();
+  const end = async () => {
+    const box = (await row.boundingBox())!;
+    return box.y + box.height;
+  };
+  const held = await end();
+
+  await page.request.post('/_mock/release-history');
+  await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(1);
+  // The run is one fold now, named by an older tool call than the reader's: the reader's call is in it still, so the row
+  // was found, and what the page put above them is all that was scrolled past.
+  await expect.poll(async () => (await row.getAttribute('data-row-names'))!.split(' ')).toContain(was);
   await expect.poll(async () => Math.abs((await end()) - held)).toBeLessThan(2);
 });
 
