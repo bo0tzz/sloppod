@@ -51,6 +51,10 @@ impl Growth {
     }
 }
 
+/// How full the filesystem the pod reports has to be, while the room a session's volume was asked for hasn't arrived,
+/// before the session is told to clean up: what it has to work in is all but gone (#479).
+const NO_ROOM: f64 = 0.95;
+
 /// What a disk report says to do about a session's workspace volume (#479).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Decision {
@@ -58,6 +62,9 @@ enum Decision {
     Below,
     /// Filling up, but an expansion is already on its way: the next report looks again.
     Growing,
+    /// An expansion is on its way and the pod's filesystem is all but out of room: the session is told to clean up,
+    /// since the size the claim asks for isn't room it can use yet.
+    GrowingFull,
     /// Ask the cluster for this many bytes.
     Grow(u64),
     /// Filling up, and as big as it may become.
@@ -73,12 +80,18 @@ pub struct Outcome {
     pub full: bool,
 }
 
-/// Decides what a report means for a session's workspace volume (#479): how much of it the supervisor says is used,
-/// what the cluster says the volume is now, and what the chart allows.
+/// Decides what a report means for a session's workspace volume (#479): how much of it the supervisor says is used and
+/// how big the pod's filesystem is, what the cluster says the volume is now, and what the chart allows.
 ///
 /// The volume's own size is what its use is measured against, not the size the pod's filesystem reports: a claim the
-/// cluster has been asked to grow is on its way there before its filesystem catches up.
-fn decide(used: u64, volume: Option<&Volume>, growth: Growth) -> Decision {
+/// cluster has been asked to grow is on its way there before its filesystem catches up. That leaves the filesystem the
+/// only measure of what the session can use meanwhile, so one all but out of room is told to clean up rather than left
+/// waiting for room that may not arrive.
+fn decide(used: u64, reported: u64, volume: Option<&Volume>, growth: Growth) -> Decision {
+    let growing = volume.is_some_and(Volume::growing);
+    if growing && all_but_full(used, reported) {
+        return Decision::GrowingFull;
+    }
     // A backend that can't say what the session's volume is, or a session whose volume is gone: nothing to grow.
     let Some(size) = volume.and_then(Volume::size) else {
         return Decision::Below;
@@ -86,7 +99,7 @@ fn decide(used: u64, volume: Option<&Volume>, growth: Growth) -> Decision {
     if size == 0 || (used as f64) / (size as f64) < growth.at {
         return Decision::Below;
     }
-    if volume.is_some_and(Volume::growing) {
+    if growing {
         return Decision::Growing;
     }
     if size >= growth.max {
@@ -94,6 +107,12 @@ fn decide(used: u64, volume: Option<&Volume>, growth: Growth) -> Decision {
     }
     let step = ((size as f64) * (1.0 + growth.by)) as u64;
     Decision::Grow(step.max(size + LEAST_GROWTH).min(growth.max))
+}
+
+/// Whether the filesystem the pod reports is all but out of usable room (#479). A report that says nothing about its
+/// size says nothing here either.
+fn all_but_full(used: u64, size: u64) -> bool {
+    size > 0 && (used as f64) / (size as f64) >= NO_ROOM
 }
 
 /// Acts on a session's disk report (#479): grows its workspace volume when the report says it's filling up, and says
@@ -118,7 +137,7 @@ pub async fn on_report(
             };
         }
     };
-    match decide(used, volume.as_ref(), growth) {
+    match decide(used, size, volume.as_ref(), growth) {
         Decision::Below => Outcome {
             notice: None,
             full: false,
@@ -127,13 +146,19 @@ pub async fn on_report(
             notice: None,
             full: told,
         },
+        // An expansion is on its way, and the pod's filesystem says it's out of room meanwhile: the session is told
+        // once to clean up, and told again if it fills up anew after it has room to work in.
+        Decision::GrowingFull => Outcome {
+            notice: (!told).then(|| pending_notice(used, size)),
+            full: true,
+        },
         Decision::Grow(to) => match placement.grow_volume(session_id, to).await {
             Ok(()) => {
                 tracing::info!(session = %session_id, to, "grew a session's workspace volume");
                 Outcome {
                     notice: Some(format!(
-                        "sloppod: this session's workspace volume grew to {} (it was {}% full). Nothing on it \
-                         was touched.",
+                        "sloppod: this session's workspace volume is being grown to {} (it was {}% full). Nothing on \
+                         it was touched.",
                         size_in_words(to),
                         percent(used, size)
                     )),
@@ -220,6 +245,16 @@ async fn act_on_report(
     {
         tracing::warn!(session = %id, error = %e, "keeping that a session was told its workspace can't grow");
     }
+}
+
+/// What a session is told when its workspace is out of room while the volume it's on is still being grown (#479): the
+/// size the claim asks for is on its way, but the pod's own filesystem hasn't got it yet.
+fn pending_notice(used: u64, size: u64) -> String {
+    format!(
+        "sloppod: the workspace is {}% full and the extra room its volume was asked for hasn't arrived yet; clean \
+         build output or caches.",
+        percent(used, size)
+    )
 }
 
 /// What a session is told when its workspace is full and can't grow any more (#479).
@@ -573,14 +608,17 @@ mod tests {
     fn a_volume_grows_half_again_once_it_passes_the_threshold() {
         let volume = settled(20 << 30);
         // Below it, nothing happens.
-        assert_eq!(decide(16 << 30, Some(&volume), growth()), Decision::Below);
         assert_eq!(
-            decide((17 << 30) - 1, Some(&volume), growth()),
+            decide(16 << 30, 20 << 30, Some(&volume), growth()),
+            Decision::Below
+        );
+        assert_eq!(
+            decide((17 << 30) - 1, 20 << 30, Some(&volume), growth()),
             Decision::Below
         );
         // At it, half again.
         assert_eq!(
-            decide(17 << 30, Some(&volume), growth()),
+            decide(17 << 30, 20 << 30, Some(&volume), growth()),
             Decision::Grow(30 << 30)
         );
     }
@@ -589,7 +627,7 @@ mod tests {
     fn a_growth_is_never_less_than_five_gib() {
         // Half again of 6 GiB is 3 GiB, so the floor is what it grows by.
         assert_eq!(
-            decide(6 << 30, Some(&settled(6 << 30)), growth()),
+            decide(6 << 30, 6 << 30, Some(&settled(6 << 30)), growth()),
             Decision::Grow(11 << 30)
         );
     }
@@ -602,16 +640,16 @@ mod tests {
         };
         // A step that would pass the maximum goes to it and no further.
         assert_eq!(
-            decide(55 << 30, Some(&settled(55 << 30)), growth),
+            decide(55 << 30, 55 << 30, Some(&settled(55 << 30)), growth),
             Decision::Grow(60 << 30)
         );
         // At it, it can't grow any more, however much of it is used.
         assert_eq!(
-            decide(55 << 30, Some(&settled(60 << 30)), growth),
+            decide(55 << 30, 60 << 30, Some(&settled(60 << 30)), growth),
             Decision::Full
         );
         assert_eq!(
-            decide(60 << 30, Some(&settled(60 << 30)), growth),
+            decide(60 << 30, 60 << 30, Some(&settled(60 << 30)), growth),
             Decision::Full
         );
     }
@@ -619,20 +657,70 @@ mod tests {
     #[test]
     fn nothing_grows_while_an_expansion_is_on_its_way() {
         let growth = growth();
-        // The cluster is still provisioning what it was asked for.
+        // The cluster is still provisioning what it was asked for: use is measured against the size the claim is on
+        // its way to, and the pod's own filesystem has room to work in yet.
         let asked = Volume {
             requested: Some(30 << 30),
             ..settled(20 << 30)
         };
-        assert_eq!(decide(28 << 30, Some(&asked), growth), Decision::Growing);
-        // Given it, and waiting for the pod to be restarted to finish it.
+        assert_eq!(
+            decide(18 << 30, 20 << 30, Some(&asked), growth),
+            Decision::Below
+        );
+        // The filesystem has grown, and the resize waits on a new pod to finish: filling up, nothing more asked for.
         let waiting = Volume {
             resizing: true,
             ..settled(30 << 30)
         };
-        assert_eq!(decide(28 << 30, Some(&waiting), growth), Decision::Growing);
+        assert_eq!(
+            decide(28 << 30, 30 << 30, Some(&waiting), growth),
+            Decision::Growing
+        );
         // A backend that can't say what the volume is, and a session whose volume is gone.
-        assert_eq!(decide(28 << 30, None, growth), Decision::Below);
+        assert_eq!(decide(28 << 30, 30 << 30, None, growth), Decision::Below);
+    }
+
+    #[test]
+    fn a_workspace_out_of_room_while_its_volume_grows_is_told_to_clean_up() {
+        let growth = growth();
+        // The cluster has been asked for 30 GiB and the pod's filesystem is still the 20 GiB it had, all but full:
+        // the bigger size the claim asks for isn't room the session can use yet (#479).
+        let asked = Volume {
+            requested: Some(30 << 30),
+            ..settled(20 << 30)
+        };
+        assert_eq!(
+            decide(20 << 30, 20 << 30, Some(&asked), growth),
+            Decision::GrowingFull
+        );
+        assert_eq!(
+            decide(19 << 30, 20 << 30, Some(&asked), growth),
+            Decision::GrowingFull
+        );
+        // Room to work in yet: left for the next report rather than told anything.
+        assert_eq!(
+            decide(18 << 30, 20 << 30, Some(&asked), growth),
+            Decision::Below
+        );
+        // A filesystem already grown, with the resize waiting on a new pod: the same measure of what's left.
+        let waiting = Volume {
+            resizing: true,
+            ..settled(30 << 30)
+        };
+        assert_eq!(
+            decide(29 << 30, 30 << 30, Some(&waiting), growth),
+            Decision::GrowingFull
+        );
+        assert_eq!(
+            decide(28 << 30, 30 << 30, Some(&waiting), growth),
+            Decision::Growing
+        );
+        // A report that says nothing about the filesystem's size says nothing about its room: the size the claim is
+        // on its way to is all there is to go on.
+        assert_eq!(
+            decide(28 << 30, 0, Some(&waiting), growth),
+            Decision::Growing
+        );
     }
 
     #[test]
@@ -737,7 +825,8 @@ mod tests {
         assert_eq!(
             outcome.notice.as_deref(),
             Some(
-                "sloppod: this session's workspace volume grew to 30 GiB (it was 90% full). Nothing on it was touched."
+                "sloppod: this session's workspace volume is being grown to 30 GiB (it was 90% full). Nothing on it \
+                 was touched."
             )
         );
         assert!(!outcome.full);
@@ -794,6 +883,40 @@ mod tests {
         let next = on_report(&fake, "s", 18 << 30, 20 << 30, first.full, growth()).await;
         assert_eq!(next.notice, None);
         assert!(next.full);
+    }
+
+    #[tokio::test]
+    async fn a_workspace_out_of_room_while_its_volume_grows_is_told_once() {
+        // The cluster has been asked for 30 GiB and the pod's filesystem is still the 20 GiB it had, full: the size
+        // the claim asks for isn't room the session can use, so it's told to clean up (#479).
+        let asked = Volume {
+            requested: Some(30 << 30),
+            ..settled(20 << 30)
+        };
+        let fake = Fake::new(asked, false);
+        let first = on_report(&fake, "s", 20 << 30, 20 << 30, false, growth()).await;
+        assert_eq!(
+            first.notice.as_deref(),
+            Some(
+                "sloppod: the workspace is 100% full and the extra room its volume was asked for hasn't arrived \
+                 yet; clean build output or caches."
+            )
+        );
+        assert!(first.full);
+        assert!(fake.grown().is_empty());
+
+        // Five minutes later it's just as full and the room still hasn't arrived: nothing more is said.
+        let next = on_report(&fake, "s", 20 << 30, 20 << 30, first.full, growth()).await;
+        assert_eq!(next.notice, None);
+        assert!(next.full);
+
+        // Room to work in again — the filesystem grew, or work was cleaned up — so a workspace that fills up anew is
+        // worth saying again.
+        let grown = Fake::new(settled(30 << 30), false);
+        let quiet = on_report(&grown, "s", 10 << 30, 30 << 30, next.full, growth()).await;
+        assert_eq!(quiet.notice, None);
+        assert!(!quiet.full);
+        assert!(grown.grown().is_empty());
     }
 
     /// A session in the database, with a hub over it, for reports to be acted on (#479).
