@@ -268,6 +268,32 @@ pub fn repo_from_git_path(name: &str) -> &str {
     name.strip_suffix(".git").unwrap_or(name)
 }
 
+/// A Kubernetes quantity of storage in bytes, e.g. `20Gi`, `10G`, `512Mi` or `1048576`; none for one it can't read.
+/// Every reading of a volume size goes through here, whether it comes from the cluster or from a setting.
+pub fn storage_bytes(quantity: &str) -> Option<u64> {
+    let quantity = quantity.trim();
+    let split = quantity
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(quantity.len());
+    let (number, suffix) = quantity.split_at(split);
+    let number: f64 = number.parse().ok()?;
+    let factor: f64 = match suffix {
+        "" => 1.0,
+        "k" => 1e3,
+        "M" => 1e6,
+        "G" => 1e9,
+        "T" => 1e12,
+        "P" => 1e15,
+        "Ki" => 1024.0,
+        "Mi" => 1024f64.powi(2),
+        "Gi" => 1024f64.powi(3),
+        "Ti" => 1024f64.powi(4),
+        "Pi" => 1024f64.powi(5),
+        _ => return None,
+    };
+    Some((number * factor).round() as u64)
+}
+
 /// A repository grant's `access`: read only, or read and push the session's branches (ADR 2).
 pub const READ_ONLY: &str = "ro";
 pub const READ_WRITE: &str = "rw";
@@ -551,6 +577,20 @@ pub trait PlacementBackend: Send + Sync {
     async fn volumes(&self) -> Result<Vec<Volume>> {
         Ok(Vec::new())
     }
+    /// The session's workspace volume as the cluster has it right now, for deciding whether to grow it (#479), told
+    /// apart from the cached list [`volumes`](Self::volumes) returns. None by default, for a backend that can't tell,
+    /// and for a session whose volume is gone.
+    async fn volume(&self, _session_id: &str) -> Result<Option<Volume>> {
+        Ok(None)
+    }
+    /// Asks the cluster to grow the session's workspace volume to `size` bytes (#479). The storage class has to allow
+    /// expansion (`allowVolumeExpansion`); an error otherwise, or when the cluster wouldn't take it. Not supported by
+    /// default, so a backend that can't grow its volumes says so rather than silently doing nothing.
+    async fn grow_volume(&self, _session_id: &str, _size: u64) -> Result<()> {
+        Err(Error::new(
+            "growing a session's volume isn't supported by this placement backend",
+        ))
+    }
 }
 
 /// A volume the placement backend holds for a session, as the cluster has it.
@@ -560,8 +600,29 @@ pub struct Volume {
     pub name: String,
     /// The session it's for, by its name; none when it doesn't say.
     pub session_id: Option<String>,
-    /// Its size in bytes, as the cluster provisioned it (or was asked to); none when it doesn't say.
+    /// What the cluster has provisioned, in bytes; none when it doesn't say. Below [`requested`](Self::requested)
+    /// while an expansion is on its way (#479).
     pub capacity: Option<u64>,
+    /// What it asks for, in bytes; none when it doesn't say. More than `capacity` while an expansion is under way.
+    pub requested: Option<u64>,
+    /// Whether it says a resize is under way in so many words, e.g. a claim waiting for its pod to be restarted
+    /// before the filesystem can catch up (`FileSystemResizePending`) (#479).
+    pub resizing: bool,
+}
+
+impl Volume {
+    /// How big it is, in bytes: what it asks for, or what's provisioned; none when neither says. What to measure a
+    /// session's use against and to grow from, since a claim that's been asked for more is on its way there.
+    pub fn size(&self) -> Option<u64> {
+        self.requested.or(self.capacity)
+    }
+
+    /// Whether an expansion is already under way, so asking for another would be too early (#479). The cluster may
+    /// still be provisioning what was asked for, or may be waiting for the pod to be restarted to finish it.
+    pub fn growing(&self) -> bool {
+        self.resizing
+            || matches!((self.capacity, self.requested), (Some(capacity), Some(requested)) if capacity < requested)
+    }
 }
 
 /// A session's pod the cluster can't place, as the placement backend sees it (#454).
@@ -806,6 +867,60 @@ pub trait ProposalKind: Send + Sync {
         proposal: uuid::Uuid,
         payload: &Value,
     ) -> Result<Value>;
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+
+    #[test]
+    fn reads_storage_quantities() {
+        assert_eq!(storage_bytes("20Gi"), Some(20 * 1024 * 1024 * 1024));
+        assert_eq!(storage_bytes("10G"), Some(10_000_000_000));
+        assert_eq!(storage_bytes("1.5Gi"), Some(1_610_612_736));
+        assert_eq!(storage_bytes("1048576"), Some(1_048_576));
+        assert_eq!(storage_bytes(" 512Mi "), Some(512 * 1024 * 1024));
+        assert_eq!(storage_bytes("lots"), None);
+        assert_eq!(storage_bytes("20GiB"), None);
+    }
+
+    #[test]
+    fn a_volume_is_as_big_as_it_asks_for_and_grows_until_the_cluster_catches_up() {
+        let settled = |capacity: u64| Volume {
+            name: "workdir-sloppod-1".into(),
+            session_id: Some("1".into()),
+            capacity: Some(capacity),
+            requested: Some(capacity),
+            resizing: false,
+        };
+        assert_eq!(settled(20 << 30).size(), Some(20 << 30));
+        assert!(!settled(20 << 30).growing());
+
+        // Asked for more than it has: its size is what it's becoming, and it's growing meanwhile.
+        let growing = Volume {
+            requested: Some(30 << 30),
+            ..settled(20 << 30)
+        };
+        assert_eq!(growing.size(), Some(30 << 30));
+        assert!(growing.growing());
+
+        // Waiting for the pod to be restarted to finish an expansion it has already been given.
+        let waiting = Volume {
+            resizing: true,
+            ..settled(30 << 30)
+        };
+        assert!(waiting.growing());
+
+        // A claim the cluster hasn't said anything about yet.
+        let quiet = Volume {
+            capacity: None,
+            requested: None,
+            resizing: false,
+            ..settled(0)
+        };
+        assert_eq!(quiet.size(), None);
+        assert!(!quiet.growing());
+    }
 }
 
 #[cfg(test)]

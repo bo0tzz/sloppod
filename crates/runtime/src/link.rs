@@ -805,13 +805,17 @@ async fn run(state: AppState, session_id: Uuid, socket: WebSocket) {
                     .await;
             }
             FromSupervisor::Disk { used, size } => {
-                // Kept with the session, so a parked one still shows its last known use (#455).
-                match db::set_disk(&state.db, session_id, used, size).await {
-                    Ok(()) => state.hub.broadcast_session(session_id).await,
-                    Err(e) => {
-                        tracing::warn!(session = %session_id, error = %e, "keeping a session's disk use")
-                    }
-                }
+                let report = keep_disk(&state.db, &state.hub, session_id, used, size).await;
+                // Filling up: its volume grows, or it's told once that it can't (#479). In the background: it asks
+                // the cluster, and tells the session, without holding up the messages that follow.
+                tokio::spawn(crate::storage::on_disk(
+                    state.placement.clone(),
+                    state.db.clone(),
+                    state.hub.clone(),
+                    crate::storage::Growth::settings(&state.config),
+                    session_id,
+                    report,
+                ));
             }
             FromSupervisor::RunResult { id, output, error } => {
                 agent.run_result(id, output, error);
@@ -923,6 +927,26 @@ async fn agent_failed(state: &AppState, session: Uuid, title: &str, error: &str)
         Ok(false) => state.hub.broadcast_session(session).await,
         Err(e) => tracing::warn!(%session, error = %e, "storing the agent's error"),
     }
+}
+
+/// Keeps a session's disk report with it (#455) and stamps it (#479): the time is taken first, as the report comes
+/// in, before anything is awaited. Keeping it and telling the UIs can be slow — a link that is being replaced, a store
+/// that is busy — and a report they hold up mustn't look newer than one that came in after it, or an old report
+/// decides over the newer one's word (`Hub::on_disk_report`).
+pub(crate) async fn keep_disk(
+    db: &sqlx::PgPool,
+    hub: &Arc<Hub>,
+    id: Uuid,
+    used: u64,
+    size: u64,
+) -> crate::storage::Report {
+    let at = std::time::Instant::now();
+    // Kept with the session, so a parked one still shows its last known use (#455).
+    match db::set_disk(db, id, used, size).await {
+        Ok(()) => hub.broadcast_session(id).await,
+        Err(e) => tracing::warn!(session = %id, error = %e, "keeping a session's disk use"),
+    }
+    crate::storage::Report { at, used, size }
 }
 
 /// Tells the agent which of its commands its pod's ending cut off.

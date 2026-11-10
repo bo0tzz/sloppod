@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
@@ -329,6 +330,8 @@ pub struct Live {
     /// Held while a model the user picked is recorded or applied (#461), so a pick and its application never overlap and
     /// one pick isn't applied twice.
     switching: Mutex<()>,
+    /// The session's workspace-volume reports, one at a time and in the order they came in (#479).
+    reports: Mutex<Reports>,
     /// Notified when something a steer waits for ends: a compaction, a tool call, a permission request, the turn.
     boundary: Notify,
     /// When the agent was last heard from, for telling it the time after a gap; `None` until this runtime knows.
@@ -339,6 +342,16 @@ pub struct Live {
     /// How many questions and permission requests are open, as `state.permissions` last said; kept apart for the
     /// same reason as `commands` (#368).
     asks: StdMutex<(usize, usize)>,
+}
+
+/// A session's workspace-volume reports (#479): one at a time, in the order they came in. Two a session's supervisor
+/// sends overlapping — a report on a reconnect while the one before it still waits on the cluster — would both find
+/// the session untold and both tell it, and one that came in earlier but is dealt with later would decide over what
+/// the newer report already decided.
+#[derive(Default)]
+struct Reports {
+    /// When the last report that was dealt with came in; `None` until one is.
+    newest: Option<Instant>,
 }
 
 /// How many of the agent's commands are running, and their command lines when its supervisor sends them.
@@ -565,6 +578,7 @@ impl Hub {
                     transition: Mutex::default(),
                     egress: Mutex::default(),
                     switching: Mutex::default(),
+                    reports: Mutex::default(),
                     boundary: Notify::new(),
                     heard_at: StdMutex::default(),
                     commands: StdMutex::default(),
@@ -2056,24 +2070,63 @@ impl Hub {
         true
     }
 
-    /// Says that the session's pod was stopped while commands of its agent ran, which ended them (`what` lists them).
-    /// For a pod replaced (a new image, a move) the agent is told, to start again what it still needs. For a parked
-    /// session it's only recorded in its transcript: queued for the agent, it would wake the session at the next
-    /// start (#454), when it was parked to stay parked.
-    pub async fn commands_ended(self: &Arc<Self>, id: Uuid, what: String) {
-        let parked = matches!(self.store.get_session(id).await, Ok(Some(row)) if row.phase() == Phase::Parked);
-        if !parked {
-            self.notify(id, what).await;
-            return;
+    /// Says something the session's agent should know, or, when the session isn't acting (parked, stopped or deleted,
+    /// `SessionRow::not_acting`), records it in the transcript instead and says so by answering `false`. A notice
+    /// queued for an agent that's gone is kept, and restoring the queue wakes the session for it (#454): for one
+    /// parked to stay parked that's wrong, and its transcript shows the notice either way. `title` is how the
+    /// transcript heads it.
+    ///
+    /// Read and told as one step, under the session's transition lock, which parking takes too: deciding from a phase
+    /// read and telling afterwards would let a park take the agent away in between, leaving the notice queued behind
+    /// the parked session, which its next start would then wake for.
+    pub async fn notify_or_record(self: &Arc<Self>, id: Uuid, title: &str, text: String) -> bool {
+        let live = self.live(id);
+        let _transition = live.transition.lock().await;
+        match self.store.get_session(id).await {
+            Ok(Some(row)) if row.not_acting().is_none() => self.notify(id, text).await,
+            _ => {
+                self.record(
+                    id,
+                    json!({
+                        "sessionUpdate": "notice", "severity": "info", "title": title, "description": text,
+                    }),
+                )
+                .await;
+                false
+            }
         }
-        self.record(
-            id,
-            json!({
-                "sessionUpdate": "notice", "severity": "info", "title": "Commands ended by parking",
-                "description": what,
-            }),
-        )
-        .await;
+    }
+
+    /// Runs `f` for one of a session's workspace-volume reports, and says whether it ran (#479). A session's reports
+    /// are dealt with one at a time: `at` is when this one came in, and one that came in before a report already dealt
+    /// with is dropped, so a report that is slow — waiting on the cluster — can't decide over a newer one, nor two
+    /// overlapping ones decide the same thing twice. Its own lock, not the transition lock: a report being dealt with
+    /// holds up no park or wake.
+    pub async fn on_disk_report<T, F, Fut>(
+        self: &Arc<Self>,
+        id: Uuid,
+        at: Instant,
+        f: F,
+    ) -> Option<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = T>,
+    {
+        let live = self.live(id);
+        let mut reports = live.reports.lock().await;
+        if reports.newest.is_some_and(|newest| at < newest) {
+            return None;
+        }
+        reports.newest = Some(at);
+        Some(f().await)
+    }
+
+    /// Says that the session's pod was stopped while commands of its agent ran, which ended them (`what` lists them).
+    /// For a pod replaced (a new image, a move) the agent is told, to start again what it still needs. For a session
+    /// that isn't acting it's only recorded in its transcript: queued for the agent, it would wake the session at the
+    /// next start (#454), when it was parked to stay parked.
+    pub async fn commands_ended(self: &Arc<Self>, id: Uuid, what: String) {
+        self.notify_or_record(id, "Commands ended", what).await;
     }
 
     /// Tells the agent something: a new turn when it's idle, steered into the running one, or queued until it's

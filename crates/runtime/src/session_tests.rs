@@ -2080,6 +2080,115 @@ async fn a_notice_after_a_restore_joins_the_kept_queue() {
     );
 }
 
+/// What a session whose workspace is full and can't grow is told (#479). A session at its most idle is told it as
+/// its pod stops, which is the report the supervisor sends last.
+const FULL_WORKSPACE: &str =
+    "sloppod: the workspace is 91% full and can't grow any more; clean build output or caches.";
+
+#[tokio::test]
+async fn what_a_parked_session_is_told_goes_in_its_transcript_and_not_its_queue() {
+    let h = Harness::starting().await;
+    h.store.set_phase(h.id, Phase::Parked).await.unwrap();
+    // Waking the session would be recorded here; nothing about its workspace should ask for it.
+    let woken = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = woken.clone();
+    h.hub.set_waker(Arc::new(move |id| {
+        seen.lock().unwrap().push(id);
+        Box::pin(async { Ok(()) })
+    }));
+
+    let told_its_agent = h
+        .hub
+        .clone()
+        .notify_or_record(h.id, "Workspace volume", FULL_WORKSPACE.into())
+        .await;
+    assert!(!told_its_agent);
+
+    // Its transcript heads it by what it's about, and nothing was queued for it.
+    let notices: Vec<Value> = h
+        .store
+        .updates(h.id)
+        .into_iter()
+        .filter(|u| u["sessionUpdate"] == "notice")
+        .collect();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0]["title"], "Workspace volume");
+    assert_eq!(notices[0]["description"], FULL_WORKSPACE);
+    assert!(h.store.queues().await.unwrap().is_empty());
+
+    // A restart puts the kept queues back and wakes a session for them: it kept none, so it stays parked, with
+    // nothing sent to its agent.
+    let (hub, _agent, mut to_agent) = restarted(&h).await;
+    assert_eq!(
+        hub.replay(h.id).await.unwrap().queue["params"]["messages"],
+        json!([])
+    );
+    assert!(woken.lock().unwrap().is_empty());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), to_agent.recv())
+            .await
+            .is_err()
+    );
+    assert_eq!(h.phase().await, "parked");
+}
+
+#[tokio::test]
+async fn a_notice_that_overlaps_parking_reaches_the_agent_that_is_still_there() {
+    let mut h = Harness::ready().await;
+    // The notice reads the session as it is now — idle, with its agent up — and holds there. Parking, if the two
+    // aren't kept apart, happens in that moment and takes the agent away, so the notice is left queued behind a
+    // session whose next start would wake it for it (#454). Deciding and telling are one step, under the transition
+    // lock parking takes, so the notice reaches the agent that's still there and parking then gives way to its turn.
+    h.store.gate_reads.store(true, Ordering::SeqCst);
+    let notice = {
+        let (hub, id) = (h.hub.clone(), h.id);
+        tokio::spawn(async move {
+            hub.notify_or_record(id, "Workspace volume", FULL_WORKSPACE.into())
+                .await
+        })
+    };
+    h.store.read_started.notified().await;
+    h.store.gate_reads.store(false, Ordering::SeqCst);
+
+    let parking = {
+        let (hub, id) = (h.hub.clone(), h.id);
+        tokio::spawn(async move { hub.park(id, || async { Ok(()) }).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    h.store.reads_released.notify_one();
+    assert!(
+        notice.await.unwrap(),
+        "the agent that was still there should have been told"
+    );
+    // Parking waited for it, and found a turn: the session isn't parked with the notice left in its queue for a
+    // start to wake it for.
+    assert!(matches!(
+        parking.await.unwrap(),
+        Err(crate::session::ParkError::InTurn)
+    ));
+    assert_ne!(h.phase().await, "parked");
+    assert_eq!(
+        prompt_text(&next_prompt(&mut h.to_agent).await),
+        [FULL_WORKSPACE]
+    );
+}
+
+#[tokio::test]
+async fn what_a_session_that_is_acting_is_told_still_waits_for_its_agent() {
+    // Starting: its agent is on its way, so the notice waits queued for it rather than only being recorded.
+    let h = Harness::starting().await;
+    assert!(
+        h.hub
+            .clone()
+            .notify_or_record(h.id, "Workspace volume", FULL_WORKSPACE.into())
+            .await
+    );
+    let kept = h.store.queues().await.unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].1[0]["blocks"][0]["text"], FULL_WORKSPACE);
+}
+
 #[tokio::test]
 async fn every_turn_that_ends_is_counted_with_its_error() {
     let mut h = Harness::ready().await;

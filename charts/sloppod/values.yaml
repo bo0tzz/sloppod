@@ -13,6 +13,13 @@ session:
   storage:
     size: 20Gi
     storageClass: ""
+    # A session's workspace volume grows before it fills up (#479): when its supervisor reports this much of it used
+    # (a fraction), the runtime asks for a bigger claim, a fraction of its size more (never less than 5Gi), up to
+    # maxSize. The storage class has to allow expansion (`allowVolumeExpansion`); where it doesn't, or the maximum is
+    # reached, the session is told once that it can't grow and should clean up.
+    growAt: 0.85
+    growBy: 0.5
+    maxSize: 100Gi
   cpu: ""
   memory: 4Gi
   # Hosts sessions may reach without the authorizer, e.g. package registries. Empty keeps the built-in list. A `*`

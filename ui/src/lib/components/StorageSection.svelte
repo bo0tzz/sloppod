@@ -71,7 +71,7 @@
     <Text color="muted" size="small">
       Each session keeps its files on a volume of its own while it's parked. A stopped session's volume goes a week after
       it stopped, unless you keep it; a deleted one's when it can't be restored any more. A session says how much it uses
-      while it runs, and once more as it parks.
+      while it runs, and once more as it parks. A volume that's filling up grows on its own, before it runs out of room.
     </Text>
   </div>
 
@@ -101,11 +101,15 @@
             {/if}
             <span class="text-muted w-24 shrink-0 text-end" data-testid="storage-used">
               {#if session.disk}
-                <span title="of {bytes(session.disk.size)}">{bytes(session.disk.used)}</span>
+                {bytes(session.disk.used)}
               {:else}
                 not measured
               {/if}
             </span>
+            {#if volume.capacity !== null}
+              <!-- The volume's size as the cluster has it now (#479): what it's been grown to, not what the session last reported. -->
+              <Text color="muted" size="small" data-testid="storage-size">of {bytes(volume.capacity)}</Text>
+            {/if}
             {#if !session.deleted_at && session.kind === 'work'}
               <div class="flex shrink-0 gap-1">
                 {#if session.phase === 'stopped'}

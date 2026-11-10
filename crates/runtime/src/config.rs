@@ -84,6 +84,34 @@ pub struct Config {
     #[arg(long, env = "SLOPPOD_SESSION_STORAGE_CLASS")]
     pub session_storage_class: Option<String>,
 
+    /// How full a session's workspace volume may get before the runtime grows it, as a fraction (#479).
+    #[arg(
+        long,
+        env = "SLOPPOD_SESSION_STORAGE_GROW_AT",
+        default_value = "0.85",
+        value_parser = fraction
+    )]
+    pub session_storage_grow_at: f64,
+
+    /// How much bigger each growth makes it, as a fraction of its size (`0.5` is half again), never less than
+    /// [`storage::LEAST_GROWTH`](crate::storage) (#479).
+    #[arg(
+        long,
+        env = "SLOPPOD_SESSION_STORAGE_GROW_BY",
+        default_value = "0.5",
+        value_parser = fraction
+    )]
+    pub session_storage_grow_by: f64,
+
+    /// The largest a session's workspace volume may grow to, a Kubernetes quantity like `100Gi` (#479).
+    #[arg(
+        long,
+        env = "SLOPPOD_SESSION_STORAGE_MAX_SIZE",
+        default_value = "100Gi",
+        value_parser = quantity
+    )]
+    pub session_storage_max_size: u64,
+
     #[arg(long, env = "SLOPPOD_SESSION_CPU")]
     pub session_cpu: Option<String>,
 
@@ -167,6 +195,20 @@ impl Config {
     pub fn litellm_namespaces(&self) -> Vec<String> {
         litellm_namespaces(self.litellm_namespaces.as_deref(), &self.namespace)
     }
+}
+
+/// A fraction of a volume, e.g. `0.85` for 85% full or `0.5` for half again (#479).
+fn fraction(given: &str) -> Result<f64, String> {
+    match given.parse::<f64>() {
+        Ok(fraction) if fraction > 0.0 => Ok(fraction),
+        _ => Err(format!("a fraction above zero, e.g. 0.85: {given}")),
+    }
+}
+
+/// A Kubernetes quantity of storage, e.g. `100Gi`, as bytes (#479).
+fn quantity(given: &str) -> Result<u64, String> {
+    sloppod_contracts::storage_bytes(given)
+        .ok_or_else(|| format!("a storage quantity, e.g. 100Gi: {given}"))
 }
 
 fn litellm_namespaces(given: Option<&str>, own: &str) -> Vec<String> {
