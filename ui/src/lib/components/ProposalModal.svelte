@@ -198,6 +198,9 @@
     }
     if (shown.kind !== 'github.issue.create') return;
     drafts = (shown.payload as IssuesPayload).issues.map((issue) => ({ ...issue, labels: [...issue.labels], file: true }));
+    // A label half-typed into a field isn't part of the payload a fresh form starts from (#108), and the next
+    // proposal's issue at the same position would show it.
+    labelDrafts = {};
   }
 
   /** Records the decision; the modal only stays on this proposal to show a failure. */
