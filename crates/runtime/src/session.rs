@@ -215,6 +215,11 @@ struct Permission {
     method: String,
     params: Value,
     asker: Asker,
+    /// Whether the server finishing its own elicitation may settle this request (#481). The agent's
+    /// `elicitation/complete` names only the server's `elicitationId` and says nothing about which server that is, so
+    /// a request with no such id (an `ask_user` question), or one whose id another of the session's open questions
+    /// shares (two servers are free to choose the same), is the user's to answer rather than a guess.
+    completable: bool,
 }
 
 /// Who waits on a permission request or question.
@@ -1551,7 +1556,12 @@ impl Hub {
         self.resolve_permissions(id, resolved);
     }
 
-    pub async fn on_agent_notification(&self, id: Uuid, message: Value) {
+    pub async fn on_agent_notification(self: &Arc<Self>, id: Uuid, message: Value) {
+        // A URL elicitation the server has finished with, which the agent passes on as it heard (#481).
+        if message["method"] == "elicitation/complete" {
+            self.completed_elicitation(id, &message["params"]).await;
+            return;
+        }
         if message["method"] != "session/update" {
             tracing::debug!(session = %id, method = %message["method"], "ignoring agent notification");
             return;
@@ -1659,6 +1669,18 @@ impl Hub {
                 }
                 params["_meta"] = meta;
             }
+            // A URL elicitation the server's own completion could settle, unless another open question answers to
+            // the same server-chosen id: then neither is, for as long as they're open (#481).
+            let mut completable =
+                method == "elicitation/create" && params["elicitationId"].is_string();
+            if let Some(elicitation_id) = params["elicitationId"].as_str() {
+                for open in state.permissions.values_mut() {
+                    if open.params["elicitationId"].as_str() == Some(elicitation_id) {
+                        open.completable = false;
+                        completable = false;
+                    }
+                }
+            }
             state.next_permission += 1;
             let pid = state.next_permission;
             state.permissions.insert(
@@ -1670,6 +1692,7 @@ impl Hub {
                         request_id,
                         agent: agent.clone(),
                     },
+                    completable,
                 },
             );
             live.sync_asks(&state);
@@ -1685,6 +1708,50 @@ impl Hub {
             },
         );
         self.broadcast_session(id).await;
+    }
+
+    /// The server's own URL elicitation is done — the user opened the link and finished what it asked for there — as
+    /// the agent passes on with `elicitation/complete` (#481): the card closes for every UI and the question stops
+    /// counting as waiting, the request the agent may still be holding is answered as the user having accepted it
+    /// (they did, through the link), and the chat is told, so a card that goes isn't the only sign.
+    async fn completed_elicitation(self: &Arc<Self>, id: Uuid, params: &Value) {
+        let Some(elicitation_id) = params["elicitationId"].as_str() else {
+            tracing::debug!(session = %id, "an elicitation completed without naming itself");
+            return;
+        };
+        let open = {
+            let live = self.live(id);
+            let state = live.state.lock().await;
+            state
+                .permissions
+                .iter()
+                .find(|(_, p)| p.params["elicitationId"].as_str() == Some(elicitation_id))
+                .map(|(pid, p)| (*pid, p.completable))
+        };
+        // One that isn't open any more: answered meanwhile, or never shown here.
+        let Some((pid, completable)) = open else {
+            tracing::debug!(session = %id, elicitation = %elicitation_id, "an elicitation completed that wasn't open");
+            return;
+        };
+        // The id is the server's to choose and the notification says nothing else, so when another of the session's
+        // open questions answers to it too, this would be a guess at which server finished: it stays the user's to
+        // answer (#481).
+        if !completable {
+            tracing::debug!(session = %id, elicitation = %elicitation_id, "an elicitation completed whose id is shared; leaving it to the user");
+            return;
+        }
+        self.answer_permission(id, pid, Ok(json!({"action": "accept"})), "the server")
+            .await;
+        self.record(
+            id,
+            json!({
+                "sessionUpdate": "notice",
+                "severity": "info",
+                "title": "Link completed",
+                "description": "The server finished what it asked for through the link.",
+            }),
+        )
+        .await;
     }
 
     /// The first answer to a permission request wins; later ones are ignored. `by` says who answered, for the log.
@@ -2728,6 +2795,9 @@ impl Hub {
                     method: "elicitation/create".into(),
                     params: params.clone(),
                     asker: Asker::Tool { key, questions },
+                    // An `ask_user` question has no server behind it to finish it: the agent answers it, or the user
+                    // never does (#481).
+                    completable: false,
                 },
             );
             live.sync_asks(&state);

@@ -274,3 +274,132 @@ async fn a_request_carries_an_id_of_its_own_whatever_the_server_calls_it() {
     // And a UI that loads the session again is sent the requests as they are, ids and all.
     assert_eq!(requests(&hub.replay(id).await.unwrap()), asked);
 }
+
+#[tokio::test]
+async fn a_url_elicitation_the_server_finishes_closes_the_card_and_answers_it() {
+    let (hub, store, id, agent, mut sent) = session().await;
+
+    // A server's URL elicitation, as the agent forwards it.
+    from_agent(
+        &hub,
+        id,
+        &agent,
+        json!({"jsonrpc": "2.0", "id": 7, "method": "elicitation/create", "params": {
+            "sessionId": id,
+            "mode": "url",
+            "message": "Authorize logs",
+            "url": "https://logs.example.com/oauth/authorize",
+            "elicitationId": "login",
+        }}),
+    )
+    .await;
+    let row = store.get_session(id).await.unwrap().unwrap();
+    assert_eq!(hub.session_api(&row).await.waiting.questions, 1);
+
+    // The user opens the link and finishes there; the server says so, and the agent passes it on as it heard it.
+    from_agent(
+        &hub,
+        id,
+        &agent,
+        json!({"jsonrpc": "2.0", "method": "elicitation/complete", "params": {
+            "sessionId": id,
+            "elicitationId": "login",
+        }}),
+    )
+    .await;
+
+    // Nothing waits on the user any more, and the request the agent is holding is answered as accepted: the user did
+    // complete the flow, through the link.
+    assert_eq!(hub.session_api(&row).await.waiting.questions, 0);
+    assert!(hub.replay(id).await.unwrap().permissions.is_empty());
+    let response = loop {
+        match sent.recv().await.expect("the link closed") {
+            sloppod_protocol::link::ToSupervisor::Acp { message } => {
+                if message["id"] == json!(7) {
+                    break message;
+                }
+            }
+            _ => continue,
+        }
+    };
+    assert_eq!(response["result"], json!({"action": "accept"}));
+
+    // And the chat says so, so a card that goes isn't the only sign that it was done.
+    let notices: Vec<Value> = store
+        .updates(id)
+        .into_iter()
+        .filter(|update| update["sessionUpdate"] == "notice")
+        .collect();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0]["title"], "Link completed");
+}
+
+#[tokio::test]
+async fn a_completion_does_not_choose_between_questions_sharing_an_id() {
+    let (hub, store, id, agent, mut sent) = session().await;
+
+    // Two servers' URL questions, one after the other, both naming themselves "login" (#481).
+    for (request_id, server) in [(7, "logs"), (8, "metrics")] {
+        from_agent(
+            &hub,
+            id,
+            &agent,
+            json!({"jsonrpc": "2.0", "id": request_id, "method": "elicitation/create", "params": {
+                "sessionId": id,
+                "mode": "url",
+                "message": format!("Authorize {server}"),
+                "url": "https://example.com/oauth/authorize",
+                "elicitationId": "login",
+            }}),
+        )
+        .await;
+    }
+    assert_eq!(hub.replay(id).await.unwrap().permissions.len(), 2);
+
+    // A completion names the elicitation and nothing about which server asked it: answering either would be a guess,
+    // so neither is settled and the chat isn't told that a question was finished.
+    let complete = json!({"jsonrpc": "2.0", "method": "elicitation/complete", "params": {
+        "sessionId": id,
+        "elicitationId": "login",
+    }});
+    from_agent(&hub, id, &agent, complete.clone()).await;
+    assert_eq!(hub.replay(id).await.unwrap().permissions.len(), 2);
+    assert!(sent.try_recv().is_err(), "the agent was answered");
+    assert!(!says_a_link_was_completed(&store, id));
+
+    // The user answers one of them by hand; the other is still theirs, not the completion's to take.
+    let (pid, _, _) = hub.replay(id).await.unwrap().permissions[0].clone();
+    hub.answer_permission(id, pid, Ok(json!({"action": "decline"})), "a test")
+        .await;
+    from_agent(&hub, id, &agent, complete).await;
+    assert_eq!(hub.replay(id).await.unwrap().permissions.len(), 1);
+    assert!(!says_a_link_was_completed(&store, id));
+}
+
+/// Whether the session's log says a link was completed.
+fn says_a_link_was_completed(store: &MemoryStore, id: Uuid) -> bool {
+    store
+        .updates(id)
+        .iter()
+        .any(|update| update["sessionUpdate"] == "notice" && update["title"] == "Link completed")
+}
+
+#[tokio::test]
+async fn an_elicitation_completed_that_isnt_open_is_left_alone() {
+    let (hub, store, id, agent, _sent) = session().await;
+
+    // A server completing one nobody has open: answered meanwhile, or never shown here. Nothing happens, and nothing
+    // is said in the chat.
+    from_agent(
+        &hub,
+        id,
+        &agent,
+        json!({"jsonrpc": "2.0", "method": "elicitation/complete", "params": {
+            "sessionId": id,
+            "elicitationId": "login",
+        }}),
+    )
+    .await;
+    assert!(hub.replay(id).await.unwrap().permissions.is_empty());
+    assert!(store.updates(id).is_empty(), "{:?}", store.updates(id));
+}

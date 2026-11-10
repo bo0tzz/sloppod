@@ -3031,6 +3031,10 @@ test('two servers\' URL questions named the same are both the user\'s to answer'
   const card = questionCard(page);
   await expect(card.getByTestId('question-asker')).toContainText('logs asks');
   await expect(card.getByTestId('questions-queued')).toContainText('One more request after this');
+  // A completion names the shared id and nothing about which server asked it: settling either would be a guess, so
+  // both are still the user's to answer (#481).
+  expect((await page.request.post(`/_mock/complete?session=${id}&id=login`)).status()).toBe(409);
+  await expect(card.getByTestId('question-asker')).toContainText('logs asks');
   await card.getByRole('button', { name: 'Done' }).click();
   // The other is still there to answer: keyed on the server's own id, it was dropped when the second arrived.
   await expect(card.getByTestId('question-asker')).toContainText('docs asks');
@@ -3042,6 +3046,30 @@ test('two servers\' URL questions named the same are both the user\'s to answer'
     ['logs', { action: 'accept' }],
     ['docs', { action: 'accept' }],
   ]);
+});
+
+test('a URL question the server finishes itself closes the card, and the chat says so', async ({ page }) => {
+  const id = await createSession(page, 'A server finishes its link in sloppod');
+  await finishTurn(page);
+  await page.request.delete('/_mock/answers');
+  await page.request.post(`/_mock/elicit?session=${id}&mode=url&server=logs&id=login`);
+  const card = questionCard(page);
+  await expect(card).toBeVisible();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'waiting');
+
+  // The user opened the link and finished there: the server says so and the agent passes it on, so there's nothing
+  // left to answer — the card goes, nothing waits on the user, and the chat says what happened (#481).
+  await page.request.post(`/_mock/complete?session=${id}&id=login`);
+  await expect(card).toBeHidden();
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+  // A notice in the chat, as `withdraw_question`'s is: the card going isn't the only sign it was done.
+  const notice = page.getByTestId('notice');
+  await expect(notice).toContainText('Link completed');
+  await expect(notice).toContainText('The server finished what it asked for through the link.');
+
+  // And the request the agent was holding is answered as the user having completed it.
+  const answers: { server: string; mode: string; result: unknown }[] = await (await page.request.get('/_mock/answers')).json();
+  expect(answers).toEqual([{ server: 'logs', mode: 'url', question: expect.any(String), result: { action: 'accept' } }]);
 });
 
 test('a highlight shows as a card in the chat and in the for-you list, and is still there after a reload', async ({ page }) => {

@@ -2966,6 +2966,28 @@ const server = http.createServer(async (req, res) => {
       });
       return json(res, 200, {});
     }
+    if (url.pathname === '/_mock/complete' && req.method === 'POST') {
+      // The MCP server itself finished a URL elicitation (#481): the agent passes that on, and the runtime, as here,
+      // closes the card for every UI, answers the request the agent still holds as accepted — the user did complete
+      // the flow, through the link — and says so in the chat. `?id=` names the elicitation.
+      const session = sessions.get(url.searchParams.get('session') ?? '');
+      if (!session) return json(res, 404, { error: 'no such session' });
+      const elicitationId = url.searchParams.get('id') ?? 'login';
+      const open = [...session.pending.values()].filter((asking) => asking.params.elicitationId === elicitationId);
+      // The id is the server's to choose and the notification says nothing else: while two open questions answer to
+      // it, neither is settled — the runtime leaves them to the user, and so does this (#481).
+      if (open.length > 1) return json(res, 409, { error: 'two open questions share that id' });
+      const pending = open[0];
+      if (!pending) return json(res, 404, { error: 'no such open elicitation' });
+      session.emit({
+        sessionUpdate: 'notice',
+        severity: 'info',
+        title: 'Link completed',
+        description: 'The server finished what it asked for through the link.',
+      });
+      resolvePending(session, pending, { action: 'accept' });
+      return json(res, 200, {});
+    }
     // What the mock agent has been answered with, oldest first: `{server, mode, question, result}` (#481).
     if (url.pathname === '/_mock/answers') {
       const given = answers;
