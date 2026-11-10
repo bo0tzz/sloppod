@@ -478,6 +478,8 @@ async fn launch_for(
                     .map(str::to_owned),
             }),
         install_tools: session.repo.is_some(),
+        // Until the agent has come up once on the copy (#478): after that it's the session's own workspace.
+        workspace_copied: session.workspace_copied_from.is_some(),
         command: agent.command.clone(),
         env,
         cwd: work_dir(session).to_owned(),
@@ -1023,6 +1025,14 @@ async fn start_agent_session(
     }
     db::set_agent_session(&state.db, session.id, &agent_session_id, &agent_state).await?;
     db::clear_agent_status(&state.db, session.id).await?;
+    // Its agent is up on a workspace copied from its parent's (#478): the copy has been taken over — the checkout is
+    // on this session's own branch and the parent's identity is gone — so a start from here on is the session's own
+    // workspace and nothing of it is undone.
+    if session.workspace_copied_from.is_some()
+        && let Err(e) = db::clear_workspace_copied_from(&state.db, session.id).await
+    {
+        tracing::warn!(session = %session.id, error = %e, "forgetting a taken-over workspace copy");
+    }
     // Cleared once a turn starts with it, so an agent that goes before then leaves it for the next.
     let pending = db::pending_prompt(&state.db, session.id).await?;
     agent.ready(AgentReady {

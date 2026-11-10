@@ -35,6 +35,10 @@ jobs:
           context: .
           file: Containerfile
           target: runtime
+          # The build the UI is baked with, and the same value the chart job passes as the chart's app version, which
+          # the runtime reports as its build (#448).
+          build-args: |
+            SLOPPOD_BUILD=${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
           push: true
           tags: |
             ghcr.io/bo0tzz/sloppod:${{ github.sha }}

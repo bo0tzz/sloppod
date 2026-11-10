@@ -2307,11 +2307,12 @@ async fn highlights_stay_open_until_marked_seen(db: PgPool) {
     assert_eq!(db::open_highlights(&db, s).await.unwrap(), 2);
     assert_eq!(db::open_highlights(&db, other).await.unwrap(), 1);
 
-    // Marked seen, it's no longer open but still listed, in order, with when.
-    let seen = db::mark_highlight_seen(&db, s, first.id)
-        .await
-        .unwrap()
-        .expect("the session's highlight");
+    // Marked seen, it's no longer open but still listed, in order, with when. The one highlight that was open is the
+    // one the agent hears about (#462).
+    let seen = match db::mark_highlight_seen(&db, s, first.id).await.unwrap() {
+        db::Marked::Seen(row) => row,
+        _ => panic!("marking an open highlight seen is the change the agent hears about"),
+    };
     assert!(seen.seen_at.is_some());
     assert_eq!(db::open_highlights(&db, s).await.unwrap(), 1);
     let listed = db::list_highlights(&db, s).await.unwrap();
@@ -2321,18 +2322,19 @@ async fn highlights_stay_open_until_marked_seen(db: PgPool) {
     );
     assert!(listed[0].seen_at.is_some() && listed[1].seen_at.is_none());
 
-    // Marking it again keeps when it was first seen; another session's highlight isn't this one's to mark.
-    let again = db::mark_highlight_seen(&db, s, first.id)
-        .await
-        .unwrap()
-        .unwrap();
+    // Marking it again keeps when it was first seen, and is not a second thing the agent hears about; another
+    // session's highlight isn't this one's to mark.
+    let again = match db::mark_highlight_seen(&db, s, first.id).await.unwrap() {
+        db::Marked::AlreadySeen(row) => row,
+        _ => panic!("marking a seen highlight again changes nothing"),
+    };
     assert_eq!(again.seen_at, seen.seen_at);
-    assert!(
+    assert!(matches!(
         db::mark_highlight_seen(&db, other, second.id)
             .await
-            .unwrap()
-            .is_none()
-    );
+            .unwrap(),
+        db::Marked::NotFound
+    ));
     assert_eq!(db::open_highlights(&db, s).await.unwrap(), 1);
 }
 
@@ -2390,11 +2392,12 @@ async fn an_agent_takes_back_a_highlight_the_user_has_not_seen(db: PgPool) {
             .unwrap(),
         db::Retraction::AlreadyRetracted
     ));
-    // Seen after the fact doesn't reopen or mark it: it was taken back.
-    let after = db::mark_highlight_seen(&db, s, wrong.id)
-        .await
-        .unwrap()
-        .unwrap();
+    // Seen after the fact doesn't reopen or mark it: it was taken back, and the request says so rather than telling
+    // the agent the user has seen a highlight it never saw (#462).
+    let after = match db::mark_highlight_seen(&db, s, wrong.id).await.unwrap() {
+        db::Marked::Retracted(row) => row,
+        _ => panic!("a retracted highlight isn't the user's to mark seen"),
+    };
     assert!(after.seen_at.is_none() && after.retracted_at.is_some());
 }
 

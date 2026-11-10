@@ -1132,6 +1132,33 @@ test('the sidebar shows a redeployed runtime once the connection is back', async
   }
 });
 
+test('the version says when the page is older than the runtime, and reloads on click', async ({ page }) => {
+  // The e2e build is built as `e2e` (the `test:e2e` script's `SLOPPOD_BUILD`), which is not the build the mock reports,
+  // so the page is out of step from the start: the version shows the dot, and a click reloads into the new bundle.
+  let loads = 0;
+  page.on('load', () => loads++);
+  // The home page is the session list, without the sidebar the version sits in.
+  await page.goto('/settings');
+  const stale = page.getByTestId('version-stale');
+  await expect(stale).toBeVisible();
+  await expect(stale).toHaveAttribute('title', 'newer version: reload');
+  await expect(page.getByTestId('runtime-build')).toHaveText('sloppod 0.0.1-main.1');
+
+  const before = loads;
+  await stale.click();
+  await expect.poll(() => loads).toBeGreaterThan(before);
+
+  try {
+    // A runtime built from the same build as the page is not a newer one, so the dot goes.
+    await page.request.post('/_mock/build?version=0.0.1-main.1&build=e2e');
+    await page.request.post('/_mock/drop');
+    await expect(page.getByTestId('runtime-build')).toHaveText('sloppod 0.0.1-main.1');
+    await expect(stale).toBeHidden();
+  } finally {
+    await page.request.post('/_mock/build');
+  }
+});
+
 test('a message written while reconnecting is sent once the connection is back', async ({ page }) => {
   await createSession(page, 'Reconnect me in sloppod');
   await finishTurn(page);
@@ -4542,6 +4569,20 @@ test('a session at its usage limit says when it carries on', async ({ page }) =>
   await expect(page.getByTestId('session-limited')).toBeHidden();
 });
 
+/**
+ * Picks a timezone in Settings. The list holds every zone a browser knows, so it scrolls, and until the user scrolls it
+ * the list keeps realigning to the selected zone as its scroll buttons come and go — which moves the option under the
+ * pointer and makes a click land on another one (#492). Scrolling it first, as a user would, settles it.
+ */
+async function chooseTimezone(page: Page, zone: string) {
+  const setting = page.getByTestId('timezone-setting').getByRole('combobox', { name: 'Timezone' });
+  await setting.click();
+  await page.getByRole('listbox').hover();
+  await page.mouse.wheel(0, -20_000);
+  await page.getByRole('option', { name: zone, exact: true }).click();
+  return setting;
+}
+
 test.describe('in Amsterdam', () => {
   test.use({ timezoneId: 'Europe/Amsterdam' });
 
@@ -4552,8 +4593,7 @@ test.describe('in Amsterdam', () => {
     await expect(setting).toContainText('Europe/Amsterdam');
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Europe/Amsterdam');
 
-    await setting.click();
-    await page.getByRole('option', { name: 'Asia/Tokyo', exact: true }).click();
+    await chooseTimezone(page, 'Asia/Tokyo');
     await expect(setting).toContainText('Asia/Tokyo');
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Asia/Tokyo');
 
@@ -4573,11 +4613,9 @@ test.describe('in UTC', () => {
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('UTC');
     await expect(setting).toContainText('UTC');
 
-    await setting.click();
-    await page.getByRole('option', { name: 'Asia/Tokyo', exact: true }).click();
+    await chooseTimezone(page, 'Asia/Tokyo');
     await expect(setting).toContainText('Asia/Tokyo');
-    await setting.click();
-    await page.getByRole('option', { name: 'UTC', exact: true }).click();
+    await chooseTimezone(page, 'UTC');
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('UTC');
   });
 
@@ -4594,8 +4632,7 @@ test.describe('in UTC', () => {
     // Another timezone in Settings, and back to the session without a reload.
     await page.getByRole('link', { name: 'Settings' }).first().click();
     const setting = page.getByTestId('timezone-setting').getByRole('combobox', { name: 'Timezone' });
-    await setting.click();
-    await page.getByRole('option', { name: 'Asia/Tokyo', exact: true }).click();
+    await chooseTimezone(page, 'Asia/Tokyo');
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Asia/Tokyo');
     await page.getByRole('navigation', { name: 'Sessions' }).getByRole('link', { name: /Put the deploy check off/ }).click();
 

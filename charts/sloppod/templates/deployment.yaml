@@ -57,8 +57,9 @@ spec:
               value: app.kubernetes.io/name=sloppod,app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=runtime
             - name: SLOPPOD_CA_SECRET
               value: {{ include "sloppod.caSecret" . }}
-            - name: SLOPPOD_BUILD
-              value: {{ .Chart.AppVersion | quote }}
+            # Not SLOPPOD_BUILD: the image carries what it was built from and sets it for the runtime and the UI it
+            # serves alike, so the two can't name different builds (#448). The chart's appVersion isn't the build of
+            # whichever image a deployment put here.
             - name: SLOPPOD_VERSION
               value: {{ .Chart.Version | quote }}
             - name: SLOPPOD_SESSION_IMAGE

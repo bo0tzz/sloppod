@@ -99,8 +99,9 @@ jobs:
           install_args: node
       - run: npm ci
       - run: npx playwright install --with-deps chromium
-      - run: npx vite build
-      - run: npx playwright test --project=e2e --shard=${{ matrix.shard }}/3
+      # The scripts build the page the way the tests expect it — with a build of its own (`SLOPPOD_BUILD=e2e`) — so CI
+      # and a developer's run can't drift (#448).
+      - run: npm run test:e2e -- --shard=${{ matrix.shard }}/3
 
   # The scrolling tests again in Firefox, which the chat is read in: its scroll and resize timing differ from Chromium's.
   e2e-firefox:
@@ -117,8 +118,7 @@ jobs:
           install_args: node
       - run: npm ci
       - run: npx playwright install --with-deps firefox
-      - run: npx vite build
-      - run: npx playwright test --project=firefox
+      - run: npm run test:e2e:firefox
 
   # The one check to require for the UI: it keeps the name `ui`, and passes when the jobs above were skipped.
   ui:
@@ -145,9 +145,28 @@ jobs:
           context: .
           file: Containerfile
           target: runtime
+          # Loaded, so the next step can look inside it.
+          load: true
+          tags: sloppod:build-check
+          build-args: SLOPPOD_BUILD=build-check
           cache-from: |
             type=gha,scope=runtime
             type=gha,scope=session
+      # The runtime reports the build its image carries, and the UI the image serves was baked with the same value, so a
+      # page can tell when the runtime behind it has moved on (#448). The chart sets neither: they come from one place.
+      - name: The runtime and the UI it serves name the same build
+        run: |
+          docker run --rm --entrypoint sh sloppod:build-check -c '[ "$SLOPPOD_BUILD" = build-check ]'
+          docker run --rm --entrypoint sh sloppod:build-check -c 'grep -rq build-check /usr/share/sloppod/ui'
+      - uses: jdx/mise-action@82a612c5ab8bcda7cc5db6b7e81a8e7584c3dc6e # v5.2.3
+        with:
+          install_args: helm
+      # The chart leaves the runtime's build to its image (#448): an image tag or app version that differs from the
+      # image's build must not relabel it, or a page would show a dot that reloading never clears.
+      - name: The chart leaves the runtime's build to its image
+        run: |
+          ! helm template charts/sloppod --set image.tag=v0.0.0 --set session.image.tag=v0.0.0 \
+            --set database.existingSecret=db --set masterKey.existingSecret=key | grep -q 'name: SLOPPOD_BUILD'
       - name: Build the session image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:

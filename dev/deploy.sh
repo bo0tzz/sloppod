@@ -9,9 +9,12 @@ root=$(dirname "$here")
 state=${SLOPPOD_DEV_STATE:-$here/.state}
 export HELM_CACHE_HOME=$state/helm/cache HELM_CONFIG_HOME=$state/helm/config HELM_DATA_HOME=$state/helm/data
 
+# What the images are built from, so the runtime reports it and the page it serves compares its own build against it
+# (#448), as a published image does.
+build=$(git -C "$root" rev-parse HEAD)
 for target in runtime session; do
   image=ghcr.io/bo0tzz/sloppod$([[ $target == session ]] && echo -session || true):dev
-  docker build --target "$target" -t "$image" -f "$root/Containerfile" "$root"
+  docker build --target "$target" --build-arg "SLOPPOD_BUILD=$build" -t "$image" -f "$root/Containerfile" "$root"
   kind load docker-image --name "$name" "$image"
 done
 
