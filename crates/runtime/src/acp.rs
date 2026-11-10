@@ -172,8 +172,11 @@ impl Conn {
             .map_err(internal)?;
         let before = older_than(&page);
         let times: Vec<String> = page.iter().map(|(_, at, _)| event_time(*at)).collect();
+        // Each update's own sequence number, in step with them and their times: one sequence serves every session, so a
+        // session's are not consecutive, and a UI joining a page onto what it has needs the real ones (#93).
+        let seqs: Vec<i64> = page.iter().map(|(seq, _, _)| *seq).collect();
         let updates: Vec<Value> = page.into_iter().map(|(_, _, update)| update).collect();
-        Ok(json!({"updates": updates, "at": times, "before": before}))
+        Ok(json!({"updates": updates, "at": times, "seqs": seqs, "before": before}))
     }
 
     async fn handle_request(self: Arc<Self>, id: Value, method: String, params: Value) {

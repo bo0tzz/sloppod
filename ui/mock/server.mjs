@@ -28,6 +28,11 @@ const { values: args } = parseArgs({
 const DELAY = Number(args.delay);
 /** How many updates a UI gets at once, as the runtime sends them. */
 const HISTORY_PAGE = 2000;
+/**
+ * One sequence for every session, as the runtime's is (`session_events.seq`): a session's own numbers then have gaps
+ * where other sessions wrote in between, which is what a UI catching one up has to work with (#93).
+ */
+let eventSeq = 0;
 const REPOS = ['bo0tzz/sloppod', 'bo0tzz/memini', 'immich-app/static-pages'];
 // The adapter's model picker, as it appears in `configOptions`.
 const MODELS = [
@@ -90,9 +95,9 @@ class MockSession {
   }
 
   emit(update, at = now()) {
-    // Like the runtime, an update says where it falls in the log, from 1 (what a read position counts in), and when it
-    // was recorded.
-    const params = { sessionId: this.data.id, update, _meta: { sloppod: { seq: this.log.length + 1, at } } };
+    // Like the runtime, an update says where it falls in the log — one sequence for every session, from 1, which is
+    // what a read position counts in — and when it was recorded.
+    const params = { sessionId: this.data.id, update, _meta: { sloppod: { seq: ++eventSeq, at } } };
     this.log.push(params);
     this.data.active_at = now();
     for (const conn of this.subscribers) conn.notify('session/update', params);
@@ -1740,8 +1745,8 @@ function handleCall(conn, message) {
         });
         return;
       }
-      // Like the runtime: only the latest of the log, with where to ask for older pages. An update's seq is its
-      // position in the log, from 1.
+      // Like the runtime: only the latest of the log, with where to ask for older pages — by sequence number, which is
+      // one sequence across every session.
       const start = Math.max(0, session.log.length - HISTORY_PAGE);
       for (const entry of session.log.slice(start)) conn.notify('session/update', entry);
       session.subscribers.add(conn);
@@ -1750,7 +1755,7 @@ function handleCall(conn, message) {
       broadcastQueue(session, [conn]);
       conn.respond(id, {
         configOptions: session.configOptions(),
-        _meta: { sloppod: { historyBefore: start > 0 ? start + 1 : null } },
+        _meta: { sloppod: { historyBefore: start > 0 ? session.log[start]._meta.sloppod.seq : null } },
       });
       for (const pending of session.pending.values()) sendPending(session, pending, conn);
       return;
@@ -1770,12 +1775,16 @@ function handleCall(conn, message) {
         held.then(() => handleCall(conn, message));
         return;
       }
-      const end = Math.max(0, Math.min(session.log.length, Number(params.before) - 1));
+      // `before` is a sequence number, as the runtime's is: the page is the log before the first entry at or after it.
+      const first = session.log.findIndex((entry) => entry._meta.sloppod.seq >= Number(params.before));
+      const end = first === -1 ? session.log.length : first;
       const start = Math.max(0, end - HISTORY_PAGE);
+      const page = session.log.slice(start, end);
       conn.respond(id, {
-        updates: session.log.slice(start, end).map((entry) => entry.update),
-        at: session.log.slice(start, end).map((entry) => entry._meta.sloppod.at),
-        before: start > 0 ? start + 1 : null,
+        updates: page.map((entry) => entry.update),
+        at: page.map((entry) => entry._meta.sloppod.at),
+        seqs: page.map((entry) => entry._meta.sloppod.seq),
+        before: start > 0 ? session.log[start]._meta.sloppod.seq : null,
       });
       return;
     }
@@ -2162,7 +2171,7 @@ async function handleApi(req, res, url) {
         // As the runtime has them: each event with its sequence number and when it was recorded.
         const events = session.log
           .slice(index, next?.index)
-          .map((e, i) => ({ seq: index + i + 1, at: new Date().toISOString(), update: e.update }));
+          .map((e) => ({ seq: e._meta.sloppod.seq, at: new Date().toISOString(), update: e.update }));
         return { message_id: entry.update.messageId, model_calls: [{ request_id: `req_mock_${index}` }], events };
       });
       res.writeHead(200, {
@@ -2858,10 +2867,19 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, {});
     }
     if (url.pathname === '/_mock/say' && req.method === 'POST') {
-      // More output in every session, as if its agent carried on.
+      // More output in every session, as if its agent carried on; with `session`, in that one only, and with `count`,
+      // that many messages, each numbered after `text` (`Part 7`), for a run longer than a page of history.
       const text = url.searchParams.get('text') ?? '';
-      for (const session of sessions.values()) {
-        session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text }, messageId: randomUUID() });
+      const count = Number(url.searchParams.get('count') ?? 1);
+      const only = sessions.get(url.searchParams.get('session') ?? '');
+      for (const session of only ? [only] : sessions.values()) {
+        for (let i = 0; i < count; i++) {
+          session.emit({
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: count > 1 ? `${text} ${i}` : text },
+            messageId: randomUUID(),
+          });
+        }
       }
       return json(res, 200, {});
     }
