@@ -993,10 +993,39 @@ const GIT_OPERATION_STATE: &[&str] = &[
     "sequencer",
 ];
 
+/// Removes the `*.lock` files in a git directory (`index.lock`, `config.lock`, `HEAD.lock`, those on refs and
+/// reflogs): the process that held them was the other session's, on a volume that was copied while it ran, so
+/// nothing here will ever release them.
+fn remove_git_locks(git_dir: &Path) -> anyhow::Result<()> {
+    fn walk(dir: &Path, recurse: bool) -> anyhow::Result<()> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if path.is_dir() {
+                if recurse {
+                    walk(&path, true)?;
+                }
+            } else if path.extension().is_some_and(|e| e == "lock") {
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("removing {}", path.display()))?;
+            }
+        }
+        Ok(())
+    }
+    walk(git_dir, false)?;
+    walk(&git_dir.join("refs"), true)?;
+    walk(&git_dir.join("logs"), true)
+}
+
 /// Takes a checkout copied from another session's volume over as this session's: its branch, the origin it points
 /// at, and nothing of the other session's work in it. Ignored files stay: they are the build caches the copy is for.
 async fn reset_copied_checkout(env: &[(String, String)], repo: &Repo) -> anyhow::Result<()> {
     let git_dir = Path::new(&repo.path).join(".git");
+    remove_git_locks(&git_dir)?;
     for name in GIT_OPERATION_STATE {
         let path = git_dir.join(name);
         let removed = if path.is_dir() {
@@ -1516,6 +1545,33 @@ mod copied_workspace_tests {
             "refs/heads/sloppod/child"
         );
         assert_eq!(out(&env, &repo, &["remote"]).await.trim(), "origin");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn locks_the_parent_left_do_not_stop_the_takeover() {
+        let root = scratch("copied-locks");
+        let (origin, repo, env) = parent_checkout(&root).await;
+        let git_dir = repo.join(".git");
+        for lock in [
+            "index.lock",
+            "config.lock",
+            "HEAD.lock",
+            "refs/heads/sloppod/parent.lock",
+        ] {
+            std::fs::write(git_dir.join(lock), "").unwrap();
+        }
+
+        reset_copied_checkout(&env, &repo_for(&origin, &repo, "sloppod/child", None))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out(&env, &repo, &["branch", "--show-current"]).await.trim(),
+            "sloppod/child"
+        );
+        assert!(!git_dir.join("index.lock").exists());
+        assert!(!git_dir.join("refs/heads/sloppod/parent.lock").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
