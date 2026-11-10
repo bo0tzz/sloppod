@@ -3745,6 +3745,21 @@ test('grants, narrows, times and revokes the grants of a running session', async
   await expect(page.getByText("sloppod: the user revoked this session's grant packages.")).toBeVisible();
 });
 
+test('grants the ability to start sub-sessions, revokes it, and grants it again', async ({ page }) => {
+  await createSession(page, 'Fix the build in bo0tzz/sloppod');
+  const grants = await openGrants(page);
+  // A top-level session starts with it.
+  await expect(grants.getByTestId('grant-subsessions')).toContainText('Start sub-sessions');
+  await grants.getByTestId('grant-subsessions').getByRole('button', { name: 'Revoke' }).click();
+  await expect(grants.getByTestId('grant-subsessions')).toHaveCount(0);
+  // It's offered again, so a session that lost it can get it back.
+  const add = grants.getByTestId('add-grant');
+  await add.getByRole('combobox', { name: 'Grant' }).click();
+  await page.getByRole('option', { name: 'subsessions' }).click();
+  await add.getByRole('button', { name: 'Grant' }).click();
+  await expect(grants.getByTestId('grant-subsessions')).toContainText('Start sub-sessions');
+});
+
 test('grants a session one of the work graphs at a level', async ({ page }) => {
   await createSession(page, 'Fix the build in bo0tzz/sloppod');
   await page.getByRole('button', { name: 'Session actions' }).click();

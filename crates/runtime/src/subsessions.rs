@@ -390,18 +390,35 @@ pub async fn message(state: &AppState, from: Uuid, arguments: &Value) -> Result<
     Ok("Sent.".into())
 }
 
-/// `park_session`: parks one of `parent`'s sub-sessions, so it stops holding one of its tree's running slots. A
-/// message wakes it again.
+/// The session `parent` may park: one of its descendants at any depth, not deleted. A session can't park itself or
+/// one outside its subtree.
+pub(crate) async fn parkable(
+    db: &sqlx::PgPool,
+    parent: Uuid,
+    id: Uuid,
+) -> Result<db::SessionRow, String> {
+    let child = db::get_session(db, id)
+        .await
+        .map_err(|e| e.to_string())?
+        .filter(|child| child.deleted_at.is_none())
+        .ok_or("you can park your own sub-sessions, at any depth")?;
+    if !db::descendant_of(db, child.id, parent)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        return Err("you can park your own sub-sessions, at any depth".into());
+    }
+    Ok(child)
+}
+
+/// `park_session`: parks one of `parent`'s sub-sessions, at any depth, so it stops holding one of its tree's running
+/// slots. A message wakes it again.
 pub async fn park(state: &AppState, parent: Uuid, arguments: &Value) -> Result<String, String> {
     let id: Uuid = arguments["id"]
         .as_str()
         .and_then(|id| id.parse().ok())
         .ok_or("give the session's `id`")?;
-    let child = db::get_session(&state.db, id)
-        .await
-        .map_err(|e| e.to_string())?
-        .filter(|child| child.parent_id == Some(parent) && child.deleted_at.is_none())
-        .ok_or("you can park your own sub-sessions")?;
+    let child = parkable(&state.db, parent, id).await?;
     match lifecycle::park(state, &child).await {
         Ok(()) => Ok("Parked. A message wakes it.".into()),
         Err(ParkError::InTurn) => {
@@ -519,7 +536,7 @@ pub fn tools(endpoint_models: &[String], may_spawn: bool) -> Vec<Value> {
         }),
         json!({
             "name": "park_session",
-            "description": "Park one of your sub-sessions, by id: its pod stops, and it no longer counts towards the sub-sessions running at once. Its volume, branch and conversation stay, and a message wakes it. Sub-sessions that have reported and gone quiet are parked after a few minutes anyway.",
+            "description": "Park one of your sub-sessions, at any depth, by id: its pod stops, and it no longer counts towards the sub-sessions running at once. Its volume, branch and conversation stay, and a message wakes it. Sub-sessions that have reported and gone quiet are parked after a few minutes anyway.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"id": {"type": "string"}},

@@ -277,6 +277,19 @@ pub async fn descendants(db: &PgPool, session: Uuid) -> sqlx::Result<Vec<Session
     .await
 }
 
+/// Whether `session` is below `ancestor` at any depth, deleted or not. A session isn't its own descendant.
+pub async fn descendant_of(db: &PgPool, session: Uuid, ancestor: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "with recursive up as (select id, parent_id from sessions where id = $1 \
+           union all select s.id, s.parent_id from sessions s join up on s.id = up.parent_id) \
+         select exists(select 1 from up where id = $2 and id <> $1)",
+    )
+    .bind(session)
+    .bind(ancestor)
+    .fetch_one(db)
+    .await
+}
+
 /// How many sub-sessions of `session`'s tree, its root's descendants, are running: what ADR 27's limit counts.
 pub async fn running_in_tree(db: &PgPool, session: Uuid) -> sqlx::Result<i64> {
     sqlx::query_scalar(

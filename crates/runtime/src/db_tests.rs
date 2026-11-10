@@ -949,6 +949,51 @@ async fn an_owner_has_one_utility_session_that_isnt_listed(db: PgPool) {
 }
 
 #[sqlx::test(migrator = "db::MIGRATOR")]
+async fn a_parent_can_park_its_descendants_at_any_depth(db: PgPool) {
+    // `list_sessions` shows a parent its grandchildren, so it can park them (#495).
+    let root = session(&db, "alice").await;
+    let child = session(&db, "alice").await;
+    let grandchild = session(&db, "alice").await;
+    let unrelated = session(&db, "alice").await;
+    db::set_parent(&db, child, root).await.unwrap();
+    db::set_parent(&db, grandchild, child).await.unwrap();
+    assert_eq!(
+        crate::subsessions::parkable(&db, root, grandchild)
+            .await
+            .unwrap()
+            .id,
+        grandchild
+    );
+    // Not itself, and not a session outside its subtree.
+    assert!(crate::subsessions::parkable(&db, root, root).await.is_err());
+    assert!(
+        crate::subsessions::parkable(&db, root, unrelated)
+            .await
+            .is_err()
+    );
+    // A child parks its own child, not its parent.
+    assert_eq!(
+        crate::subsessions::parkable(&db, child, grandchild)
+            .await
+            .unwrap()
+            .id,
+        grandchild
+    );
+    assert!(
+        crate::subsessions::parkable(&db, child, root)
+            .await
+            .is_err()
+    );
+    // A deleted one can't be parked.
+    db::mark_deleted(&db, grandchild).await.unwrap();
+    assert!(
+        crate::subsessions::parkable(&db, root, grandchild)
+            .await
+            .is_err()
+    );
+}
+
+#[sqlx::test(migrator = "db::MIGRATOR")]
 async fn a_sessions_first_message_is_its_task(db: PgPool) {
     let id = session(&db, "alice").await;
     assert_eq!(db::first_message(&db, id).await.unwrap(), None);

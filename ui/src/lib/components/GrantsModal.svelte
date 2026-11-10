@@ -13,7 +13,7 @@
   }: { session: Session; onChange: (session: Session) => void; onClose: () => void } = $props();
 
   /** What can be granted while a session runs; repositories are added on their own. */
-  const builtIn = ['model', 'github', 'packages', 'docs', 'codex', 'work'];
+  const builtIn = ['model', 'github', 'packages', 'docs', 'codex', 'work', 'subsessions'];
   /** The user's own capabilities, offered by name after the built-ins; without them, only the built-ins. */
   let own = $state<string[]>([]);
   /** The user's work graphs (ADR 30), for a `work` grant: one per graph. */
