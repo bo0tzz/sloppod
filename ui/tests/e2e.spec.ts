@@ -1334,6 +1334,7 @@ test('queues messages while the agent starts', async ({ page }) => {
 });
 
 test('follows new output while the reader is at the bottom, across a reconnect', { tag: '@scroll' }, async ({ page }) => {
+  showChatLog(page);
   await page.setViewportSize({ width: 1000, height: 500 });
   await createSession(page, 'Give me a long answer in sloppod');
   const end = page.getByText('The end.');
@@ -1803,8 +1804,16 @@ test('sending a message scrolls the chat to it, and so does scrolling the sessio
   await expect(userMessages(page).filter({ hasText: message })).toBeInViewport();
 });
 
+/** TEMP: prints the chat's own diagnostics, which a browser console doesn't put in the test's output. */
+function showChatLog(page: Page) {
+  page.on('console', (message) => {
+    if (message.text().startsWith('DBG-history')) console.log(message.text());
+  });
+}
+
 /** Opens a session whose log is longer than one page of history: the latest in the transcript, the rest below it. */
 async function openLongHistory(page: Page) {
+  showChatLog(page);
   await page.setViewportSize({ width: 1000, height: 500 });
   const prompt = 'Write a long history in sloppod';
   await createSession(page, prompt);
@@ -1815,10 +1824,17 @@ async function openLongHistory(page: Page) {
   return prompt;
 }
 
-/** Scrolls up the way the reader does: from the chat, so the wheel goes to the transcript and not the session list. */
+/**
+ * Reads up to the top of the chat. A wheel event scrolls a page at most in some browsers (Firefox), so what the reader's
+ * wheel asks for is scrolled here — the chat itself, by as much as the wheel said — rather than left to the browser.
+ */
 async function wheelUp(page: Page) {
-  await page.getByText('The end.').hover();
-  await page.mouse.wheel(0, -100_000);
+  const scroller = page.getByTestId('transcript-scroller');
+  await scroller.hover();
+  await scroller.evaluate((element) => {
+    element.dispatchEvent(new WheelEvent('wheel', { deltaY: -100_000, deltaMode: 0, bubbles: true }));
+    element.scrollTo({ top: 0 });
+  });
 }
 
 test('reading up brings in the earlier history by itself, with no click', { tag: '@scroll' }, async ({ page }) => {
@@ -1892,19 +1908,29 @@ test('the reader’s place holds when the row they are at is written to as the p
   await expect.poll(async () => Math.abs((await end()) - held)).toBeLessThan(2);
 });
 
-test('older history comes in when the page that opens cannot scroll', { tag: '@scroll' }, async ({ page }) => {
+/**
+ * Opens a session whose log is more than one page and whose latest page renders shorter than the view: one row, and
+ * nothing to scroll. The turn is waited out first, so that what opens is the whole log's latest page.
+ */
+async function openUnscrollablePage(page: Page) {
+  showChatLog(page);
   await page.setViewportSize({ width: 1000, height: 800 });
   const prompt = 'Write a short log with many tool updates in sloppod';
   await createSession(page, prompt);
-  const scroller = page.getByTestId('transcript-scroller');
+  await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
   await page.reload();
   await expect(page.locator('[data-testid="transcript"] [data-row-names]')).toHaveCount(1);
   await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(0);
   // The page fits the view: there is nothing to scroll, and so no scroll event for anything to be read from.
-  expect(await scroller.evaluate((element) => element.scrollHeight <= element.clientHeight)).toBe(true);
+  expect(await page.getByTestId('transcript-scroller').evaluate((element) => element.scrollHeight <= element.clientHeight)).toBe(true);
+  return prompt;
+}
+
+test('older history comes in when the page that opens cannot scroll', { tag: '@scroll' }, async ({ page }) => {
+  const prompt = await openUnscrollablePage(page);
 
   // Asking to go up is what reaches the rest of the session, viewport or not.
-  await scroller.hover();
+  await page.getByTestId('transcript-scroller').hover();
   await page.mouse.wheel(0, -200);
   await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(1);
 });
@@ -1938,6 +1964,40 @@ test('the reader’s place holds when the page before widens a fold they are at'
   // was found, and what the page put above them is all that was scrolled past.
   await expect.poll(async () => (await row.getAttribute('data-row-names'))!.split(' ')).toContain(was);
   await expect.poll(async () => Math.abs((await end()) - held)).toBeLessThan(2);
+});
+
+/** A touch gesture on the chat: a finger down at `from`, moves to `to`, and up. */
+async function swipe(page: Page, from: number, to: number) {
+  await page.evaluate(
+    ([from, to]) => {
+      const scroller = document.querySelector('[data-testid="transcript-scroller"]')!;
+      const at = (clientY: number) => new Touch({ identifier: 1, target: scroller, clientX: 40, clientY });
+      const send = (type: string, touches: Touch[]) =>
+        scroller.dispatchEvent(new TouchEvent(type, { bubbles: true, cancelable: true, touches, changedTouches: touches }));
+      send('touchstart', [at(from)]);
+      for (let step = 1; step <= 6; step++) send('touchmove', [at(from + ((to - from) * step) / 6)]);
+      send('touchend', []);
+    },
+    [from, to],
+  );
+}
+
+test('a swipe is read within the gesture it is part of', { tag: '@scroll' }, async ({ page }) => {
+  const prompt = await openUnscrollablePage(page);
+  // Not every browser lets a test make touch events to send, and there is nothing to check where it doesn't.
+  test.skip(
+    !(await page.evaluate(() => typeof Touch === 'function' && typeof TouchEvent === 'function')),
+    'this browser has no touch events to send',
+  );
+
+  // Two swipes up, the second beginning lower down than the first one ended: neither asks for older history.
+  await swipe(page, 600, 400);
+  await swipe(page, 700, 500);
+  await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(0);
+
+  // A swipe down does.
+  await swipe(page, 400, 700);
+  await expect(userMessages(page).filter({ hasText: prompt })).toHaveCount(1);
 });
 
 test('older history comes in for a reader who only drags the scrollbar', { tag: '@scroll' }, async ({ page }) => {

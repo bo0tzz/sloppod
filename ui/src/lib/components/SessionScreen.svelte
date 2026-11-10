@@ -244,6 +244,28 @@
 
   /** Fetches the page before while the reader is reading up into it, as any chat does; never on opening at the top. */
   function loadEarlierIfNear() {
+    if (scroller && positioned && userScrolled && scroller.scrollTop <= EARLIER_WITHIN_SCREENS * scroller.clientHeight) {
+      // TEMP diagnostics: what the guards see when the reader is up near the top.
+      console.log(
+        'DBG-history',
+        JSON.stringify({
+          top: Math.round(scroller.scrollTop),
+          client: scroller.clientHeight,
+          height: Math.round(scroller.scrollHeight),
+          content: Math.round(content?.getBoundingClientRect().height ?? 0),
+          rows: rowElements().length,
+          firstRow: Math.round(rowElements()[0]?.getBoundingClientRect().height ?? 0),
+          positioned,
+          scrolled: userScrolled,
+          asked: askedEarlier,
+          atBottom,
+          loading: view.loadingHistory,
+          err: view.historyError,
+          before: view.historyBefore,
+          cv: typeof CSS !== 'undefined' && CSS.supports('content-visibility', 'auto'),
+        }),
+      );
+    }
     if (!scroller || !positioned || !userScrolled) return;
     // Being at the bottom says nothing when the page fits the view and there is nowhere below to be: what the reader
     // asked for above them is what is fetched, and being able to see the bottom doesn't make that not so.
@@ -336,20 +358,34 @@
     };
     const press = () => (pointerHeld = true);
     const release = () => (pointerHeld = false);
+    // A finger's direction only means anything within the gesture it started: a gesture beginning where the last ended
+    // would read as going back the way it came.
+    const touchStart = (event: TouchEvent) => (lastTouchY = event.touches[0]?.clientY ?? null);
+    const touchEnd = () => (lastTouchY = null);
     const events = ['wheel', 'touchmove', 'keydown', 'pointerdown'] as const;
     for (const event of events) scroller.addEventListener(event, scrolling, { passive: true });
     scroller.addEventListener('pointerdown', press);
+    scroller.addEventListener('touchstart', touchStart, { passive: true });
+    scroller.addEventListener('touchend', touchEnd);
+    scroller.addEventListener('touchcancel', touchEnd);
     window.addEventListener('pointerup', release);
     window.addEventListener('pointercancel', release);
     return () => {
       events.forEach((event) => scroller?.removeEventListener(event, scrolling));
       scroller?.removeEventListener('pointerdown', press);
+      scroller?.removeEventListener('touchstart', touchStart);
+      scroller?.removeEventListener('touchend', touchEnd);
+      scroller?.removeEventListener('touchcancel', touchEnd);
       window.removeEventListener('pointerup', release);
       window.removeEventListener('pointercancel', release);
     };
   });
 
-  /** A last touch position, for telling which way a finger is going: a swipe down is a reader asking for what's above. */
+  /**
+   * Where the finger was last seen in the gesture it is in, for telling which way it is going: a swipe down is a reader
+   * asking for what's above. The gesture's own start sets it and its end clears it, so one that begins where the last
+   * one stopped isn't read as going back the way it came.
+   */
   let lastTouchY: number | null = null;
   const EARLIER_KEYS = new Set(['PageUp', 'Home', 'ArrowUp']);
   const LATER_KEYS = new Set(['PageDown', 'End', 'ArrowDown']);
