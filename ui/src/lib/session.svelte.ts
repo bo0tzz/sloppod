@@ -360,15 +360,14 @@ export class SessionView {
       let ask = before;
       for (let page = 0; catchingUp && ask !== null && ask > top + 1 && page < GAP_PAGES; page++) {
         const fetched = await this.#historyPage(ask);
-        const first = ask - fetched.updates.length;
-        // The page is oldest first, so the part that joins what the view has is its end: everything above its own top.
-        const joins = Math.max(0, Math.min(fetched.updates.length, ask - 1 - top));
-        const piece = fetched.updates.map((update, index) => ({
+        // The page's own sequence numbers, which have gaps in them — one sequence serves every session — so the part of
+        // it the view doesn't already have is everything above its own top. Nothing is worked out from the count.
+        const piece: LoggedUpdate[] = fetched.updates.map((update, index) => ({
           update,
-          seq: first + index,
+          seq: fetched.seqs[index],
           at: fetched.at?.[index] ?? null,
         }));
-        between = [...piece.slice(Math.max(0, piece.length - joins)), ...between];
+        between = [...piece.filter((u) => u.seq > top), ...between];
         ask = fetched.before;
       }
       // Left while those pages were on their way: the close ends this load, as it does above, and a newer showing's
@@ -378,15 +377,13 @@ export class SessionView {
         return;
       }
       if (generation !== this.#generation) return;
-      const joined = ask === null || ask <= top + 1;
-      const kept = catchingUp && joined
+      const joined = ask === null || ask <= top + 1;      const kept = catchingUp && joined
         ? this.#updates.filter((u) => u.seq === 0 || (before !== null && u.seq < before))
         : [];
       const updates = [...kept, ...(joined ? between : []), ...replay];
       // Nothing kept is the usual case: the replay is the transcript, as it was built.
       const transcript = kept.length === 0 && between.length === 0 ? this.#replay! : new Transcript();
-      if (transcript !== this.#replay) for (const { update, seq, at } of updates) transcript.apply(update, seq, at);
-      this.transcript = transcript;
+      if (transcript !== this.#replay) for (const { update, seq, at } of updates) transcript.apply(update, seq, at);      this.transcript = transcript;
       this.#updates = updates;
       if (!catchingUp || !joined) this.historyBefore = before;
       this.historyError = null;
@@ -411,7 +408,7 @@ export class SessionView {
 
   /** A page of the session's history before `before`, as `session/load`'s boundary says to ask for it. */
   async #historyPage(before: number) {
-    return app.request<{ updates: SessionUpdate[]; at?: string[]; before: number | null }>('_sloppod/history', {
+    return app.request<{ updates: SessionUpdate[]; at?: string[]; seqs: number[]; before: number | null }>('_sloppod/history', {
       sessionId: this.id,
       before,
     });
@@ -516,8 +513,12 @@ export class SessionView {
       // A reload meanwhile has replaced what this page goes in front of.
       if (this.historyBefore !== before || !page) return;
       const transcript = new Transcript();
-      // An older page's events are before whatever was read, as far as the unread marker goes: they have no place.
-      const updates = [...page.updates.map((update, index) => ({ update, seq: 0, at: page.at?.[index] ?? null })), ...this.#updates];
+      // Their own sequence numbers, as the page gives them: they are before whatever was read, so they count as read
+      // all the same, and a row of one can still be told apart by where it is (#48, #485, #93).
+      const updates = [
+        ...page.updates.map((update, index) => ({ update, seq: page.seqs[index], at: page.at?.[index] ?? null })),
+        ...this.#updates,
+      ];
       for (const { update, seq, at } of updates) transcript.apply(update, seq, at);
       this.#updates = updates;
       this.transcript = transcript;

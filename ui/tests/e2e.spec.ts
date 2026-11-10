@@ -2137,18 +2137,25 @@ test('switching back to a session that grew by more than a page keeps the whole 
   // and, since the view believes it has everything, one it could never fetch (#93).
   await open(backoff).click();
   await expect(page.getByText(/Done\. The tests pass/)).toBeVisible();
-  // A run of messages in the session that's away, longer than the page a load replays.
-  await page.request.post(`/_mock/say?session=${long}&count=3000&text=Part`);
+  // A run of messages in the session that's away, longer than the page a load replays, with the other session writing
+  // in between: one sequence serves every session, so this session's numbers are not consecutive.
+  for (let part = 0; part < 3; part++) {
+    await page.request.post(`/_mock/say?session=${long}&count=700&text=B${part}`);
+    await page.request.post(`/_mock/say?session=${backoff}&count=120&text=Noise`);
+  }
 
   await open(long).click();
   await expect(page.getByText('The end.')).toBeVisible();
   // The load lands with the latest page: waiting for the newest of what arrived means what's checked next is after it.
-  await expect(agentMessages(page).filter({ hasText: 'Part 2999' })).toBeAttached();
-  // And the run between that page and what the view had is there too: without it the conversation shows a hole, and
-  // one this view could never fetch, since it believes it has everything older (its boundary says so).
-  for (const said of ['Part 0', 'Part 999']) {
+  await expect(agentMessages(page).filter({ hasText: 'B2 699' })).toBeAttached();
+  // And the run between that page and what the view had is there: without it the conversation shows a hole, and one
+  // this view could never fetch, since it believes it has everything older (its boundary says so).
+  for (const said of ['B0 0', 'B0 99']) {
     await expect(agentMessages(page).filter({ hasText: said })).toBeAttached();
   }
+  // And nothing the view already had was joined in again: with the sequences worked out from counts, the cached page is
+  // re-added and its messages read twice.
+  await expect(agentMessages(page).filter({ hasText: 'The end.' })).toHaveCount(1);
 });
 
 test('switching back keeps the reader’s place', { tag: '@scroll' }, async ({ page }) => {
