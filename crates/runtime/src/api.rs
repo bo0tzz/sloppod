@@ -1029,8 +1029,8 @@ async fn list_highlights(
     Ok(Json(highlights))
 }
 
-/// The user marks a highlight seen: that's all it does. No turn starts and the agent isn't told, whatever it has done
-/// since.
+/// The user marks a highlight seen: no turn starts, whatever the agent has done since, and it hears which of its
+/// highlights were seen with its next turn (#462).
 async fn mark_highlight_seen(
     State(state): State<AppState>,
     User(user): User,
@@ -1039,9 +1039,9 @@ async fn mark_highlight_seen(
     db::owned_session(&state.db, id, &user)
         .await?
         .ok_or_else(not_found)?;
-    let row = db::mark_highlight_seen(&state.db, id, highlight)
-        .await?
-        .ok_or_else(not_found)?;
+    let marked = db::mark_highlight_seen(&state.db, id, highlight).await?;
+    state.hub.note_highlight_seen(id, &marked).await;
+    let row = marked.row().ok_or_else(not_found)?;
     let highlight = row.to_api();
     state.hub.broadcast_highlight(&highlight);
     Ok(Json(highlight))
@@ -1054,7 +1054,8 @@ struct Snooze {
 }
 
 /// The user puts a highlight off until later (#467): it stops counting as waiting on them and comes back at its time.
-/// Like seen, no turn starts and the agent isn't told, and it stays the agent's to retract.
+/// No turn starts, and the agent is told nothing — a snooze isn't a seen, which it does hear about with its next turn
+/// (#462) — and it stays the agent's to retract.
 async fn snooze_highlight(
     State(state): State<AppState>,
     User(user): User,
