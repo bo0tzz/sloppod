@@ -7,6 +7,7 @@
     Field,
     Heading,
     Icon,
+    IconButton,
     Input,
     LoadingSpinner,
     ModalBody,
@@ -16,7 +17,7 @@
     modalManager,
   } from '@immich/ui';
   import Dialog from './Dialog.svelte';
-  import { mdiChevronRight, mdiOpenInNew } from '@mdi/js';
+  import { mdiChevronRight, mdiClose, mdiOpenInNew } from '@mdi/js';
   import { tick } from 'svelte';
   import {
     api,
@@ -100,6 +101,22 @@
   const closeReasons = { completed: 'completed', not_planned: 'not planned', duplicate: 'a duplicate' };
   const closing = (close: NonNullable<IssueUpdate['close']>) => (close === true ? 'close' : `close as ${closeReasons[close]}`);
   const filing = $derived(drafts.filter((draft) => draft.file).length);
+  /** What's typed into each issue draft's "add a label" field, by its position (#108). */
+  let labelDrafts = $state<Record<number, string>>({});
+
+  /** Adds the typed label to a draft, unless it's empty or already there. */
+  function addLabel(index: number) {
+    const label = (labelDrafts[index] ?? '').trim();
+    const draft = drafts[index];
+    if (!label || !draft) return;
+    if (!draft.labels.includes(label)) draft.labels = [...draft.labels, label];
+    labelDrafts[index] = '';
+  }
+
+  function removeLabel(index: number, label: string) {
+    const draft = drafts[index];
+    if (draft) draft.labels = draft.labels.filter((existing) => existing !== label);
+  }
   let updateDrafts = $state<(IssueUpdate & { make: boolean })[]>([]);
   const making = $derived(updateDrafts.filter((draft) => draft.make).length);
   // What the issues an update rewrites say now, to show its change against.
@@ -181,6 +198,9 @@
     }
     if (shown.kind !== 'github.issue.create') return;
     drafts = (shown.payload as IssuesPayload).issues.map((issue) => ({ ...issue, labels: [...issue.labels], file: true }));
+    // A label half-typed into a field isn't part of the payload a fresh form starts from (#108), and the next
+    // proposal's issue at the same position would show it.
+    labelDrafts = {};
   }
 
   /** Records the decision; the modal only stays on this proposal to show a failure. */
@@ -583,7 +603,42 @@
             <Heading tag="h3" size="tiny" data-testid="issue-title">{draft.title}</Heading>
           {/if}
         </div>
-        {#if draft.labels.length > 0}
+        {#if editing && draft.file}
+          <!-- Labels a reviewer can change, so a wrong one doesn't mean rejecting the whole proposal (#108). -->
+          <div class="flex flex-wrap items-center gap-2" data-testid="issue-labels">
+            {#each draft.labels as label (label)}
+              <span class="flex items-center gap-1">
+                <Badge size="tiny" shape="round" color="secondary">{label}</Badge>
+                <IconButton
+                  icon={mdiClose}
+                  aria-label="Remove label {label}"
+                  variant="ghost"
+                  shape="round"
+                  size="tiny"
+                  color="secondary"
+                  onclick={() => removeLabel(index, label)}
+                />
+              </span>
+            {/each}
+            {#if draft.labels.length === 0}
+              <Text size="small" color="muted">No labels</Text>
+            {/if}
+          </div>
+          <form
+            class="flex items-end gap-2"
+            onsubmit={(event) => {
+              event.preventDefault();
+              addLabel(index);
+            }}
+          >
+            <div class="w-48">
+              <Field label="Add a label">
+                <Input bind:value={labelDrafts[index]} placeholder="priority" />
+              </Field>
+            </div>
+            <Button type="submit" size="small" shape="round" disabled={!(labelDrafts[index] ?? '').trim()}>Add</Button>
+          </form>
+        {:else if draft.labels.length > 0}
           <div class="flex flex-wrap gap-1">
             {#each draft.labels as label (label)}
               <Badge size="tiny" shape="round" color="secondary">{label}</Badge>

@@ -888,9 +888,21 @@ test('files issues, leaving one out and editing another', async ({ page }) => {
   const drafts = page.getByTestId('issue-draft');
   await expect(drafts).toHaveCount(3);
   await expect(drafts.nth(1)).toContainText('enforcement');
+  // Labels are the agent's until the reviewer edits, which is when they become changeable (#108).
+  await expect(drafts.nth(1).getByTestId('issue-labels')).toHaveCount(0);
   await drafts.nth(2).getByRole('checkbox', { name: 'File this issue' }).click();
   await page.getByRole('button', { name: 'Edit' }).click();
   await drafts.nth(0).getByRole('textbox', { name: 'Issue title' }).fill('Steer at the next tool boundary');
+  const labels = drafts.nth(1).getByTestId('issue-labels');
+  await labels.getByRole('button', { name: 'Remove label enforcement' }).click();
+  await expect(labels.getByText('enforcement')).toHaveCount(0);
+  await drafts.nth(1).getByRole('textbox', { name: 'Add a label' }).fill('priority');
+  await drafts.nth(1).getByRole('button', { name: 'Add' }).click();
+  await expect(labels.getByText('priority')).toBeVisible();
+  // The same label twice is one label.
+  await drafts.nth(1).getByRole('textbox', { name: 'Add a label' }).fill('priority');
+  await drafts.nth(1).getByRole('button', { name: 'Add' }).click();
+  await expect(labels.getByText('priority')).toHaveCount(1);
   await page.getByRole('button', { name: 'File 2 issues' }).click();
 
   await expect(page.getByTestId('proposal-detail')).toBeHidden();
@@ -901,6 +913,10 @@ test('files issues, leaving one out and editing another', async ({ page }) => {
   expect((filed.payload.issues as { title: string }[]).map((issue) => issue.title)).toEqual([
     'Steer at the next tool boundary',
     'Fail fast on blocked egress',
+  ]);
+  expect((filed.payload.issues as { labels: string[] }[]).map((issue) => issue.labels)).toEqual([
+    ['dogfood'],
+    ['dogfood', 'priority'],
   ]);
 });
 
