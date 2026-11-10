@@ -412,15 +412,20 @@ pub(crate) async fn parkable(
 }
 
 /// `park_session`: parks one of `parent`'s sub-sessions, at any depth, so it stops holding one of its tree's running
-/// slots. A message wakes it again.
+/// slots. A message wakes it again; a deeper descendant is woken by its own parent, since `message_session` reaches
+/// only direct relatives.
 pub async fn park(state: &AppState, parent: Uuid, arguments: &Value) -> Result<String, String> {
     let id: Uuid = arguments["id"]
         .as_str()
         .and_then(|id| id.parse().ok())
         .ok_or("give the session's `id`")?;
     let child = parkable(&state.db, parent, id).await?;
+    let direct = child.parent_id == Some(parent);
     match lifecycle::park(state, &child).await {
-        Ok(()) => Ok("Parked. A message wakes it.".into()),
+        Ok(()) if direct => Ok("Parked. A message wakes it.".into()),
+        Ok(()) => Ok(
+            "Parked. A message from its parent wakes it; message that session to have it wake the child.".into(),
+        ),
         Err(ParkError::InTurn) => {
             Err("it's in a turn; message it to wrap up, or try again once it's idle".into())
         }
@@ -536,7 +541,7 @@ pub fn tools(endpoint_models: &[String], may_spawn: bool) -> Vec<Value> {
         }),
         json!({
             "name": "park_session",
-            "description": "Park one of your sub-sessions, at any depth, by id: its pod stops, and it no longer counts towards the sub-sessions running at once. Its volume, branch and conversation stay, and a message wakes it. Sub-sessions that have reported and gone quiet are parked after a few minutes anyway.",
+            "description": "Park one of your sub-sessions, at any depth, by id: its pod stops, and it no longer counts towards the sub-sessions running at once. Its volume, branch and conversation stay, and a message wakes it; a deeper descendant is woken by its own parent, so message that parent to have it wake the child. Sub-sessions that have reported and gone quiet are parked after a few minutes anyway.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"id": {"type": "string"}},
@@ -768,5 +773,16 @@ mod tests {
         for tool in ["message_session", "park_session", "list_sessions"] {
             assert!(names(false).contains(&tool.to_owned()), "{tool}");
         }
+        // A deeper descendant is woken by its own parent, since `message_session` reaches only direct relatives.
+        let park = tools(&[], false)
+            .into_iter()
+            .find(|t| t["name"] == "park_session")
+            .unwrap();
+        assert!(
+            park["description"]
+                .as_str()
+                .unwrap()
+                .contains("woken by its own parent")
+        );
     }
 }
