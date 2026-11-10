@@ -147,25 +147,29 @@ const closeReasons: Record<'completed' | 'not_planned' | 'duplicate', string> = 
 };
 
 /**
- * What an update changes, each named, in the order it's carried out (#289): a comment, then the labels, then the
- * text, then closing or reopening. A pull request's own changes (`ready`) are named too.
+ * What an update changes, each named, in the order it's carried out (#289): the comment, then the labels, then, for a
+ * pull request, reopening and marking it ready — both before its text is patched (see `pull_request_updates::apply`) —
+ * then the title and body, then closing; for an issue, closing and reopening go in one patch, so they come last.
  */
-export function updateChanges(update: IssueUpdate): string[] {
+export function updateChanges(update: IssueUpdate, kind: 'issue' | 'pull_request' = 'issue'): string[] {
   const changes: string[] = [];
   if (update.comment !== undefined) changes.push('Adds a comment');
   if (update.add_labels?.length) changes.push(`Adds labels: ${update.add_labels.join(', ')}`);
   if (update.remove_labels?.length) changes.push(`Removes labels: ${update.remove_labels.join(', ')}`);
+  if (kind === 'pull_request') {
+    if (update.reopen) changes.push('Reopens it');
+    if (update.ready) changes.push('Marks it ready for review');
+  }
   if (update.title !== undefined) changes.push('Changes the title');
   if (update.body !== undefined) changes.push(update.body === '' ? 'Clears the body' : 'Rewrites the body');
   if (update.close) changes.push(update.close === true ? 'Closes it' : `Closes as ${closeReasons[update.close]}`);
-  if (update.reopen) changes.push('Reopens it');
-  if (update.ready) changes.push('Marks it ready for review');
+  if (kind === 'issue' && update.reopen) changes.push('Reopens it');
   return changes;
 }
 
 /** What one update does, and to what: `#35 · Adds a comment, Closes as completed`. */
-export function updateSummary(update: IssueUpdate): string {
-  const changes = updateChanges(update);
+export function updateSummary(update: IssueUpdate, kind: 'issue' | 'pull_request' = 'issue'): string {
+  const changes = updateChanges(update, kind);
   return `#${update.number}${changes.length ? ` · ${changes.join(', ')}` : ''}`;
 }
 
@@ -215,7 +219,7 @@ export function proposalSummary(proposal: Proposal): { label: string; title: str
       const updates = updateList(payload);
       return {
         label: 'Pull request updates',
-        title: updates.length === 1 ? updateSummary(updates[0]) : `${updates.length} pull requests`,
+        title: updates.length === 1 ? updateSummary(updates[0], 'pull_request') : `${updates.length} pull requests`,
         detail: payloadText(payload.repo),
         icon: mdiSourcePull,
       };

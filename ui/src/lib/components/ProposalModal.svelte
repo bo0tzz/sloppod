@@ -435,7 +435,7 @@
                 </div>
                 <!-- What it changes, each named, in the order it's carried out (#289). -->
                 <ul class="text-muted flex flex-col text-xs" data-testid="issue-update-changes">
-                  {#each updateChanges(update) as change, index (index)}
+                  {#each updateChanges(update, shown.kind === 'github.pr.update' ? 'pull_request' : 'issue') as change, index (index)}
                     <li>{change}</li>
                   {/each}
                 </ul>

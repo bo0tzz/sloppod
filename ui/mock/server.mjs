@@ -1426,6 +1426,7 @@ function createPullRequestUpdates(session) {
         { number: 96, comment: 'Replaced by #99.', close: true, remove_labels: ['wip'] },
         {
           number: 97,
+          reopen: true,
           ready: true,
           title: 'Show why a pod fails to start',
           body: 'A pod that fails to start says why in the UI.\n\nCloses #59.',

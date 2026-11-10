@@ -4173,6 +4173,13 @@ test('reviews and approves updates to open pull requests', async ({ page }) => {
   await expect(updates.nth(0)).not.toContainText('close as');
   await expect(updates.nth(0)).toContainText('Removes labels: wip');
   await expect(updates.nth(1)).toContainText('Marks it ready for review');
+  // Named in the order they're carried out: reopening and marking ready come before the text is patched (#289).
+  await expect(updates.nth(1).getByTestId('issue-update-changes').getByRole('listitem')).toHaveText([
+    'Reopens it',
+    'Marks it ready for review',
+    'Changes the title',
+    'Rewrites the body',
+  ]);
   // A rewrite shows against what the pull request says now.
   await expect(updates.nth(1).getByTestId('issue-update-title')).toHaveText('Title: WIP: pod failures → Show why a pod fails to start');
   const bodyDiff = updates.nth(1).getByTestId('diff');
