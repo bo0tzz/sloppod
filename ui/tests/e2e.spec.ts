@@ -1027,6 +1027,42 @@ test('replays the history once after a page reload', async ({ page }) => {
   await expect(page.getByTestId('proposal-card')).toHaveCount(1);
 });
 
+/** The chat as it reads, message for message, for comparing what one load's transcript shows with another's. */
+async function chatText(page: Page) {
+  return {
+    user: await userMessages(page).allTextContents(),
+    agent: await agentMessages(page).allTextContents(),
+    tools: await toolCallsInTranscript(page),
+  };
+}
+
+test('a reconnect is sent only what it missed', { tag: '@scroll' }, async ({ page }) => {
+  const prompt = 'Reconnect me in sloppod';
+  await createSession(page, prompt);
+  await finishTurn(page);
+  await expectTranscriptOnce(page, prompt);
+  // Where this view's own copy ends, which the load after the drop says it has (#449).
+  const at = Number(await page.locator('[data-testid="transcript"] [data-seq]').last().getAttribute('data-seq'));
+
+  await page.request.delete('/_mock/loads');
+  await page.request.post('/_mock/drop?for=3000');
+  await expect(page.getByTestId('reconnecting')).toBeVisible();
+  // Output while it is away: this is what the reconnect is for, and all it should bring.
+  await page.request.post('/_mock/say?text=While%20you%20were%20away.&count=3');
+  await expect(page.getByTestId('reconnecting')).toBeHidden({ timeout: 15_000 });
+  await expect(page.getByText('While you were away. 2')).toBeVisible();
+
+  const loads = await (await page.request.get('/_mock/loads')).json();
+  expect(loads.at(-1)).toMatchObject({ resumed: true, updates: 3, after: at });
+
+  // And what it shows is what a full load of the session shows, message for message — where a UI that joined the
+  // updates wrongly would come apart.
+  const shown = await chatText(page);
+  await page.reload();
+  await expect(page.getByText('While you were away. 2')).toBeVisible();
+  expect(await chatText(page)).toEqual(shown);
+});
+
 test('reconnects after the socket drops without duplicating history', async ({ page }) => {
   const prompt = 'Reconnect me in sloppod';
   await createSession(page, prompt);
@@ -2108,9 +2144,13 @@ test('switching back catches up with what came in meanwhile', { tag: '@scroll' }
   const { long, open } = await twoSessionsOpen(page);
   // In the other session, the first one's agent carries on: its view isn't following, so it misses this, and the load
   // that follows the switch is what brings it.
+  await page.request.delete('/_mock/loads');
   await page.request.post('/_mock/say?text=Meanwhile%20in%20the%20first.');
   await open(long).click();
   await expect(page.getByText('Meanwhile in the first.')).toBeVisible();
+  // The view still had the session, so the load was sent only what came in meanwhile, not the page again (#449).
+  const loads = await (await page.request.get('/_mock/loads')).json();
+  expect(loads.at(-1)).toMatchObject({ session: long, resumed: true, updates: 1 });
 });
 
 test('switching back keeps the reader’s place in history they had read into', { tag: '@scroll' }, async ({ page }) => {
@@ -4152,6 +4192,44 @@ test("adds a capability of one's own, grants it to a session, and deletes it", a
   await expect(section).toContainText('No capability of your own yet.');
 });
 
+test('an Add form comes into view, with its name focused, and Esc leaves it', async ({ page }) => {
+  // On a phone, a form that opens below the fold looks like the tap did nothing (#370).
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/settings');
+  const section = page.getByTestId('credentials-claude');
+  await section.getByRole('button', { name: 'Add Claude account' }).click();
+  const form = section.locator('form');
+  await expect(form).toBeInViewport();
+  await expect(form.getByRole('textbox', { name: 'Name' })).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(form).toHaveCount(0);
+  await expect(section.getByRole('button', { name: 'Add Claude account' })).toBeVisible();
+});
+
+test('Settings groups its sections, and the nav goes to each', async ({ page }) => {
+  await page.goto('/settings');
+  const nav = page.getByTestId('settings-nav');
+  await expect(page.getByTestId('settings-group-defaults')).toContainText('Defaults for new sessions');
+  await nav.getByRole('button', { name: 'Credentials' }).click();
+  await expect(page.getByTestId('credentials-claude')).toBeInViewport();
+  await nav.getByRole('button', { name: 'Capabilities' }).click();
+  await expect(page.getByTestId('capabilities')).toBeInViewport();
+  await nav.getByRole('button', { name: 'Sessions' }).click();
+  await expect(page.getByTestId('storage')).toBeInViewport();
+  await nav.getByRole('button', { name: 'Defaults' }).click();
+  await expect(page.getByTestId('timezone-setting')).toBeInViewport();
+
+  // Keyboard too: focus goes with the navigation, so Tab carries on inside the group (#370).
+  const credentials = nav.getByRole('button', { name: 'Credentials' });
+  await credentials.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.getByTestId('settings-group-credentials-heading')).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect
+    .poll(async () => page.evaluate(() => document.activeElement?.closest('[data-testid="settings-group-credentials"]') !== null))
+    .toBe(true);
+});
+
 test('a token for a capability is added in settings and chosen for the capability', async ({ page }) => {
   await page.goto('/settings');
   const tokens = page.getByTestId('credentials-token');
@@ -4876,16 +4954,24 @@ test('a session at its usage limit says when it carries on', async ({ page }) =>
 });
 
 /**
- * Picks a timezone in Settings. The list holds every zone a browser knows, so it scrolls, and until the user scrolls it
- * the list keeps realigning to the selected zone as its scroll buttons come and go — which moves the option under the
- * pointer and makes a click land on another one (#492). Scrolling it first, as a user would, settles it.
+ * Picks a timezone in Settings, without saving it. The list holds every zone a browser knows, so it scrolls, and until
+ * the user scrolls it the list keeps realigning to the selected zone as its scroll buttons come and go — which moves
+ * the option under the pointer and makes a click land on another one (#492). Scrolling it first, as a user would,
+ * settles it.
  */
-async function chooseTimezone(page: Page, zone: string) {
+async function pickTimezone(page: Page, zone: string) {
   const setting = page.getByTestId('timezone-setting').getByRole('combobox', { name: 'Timezone' });
   await setting.click();
   await page.getByRole('listbox').hover();
   await page.mouse.wheel(0, -20_000);
   await page.getByRole('option', { name: zone, exact: true }).click();
+  return setting;
+}
+
+/** Picks a timezone and saves it, as Settings asks: its sections save with a button (#370). */
+async function setTimezone(page: Page, zone: string) {
+  const setting = await pickTimezone(page, zone);
+  await page.getByTestId('timezone-setting').getByRole('button', { name: 'Save' }).click();
   return setting;
 }
 
@@ -4899,8 +4985,12 @@ test.describe('in Amsterdam', () => {
     await expect(setting).toContainText('Europe/Amsterdam');
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Europe/Amsterdam');
 
-    await chooseTimezone(page, 'Asia/Tokyo');
+    // Picking one isn't saving it: this section saves with a button, like the others here (#370).
+    await pickTimezone(page, 'Asia/Tokyo');
     await expect(setting).toContainText('Asia/Tokyo');
+    await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Europe/Amsterdam');
+
+    await page.getByTestId('timezone-setting').getByRole('button', { name: 'Save' }).click();
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Asia/Tokyo');
 
     // Once set, it's kept, whatever the browser's.
@@ -4919,10 +5009,28 @@ test.describe('in UTC', () => {
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('UTC');
     await expect(setting).toContainText('UTC');
 
-    await chooseTimezone(page, 'Asia/Tokyo');
+    await setTimezone(page, 'Asia/Tokyo');
     await expect(setting).toContainText('Asia/Tokyo');
-    await chooseTimezone(page, 'UTC');
+    await setTimezone(page, 'UTC');
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('UTC');
+  });
+
+  test('a zone picked while a save is in flight is kept, to save next', async ({ page }) => {
+    await page.request.post('/_mock/forget-timezone');
+    await page.goto('/settings');
+    const setting = page.getByTestId('timezone-setting').getByRole('combobox', { name: 'Timezone' });
+    await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('UTC');
+
+    // The save is slow, so the pick after it lands while it's in flight (#370).
+    await page.request.post('/_mock/slow-settings?ms=700');
+    await pickTimezone(page, 'Asia/Tokyo');
+    await page.getByTestId('timezone-setting').getByRole('button', { name: 'Save' }).click();
+    await pickTimezone(page, 'UTC');
+
+    // The save landed with Asia/Tokyo, and the later pick is still there, to save next.
+    await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Asia/Tokyo');
+    await expect(setting).toContainText('UTC');
+    await expect(page.getByTestId('timezone-setting').getByRole('button', { name: 'Save' })).toBeEnabled();
   });
 
   test('the snooze choices follow a timezone chosen in Settings, without a reload', async ({ page }) => {
@@ -4938,7 +5046,7 @@ test.describe('in UTC', () => {
     // Another timezone in Settings, and back to the session without a reload.
     await page.getByRole('link', { name: 'Settings' }).first().click();
     const setting = page.getByTestId('timezone-setting').getByRole('combobox', { name: 'Timezone' });
-    await chooseTimezone(page, 'Asia/Tokyo');
+    await setTimezone(page, 'Asia/Tokyo');
     await expect.poll(async () => (await (await page.request.get('/api/v1/settings')).json()).timezone).toBe('Asia/Tokyo');
     await page.getByRole('navigation', { name: 'Sessions' }).getByRole('link', { name: /Put the deploy check off/ }).click();
 

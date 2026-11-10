@@ -2586,6 +2586,24 @@ impl Hub {
         self.store.last_event(id).await
     }
 
+    /// Whether the session's log still holds the event with this sequence number, which a load resuming from a UI's
+    /// own place needs it to (#449).
+    pub async fn has_event(&self, id: Uuid, seq: i64) -> Result<bool, sqlx::Error> {
+        self.store.has_event(id, seq).await
+    }
+
+    /// Up to `limit` of the session's recorded updates after `after` and before `before`, oldest first: what a UI
+    /// that reconnects is sent, rather than the whole latest page again (#449).
+    pub async fn events_after(
+        &self,
+        id: Uuid,
+        after: i64,
+        before: i64,
+        limit: i64,
+    ) -> Result<Vec<(i64, DateTime<Utc>, Value)>, sqlx::Error> {
+        self.store.events_after(id, after, before, limit).await
+    }
+
     /// Everything a UI needs when it loads a session, but the log.
     pub async fn replay(&self, id: Uuid) -> Result<Replay, sqlx::Error> {
         let live = self.live(id);

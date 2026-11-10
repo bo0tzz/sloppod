@@ -331,6 +331,10 @@ export class SessionView {
     // Left and shown again while that was waiting: the load this call was for isn't this view's any more, and starting
     // one here would run beside the one that is (#93).
     if (this.#stopped || generation !== this.#generation) return;
+    // Where this view's own copy ends, which it tells the runtime when it loads again: then it's sent only what came
+    // after it rather than the latest page all over again (#449). A view with nothing to resume from asks for the
+    // page, as it always did.
+    const top = this.#updates.reduce((top, u) => Math.max(top, u.seq), 0);
     this.#replay = new Transcript();
     this.#replayUpdates = [];
     this.#loading = true;
@@ -339,6 +343,7 @@ export class SessionView {
         sessionId: this.id,
         cwd: '/',
         mcpServers: [],
+        ...(top > 0 ? { _meta: { sloppod: { after: top } } } : {}),
       });
       // The view was left while the runtime read the session: it has subscribed this socket by now, and stops.
       if (this.#stopped) {
@@ -346,48 +351,59 @@ export class SessionView {
         return;
       }
       if (generation !== this.#generation) return;
-      const before = (response?._meta?.sloppod as { historyBefore?: number | null } | undefined)?.historyBefore ?? null;
+      const meta = (response?._meta?.sloppod ?? {}) as { historyBefore?: number | null; resumed?: boolean };
+      const before = meta.historyBefore ?? null;
       const replay = this.#replayUpdates;
-      // A session this view already had is caught up rather than started over (#93): the replay is the latest page, so
-      // what it doesn't cover goes in front of it — the older pages the reader read into (which carry no seqs of their
-      // own) and the part of its last page that has since fallen off the end. Its own boundary is still the one to ask
-      // for the page before, since the log only grows.
       const catchingUp = this.#updates.length > 0;
-      const top = this.#updates.reduce((top, u) => Math.max(top, u.seq), 0);
-      // The log can grow past this view by more than a page: then the replay starts beyond what it has, and what lies
-      // between is fetched before the two are joined, or the conversation would show a hole it could never fill. A
-      // session's log only grows, so the run is whole; more than a few pages of it is more than this is worth, and the
-      // view starts over from the replay instead.
-      let between: LoggedUpdate[] = [];
-      let ask = before;
-      for (let page = 0; catchingUp && ask !== null && ask > top + 1 && page < GAP_PAGES; page++) {
-        const fetched = await this.#historyPage(ask);
-        // The page's own sequence numbers, which have gaps in them — one sequence serves every session — so the part of
-        // it the view doesn't already have is everything above its own top. Nothing is worked out from the count.
-        const piece: LoggedUpdate[] = fetched.updates.map((update, index) => ({
-          update,
-          seq: fetched.seqs[index],
-          at: fetched.at?.[index] ?? null,
-        }));
-        between = [...piece.filter((u) => u.seq > top), ...between];
-        ask = fetched.before;
+      if (meta.resumed === true && catchingUp) {
+        // The runtime sent only what this view was missing (#449): everything it has is still right, so the updates go
+        // onto the end of the transcript it shows — as live ones do, being the same kind of thing — and the boundary it
+        // holds for older pages is still the one to ask from.
+        const missed = replay.filter((u) => u.seq > top);
+        for (const { update, seq, at } of missed) this.transcript.apply(update, seq, at);
+        this.#updates = [...this.#updates, ...missed];
+      } else {
+        // A session this view already had is caught up rather than started over (#93): the replay is the latest page,
+        // so what it doesn't cover goes in front of it — the older pages the reader read into and the part of its last
+        // page that has since fallen off the end. Its own boundary is still the one to ask for the page before, since
+        // the log only grows.
+        // The log can grow past this view by more than a page: then the replay starts beyond what it has, and what lies
+        // between is fetched before the two are joined, or the conversation would show a hole it could never fill. A
+        // session's log only grows, so the run is whole; more than a few pages of it is more than this is worth, and the
+        // view starts over from the replay instead.
+        let between: LoggedUpdate[] = [];
+        let ask = before;
+        for (let page = 0; catchingUp && ask !== null && ask > top + 1 && page < GAP_PAGES; page++) {
+          const fetched = await this.#historyPage(ask);
+          // The page's own sequence numbers, which have gaps in them — one sequence serves every session — so the part
+          // of it the view doesn't already have is everything above its own top. Nothing is worked out from the count.
+          const piece: LoggedUpdate[] = fetched.updates.map((update, index) => ({
+            update,
+            seq: fetched.seqs[index],
+            at: fetched.at?.[index] ?? null,
+          }));
+          between = [...piece.filter((u) => u.seq > top), ...between];
+          ask = fetched.before;
+        }
+        // Left while those pages were on their way: the close ends this load, as it does above, and a newer showing's
+        // load is the one to go on (#93).
+        if (this.#stopped) {
+          await this.#close();
+          return;
+        }
+        if (generation !== this.#generation) return;
+        const joined = ask === null || ask <= top + 1;
+        const kept = catchingUp && joined ? this.#updates.filter((u) => u.seq === 0 || (before !== null && u.seq < before)) : [];
+        const updates = [...kept, ...(joined ? between : []), ...replay];
+        // Nothing kept is the usual case: the replay is the transcript, as it was built.
+        const transcript = kept.length === 0 && between.length === 0 ? this.#replay! : new Transcript();
+        if (transcript !== this.#replay) {
+          for (const { update, seq, at } of updates) transcript.apply(update, seq, at);
+        }
+        this.transcript = transcript;
+        this.#updates = updates;
+        if (!catchingUp || !joined) this.historyBefore = before;
       }
-      // Left while those pages were on their way: the close ends this load, as it does above, and a newer showing's
-      // load is the one to go on (#93).
-      if (this.#stopped) {
-        await this.#close();
-        return;
-      }
-      if (generation !== this.#generation) return;
-      const joined = ask === null || ask <= top + 1;      const kept = catchingUp && joined
-        ? this.#updates.filter((u) => u.seq === 0 || (before !== null && u.seq < before))
-        : [];
-      const updates = [...kept, ...(joined ? between : []), ...replay];
-      // Nothing kept is the usual case: the replay is the transcript, as it was built.
-      const transcript = kept.length === 0 && between.length === 0 ? this.#replay! : new Transcript();
-      if (transcript !== this.#replay) for (const { update, seq, at } of updates) transcript.apply(update, seq, at);      this.transcript = transcript;
-      this.#updates = updates;
-      if (!catchingUp || !joined) this.historyBefore = before;
       this.historyError = null;
       this.configOptions = response?.configOptions ?? [];
     } finally {

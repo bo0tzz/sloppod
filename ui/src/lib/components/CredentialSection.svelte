@@ -16,6 +16,7 @@
   import { mdiPlus, mdiTrashCanOutline } from '@mdi/js';
   import { api, type Credential, type GitHubUserConfig } from '#lib/api.ts';
   import { absoluteTime } from '#lib/format.ts';
+  import { opensForAdding } from '#lib/forms.ts';
   import { tokenExpiry, type CredentialKindSpec } from '#lib/presentation.ts';
 
   let {
@@ -156,7 +157,7 @@
   {/if}
 
   {#if adding}
-    <form class="border-light-200 bg-light-50 flex flex-col gap-3 rounded-2xl border p-4" onsubmit={save}>
+    <form use:opensForAdding={reset} class="border-light-200 bg-light-50 flex flex-col gap-3 rounded-2xl border p-4" onsubmit={save}>
       <Heading tag="h3" size="tiny">New {spec.noun}</Heading>
       <Field label="Name" required="indicator">
         <Input bind:value={name} autocomplete="off" />
