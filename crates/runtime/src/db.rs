@@ -2025,21 +2025,57 @@ pub async fn due_highlights(db: &PgPool) -> sqlx::Result<Vec<HighlightRow>> {
     .await
 }
 
-/// Marks one of the session's highlights seen, if it's still open; the row either way, none if it isn't the session's.
-/// The caller keeps the note the agent hears about it (#462); this only records it.
-pub async fn mark_highlight_seen(
-    db: &PgPool,
-    session: Uuid,
-    id: Uuid,
-) -> sqlx::Result<Option<HighlightRow>> {
-    sqlx::query_as(AssertSqlSafe(format!(
-        "update highlights set seen_at = case when retracted_at is null then coalesce(seen_at, now()) else seen_at end \
-         where id = $1 and session_id = $2 returning {HIGHLIGHT_COLUMNS}"
+/// What came of the user marking a highlight seen.
+pub enum Marked {
+    /// It was open, and is seen now: the one outcome the agent hears about (#462).
+    Seen(HighlightRow),
+    /// The user had marked it seen already, and a second request changes nothing.
+    AlreadySeen(HighlightRow),
+    /// The agent took it back first, so marking it seen changes nothing.
+    Retracted(HighlightRow),
+    /// No such highlight of the session's.
+    NotFound,
+}
+
+impl Marked {
+    /// The highlight as it is now, for the answer a UI gets either way.
+    pub fn row(self) -> Option<HighlightRow> {
+        match self {
+            Marked::Seen(row) | Marked::AlreadySeen(row) | Marked::Retracted(row) => Some(row),
+            Marked::NotFound => None,
+        }
+    }
+}
+
+/// Marks one of the session's highlights seen, if it's still open, and says what the request came to: only a highlight
+/// that was open is one the agent hears the user has seen (#462), so the caller notes just that. A request that changes
+/// nothing is answered with the row as it is, so a UI clicking Seen twice, or on a card the agent has taken back, gets
+/// the same answer as the first time.
+pub async fn mark_highlight_seen(db: &PgPool, session: Uuid, id: Uuid) -> sqlx::Result<Marked> {
+    let open: Option<HighlightRow> = sqlx::query_as(AssertSqlSafe(format!(
+        "update highlights set seen_at = now() \
+         where id = $1 and session_id = $2 and seen_at is null and retracted_at is null \
+         returning {HIGHLIGHT_COLUMNS}"
     )))
     .bind(id)
     .bind(session)
     .fetch_optional(db)
-    .await
+    .await?;
+    if let Some(row) = open {
+        return Ok(Marked::Seen(row));
+    }
+    let found: Option<HighlightRow> = sqlx::query_as(AssertSqlSafe(format!(
+        "select {HIGHLIGHT_COLUMNS} from highlights where id = $1 and session_id = $2"
+    )))
+    .bind(id)
+    .bind(session)
+    .fetch_optional(db)
+    .await?;
+    Ok(match found {
+        Some(row) if row.retracted_at.is_some() => Marked::Retracted(row),
+        Some(row) => Marked::AlreadySeen(row),
+        None => Marked::NotFound,
+    })
 }
 
 /// What came of the agent taking a highlight back.

@@ -531,10 +531,15 @@ impl Hub {
         *self.live(id).heard_at.lock().expect("hub lock") = Some(self.now());
     }
 
-    /// `blocks` as the agent gets them: after a gap, and always for a notice, led by a line with the time; then any
-    /// note about highlights the user has seen (#462), which rides along with this turn and is taken with it.
-    async fn with_time(&self, id: Uuid, blocks: Vec<Value>, notice: bool) -> Vec<Value> {
-        let notes = self.take_riding_notes(id).await;
+    /// `blocks` as the agent gets them: after a gap, and always for a notice, led by a line with the time; then the
+    /// `riding` notes given, which lead this prompt and are told with it (#462).
+    async fn with_time(
+        &self,
+        id: Uuid,
+        blocks: Vec<Value>,
+        notice: bool,
+        riding: Vec<Value>,
+    ) -> Vec<Value> {
         let heard_at = self.heard_at(id).await;
         let zone = match self.store.get_session(id).await {
             Ok(Some(row)) => self.store.owner_zone(&row.owner).await,
@@ -548,13 +553,13 @@ impl Hub {
         time_line(self.now(), heard_at, notice, zone)
             .map(|line| json!({"type": "text", "text": line}))
             .into_iter()
-            .chain(notes)
+            .chain(riding)
             .chain(blocks)
             .collect()
     }
 
-    /// Takes the queue's riding notes, for the prompt about to be sent: they're told once, and what is being sent is
-    /// where they go. Nothing if there are none.
+    /// Takes the queue's riding notes — the highlights the user has seen (#462) — for the prompt about to be sent:
+    /// they're told once, and what is being sent is where they go. Nothing if there are none.
     async fn take_riding_notes(&self, id: Uuid) -> Vec<Value> {
         let live = self.live(id);
         let mut state = live.state.lock().await;
@@ -567,6 +572,28 @@ impl Hub {
         state.queue = rest;
         self.save_queue(id, &state).await;
         notes.into_iter().flat_map(|q| q.blocks).collect()
+    }
+
+    /// Puts riding notes back at the front of the queue: the prompt they were taken for wasn't sent after all, so they
+    /// wait for the next one that is.
+    async fn return_riding_notes(&self, id: Uuid, notes: Vec<Value>) {
+        if notes.is_empty() {
+            return;
+        }
+        let live = self.live(id);
+        let mut state = live.state.lock().await;
+        state.queue.insert(
+            0,
+            Queued {
+                id: None,
+                blocks: notes,
+                notice: false,
+                ride_along: true,
+                reply: None,
+                seq: 0,
+            },
+        );
+        self.save_queue(id, &state).await;
     }
 
     pub fn set_proposal_kinds(&self, kinds: crate::proposals::ProposalKinds) {
@@ -1087,11 +1114,24 @@ impl Hub {
                         .await;
                 }
             }
-            let mut blocks: Vec<Value> = pending
+            // The notes about seen highlights come first, whatever order they joined the queue in (#462): a note leads
+            // the user's message, which is what the prompt's guidance about them tells the agent to expect.
+            let mut blocks: Vec<Value> = queued
                 .iter()
-                .map(|text| json!({"type": "text", "text": text}))
+                .filter(|q| q.ride_along)
+                .flat_map(|q| q.blocks.iter().cloned())
                 .collect();
-            blocks.extend(queued.iter().flat_map(|q| q.blocks.iter().cloned()));
+            blocks.extend(
+                pending
+                    .iter()
+                    .map(|text| json!({"type": "text", "text": text})),
+            );
+            blocks.extend(
+                queued
+                    .iter()
+                    .filter(|q| !q.ride_along)
+                    .flat_map(|q| q.blocks.iter().cloned()),
+            );
             let notice = queued.iter().any(|q| q.notice);
             // One decision under the lock, so no other agent's readiness or turn can slip in between.
             let started = {
@@ -1897,7 +1937,10 @@ impl Hub {
         notice: bool,
         held: Option<Uuid>,
     ) -> Result<Value, RpcError> {
-        let prompt = self.with_time(id, blocks, notice).await;
+        // Taken for this turn, and put back if it turns out not to be sent: the agent hears them with whatever goes
+        // after it instead (#462).
+        let riding = self.take_riding_notes(id).await;
+        let prompt = self.with_time(id, blocks, notice, riding.clone()).await;
         #[cfg(test)]
         self.send_gate.pass().await;
         // Sent and noted under the lock a link's going takes, so that either finds the other done: a turn sent on a
@@ -1917,6 +1960,7 @@ impl Hub {
             }
         };
         let Some(answer) = answer else {
+            self.return_riding_notes(id, riding).await;
             return Err(self.unsent(id, held).await);
         };
         let result = answer.await;
@@ -2267,12 +2311,12 @@ impl Hub {
 
     /// Tells the agent which of its highlights the user has seen (#462), with its next turn rather than a turn of its
     /// own: the user's next message, a notice, a steer. One note however many highlights: each is a line of it. It
-    /// waits in the queue, and so through a restart, until something is sent that it can go with.
-    pub async fn note_highlight_seen(
-        self: &Arc<Self>,
-        id: Uuid,
-        highlight: &crate::db::HighlightRow,
-    ) {
+    /// waits in the queue, and so through a restart, until something is sent that it can go with. Only a highlight that
+    /// was open and is seen now is told: a second Seen, or one the agent has taken back, says nothing.
+    pub async fn note_highlight_seen(self: &Arc<Self>, id: Uuid, marked: &crate::db::Marked) {
+        let crate::db::Marked::Seen(highlight) = marked else {
+            return;
+        };
         let line = format!(
             "sloppod: the user has seen your highlight {}: {}",
             highlight.id,
@@ -2313,10 +2357,21 @@ impl Hub {
         held: Option<Uuid>,
         message: Option<Uuid>,
     ) -> Result<Value, RpcError> {
+        // Taken once, and with every attempt from here on: a steer the agent turns into a prompt, or one that can't be
+        // delivered at all, must not lose the notes that were meant to lead this message (#462).
+        let riding = self.take_riding_notes(id).await;
         for _ in 0..10 {
             self.before_steer(id, notice).await;
-            let (agent, agent_session_id) = self.agent_for(id).await?;
-            let prompt = self.with_time(id, blocks.clone(), notice).await;
+            let (agent, agent_session_id) = match self.agent_for(id).await {
+                Ok(found) => found,
+                Err(e) => {
+                    self.return_riding_notes(id, riding).await;
+                    return Err(e);
+                }
+            };
+            let prompt = self
+                .with_time(id, blocks.clone(), notice, riding.clone())
+                .await;
             let (request, answer) = agent.send_request(
                 "_session/steering",
                 json!({
@@ -2326,7 +2381,13 @@ impl Hub {
                 }),
             );
             self.sent(id, held, request, false).await;
-            let result = answer.await?;
+            let result = match answer.await {
+                Ok(result) => result,
+                Err(e) => {
+                    self.return_riding_notes(id, riding).await;
+                    return Err(e);
+                }
+            };
             if result["outcome"] != "promptRequired" {
                 if message.is_some() {
                     self.record_user_message(id, &json!(blocks), true, message)
@@ -2343,6 +2404,8 @@ impl Hub {
                 !std::mem::replace(&mut state.turn_running, true)
             };
             if start {
+                // Back in the queue, where the turn that starts now takes them and leads its prompt with them.
+                self.return_riding_notes(id, riding).await;
                 let queued = vec![Queued {
                     id: message,
                     blocks,
@@ -2357,6 +2420,7 @@ impl Hub {
             // Our record of the turn hasn't caught up with the agent's yet.
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
+        self.return_riding_notes(id, riding).await;
         Err(RpcError::new(
             -32002,
             "couldn't deliver the message; send it again",

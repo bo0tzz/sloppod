@@ -1039,10 +1039,9 @@ async fn mark_highlight_seen(
     db::owned_session(&state.db, id, &user)
         .await?
         .ok_or_else(not_found)?;
-    let row = db::mark_highlight_seen(&state.db, id, highlight)
-        .await?
-        .ok_or_else(not_found)?;
-    state.hub.note_highlight_seen(id, &row).await;
+    let marked = db::mark_highlight_seen(&state.db, id, highlight).await?;
+    state.hub.note_highlight_seen(id, &marked).await;
+    let row = marked.row().ok_or_else(not_found)?;
     let highlight = row.to_api();
     state.hub.broadcast_highlight(&highlight);
     Ok(Json(highlight))

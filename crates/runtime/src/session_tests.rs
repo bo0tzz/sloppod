@@ -555,6 +555,22 @@ fn highlight(id: Uuid, session: Uuid, text: &str) -> crate::db::HighlightRow {
     }
 }
 
+/// A highlight the user has just marked seen, as the store reports it to the route: the one outcome the agent hears
+/// about (#462).
+fn seen_highlight(id: Uuid, session: Uuid, text: &str) -> crate::db::Marked {
+    crate::db::Marked::Seen(highlight(id, session, text))
+}
+
+/// A highlight the agent has taken back, so marking it seen changes nothing.
+fn retracted_highlight(id: Uuid, session: Uuid, text: &str) -> crate::db::HighlightRow {
+    crate::db::HighlightRow {
+        seen_at: None,
+        retracted_at: Some(START.parse().unwrap()),
+        retraction_reason: Some("wrong".into()),
+        ..highlight(id, session, text)
+    }
+}
+
 #[tokio::test]
 async fn a_seen_highlight_is_told_with_the_next_turn_and_starts_no_turn() {
     let mut h = Harness::ready().await;
@@ -562,7 +578,7 @@ async fn a_seen_highlight_is_told_with_the_next_turn_and_starts_no_turn() {
     h.hub
         .note_highlight_seen(
             h.id,
-            &highlight(id, h.id, "The build is green\nand the tag is pushed"),
+            &seen_highlight(id, h.id, "The build is green\nand the tag is pushed"),
         )
         .await;
 
@@ -601,10 +617,10 @@ async fn two_seen_highlights_make_one_note() {
     let mut h = Harness::ready().await;
     let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
     h.hub
-        .note_highlight_seen(h.id, &highlight(first, h.id, "It's done"))
+        .note_highlight_seen(h.id, &seen_highlight(first, h.id, "It's done"))
         .await;
     h.hub
-        .note_highlight_seen(h.id, &highlight(second, h.id, "Re-run the job"))
+        .note_highlight_seen(h.id, &seen_highlight(second, h.id, "Re-run the job"))
         .await;
 
     // One note, with a line for each: the agent gets it all in one prompt rather than one per highlight.
@@ -625,12 +641,106 @@ async fn two_seen_highlights_make_one_note() {
 }
 
 #[tokio::test]
+async fn a_note_leads_a_message_that_was_already_waiting() {
+    let mut h = Harness::ready().await;
+    let id = Uuid::new_v4();
+    let busy = h.prompt("Busy");
+    let busy_request = h.next().await;
+
+    // The user's message queues behind the turn, and they mark a highlight seen after that: the note still leads it,
+    // whatever order the two joined the queue in (#462).
+    let later = h.prompt("Later");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    h.hub
+        .note_highlight_seen(h.id, &seen_highlight(id, h.id, "It's done"))
+        .await;
+
+    h.respond(&busy_request, json!({"stopReason": "end_turn"}))
+        .await;
+    busy.await.unwrap().unwrap();
+    let next = h.next().await;
+    assert_eq!(
+        prompt_text(&next),
+        [
+            format!("sloppod: the user has seen your highlight {id}: It's done"),
+            "Later".to_owned(),
+        ]
+    );
+    h.respond(&next, json!({"stopReason": "end_turn"})).await;
+    later.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_steer_the_agent_turns_into_a_prompt_still_carries_the_note() {
+    let mut h = Harness::ready().await;
+    let id = Uuid::new_v4();
+    h.hub
+        .note_highlight_seen(h.id, &seen_highlight(id, h.id, "It's done"))
+        .await;
+
+    // A steer on an agent whose turn it won't take: it asks for a prompt instead, and the note goes with that rather
+    // than being lost with the steer (#462).
+    let steer = {
+        let (hub, session) = (h.hub.clone(), h.id);
+        tokio::spawn(async move {
+            hub.steer(
+                session,
+                json!({"sessionId": session, "prompt": [{"type": "text", "text": "Also this"}]}),
+            )
+            .await
+        })
+    };
+    let steering = h.next().await;
+    assert_eq!(steering["method"], "_session/steering");
+    h.respond(&steering, json!({"outcome": "promptRequired"}))
+        .await;
+    let turn = h.next().await;
+    assert_eq!(turn["method"], "session/prompt");
+    assert_eq!(
+        prompt_text(&turn),
+        [
+            format!("sloppod: the user has seen your highlight {id}: It's done"),
+            "Also this".to_owned(),
+        ]
+    );
+    h.respond(&turn, json!({"stopReason": "end_turn"})).await;
+    steer.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn only_a_highlight_that_was_open_is_heard_about() {
+    let mut h = Harness::ready().await;
+    let id = Uuid::new_v4();
+    // What the route passes on is what the store said came of the request: a second Seen, and one the agent took back
+    // first, are both nothing the agent should be told the user has seen (#462).
+    h.hub
+        .note_highlight_seen(
+            h.id,
+            &crate::db::Marked::AlreadySeen(highlight(id, h.id, "It's done")),
+        )
+        .await;
+    h.hub
+        .note_highlight_seen(
+            h.id,
+            &crate::db::Marked::Retracted(retracted_highlight(id, h.id, "It's done")),
+        )
+        .await;
+    assert!(h.store.queues().await.unwrap().is_empty());
+
+    let turn = h.prompt("Carry on");
+    let request = h.next().await;
+    assert_eq!(prompt_text(&request), ["Carry on"]);
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn a_seen_highlight_wakes_no_parked_session_not_even_after_a_restart() {
     let mut h = Harness::starting().await;
     h.store.set_phase(h.id, Phase::Parked).await.unwrap();
     let id = Uuid::new_v4();
     h.hub
-        .note_highlight_seen(h.id, &highlight(id, h.id, "It's done"))
+        .note_highlight_seen(h.id, &seen_highlight(id, h.id, "It's done"))
         .await;
     assert!(h.to_agent.try_recv().is_err());
     assert_eq!(kept_texts(&h).await.len(), 1);
