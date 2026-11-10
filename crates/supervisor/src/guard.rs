@@ -5,6 +5,7 @@
 use std::io::Read;
 
 use serde_json::Value;
+use sloppod_contracts::github::{Site, clone_instead, repo_path, single_file_read};
 
 /// Reads the hook's input from stdin; exits 2 with the reason on stderr to refuse, which Claude Code shows the agent.
 pub fn run() -> i32 {
@@ -37,7 +38,11 @@ fn refusal(call: &Value) -> Option<String> {
     let commands = split(command);
     commands
         .iter()
-        .find_map(|c| blanket_staging(&c.words).or_else(|| pkill(&c.words)))
+        .find_map(|c| {
+            blanket_staging(&c.words)
+                .or_else(|| pkill(&c.words))
+                .or_else(|| file_fetch(&c.words))
+        })
         .or_else(|| watched.then(|| pgrep_wait(&commands)).flatten())
         .or_else(|| watched.then(|| detached(&commands)).flatten())
         .or_else(|| loop_wait(&commands))
@@ -272,6 +277,129 @@ fn pkill(words: &[String]) -> Option<String> {
     })
 }
 
+/// Reading one file from GitHub with a command, which the agent clones the repository for instead. The same rule the
+/// runtime's request policy applies to the requests themselves (`sloppod_contracts::github`), and the same words, so
+/// the agent hears it before a request is made and however it tried.
+///
+/// `raw.githubusercontent.com` stays reachable at the network level — package and tool installers fetch from it, so
+/// it's one of the hosts a session reaches directly (`SLOPPOD_DIRECT_HOSTS`, ADR 11) — which is why an agent's own
+/// commands are refused here rather than at egress.
+fn file_fetch(words: &[String]) -> Option<String> {
+    let program = program(words);
+    match program.first()?.as_str() {
+        "gh" => gh_file_fetch(&program[1..]),
+        "curl" | "wget" => download_file_fetch(&program[1..]),
+        _ => None,
+    }
+}
+
+/// A `gh` command that reads one file: `gh api` of a single-file endpoint, and `gh browse` of a path.
+fn gh_file_fetch(args: &[String]) -> Option<String> {
+    match args.first()?.as_str() {
+        "api" => {
+            let endpoint = api_path(&args[1..])?;
+            single_file_read(Site::Api, &endpoint).map(|repo| clone_instead(Some(&repo)))
+        }
+        // The repository is the working copy's, which a command line doesn't say: the hint is the generic one.
+        "browse" => browse_path(&args[1..])
+            .is_some_and(|path| path.contains('/') || path.contains('.'))
+            .then(|| clone_instead(None)),
+        _ => None,
+    }
+}
+
+/// The long flags whose value is the next word, for the tools read here.
+const TAKES_VALUE: [&str; 17] = [
+    "-H",
+    "--header",
+    "-X",
+    "--method",
+    "-f",
+    "--raw-field",
+    "-F",
+    "--field",
+    "--input",
+    "-q",
+    "--jq",
+    "-t",
+    "--template",
+    "--hostname",
+    "--cache",
+    "-b",
+    "--branch",
+];
+
+/// A `gh api` command's endpoint, as a path: `repos/o/r/contents/x`, `/repos/…` and `https://api.github.com/repos/…`
+/// all read the same. `None` when the command has no endpoint, or one the flags hid.
+fn api_path(args: &[String]) -> Option<String> {
+    let endpoint = first_positional(args)?;
+    let path = endpoint
+        .strip_prefix("https://api.github.com")
+        .or_else(|| endpoint.strip_prefix("http://api.github.com"))
+        .unwrap_or(&endpoint);
+    Some(if path.starts_with('/') {
+        path.to_owned()
+    } else {
+        format!("/{path}")
+    })
+}
+
+/// The path a `gh browse` command names, if it names one.
+fn browse_path(args: &[String]) -> Option<String> {
+    first_positional(args)
+}
+
+/// The first word that isn't a flag or a flag's value: the positional argument a command takes.
+fn first_positional(args: &[String]) -> Option<String> {
+    let mut args = args.iter();
+    while let Some(word) = args.next() {
+        if word == "--" {
+            return args.next().cloned();
+        }
+        if word.starts_with('-') {
+            // A flag's value is the next word, unless it's attached with `=`.
+            if TAKES_VALUE.contains(&word.as_str()) {
+                args.next();
+            }
+            continue;
+        }
+        return Some(word.clone());
+    }
+    None
+}
+
+/// A `curl` or `wget` of one file from GitHub: `raw.githubusercontent.com`, or github.com's `…/raw/…` and
+/// `…/blob/…` views.
+fn download_file_fetch(args: &[String]) -> Option<String> {
+    args.iter()
+        .find_map(|word| github_file_url(word))
+        .map(|repo| clone_instead(repo.as_deref()))
+}
+
+/// The repository a word is a download of one file from, if it is: `raw.githubusercontent.com/<owner>/<name>/…` (the
+/// raw host serves one file, whatever the path), or github.com's view of one. `Some(None)` when it's a download of
+/// one file but the URL doesn't name a repository, which the hint says without one.
+fn github_file_url(word: &str) -> Option<Option<String>> {
+    let (host, path) = url_parts(word)?;
+    match host {
+        "raw.githubusercontent.com" => {
+            Some(repo_path(&format!("/{path}"), "/").map(|(repo, _)| repo))
+        }
+        "github.com" | "www.github.com" => {
+            single_file_read(Site::Web, &format!("/{path}")).map(Some)
+        }
+        _ => None,
+    }
+}
+
+/// A URL's host and path, from a word that's one, with a scheme or without, and with any userinfo and port.
+fn url_parts(word: &str) -> Option<(&str, &str)> {
+    let rest = word.split_once("://").map(|(_, rest)| rest).unwrap_or(word);
+    let (authority, path) = rest.split_once('/')?;
+    let host = authority.rsplit('@').next()?.split(':').next()?;
+    (!host.is_empty() && !path.is_empty()).then_some((host, path))
+}
+
 /// Whether a simple command is `pgrep` with `-f`, which matches the watcher's own shell.
 fn pgrep_f(words: &[String]) -> bool {
     let words = program(words);
@@ -412,6 +540,77 @@ mod tests {
         assert!(bash("sleep 1; pkill node").is_some());
         assert_eq!(bash("pgrep -af node"), None);
         assert_eq!(bash("kill 1234"), None);
+    }
+
+    #[test]
+    fn refuses_reading_one_file_from_github() {
+        for command in [
+            "gh api repos/o/r/contents/src/main.rs",
+            "gh api /repos/o/r/contents/README.md",
+            "gh api repos/o/r/contents",
+            "gh api repos/o/r/readme",
+            "gh api repos/o/r/readme/docs",
+            "gh api repos/o/r/git/blobs/8e2a1c",
+            "gh api --method GET -H 'Accept: application/vnd.github.raw' repos/o/r/git/blobs/8e2a1c",
+            "gh api https://api.github.com/repos/o/r/contents/a/b",
+            "gh api -q .name /repos/o/r/contents",
+            "cd /workspace/repo && gh api repos/o/r/contents/x",
+            "gh browse src/main.rs",
+            "gh browse README.md",
+            "gh browse -- wiki/Home.md",
+            "curl -sL https://raw.githubusercontent.com/o/r/main/src/main.rs",
+            "curl -s https://raw.githubusercontent.com/o/r/main/f -o out.txt",
+            "wget https://raw.githubusercontent.com/o/r/main/README.md",
+            "curl https://github.com/o/r/raw/main/src/main.rs",
+            "curl -O https://github.com/o/r/blob/main/src/main.rs",
+        ] {
+            assert!(
+                bash(command).is_some_and(|r| r.contains("clone the repository instead")),
+                "{command}"
+            );
+        }
+        // The hint names the clone to make, when the command says which repository it's about.
+        assert!(
+            bash("gh api repos/futo/kupra/contents/README.md")
+                .is_some_and(|r| r.contains("https://github.com/futo/kupra /workspace/tmp/kupra"))
+        );
+        assert!(
+            bash("curl -sL https://raw.githubusercontent.com/futo/kupra/main/x.rs")
+                .is_some_and(|r| r.contains("https://github.com/futo/kupra /workspace/tmp/kupra"))
+        );
+    }
+
+    #[test]
+    fn leaves_the_rest_of_github_alone_at_the_command_line() {
+        for command in [
+            "git clone --depth 1 https://github.com/o/r /workspace/tmp/r",
+            "git clone --branch fix https://github.com/o/r.git /workspace/tmp/r",
+            "git fetch origin",
+            "gh issue view 12",
+            "gh pr view 12 --comments",
+            "gh api repos/o/r/pulls/12",
+            "gh api /repos/o/r/pulls",
+            "gh api repos/o/r/issues -q '.[].title'",
+            "gh api repos/o/r/contentsomething",
+            "gh api repos/o/r/git/trees/main",
+            "gh api repos/o/r/git/blobsomething",
+            // A repository named `blob` or `raw` is read through the API like any other.
+            "gh api repos/acme/blob/issues",
+            "gh api repos/acme/blob/git/trees/main",
+            "gh api repos/acme/raw/pulls",
+            "gh api search/code -f q=clone",
+            "gh api graphql -f query='{ viewer { login } }'",
+            "gh api -X POST repos/o/r/issues -f title=x",
+            "gh browse",
+            "gh browse 12",
+            "gh browse -b main",
+            "curl -sL https://api.github.com/repos/o/r/git/trees/main",
+            "curl -sL https://github.com/o/r/archive/main.tar.gz",
+            "wget https://objects.githubusercontent.com/o/r/main/f",
+            "curl -sL https://raw.githubusercontent.com.evil.test/o/r/main/f",
+        ] {
+            assert_eq!(bash(command), None, "{command}");
+        }
     }
 
     #[test]

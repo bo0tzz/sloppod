@@ -141,6 +141,12 @@ fn environment(context: &AgentContext, acts: bool) -> String {
             context.repos_dir
         ));
     }
+    lines.push_str(&format!(
+        "- To read another repository, clone it shallowly into `$TMPDIR` ({}/tmp), e.g. `git clone --depth 1 \
+         https://github.com/<owner>/<repo>`; single files and lines aren't fetched remotely, so read the clone \
+         locally instead.\n",
+        context.workdir
+    ));
     if acts {
         lines.push_str(&format!(
             "- Only {workdir} survives a restart of the pod: keep your work there, and use `$TMPDIR` \

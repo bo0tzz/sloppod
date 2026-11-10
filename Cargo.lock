@@ -3331,6 +3331,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "serde_json",
+ "sloppod-contracts",
  "sloppod-protocol",
  "tokio",
  "tokio-tungstenite 0.30.0",
