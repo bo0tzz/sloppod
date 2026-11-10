@@ -110,6 +110,96 @@ fn err(e: impl std::fmt::Display) -> Error {
     Error::new(e.to_string())
 }
 
+/// The `Sandbox` a session is placed as: one pod with the session's workspace volume. With `spec.clone_from` set,
+/// that volume starts as a copy of another session's claim — `dataSource` makes the cluster clone it, which only a
+/// storage class that supports cloning can do (#478). Nothing here checks that: the session's supervisor is told the
+/// workspace was copied, and the runtime falls back to a fresh one when the clone never arrives.
+fn sandbox(spec: &PlacementSpec, service_account: &str, pull_policy: &str) -> serde_json::Value {
+    let env: Vec<_> = spec
+        .env
+        .iter()
+        .map(|(k, v)| json!({"name": k, "value": v}))
+        .collect();
+    let mut limits = serde_json::Map::new();
+    let mut requests = serde_json::Map::new();
+    if let Some(memory) = &spec.memory {
+        limits.insert("memory".into(), json!(memory));
+        requests.insert("memory".into(), json!(memory));
+    }
+    if let Some(cpu) = &spec.cpu {
+        requests.insert("cpu".into(), json!(cpu));
+    }
+    let mut claim = json!({
+        "accessModes": ["ReadWriteOnce"],
+        "resources": {"requests": {"storage": spec.storage_size}},
+    });
+    if let Some(class) = &spec.storage_class {
+        claim["storageClassName"] = json!(class);
+    }
+    if let Some(from) = &spec.clone_from {
+        claim["dataSource"] = json!({"kind": "PersistentVolumeClaim", "name": claim_name(from)});
+    }
+    json!({
+        "apiVersion": "agents.x-k8s.io/v1beta1",
+        "kind": "Sandbox",
+        "metadata": {"name": sandbox_name(&spec.session_id), "labels": spec.labels},
+        "spec": {
+            "operatingMode": "Running",
+            "podTemplate": {
+                "metadata": {"labels": spec.labels},
+                "spec": {
+                    "serviceAccountName": service_account,
+                    "automountServiceAccountToken": false,
+                    "enableServiceLinks": false,
+                    "terminationGracePeriodSeconds": 90,
+                    "securityContext": {
+                        "runAsUser": 1000,
+                        "runAsGroup": 1000,
+                        "fsGroup": 1000,
+                        // Re-own the volume only when its root isn't already the fsGroup, not on every mount:
+                        // a workdir with many files (node_modules, git objects) is slow to chown each time,
+                        // so a remounted session pod would otherwise stall while the kubelet walks it.
+                        "fsGroupChangePolicy": "OnRootMismatch",
+                        "runAsNonRoot": true,
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
+                    "containers": [{
+                        "name": "session",
+                        "image": spec.image,
+                        "imagePullPolicy": pull_policy,
+                        "env": env,
+                        "resources": {"limits": limits, "requests": requests},
+                        // The supervisor keeps the agent through link drops; a link down past its grace
+                        // period (or a wedged supervisor) restarts the container (ADR 17).
+                        "livenessProbe": {
+                            "exec": {"command": ["sloppod-supervisor", "--check"]},
+                            "periodSeconds": 30,
+                            "failureThreshold": 3,
+                        },
+                        "volumeMounts": [
+                            {"name": "workdir", "mountPath": WORKDIR},
+                            {"name": "sloppod-token", "mountPath": TOKEN_DIR, "readOnly": true},
+                        ],
+                        "securityContext": {
+                            "allowPrivilegeEscalation": false,
+                            "capabilities": {"drop": ["ALL"]},
+                        },
+                    }],
+                    "volumes": [{
+                        "name": "sloppod-token",
+                        "projected": {"sources": [{"serviceAccountToken": {
+                            "audience": "sloppod",
+                            "expirationSeconds": 3600,
+                            "path": "token",
+                        }}]},
+                    }],
+                },
+            },
+            "volumeClaimTemplates": [{"metadata": {"name": "workdir"}, "spec": claim}],
+        },
+    })
+}
+
 #[async_trait]
 impl PlacementBackend for AgentSandbox {
     fn manifest(&self) -> Manifest {
@@ -118,86 +208,7 @@ impl PlacementBackend for AgentSandbox {
 
     async fn ensure(&self, spec: &PlacementSpec) -> Result<()> {
         let name = sandbox_name(&spec.session_id);
-        let env: Vec<_> = spec
-            .env
-            .iter()
-            .map(|(k, v)| json!({"name": k, "value": v}))
-            .collect();
-        let mut limits = serde_json::Map::new();
-        let mut requests = serde_json::Map::new();
-        if let Some(memory) = &spec.memory {
-            limits.insert("memory".into(), json!(memory));
-            requests.insert("memory".into(), json!(memory));
-        }
-        if let Some(cpu) = &spec.cpu {
-            requests.insert("cpu".into(), json!(cpu));
-        }
-        let mut claim = json!({
-            "accessModes": ["ReadWriteOnce"],
-            "resources": {"requests": {"storage": spec.storage_size}},
-        });
-        if let Some(class) = &spec.storage_class {
-            claim["storageClassName"] = json!(class);
-        }
-        let sandbox = json!({
-            "apiVersion": "agents.x-k8s.io/v1beta1",
-            "kind": "Sandbox",
-            "metadata": {"name": name, "labels": spec.labels},
-            "spec": {
-                "operatingMode": "Running",
-                "podTemplate": {
-                    "metadata": {"labels": spec.labels},
-                    "spec": {
-                        "serviceAccountName": self.service_account,
-                        "automountServiceAccountToken": false,
-                        "enableServiceLinks": false,
-                        "terminationGracePeriodSeconds": 90,
-                        "securityContext": {
-                            "runAsUser": 1000,
-                            "runAsGroup": 1000,
-                            "fsGroup": 1000,
-                            // Re-own the volume only when its root isn't already the fsGroup, not on every mount:
-                            // a workdir with many files (node_modules, git objects) is slow to chown each time,
-                            // so a remounted session pod would otherwise stall while the kubelet walks it.
-                            "fsGroupChangePolicy": "OnRootMismatch",
-                            "runAsNonRoot": true,
-                            "seccompProfile": {"type": "RuntimeDefault"},
-                        },
-                        "containers": [{
-                            "name": "session",
-                            "image": spec.image,
-                            "imagePullPolicy": self.pull_policy,
-                            "env": env,
-                            "resources": {"limits": limits, "requests": requests},
-                            // The supervisor keeps the agent through link drops; a link down past its grace
-                            // period (or a wedged supervisor) restarts the container (ADR 17).
-                            "livenessProbe": {
-                                "exec": {"command": ["sloppod-supervisor", "--check"]},
-                                "periodSeconds": 30,
-                                "failureThreshold": 3,
-                            },
-                            "volumeMounts": [
-                                {"name": "workdir", "mountPath": WORKDIR},
-                                {"name": "sloppod-token", "mountPath": TOKEN_DIR, "readOnly": true},
-                            ],
-                            "securityContext": {
-                                "allowPrivilegeEscalation": false,
-                                "capabilities": {"drop": ["ALL"]},
-                            },
-                        }],
-                        "volumes": [{
-                            "name": "sloppod-token",
-                            "projected": {"sources": [{"serviceAccountToken": {
-                                "audience": "sloppod",
-                                "expirationSeconds": 3600,
-                                "path": "token",
-                            }}]},
-                        }],
-                    },
-                },
-                "volumeClaimTemplates": [{"metadata": {"name": "workdir"}, "spec": claim}],
-            },
-        });
+        let sandbox = sandbox(spec, &self.service_account, &self.pull_policy);
         self.api
             .patch(
                 &name,
@@ -207,6 +218,14 @@ impl PlacementBackend for AgentSandbox {
             .await
             .map_err(err)?;
         Ok(())
+    }
+
+    /// Whether a session's volume is there to copy (#478): its claim exists and the cluster has provisioned it.
+    async fn can_copy_workspace(&self, from: &str) -> Result<bool> {
+        Ok(self
+            .volume(from)
+            .await?
+            .is_some_and(|volume| volume.capacity.is_some()))
     }
 
     async fn suspend(&self, session_id: &str) -> Result<()> {

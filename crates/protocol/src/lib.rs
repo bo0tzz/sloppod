@@ -609,6 +609,13 @@ pub mod link {
         pub repo: Option<Repo>,
         /// Run `mise install` in the checkout when it has a mise config.
         pub install_tools: bool,
+        /// This workspace is a copy of another session's volume (#478), and hasn't been taken over yet: the
+        /// supervisor puts the checkout on this session's own branch, without the other session's uncommitted work,
+        /// and clears what that session left of its identity (keys, agent state, transcripts) before the agent
+        /// starts. The runtime stops saying so once the agent has come up on the copy, and after that the copy is
+        /// the session's own and nothing is undone.
+        #[serde(default)]
+        pub workspace_copied: bool,
         pub command: Vec<String>,
         pub env: Vec<(String, String)>,
         pub cwd: String,

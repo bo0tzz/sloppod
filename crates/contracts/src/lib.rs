@@ -539,6 +539,9 @@ pub struct PlacementSpec {
     pub memory: Option<String>,
     pub storage_size: String,
     pub storage_class: Option<String>,
+    /// The session whose workspace this session's volume starts as a copy of (#478). The backend clones that
+    /// session's volume into this one, or gives it a fresh one where it can't.
+    pub clone_from: Option<String>,
 }
 
 /// Creates and deletes session pods (ADR 16).
@@ -547,6 +550,12 @@ pub trait PlacementBackend: Send + Sync {
     fn manifest(&self) -> Manifest;
     /// Creates or updates the session's pod and volume, and runs the pod if it was suspended.
     async fn ensure(&self, spec: &PlacementSpec) -> Result<()>;
+    /// Whether a session's workspace can start as a copy of `from`'s right now: that session's volume is there to
+    /// copy, and this backend copies workspaces at all (#478). False by default, so a backend that can't says so
+    /// rather than quietly starting a fresh one.
+    async fn can_copy_workspace(&self, _from: &str) -> Result<bool> {
+        Ok(false)
+    }
     /// Ends the session's pod and keeps its volume, for a parked session (ADR 5); `ensure` brings it back.
     async fn suspend(&self, session_id: &str) -> Result<()>;
     /// Ends the session's pod so that a new one starts from the current spec, keeping its volume; e.g. to move a

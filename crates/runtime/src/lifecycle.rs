@@ -99,6 +99,9 @@ pub struct NewSession<'a> {
     pub grants: &'a [Grant],
     /// The session that spawned it, for a sub-session (ADR 27).
     pub parent: Option<Uuid>,
+    /// The session whose workspace volume this session's starts as a copy of (#478), when its parent asked for one
+    /// and the cluster can copy it.
+    pub workspace_copied_from: Option<Uuid>,
 }
 
 /// Starts a work session: records it and its first message, and places its pod. A session whose pod can't be
@@ -138,6 +141,11 @@ pub async fn start_session(
     .await?;
     if let Some(parent) = new.parent {
         db::set_parent(&state.db, id, parent).await?;
+    }
+    // Recorded before its pod is placed: the copy is what the placement clones and what its supervisor takes over
+    // (#478), until its agent has come up on it.
+    if let Some(from) = new.workspace_copied_from {
+        db::set_workspace_copied_from(&state.db, id, from).await?;
     }
     state
         .hub
@@ -265,6 +273,9 @@ pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result
     }
     // Its policy is back, so it isn't released any more (#455).
     db::set_released(&state.db, session.id, false).await?;
+    // A sub-session whose workspace starts as a copy of its parent's (#478): the parent's volume has to be there to
+    // copy, and a copy that can't be made is forgotten rather than pretended.
+    let copy = clone_from(state, session).await;
     state
         .placement
         .ensure(&PlacementSpec {
@@ -280,11 +291,60 @@ pub async fn place(state: &AppState, session: &db::SessionRow) -> anyhow::Result
             ],
             cpu: state.config.session_cpu.clone(),
             memory: state.config.session_memory.clone(),
-            storage_size: state.config.session_storage_size.clone(),
+            storage_size: storage_size(state, session, copy).await,
             storage_class: state.config.session_storage_class.clone(),
+            clone_from: copy.map(|parent| parent.to_string()),
         })
         .await?;
     Ok(())
+}
+
+/// Whether this session's workspace is placed as a copy of its parent's (#478), and which session that is: what its
+/// row says, once the parent's volume is there to copy. A copy that can't be made now is forgotten, so the session
+/// starts fresh and nothing later tries to take over a copy that isn't one.
+async fn clone_from(state: &AppState, session: &db::SessionRow) -> Option<Uuid> {
+    let parent = session.workspace_copied_from?;
+    match state.placement.can_copy_workspace(&parent.to_string()).await {
+        Ok(true) => Some(parent),
+        // A backend that can't copy, or a parent whose volume is gone (#478's fallback).
+        Ok(false) => {
+            if let Err(e) = db::clear_workspace_copied_from(&state.db, session.id).await {
+                tracing::warn!(session = %session.id, error = %e, "forgetting a workspace copy");
+            }
+            None
+        }
+        Err(e) => {
+            tracing::warn!(session = %session.id, error = %e, "asking whether a workspace can be copied");
+            None
+        }
+    }
+}
+
+/// How big the session's workspace volume starts: the configured size, and for a copy at least what the session it's
+/// copied from has (#478) — a clone can't be smaller than its source, and the parent's claim is what the child's is
+/// cloned from.
+async fn storage_size(state: &AppState, session: &db::SessionRow, clone_from: Option<Uuid>) -> String {
+    let configured = state.config.session_storage_size.clone();
+    let Some(parent) = clone_from else {
+        return configured;
+    };
+    let from = match state.placement.volume(&parent.to_string()).await {
+        Ok(volume) => volume.and_then(|volume| volume.size()),
+        Err(e) => {
+            tracing::warn!(session = %session.id, error = %e, "reading the volume to copy a workspace from");
+            None
+        }
+    };
+    let (Some(configured_bytes), Some(from)) = (sloppod_contracts::storage_bytes(&configured), from) else {
+        return configured;
+    };
+    if from <= configured_bytes {
+        return configured;
+    }
+    tracing::info!(
+        session = %session.id, from, "starting a copied workspace at the size it's copied from"
+    );
+    format!("{from}")
 }
 
 /// How long a deleted session can be restored before it's purged for good.

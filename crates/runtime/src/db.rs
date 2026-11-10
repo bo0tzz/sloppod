@@ -60,6 +60,9 @@ pub struct SessionRow {
     pub disk_seen_at: Option<DateTime<Utc>>,
     /// Whether the user keeps a stopped session's volume rather than have it removed a while after it stopped.
     pub volume_kept: bool,
+    /// The session whose workspace volume this session's started as a copy of (#478), until the copy has been taken
+    /// over; null for a workspace of its own.
+    pub workspace_copied_from: Option<Uuid>,
 }
 
 impl SessionRow {
@@ -93,6 +96,7 @@ impl SessionRow {
             disk_size: None,
             disk_seen_at: None,
             volume_kept: false,
+            workspace_copied_from: None,
         }
     }
 
@@ -204,7 +208,7 @@ impl SessionRow {
     }
 }
 
-const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, pending_model, repo, created_at, updated_at, active_at, deleted_at, agent_status, agent_error, parent_id, limited_until, image_nudged, disk_used, disk_size, disk_seen_at, volume_kept, \
+const SESSION_COLUMNS: &str = "id, owner, title, phase, agent, kind, review, agent_session_id, agent_state, model, pending_model, repo, created_at, updated_at, active_at, deleted_at, agent_status, agent_error, parent_id, limited_until, image_nudged, disk_used, disk_size, disk_seen_at, volume_kept, workspace_copied_from, \
      coalesce((select jsonb_agg(jsonb_build_object('id', g.id, 'capability', g.capability, 'params', g.params, \
      'created_at', g.created_at, 'expires_at', g.expires_at) order by g.created_at) \
      from session_grants g where g.session_id = sessions.id and (g.expires_at is null or g.expires_at > now())), \
@@ -682,6 +686,39 @@ pub async fn set_volume_kept(db: &PgPool, id: Uuid, kept: bool) -> sqlx::Result<
     .execute(db)
     .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Records that the session's workspace volume is a copy of `from`'s (#478), so that it's placed as a clone of it and
+/// its supervisor is told to take the copy over.
+pub async fn set_workspace_copied_from(db: &PgPool, id: Uuid, from: Uuid) -> sqlx::Result<()> {
+    sqlx::query("update sessions set workspace_copied_from = $2 where id = $1")
+        .bind(id)
+        .bind(from)
+        .execute(db)
+        .await
+        .map(|_| ())
+}
+
+/// Forgets that the session's workspace was copied (#478): the copy has been taken over, or it was never made, and
+/// nothing of it is left to undo.
+pub async fn clear_workspace_copied_from(db: &PgPool, id: Uuid) -> sqlx::Result<()> {
+    sqlx::query("update sessions set workspace_copied_from = null where id = $1")
+        .bind(id)
+        .execute(db)
+        .await
+        .map(|_| ())
+}
+
+/// The sessions whose workspace was placed as a copy of another's, for a sweep to check that it provisioned: their
+/// id and the session each was copied from (#478).
+pub async fn copied_workspaces(db: &PgPool) -> sqlx::Result<Vec<(Uuid, Uuid)>> {
+    let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "select id, workspace_copied_from from sessions where workspace_copied_from is not null \
+         and deleted_at is null",
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows)
 }
 
 /// The sessions with these ids, whoever owns them and whatever became of them.

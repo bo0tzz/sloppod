@@ -130,6 +130,29 @@ pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<
         None => parent.repo.clone(),
     };
     let agent = arguments["agent"].as_str().unwrap_or(&parent.agent);
+    // Where the child's workspace starts (#478): a copy of the parent's volume — its checkout, tools, dependencies
+    // and caches — or a fresh one. The parent picks; by default a child working on the parent's repository gets a
+    // copy, and one working elsewhere a fresh workspace, whose own checkout it clones anyway. Either way a copy that
+    // the cluster can't make now falls back to fresh, and the answer says what it got.
+    let asked = arguments["workspace"].as_str();
+    if !matches!(asked, None | Some("copy" | "fresh")) {
+        return Err("`workspace` is \"copy\" or \"fresh\"".into());
+    }
+    let on_parents_repo = match (repo.as_deref(), parent.repo.as_deref()) {
+        (Some(child), Some(parent)) => same_repo(child, parent),
+        _ => false,
+    };
+    let wants_copy = match asked {
+        Some("fresh") => false,
+        Some("copy") => true,
+        _ => on_parents_repo,
+    };
+    let copy = wants_copy
+        && state
+            .placement
+            .can_copy_workspace(&parent.id.to_string())
+            .await
+            .unwrap_or(false);
     let adapter = state
         .agents
         .get(agent)
@@ -204,6 +227,7 @@ pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<
             repo: repo.as_deref(),
             grants: &grants,
             parent: Some(parent.id),
+            workspace_copied_from: copy.then_some(parent.id),
         },
     )
     .await
@@ -224,8 +248,16 @@ pub async fn spawn(state: &AppState, parent: Uuid, arguments: &Value) -> Result<
             warnings.push(format!(" Warning: {warning}."));
         }
     }
+    let workspace = match (copy, wants_copy) {
+        (true, _) => " Its workspace is a copy of yours: your checkout, tools and caches, without your uncommitted \
+                      work.",
+        // Asked for, and not possible: the parent is told what it got, rather than left thinking the copy was made.
+        (false, true) => " Its workspace is fresh: yours couldn't be copied just now.",
+        (false, false) => "",
+    };
     Ok(format!(
-        "Started sub-session {} \"{}\"{branch}{on}. You're told when it reports; list_sessions shows how it's doing.{}",
+        "Started sub-session {} \"{}\"{branch}{on}.{workspace} You're told when it reports; list_sessions shows how \
+         it's doing.{}",
         child.id,
         child.title,
         warnings.concat()
@@ -430,6 +462,7 @@ pub fn tools(endpoint_models: &[String]) -> Vec<Value> {
                     "grants": {"type": "array", "items": {"type": "string"}, "description": "The capabilities to give it, of yours (e.g. [\"github\", \"repo\", \"docs\"]); defaults to all of yours. Model access always stays"},
                     "agent": {"type": "string", "description": "claude-code or codex; defaults to yours"},
                     "model": {"type": "string", "description": model},
+                    "workspace": {"type": "string", "enum": ["copy", "fresh"], "description": "Where its workspace starts. \"copy\": a copy of your volume — your checkout, tools, dependencies and caches — so it starts quickly, with your uncommitted work left out and your keys and agent state cleared. Pick it for related work on the same repository, which is the default there. \"fresh\": an empty volume, which it clones the repository into and installs tools in; the default for another repository, for an independent task, or to keep a mess of yours out of it (your caches, its own mess)"},
                 },
                 "required": ["task"],
             },
