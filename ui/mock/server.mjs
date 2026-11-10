@@ -788,6 +788,20 @@ async function agentScript(session, turn, prompt) {
     return;
   }
 
+  if (session.data.repo && /tidy one issue/i.test(prompt)) {
+    await step(2);
+    const proposeId = randomUUID();
+    tool({ toolCallId: proposeId, title: 'mcp__sloppod__propose_issue_updates', kind: 'other', status: 'pending' });
+    await step(2);
+    const proposal = createIssueUpdates(session, [{ number: 65, comment: 'Superseded by #196.', close: 'duplicate' }]);
+    update(proposeId, {
+      status: 'completed',
+      content: [{ type: 'content', content: { type: 'text', text: `Proposal ${proposal.id} created and waiting for human review.` } }],
+    });
+    await say("I've proposed closing one issue as a duplicate.");
+    return;
+  }
+
   if (session.data.repo && /tidy the pull requests/i.test(prompt)) {
     await step(2);
     const proposeId = randomUUID();
@@ -1364,15 +1378,17 @@ function createIssues(session) {
   return proposal;
 }
 
-function createIssueUpdates(session) {
-  const proposal = {
-    id: randomUUID(),
-    session_id: session.data.id,
-    kind: 'github.issue.update',
-    status: 'pending',
-    payload: {
-      repo: session.data.repo,
-      updates: [
+/** What the mock's issues say now, for the detail of an update to them, as the runtime loads it (#289). */
+const MOCK_ISSUES = {
+  100: { title: 'Reconnect drops the session', body: 'A dropped connection ends the session instead of reconnecting.' },
+  65: { title: 'Double notices about the same proposal', body: 'A decided proposal can be reported twice.' },
+  59: { title: 'Startup failures are only in the logs', body: 'A pod that fails to start says nothing.\n\nToday it only shows in the logs.' },
+};
+
+function createIssueUpdates(session, updates = []) {
+  const wanted = updates.length
+    ? updates
+    : [
         { number: 100, comment: 'Fixed by #148.', close: 'completed', remove_labels: ['priority'] },
         { number: 65, comment: 'Superseded by #196.', close: 'duplicate' },
         {
@@ -1381,16 +1397,15 @@ function createIssueUpdates(session) {
           title: 'Startup failures show in the UI',
           body: 'A pod that fails to start says why in the UI.\n\nToday it only shows in the logs.',
         },
-      ],
-    },
-    // Like the runtime's detail: what the rewritten issue says now.
-    current: [
-      {
-        number: 59,
-        title: 'Startup failures are only in the logs',
-        body: 'A pod that fails to start says nothing.\n\nToday it only shows in the logs.',
-      },
-    ],
+      ];
+  const proposal = {
+    id: randomUUID(),
+    session_id: session.data.id,
+    kind: 'github.issue.update',
+    status: 'pending',
+    payload: { repo: session.data.repo, updates: wanted },
+    // Like the runtime's detail: every issue the updates touch, as it is now, each once.
+    current: [...new Set(wanted.map((update) => update.number))].map((number) => ({ number, ...MOCK_ISSUES[number] })),
     created_at: now(),
   };
   proposals.set(proposal.id, proposal);
@@ -1417,8 +1432,13 @@ function createPullRequestUpdates(session) {
         },
       ],
     },
-    // Like the runtime's detail: what the rewritten pull request says now.
+    // Like the runtime's detail: every pull request the updates touch, as it is now.
     current: [
+      {
+        number: 96,
+        title: 'Rework the pod failure messages',
+        body: 'Says which container failed, and why.',
+      },
       {
         number: 97,
         title: 'WIP: pod failures',

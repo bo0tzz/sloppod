@@ -138,13 +138,13 @@ pub fn edit_updates(
     Ok(payload)
 }
 
-/// The items whose title or body the updates replace, each once, for the reviewer to compare with what they are now.
-pub fn rewritten(payload: &Value) -> Vec<u64> {
+/// Every item the updates touch, each once, so the detail a UI shows can name it — its title and a link (#289) — and
+/// the reviewer can compare a rewritten one's text with what it says now.
+pub fn touched(payload: &Value) -> Vec<u64> {
     let mut numbers: Vec<u64> = payload["updates"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|u| u.get("title").is_some() || u.get("body").is_some())
         .filter_map(|u| u["number"].as_u64())
         .collect();
     numbers.sort_unstable();

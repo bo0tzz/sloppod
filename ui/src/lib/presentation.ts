@@ -22,7 +22,7 @@ import {
 } from '@mdi/js';
 import type { Color } from '@immich/ui';
 import type { ConfigSelectGroup, ConfigSelectOption, PlanEntry, ToolCallStatus, ToolKind } from './acp/types.ts';
-import type { CredentialKind, Grant, Phase, Proposal, ProposalStatus, Waiting, WorkPlanChange } from './api.ts';
+import type { CredentialKind, Grant, IssueUpdate, Phase, Proposal, ProposalStatus, Waiting, WorkPlanChange } from './api.ts';
 import { timeAgo } from './format.ts';
 
 export const phases: Record<Phase, { label: string; color: Color; description: string }> = {
@@ -135,6 +135,44 @@ export function actingAs(proposal: Proposal): string | undefined {
   return typeof proposal.payload.as === 'string' ? proposal.payload.as : undefined;
 }
 
+/** The updates an issue- or pull request-update proposal carries. */
+export const updateList = (payload: Record<string, unknown>): IssueUpdate[] =>
+  Array.isArray(payload.updates) ? (payload.updates as IssueUpdate[]) : [];
+
+/** How an update closes what it touches, as its `close` says. */
+const closeReasons: Record<'completed' | 'not_planned' | 'duplicate', string> = {
+  completed: 'completed',
+  not_planned: 'not planned',
+  duplicate: 'a duplicate',
+};
+
+/**
+ * What an update changes, each named, in the order it's carried out (#289): a comment, then the labels, then the
+ * text, then closing or reopening. A pull request's own changes (`ready`) are named too.
+ */
+export function updateChanges(update: IssueUpdate): string[] {
+  const changes: string[] = [];
+  if (update.comment !== undefined) changes.push('Adds a comment');
+  if (update.add_labels?.length) changes.push(`Adds labels: ${update.add_labels.join(', ')}`);
+  if (update.remove_labels?.length) changes.push(`Removes labels: ${update.remove_labels.join(', ')}`);
+  if (update.title !== undefined) changes.push('Changes the title');
+  if (update.body !== undefined) changes.push(update.body === '' ? 'Clears the body' : 'Rewrites the body');
+  if (update.close) changes.push(update.close === true ? 'Closes it' : `Closes as ${closeReasons[update.close]}`);
+  if (update.reopen) changes.push('Reopens it');
+  if (update.ready) changes.push('Marks it ready for review');
+  return changes;
+}
+
+/** What one update does, and to what: `#35 · Adds a comment, Closes as completed`. */
+export function updateSummary(update: IssueUpdate): string {
+  const changes = updateChanges(update);
+  return `#${update.number}${changes.length ? ` · ${changes.join(', ')}` : ''}`;
+}
+
+/** Where an issue or pull request an update touches lives on GitHub. */
+export const updateHref = (repo: string, number: number, kind: 'issue' | 'pull_request'): string =>
+  `https://github.com/${repo}/${kind === 'issue' ? 'issues' : 'pull'}/${number}`;
+
 /** How a proposal reads in cards and the modal, by kind. Unknown kinds fall back to their kind name. */
 export function proposalSummary(proposal: Proposal): { label: string; title: string; detail?: string; icon: string } {
   const payload = proposal.payload;
@@ -165,19 +203,19 @@ export function proposalSummary(proposal: Proposal): { label: string; title: str
       };
     }
     case 'github.issue.update': {
-      const updates = Array.isArray(payload.updates) ? (payload.updates as { number?: unknown }[]) : [];
+      const updates = updateList(payload);
       return {
         label: 'Issue updates',
-        title: updates.length === 1 ? `#${String(updates[0].number)}` : `${updates.length} issues`,
+        title: updates.length === 1 ? updateSummary(updates[0]) : `${updates.length} issues`,
         detail: payloadText(payload.repo),
         icon: mdiAlertCircleOutline,
       };
     }
     case 'github.pr.update': {
-      const updates = Array.isArray(payload.updates) ? (payload.updates as { number?: unknown }[]) : [];
+      const updates = updateList(payload);
       return {
         label: 'Pull request updates',
-        title: updates.length === 1 ? `#${String(updates[0].number)}` : `${updates.length} pull requests`,
+        title: updates.length === 1 ? updateSummary(updates[0]) : `${updates.length} pull requests`,
         detail: payloadText(payload.repo),
         icon: mdiSourcePull,
       };
