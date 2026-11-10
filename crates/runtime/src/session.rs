@@ -43,11 +43,21 @@ pub(crate) struct Queued {
     pub(crate) id: Option<Uuid>,
     pub(crate) blocks: Vec<Value>,
     pub(crate) notice: bool,
+    /// A note that rides along with the next turn instead of asking for one: the agent hearing which of its
+    /// highlights the user has seen (#462). It waits with the rest of the queue and survives a restart with it, but
+    /// it starts no turn and wakes no session by itself.
+    pub(crate) ride_along: bool,
     pub(crate) reply: Option<oneshot::Sender<Result<Value, RpcError>>>,
     /// Where it joined the queue, counted per session; kept while it's held, so one that goes back after a failed
     /// steer takes its old place. Kept with the queue, and numbered afresh when a restart restores it; 0 for what's
     /// put at the front.
     pub(crate) seq: u64,
+}
+
+/// Whether the queue holds anything that asks for the agent: a note riding along with the next turn doesn't (#462),
+/// so a queue of nothing but those is not a reason to start a turn or to wake a session.
+pub(crate) fn asks_for_agent(queue: &[Queued]) -> bool {
+    queue.iter().any(|q| !q.ride_along)
 }
 
 /// Whether the message `id` waits in the queue, or is held on its way to the agent.
@@ -62,7 +72,7 @@ fn has_queued(state: &LiveState, id: Uuid) -> bool {
 
 /// How a queued prompt is kept in the store.
 fn stored(q: &Queued) -> Value {
-    json!({"id": q.id, "blocks": q.blocks, "notice": q.notice, "seq": q.seq})
+    json!({"id": q.id, "blocks": q.blocks, "notice": q.notice, "rideAlong": q.ride_along, "seq": q.seq})
 }
 
 /// A queued prompt from how it's kept in the store.
@@ -71,6 +81,7 @@ fn unstored(q: &Value) -> Queued {
         id: q["id"].as_str().and_then(|s| s.parse().ok()),
         blocks: q["blocks"].as_array().cloned().unwrap_or_default(),
         notice: q["notice"] == true,
+        ride_along: q["rideAlong"] == true,
         reply: None,
         seq: q["seq"].as_u64().unwrap_or_default(),
     }
@@ -82,8 +93,22 @@ fn notice_queued(text: &str) -> Queued {
         id: None,
         blocks: vec![json!({"type": "text", "text": text})],
         notice: true,
+        ride_along: false,
         reply: None,
         seq: 0,
+    }
+}
+
+/// How much of a highlight a note about it carries: its first line, cut here, since the agent has the id to look it
+/// up by and the note is a line among others in a prompt.
+const NOTE_LINE: usize = 120;
+
+/// The first line of `text`, cut to `NOTE_LINE` characters.
+fn first_line(text: &str) -> String {
+    let line = text.lines().next().unwrap_or_default().trim();
+    match line.char_indices().nth(NOTE_LINE) {
+        Some((at, _)) => format!("{}…", &line[..at]),
+        None => line.to_owned(),
     }
 }
 
@@ -506,8 +531,10 @@ impl Hub {
         *self.live(id).heard_at.lock().expect("hub lock") = Some(self.now());
     }
 
-    /// `blocks` as the agent gets them: after a gap, and always for a notice, led by a line with the time.
+    /// `blocks` as the agent gets them: after a gap, and always for a notice, led by a line with the time; then any
+    /// note about highlights the user has seen (#462), which rides along with this turn and is taken with it.
     async fn with_time(&self, id: Uuid, blocks: Vec<Value>, notice: bool) -> Vec<Value> {
+        let notes = self.take_riding_notes(id).await;
         let heard_at = self.heard_at(id).await;
         let zone = match self.store.get_session(id).await {
             Ok(Some(row)) => self.store.owner_zone(&row.owner).await,
@@ -518,12 +545,28 @@ impl Hub {
             tracing::warn!(session = %id, error = %e, "reading the owner's timezone");
             chrono_tz::UTC
         });
-        match time_line(self.now(), heard_at, notice, zone) {
-            Some(line) => std::iter::once(json!({"type": "text", "text": line}))
-                .chain(blocks)
-                .collect(),
-            None => blocks,
+        time_line(self.now(), heard_at, notice, zone)
+            .map(|line| json!({"type": "text", "text": line}))
+            .into_iter()
+            .chain(notes)
+            .chain(blocks)
+            .collect()
+    }
+
+    /// Takes the queue's riding notes, for the prompt about to be sent: they're told once, and what is being sent is
+    /// where they go. Nothing if there are none.
+    async fn take_riding_notes(&self, id: Uuid) -> Vec<Value> {
+        let live = self.live(id);
+        let mut state = live.state.lock().await;
+        if !state.queue.iter().any(|q| q.ride_along) {
+            return Vec::new();
         }
+        let (notes, rest): (Vec<Queued>, Vec<Queued>) = std::mem::take(&mut state.queue)
+            .into_iter()
+            .partition(|q| q.ride_along);
+        state.queue = rest;
+        self.save_queue(id, &state).await;
+        notes.into_iter().flat_map(|q| q.blocks).collect()
     }
 
     pub fn set_proposal_kinds(&self, kinds: crate::proposals::ProposalKinds) {
@@ -849,7 +892,8 @@ impl Hub {
     pub async fn busy(&self, id: Uuid) -> Option<bool> {
         let live = self.live(id);
         let state = live.state.lock().await;
-        let busy = state.turn_running || !state.queue.is_empty() || !state.permissions.is_empty();
+        let busy =
+            state.turn_running || asks_for_agent(&state.queue) || !state.permissions.is_empty();
         match live.running_commands() {
             _ if busy => Some(true),
             Some(running) => Some(running > 0),
@@ -999,10 +1043,12 @@ impl Hub {
             state.agent_state = agent_state;
             state.loading = false;
             self.settle_restored(id, &mut state, &[]).await;
-            // A session waiting for its usage limit keeps its queue until then.
-            let queued = match state.limited_until {
-                Some(_) => Vec::new(),
-                None => std::mem::take(&mut state.queue),
+            // A session waiting for its usage limit keeps its queue until then, and a queue of notes riding along
+            // with the next turn waits for one rather than being it (#462).
+            let queued = if asks_for_agent(&state.queue) && state.limited_until.is_none() {
+                std::mem::take(&mut state.queue)
+            } else {
+                Vec::new()
             };
             let held = self.hold(id, &mut state, &queued).await;
             if pending.is_some() || !queued.is_empty() {
@@ -1094,7 +1140,7 @@ impl Hub {
                         self.save_queue(id, &state).await;
                         let idle = state.agent_session_id.is_some()
                             && !state.turn_running
-                            && !state.queue.is_empty();
+                            && asks_for_agent(&state.queue);
                         match (state.agent.clone(), idle) {
                             (Some(agent), true) => {
                                 state.turn_running = true;
@@ -1286,7 +1332,8 @@ impl Hub {
             let idle = state.agent_session_id.is_some()
                 && !state.turn_running
                 && !state.stopped
-                && state.limited_until.is_none();
+                && state.limited_until.is_none()
+                && asks_for_agent(&state.queue);
             match (state.agent.clone(), idle) {
                 (Some(agent), true) => {
                     state.turn_running = true;
@@ -1385,6 +1432,9 @@ impl Hub {
         }
         for (id, restored, held) in restoring {
             let nothing = restored.is_empty() && held.is_empty();
+            // Read before the queue is put back, which takes both.
+            let asks = asks_for_agent(&restored);
+            let on_its_way = !held.is_empty();
             {
                 let live = self.live(id);
                 let mut state = live.state.lock().await;
@@ -1400,6 +1450,11 @@ impl Hub {
             self.broadcast_queue(id).await;
             // One waiting for its usage limit is woken when that ends.
             if self.limited_until(id).await.is_some() {
+                continue;
+            }
+            // Notes about seen highlights wait for the session's next turn rather than waking it (#462); what was on
+            // its way to the agent does wake it, since the agent has to say whether it ever got it.
+            if !asks && !on_its_way {
                 continue;
             }
             if let Err(e) = self.wake_for_message(id).await {
@@ -1741,6 +1796,7 @@ impl Hub {
                     id: Some(logged_as),
                     blocks: blocks.clone(),
                     notice: false,
+                    ride_along: false,
                     reply: None,
                     seq: 0,
                 };
@@ -1754,6 +1810,7 @@ impl Hub {
                     id: waiting.then_some(logged_as),
                     blocks: blocks.clone(),
                     notice: false,
+                    ride_along: false,
                     reply: Some(reply),
                     seq: 0,
                 });
@@ -1892,7 +1949,7 @@ impl Hub {
             live.end_work(&mut state);
             let agent_up = state.agent_session_id.is_some();
             state.turn_running =
-                agent_up && !state.queue.is_empty() && state.limited_until.is_none();
+                agent_up && asks_for_agent(&state.queue) && state.limited_until.is_none();
             let next = state.turn_running.then(|| std::mem::take(&mut state.queue));
             let held = match &next {
                 Some(queued) => self.hold(id, &mut state, queued).await,
@@ -2208,6 +2265,42 @@ impl Hub {
         .await;
     }
 
+    /// Tells the agent which of its highlights the user has seen (#462), with its next turn rather than a turn of its
+    /// own: the user's next message, a notice, a steer. One note however many highlights: each is a line of it. It
+    /// waits in the queue, and so through a restart, until something is sent that it can go with.
+    pub async fn note_highlight_seen(
+        self: &Arc<Self>,
+        id: Uuid,
+        highlight: &crate::db::HighlightRow,
+    ) {
+        let line = format!(
+            "sloppod: the user has seen your highlight {}: {}",
+            highlight.id,
+            first_line(&highlight.text)
+        );
+        let live = self.live(id);
+        let mut state = live.state.lock().await;
+        match state.queue.iter_mut().find(|q| q.ride_along) {
+            Some(note) => {
+                let text = note
+                    .blocks
+                    .first()
+                    .and_then(|b| b["text"].as_str())
+                    .unwrap_or_default();
+                note.blocks = vec![json!({"type": "text", "text": format!("{text}\n{line}")})];
+            }
+            None => state.enqueue(Queued {
+                id: None,
+                blocks: vec![json!({"type": "text", "text": line})],
+                notice: false,
+                ride_along: true,
+                reply: None,
+                seq: 0,
+            }),
+        }
+        self.save_queue(id, &state).await;
+    }
+
     /// Steers blocks into the running turn. If that turn has just ended they start a new one here, so the turn
     /// is tracked like any other rather than run detached by the adapter. `held` is released once they reach the
     /// agent, and the user's `message` among them is logged then. A `notice` waits for a moment between the agent's
@@ -2254,6 +2347,7 @@ impl Hub {
                     id: message,
                     blocks,
                     notice,
+                    ride_along: false,
                     reply: None,
                     seq: 0,
                 }];
@@ -2305,6 +2399,7 @@ impl Hub {
                     id: None,
                     blocks,
                     notice: false,
+                    ride_along: false,
                     reply: None,
                     seq: 0,
                 });
@@ -2324,6 +2419,7 @@ impl Hub {
                 id: message,
                 blocks: blocks.clone(),
                 notice: false,
+                ride_along: false,
                 reply: None,
                 seq: 0,
             };
@@ -2835,7 +2931,7 @@ impl Hub {
                     Err(ParkError::InTurn)
                 };
             }
-            let busy = !state.queue.is_empty()
+            let busy = asks_for_agent(&state.queue)
                 || !state.permissions.is_empty()
                 || live.running_commands().is_none_or(|running| running > 0);
             if quiet && busy {
@@ -2884,7 +2980,7 @@ impl Hub {
         let (agent, agent_session_id) = {
             let mut state = live.state.lock().await;
             let busy = state.turn_running
-                || !state.queue.is_empty()
+                || asks_for_agent(&state.queue)
                 || !state.permissions.is_empty()
                 || live.running_commands().is_some_and(|running| running > 0);
             if busy || state.agent_session_id.is_none() {
@@ -2938,7 +3034,7 @@ impl Hub {
             Some(Phase::Idle) => {
                 let mut state = live.state.lock().await;
                 let busy = state.turn_running
-                    || !state.queue.is_empty()
+                    || asks_for_agent(&state.queue)
                     || !state.permissions.is_empty()
                     || live.running_commands().is_some_and(|running| running > 0);
                 if busy || state.agent_session_id.is_none() {
@@ -2979,7 +3075,7 @@ impl Hub {
         state.agent = agent.clone();
         state.agent_session_id = agent_session_id;
         match agent.filter(|_| up) {
-            Some(agent) if !state.queue.is_empty() => {
+            Some(agent) if asks_for_agent(&state.queue) => {
                 let queued = std::mem::take(&mut state.queue);
                 let held = self.hold(id, &mut state, &queued).await;
                 state.turn_running = true;

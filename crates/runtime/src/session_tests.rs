@@ -541,6 +541,157 @@ async fn a_queued_message_can_be_taken_back() {
     );
 }
 
+/// A highlight of the session's, as the store keeps one.
+fn highlight(id: Uuid, session: Uuid, text: &str) -> crate::db::HighlightRow {
+    crate::db::HighlightRow {
+        id,
+        session_id: session,
+        text: text.to_owned(),
+        created_at: START.parse().unwrap(),
+        seen_at: Some(START.parse().unwrap()),
+        snoozed_until: None,
+        retracted_at: None,
+        retraction_reason: None,
+    }
+}
+
+#[tokio::test]
+async fn a_seen_highlight_is_told_with_the_next_turn_and_starts_no_turn() {
+    let mut h = Harness::ready().await;
+    let id = Uuid::new_v4();
+    h.hub
+        .note_highlight_seen(
+            h.id,
+            &highlight(id, h.id, "The build is green\nand the tag is pushed"),
+        )
+        .await;
+
+    // Nothing goes to the agent for it, and it waits in the queue, where a restart would find it (#462).
+    assert!(h.to_agent.try_recv().is_err());
+    assert_eq!(
+        kept_texts(&h).await,
+        [format!(
+            "sloppod: the user has seen your highlight {id}: The build is green"
+        )]
+    );
+
+    // The user's next message carries it, with the highlight's id and what it said.
+    let turn = h.prompt("Carry on");
+    let request = h.next().await;
+    assert_eq!(
+        prompt_text(&request),
+        [
+            format!("sloppod: the user has seen your highlight {id}: The build is green"),
+            "Carry on".to_owned(),
+        ]
+    );
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+
+    // Told once: the message after it carries nothing.
+    let turn = h.prompt("And again");
+    let request = h.next().await;
+    assert_eq!(prompt_text(&request), ["And again"]);
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn two_seen_highlights_make_one_note() {
+    let mut h = Harness::ready().await;
+    let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+    h.hub
+        .note_highlight_seen(h.id, &highlight(first, h.id, "It's done"))
+        .await;
+    h.hub
+        .note_highlight_seen(h.id, &highlight(second, h.id, "Re-run the job"))
+        .await;
+
+    // One note, with a line for each: the agent gets it all in one prompt rather than one per highlight.
+    assert_eq!(
+        kept_texts(&h).await,
+        [format!(
+            "sloppod: the user has seen your highlight {first}: It's done\n\
+             sloppod: the user has seen your highlight {second}: Re-run the job"
+        )]
+    );
+    let turn = h.prompt("Carry on");
+    let request = h.next().await;
+    assert_eq!(prompt_text(&request).len(), 2);
+    assert!(prompt_text(&request)[0].contains(&first.to_string()));
+    assert!(prompt_text(&request)[0].contains(&second.to_string()));
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_seen_highlight_wakes_no_parked_session_not_even_after_a_restart() {
+    let mut h = Harness::starting().await;
+    h.store.set_phase(h.id, Phase::Parked).await.unwrap();
+    let id = Uuid::new_v4();
+    h.hub
+        .note_highlight_seen(h.id, &highlight(id, h.id, "It's done"))
+        .await;
+    assert!(h.to_agent.try_recv().is_err());
+    assert_eq!(kept_texts(&h).await.len(), 1);
+
+    // A restart restores the queue and wakes a session for anything in it that asks for one: a note doesn't (#462).
+    let hub = Arc::new(Hub::new(h.store.clone()));
+    hub.set_now(START.parse().unwrap());
+    let woken = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = woken.clone();
+    hub.set_waker(Arc::new(move |id| {
+        seen.lock().unwrap().push(id);
+        Box::pin(async { Ok(()) })
+    }));
+    hub.restore_queues().await.unwrap();
+    assert!(woken.lock().unwrap().is_empty());
+
+    // It's still waiting, and goes with the turn the user's next message starts, once the session is up again.
+    let (tx, mut to_agent) = mpsc::unbounded_channel();
+    let agent = Arc::new(AgentConn::new(tx));
+    hub.attach_agent(h.id, agent.clone()).await;
+    h.store.set_phase(h.id, Phase::Idle).await.unwrap();
+    hub.agent_ready(h.id, &agent, "agent-session".into(), json!({}), None)
+        .await;
+    let params = json!({"sessionId": h.id, "prompt": [{"type": "text", "text": "Carry on"}]});
+    tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.prompt(h.id, params).await }
+    });
+    let request = next_prompt(&mut to_agent).await;
+    assert_eq!(
+        prompt_text(&request),
+        [
+            format!("sloppod: the user has seen your highlight {id}: It's done"),
+            "Carry on".to_owned(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_snoozed_highlight_leaves_the_agent_untold() {
+    let mut h = Harness::ready().await;
+    // A snooze is the store's and the UI's: the route queues nothing for the agent (#467), and what it hears about
+    // with its next turn is the ones the user has seen (#462).
+    h.hub
+        .broadcast_highlight(&sloppod_protocol::api::Highlight {
+            id: Uuid::new_v4(),
+            session_id: h.id,
+            text: "Put off until later".into(),
+            created_at: START.into(),
+            seen_at: None,
+            snoozed_until: Some(START.into()),
+            retracted_at: None,
+            retraction_reason: None,
+        });
+    let turn = h.prompt("Carry on");
+    let request = h.next().await;
+    assert_eq!(prompt_text(&request), ["Carry on"]);
+    h.respond(&request, json!({"stopReason": "end_turn"})).await;
+    turn.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn a_notice_starts_a_turn_when_the_agent_is_idle() {
     let mut h = Harness::ready().await;
@@ -1585,6 +1736,7 @@ fn batch(
         id: None,
         blocks: vec![json!({"type": "text", "text": text})],
         notice: false,
+        ride_along: false,
         reply: Some(reply),
         seq: 0,
     };

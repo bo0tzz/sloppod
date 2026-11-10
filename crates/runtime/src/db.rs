@@ -1993,7 +1993,8 @@ pub async fn open_highlights(db: &PgPool, session: Uuid) -> sqlx::Result<usize> 
 }
 
 /// The user puts one of the session's open highlights off until `until` (#467); none if it isn't the session's, or is
-/// already seen or taken back. The agent isn't told, and it stays the agent's to retract: it counts as not seen.
+/// already seen or taken back. Unlike a highlight marked seen, the agent is told nothing here, and it stays the agent's
+/// to retract: it counts as not seen.
 pub async fn snooze_highlight(
     db: &PgPool,
     session: Uuid,
@@ -2025,6 +2026,7 @@ pub async fn due_highlights(db: &PgPool) -> sqlx::Result<Vec<HighlightRow>> {
 }
 
 /// Marks one of the session's highlights seen, if it's still open; the row either way, none if it isn't the session's.
+/// The caller keeps the note the agent hears about it (#462); this only records it.
 pub async fn mark_highlight_seen(
     db: &PgPool,
     session: Uuid,
