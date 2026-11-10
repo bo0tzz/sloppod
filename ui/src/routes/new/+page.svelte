@@ -104,6 +104,7 @@
               id: credential.id,
               label: `${config.login} (${credential.name})`,
               repositories: config.repositories,
+              writable: config.writable,
               more: config.more_repositories,
             };
           })),

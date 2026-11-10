@@ -1552,6 +1552,10 @@ pub struct UserToken {
     pub login: String,
     pub expires_at: Option<DateTime<Utc>>,
     pub repositories: Vec<String>,
+    /// Of those, the ones GitHub says the token's user can push to (`permissions.push`), so a picker can offer them
+    /// first (#352). Where a fine-grained token narrows further than the user's role, it's an upper bound: a
+    /// repository not in it can't be pushed to either way.
+    pub writable: Vec<String>,
     /// More than [`MAX_LISTED_PAGES`] pages of them, so the list stops short.
     pub more_repositories: bool,
 }
@@ -1606,6 +1610,7 @@ pub async fn inspect_user_token(
         .context("GitHub's /user has no login")?
         .to_owned();
     let mut repositories = Vec::new();
+    let mut writable = Vec::new();
     let mut more_repositories = false;
     for page in 1..=MAX_LISTED_PAGES + 1 {
         if page > MAX_LISTED_PAGES {
@@ -1618,11 +1623,15 @@ pub async fn inspect_user_token(
             .json()
             .await?;
         let last = items.len() < PAGE;
-        repositories.extend(
-            items
-                .iter()
-                .filter_map(|repo| repo["full_name"].as_str().map(str::to_owned)),
-        );
+        for repo in &items {
+            let Some(full_name) = repo["full_name"].as_str() else {
+                continue;
+            };
+            repositories.push(full_name.to_owned());
+            if repo["permissions"]["push"].as_bool() == Some(true) {
+                writable.push(full_name.to_owned());
+            }
+        }
         if last {
             break;
         }
@@ -1631,6 +1640,7 @@ pub async fn inspect_user_token(
         login,
         expires_at,
         repositories,
+        writable,
         more_repositories,
     }))
 }
@@ -1694,7 +1704,7 @@ pub(crate) mod tests {
     use super::*;
 
     /// A fake GitHub for a user's token: `github_pat_good` is octo's, expiring at the end of November, and
-    /// reaches `repos` repositories; any other token is refused.
+    /// reaches `repos` repositories, every other one of which it can push to; any other token is refused.
     async fn user_github(repos: usize) -> String {
         async fn user(
             headers: axum::http::HeaderMap,
@@ -1722,7 +1732,12 @@ pub(crate) mod tests {
                         let (per_page, page) = (page["per_page"], page["page"]);
                         let names: Vec<Value> = ((page - 1) * per_page
                             ..(page * per_page).min(repos))
-                            .map(|n| json!({"full_name": format!("octo/r{n}")}))
+                            .map(|n| {
+                                json!({
+                                    "full_name": format!("octo/r{n}"),
+                                    "permissions": {"push": n % 2 == 0},
+                                })
+                            })
                             .collect();
                         Json(names)
                     },
@@ -1749,6 +1764,10 @@ pub(crate) mod tests {
         );
         assert_eq!(token.repositories.len(), 150);
         assert_eq!(token.repositories[149], "octo/r149");
+        // Which of them it can push to, as GitHub reports the user's role (#352).
+        assert_eq!(token.writable.len(), 75);
+        assert!(token.writable.contains(&"octo/r0".to_owned()));
+        assert!(!token.writable.contains(&"octo/r1".to_owned()));
         assert!(!token.more_repositories);
 
         let refused = inspect_user_token(&http, &api, "github_pat_revoked")
@@ -1761,6 +1780,7 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(many.repositories.len(), MAX_LISTED_PAGES * PAGE);
+        assert_eq!(many.writable.len(), MAX_LISTED_PAGES * PAGE / 2);
         assert!(many.more_repositories);
     }
 

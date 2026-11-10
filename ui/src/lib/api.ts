@@ -349,6 +349,9 @@ export type GitHubUserConfig = {
   login: string;
   expires_at: string | null;
   repositories: string[];
+  /** Of those, the ones the token can push to, as GitHub reports the user's role (#352); absent on a credential added
+   * before the runtime kept it. */
+  writable?: string[];
   /** The list stops short: the token reaches more. */
   more_repositories: boolean;
 };

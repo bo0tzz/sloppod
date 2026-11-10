@@ -2,6 +2,7 @@
   import { Alert, Button, Field, Input, LoadingSpinner, ModalBody, ModalFooter, Select, Text } from '@immich/ui';
   import Dialog from './Dialog.svelte';
   import RepoPicker from './RepoPicker.svelte';
+  import { offeredRepositories } from '#lib/repos.ts';
   import { mdiSourceRepository } from '@mdi/js';
   import { onMount } from 'svelte';
   import { api, type GitHubUserConfig, type Session } from '#lib/api.ts';
@@ -17,7 +18,7 @@
   const form = 'add-repository';
 
   let repos = $state<string[] | null>(null);
-  let tokens = $state<{ id: string; label: string; repositories: string[]; more: boolean }[]>([]);
+  let tokens = $state<{ id: string; label: string; repositories: string[]; writable?: string[]; more: boolean }[]>([]);
   let actAs = $state(APP);
   let repo = $state<string>();
   let typed = $state('');
@@ -41,7 +42,13 @@
   // A token that reaches more repositories than were listed when it was added can be given one that isn't listed.
   const unlisted = $derived(token?.more ?? false);
   const wanted = $derived(unlisted && typed.trim() ? typed.trim() : repo);
-  const available = $derived((token ? token.repositories : (repos ?? [])).filter((candidate) => !granted.has(candidate)));
+  // What the token can push to first, the rest marked (#352); the App's repositories are all its own.
+  const available = $derived(
+    offeredRepositories(
+      (token ? token.repositories : (repos ?? [])).filter((candidate) => !granted.has(candidate)),
+      token?.writable,
+    ),
+  );
 
   onMount(async () => {
     // Without tokens, or if they can't be listed, the modal offers the App alone.
@@ -56,6 +63,7 @@
               id: credential.id,
               label: `${config.login} (${credential.name})`,
               repositories: config.repositories,
+              writable: config.writable,
               more: config.more_repositories,
             };
           });
