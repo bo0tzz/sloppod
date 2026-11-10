@@ -220,6 +220,26 @@ impl PlacementBackend for AgentSandbox {
         Ok(())
     }
 
+    /// Whether the session's Sandbox and its claim are both gone (#478). A Sandbox being deleted still answers, and a
+    /// placement applied to it is thrown away with it, so both are asked of the API server rather than a cache.
+    async fn removed(&self, session_id: &str) -> Result<bool> {
+        if self
+            .api
+            .get_opt(&sandbox_name(session_id))
+            .await
+            .map_err(err)?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .claims
+            .get_opt(&claim_name(session_id))
+            .await
+            .map_err(err)?
+            .is_none())
+    }
+
     /// Whether a session's volume is there to copy (#478): its claim exists and the cluster has provisioned it.
     async fn can_copy_workspace(&self, from: &str) -> Result<bool> {
         Ok(self

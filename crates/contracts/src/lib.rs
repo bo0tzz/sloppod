@@ -550,6 +550,12 @@ pub trait PlacementBackend: Send + Sync {
     fn manifest(&self) -> Manifest;
     /// Creates or updates the session's pod and volume, and runs the pod if it was suspended.
     async fn ensure(&self, spec: &PlacementSpec) -> Result<()>;
+    /// Whether the backend holds nothing for the session any more, as the cluster says now rather than from a cache
+    /// (#478): what placing a session again after removing it waits for, since a placement applied to an object
+    /// that's still being deleted goes with it. False by default, for a backend that can't tell.
+    async fn removed(&self, _session_id: &str) -> Result<bool> {
+        Ok(false)
+    }
     /// Whether a session's workspace can start as a copy of `from`'s right now: that session's volume is there to
     /// copy, and this backend copies workspaces at all (#478). False by default, so a backend that can't says so
     /// rather than quietly starting a fresh one.
