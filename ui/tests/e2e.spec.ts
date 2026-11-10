@@ -1132,6 +1132,33 @@ test('the sidebar shows a redeployed runtime once the connection is back', async
   }
 });
 
+test('the version says when the page is older than the runtime, and reloads on click', async ({ page }) => {
+  // The e2e build is built as `e2e` (the `test:e2e` script's `SLOPPOD_BUILD`), which is not the build the mock reports,
+  // so the page is out of step from the start: the version shows the dot, and a click reloads into the new bundle.
+  let loads = 0;
+  page.on('load', () => loads++);
+  // The home page is the session list, without the sidebar the version sits in.
+  await page.goto('/settings');
+  const stale = page.getByTestId('version-stale');
+  await expect(stale).toBeVisible();
+  await expect(stale).toHaveAttribute('title', 'newer version: reload');
+  await expect(page.getByTestId('runtime-build')).toHaveText('sloppod 0.0.1-main.1');
+
+  const before = loads;
+  await stale.click();
+  await expect.poll(() => loads).toBeGreaterThan(before);
+
+  try {
+    // A runtime built from the same build as the page is not a newer one, so the dot goes.
+    await page.request.post('/_mock/build?version=0.0.1-main.1&build=e2e');
+    await page.request.post('/_mock/drop');
+    await expect(page.getByTestId('runtime-build')).toHaveText('sloppod 0.0.1-main.1');
+    await expect(stale).toBeHidden();
+  } finally {
+    await page.request.post('/_mock/build');
+  }
+});
+
 test('a message written while reconnecting is sent once the connection is back', async ({ page }) => {
   await createSession(page, 'Reconnect me in sloppod');
   await finishTurn(page);

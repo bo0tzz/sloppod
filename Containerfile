@@ -25,12 +25,20 @@ WORKDIR /ui
 COPY ui/package.json ui/package-lock.json ./
 RUN npm ci
 COPY ui/ ./
-RUN npm run build
+# What this image was built from: publish.yml passes the commit on main and the tag on a release. The UI is baked with
+# it and the runtime carries it (below), so a page can tell when the runtime it reaches has been redeployed since
+# (#448), and the two can't name different builds, whatever a chart or a deployment says.
+ARG SLOPPOD_BUILD=
+RUN SLOPPOD_BUILD="$SLOPPOD_BUILD" npm run build
 
 FROM debian:trixie-slim AS runtime-headless
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/sloppod /usr/local/bin/sloppod
+# The runtime reports this as its build; `SLOPPOD_BUILD=` — the value without a build arg — is no name at all, which
+# the runtime reads as not knowing one.
+ARG SLOPPOD_BUILD=
+ENV SLOPPOD_BUILD=${SLOPPOD_BUILD}
 USER 65532:65532
 ENTRYPOINT ["sloppod"]
 

@@ -87,14 +87,27 @@
                 {account.user ? `Signed in as ${account.user}` : ''}
               </span>
               {#if account.version || account.build}
-                <a
-                  class="truncate opacity-75 hover:underline"
-                  href={sourceLink(account.build)}
-                  target="_blank"
-                  rel="noreferrer"
-                  title={account.build ? `Built from ${account.build}` : undefined}
-                  data-testid="runtime-build">sloppod {account.version ?? account.build}</a
-                >
+                <div class="flex min-w-0 items-center gap-1">
+                  <a
+                    class="truncate opacity-75 hover:underline"
+                    href={sourceLink(account.build)}
+                    target="_blank"
+                    rel="noreferrer"
+                    title={account.build ? `Built from ${account.build}` : undefined}
+                    data-testid="runtime-build">sloppod {account.version ?? account.build}</a
+                  >
+                  {#if account.outdated}
+                    <!-- The runtime is running a newer build than this page's bundle (#448), so a reload gets it. -->
+                    <button
+                      type="button"
+                      class="bg-warning size-1.5 shrink-0 cursor-pointer rounded-full"
+                      title="newer version: reload"
+                      aria-label="newer version: reload"
+                      data-testid="version-stale"
+                      onclick={() => location.reload()}
+                    ></button>
+                  {/if}
+                </div>
               {/if}
             </div>
             <IconButton href="/work" icon={mdiFileTreeOutline} aria-label="Work" variant="ghost" shape="round" size="small" color="secondary" />
