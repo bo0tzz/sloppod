@@ -107,9 +107,9 @@ fn error(code: i64, message: impl Into<String>) -> Value {
     json!({"code": code, "message": message.into()})
 }
 
-fn unsupported_version(code: i64, requested: &str) -> Value {
+fn unsupported_version(requested: &str) -> Value {
     json!({
-        "code": code,
+        "code": -32022,
         "message": "Unsupported protocol version",
         "data": {"supported": SUPPORTED, "requested": requested},
     })
@@ -129,41 +129,106 @@ fn complete(session: &impl Session, mut result: Value) -> Value {
 /// Whether a request is of the stateless era: its `_meta` has the era's keys, or its header names the era, which
 /// with no `_meta` is then an error. Any other request is of the era of `initialize`, whose later requests carry
 /// neither.
-fn stateless(params: &Value, header_version: Option<&str>) -> bool {
+fn stateless(params: &Value, headers: &Headers<'_>) -> bool {
     let meta = &params["_meta"];
     [META_VERSION, META_CAPABILITIES, META_CLIENT_INFO]
         .iter()
         .any(|key| meta.get(key).is_some())
-        || header_version == Some(STATELESS)
+        || headers.version == Some(STATELESS)
+}
+
+/// The standard headers of a POST to `/mcp` that the stateless era mirrors from the body, for the server to check
+/// against it: what a proxy routing on a header sees must be what the server runs.
+#[derive(Default, Clone, Copy)]
+pub struct Headers<'a> {
+    /// `MCP-Protocol-Version`
+    pub version: Option<&'a str>,
+    /// `Mcp-Method`
+    pub method: Option<&'a str>,
+    /// `Mcp-Name`, possibly in its Base64 sentinel form
+    pub name: Option<&'a str>,
+}
+
+impl Headers<'_> {
+    /// Says what's missing or doesn't match the body, as `HeaderMismatch` words it.
+    fn validate(&self, method: &str, params: &Value) -> Result<(), String> {
+        let version = params["_meta"][META_VERSION].as_str().unwrap_or_default();
+        match self.version {
+            None => return Err("Header mismatch: MCP-Protocol-Version header is missing".into()),
+            Some(header) if header != version => {
+                return Err(format!(
+                    "Header mismatch: MCP-Protocol-Version header value '{header}' does not match body value '{version}'"
+                ));
+            }
+            Some(_) => {}
+        }
+        match self.method {
+            None => return Err("Header mismatch: Mcp-Method header is missing".into()),
+            Some(header) if header != method => {
+                return Err(format!(
+                    "Header mismatch: Mcp-Method header value '{header}' does not match body value '{method}'"
+                ));
+            }
+            Some(_) => {}
+        }
+        if method == "tools/call" {
+            let name = params["name"].as_str().unwrap_or_default();
+            let Some(header) = self.name else {
+                return Err("Header mismatch: Mcp-Name header is missing".into());
+            };
+            let decoded = decode_name(header)
+                .ok_or("Header mismatch: Mcp-Name header is not valid Base64 of UTF-8")?;
+            if decoded != name {
+                return Err(format!(
+                    "Header mismatch: Mcp-Name header value '{decoded}' does not match body value '{name}'"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A header value that may carry the `=?base64?...?=` sentinel for a name that isn't plain ASCII.
+fn decode_name(header: &str) -> Option<String> {
+    use base64::Engine;
+    match header
+        .strip_prefix("=?base64?")
+        .and_then(|rest| rest.strip_suffix("?="))
+    {
+        Some(encoded) => {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()?;
+            String::from_utf8(bytes).ok()
+        }
+        None => Some(header.to_owned()),
+    }
 }
 
 /// Answers one JSON-RPC message of a POST to `/mcp`.
-pub async fn serve(
-    session: &impl Session,
-    message: Value,
-    header_version: Option<&str>,
-) -> Outcome {
+pub async fn serve(session: &impl Session, message: Value, headers: &Headers<'_>) -> Outcome {
     let Some(id) = message.get("id").cloned() else {
         return Outcome::Accepted;
     };
     let method = message["method"].as_str().unwrap_or_default();
     let params = &message["params"];
-    if method != "initialize" && stateless(params, header_version) {
-        return serve_stateless(session, id, method, params).await;
+    if method != "initialize" && stateless(params, headers) {
+        return serve_stateless(session, id, method, params, headers).await;
     }
     let result = match method {
         "initialize" => {
+            // A version it doesn't serve gets its newest of the era instead, and the client decides whether it can go on.
             let requested = params["protocolVersion"].as_str().unwrap_or(DEFAULT_LEGACY);
-            if SUPPORTED[1..].contains(&requested) {
-                Ok(json!({
-                    "protocolVersion": requested,
-                    "capabilities": {"tools": {"listChanged": true}},
-                    "serverInfo": server_info(session),
-                    "instructions": INSTRUCTIONS,
-                }))
-            } else {
-                Err(unsupported_version(-32602, requested))
-            }
+            let version = SUPPORTED[1..]
+                .iter()
+                .find(|v| **v == requested)
+                .unwrap_or(&SUPPORTED[1]);
+            Ok(json!({
+                "protocolVersion": version,
+                "capabilities": {"tools": {"listChanged": true}},
+                "serverInfo": server_info(session),
+                "instructions": INSTRUCTIONS,
+            }))
         }
         "ping" => Ok(json!({})),
         "tools/list" => list_tools(session).await,
@@ -188,13 +253,14 @@ async fn serve_stateless(
     id: Value,
     method: &str,
     params: &Value,
+    headers: &Headers<'_>,
 ) -> Outcome {
     let meta = &params["_meta"];
     let refuse = |status, error| Outcome::Reply(status, rpc(id.clone(), Err(error)));
     match meta[META_VERSION].as_str() {
         Some(STATELESS) => {}
         Some(other) => {
-            return refuse(StatusCode::BAD_REQUEST, unsupported_version(-32022, other));
+            return refuse(StatusCode::BAD_REQUEST, unsupported_version(other));
         }
         None => {
             return refuse(
@@ -208,6 +274,9 @@ async fn serve_stateless(
             StatusCode::BAD_REQUEST,
             error(-32602, format!("_meta.{META_CAPABILITIES} is required")),
         );
+    }
+    if let Err(mismatch) = headers.validate(method, params) {
+        return refuse(StatusCode::BAD_REQUEST, error(-32020, mismatch));
     }
     let result = match method {
         "server/discover" => Ok(json!({
@@ -294,11 +363,14 @@ pub async fn handler(
     let Some(id) = crate::identity::calling_session(&state, &headers, peer.ip()).await else {
         return (StatusCode::FORBIDDEN, "not a session pod").into_response();
     };
-    let header_version = headers
-        .get("mcp-protocol-version")
-        .and_then(|v| v.to_str().ok());
+    let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
+    let headers = Headers {
+        version: header("mcp-protocol-version"),
+        method: header("mcp-method"),
+        name: header("mcp-name"),
+    };
     let session = RuntimeSession { state: &state, id };
-    match serve(&session, message, header_version).await {
+    match serve(&session, message, &headers).await {
         Outcome::Accepted => StatusCode::ACCEPTED.into_response(),
         Outcome::Reply(status, body) => (status, Json(body)).into_response(),
         Outcome::Listen(messages) => sse(messages),
@@ -1008,15 +1080,30 @@ mod tests {
         json!({"jsonrpc": "2.0", "id": id.into(), "method": method, "params": params})
     }
 
-    async fn post(session: &Fake, message: Value, header: Option<&str>) -> (StatusCode, Value) {
-        match serve(session, message, header).await {
+    /// Posts as a client does: the stateless era's headers say what the body does, the version being `version` where
+    /// it's given.
+    async fn post(session: &Fake, message: Value, version: Option<&str>) -> (StatusCode, Value) {
+        let text = |v: &Value| v.as_str().map(str::to_owned);
+        let meta_version = text(&message["params"]["_meta"][META_VERSION]);
+        let (method, name) = (text(&message["method"]), text(&message["params"]["name"]));
+        let headers = Headers {
+            version: version.or(meta_version.as_deref()),
+            method: method.as_deref(),
+            name: name.as_deref(),
+        };
+        match serve(session, message, &headers).await {
             Outcome::Reply(status, body) => (status, body),
             _ => panic!("expected a reply"),
         }
     }
 
     async fn listening(session: &Fake, message: Value) -> Messages {
-        match serve(session, message, Some(STATELESS)).await {
+        let headers = Headers {
+            version: Some(STATELESS),
+            method: Some("subscriptions/listen"),
+            name: None,
+        };
+        match serve(session, message, &headers).await {
             Outcome::Listen(messages) => messages,
             _ => panic!("expected a stream"),
         }
@@ -1177,7 +1264,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unsupported_protocol_version_is_refused_with_the_supported_ones() {
+    async fn an_unsupported_protocol_version_is_refused_in_the_stateless_era_and_negotiated_in_the_other()
+     {
         let session = Fake::new();
         let expected = json!({
             "message": "Unsupported protocol version",
@@ -1195,25 +1283,24 @@ mod tests {
         assert_eq!(body["error"]["data"], expected["data"]);
         assert_eq!(body["id"], 1);
 
-        let (status, body) = post(
-            &session,
-            request(2, "initialize", json!({"protocolVersion": "1900-01-01"})),
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["error"]["code"], -32602);
-        assert_eq!(body["error"]["message"], expected["message"]);
-        assert_eq!(body["error"]["data"], expected["data"]);
-
-        // `initialize` is not how a 2026 client starts.
+        // A handshake client asking for a version it doesn't serve is told the newest the era has, and decides itself.
+        for requested in ["1900-01-01", STATELESS] {
+            let (status, body) = post(
+                &session,
+                request(2, "initialize", json!({"protocolVersion": requested})),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["result"]["protocolVersion"], "2025-11-25");
+        }
         let (_, body) = post(
             &session,
-            request(3, "initialize", json!({"protocolVersion": STATELESS})),
+            request(3, "initialize", json!({"protocolVersion": "2025-03-26"})),
             None,
         )
         .await;
-        assert_eq!(body["error"]["data"]["requested"], STATELESS);
+        assert_eq!(body["result"]["protocolVersion"], "2025-03-26");
         // A 2025 client's version isn't a version of the stateless era either.
         let (status, body) = post(
             &session,
@@ -1276,11 +1363,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_2026_request_whose_headers_dont_match_its_body_is_refused_before_it_runs() {
+        let session = Fake::new();
+        let call = || {
+            request(
+                1,
+                "tools/call",
+                json!({"_meta": modern_meta(STATELESS), "name": "ask_user"}),
+            )
+        };
+        let good = Headers {
+            version: Some(STATELESS),
+            method: Some("tools/call"),
+            name: Some("ask_user"),
+        };
+        let Outcome::Reply(status, body) = serve(&session, call(), &good).await else {
+            panic!("expected a reply");
+        };
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["content"][0]["text"], "called ask_user");
+        // The name may come Base64-encoded.
+        let encoded = Headers {
+            name: Some("=?base64?YXNrX3VzZXI=?="),
+            ..good
+        };
+        assert!(matches!(
+            serve(&session, call(), &encoded).await,
+            Outcome::Reply(StatusCode::OK, _)
+        ));
+
+        let cases = [
+            (
+                Headers {
+                    version: None,
+                    ..good
+                },
+                "MCP-Protocol-Version header is missing",
+            ),
+            (
+                Headers {
+                    version: Some("2025-11-25"),
+                    ..good
+                },
+                "MCP-Protocol-Version header value '2025-11-25'",
+            ),
+            (
+                Headers {
+                    method: None,
+                    ..good
+                },
+                "Mcp-Method header is missing",
+            ),
+            (
+                Headers {
+                    method: Some("tools/list"),
+                    ..good
+                },
+                "Mcp-Method header value 'tools/list'",
+            ),
+            (Headers { name: None, ..good }, "Mcp-Name header is missing"),
+            (
+                Headers {
+                    name: Some("list_work"),
+                    ..good
+                },
+                "Mcp-Name header value 'list_work'",
+            ),
+            (
+                Headers {
+                    name: Some("=?base64?bGlzdF93b3Jr?="),
+                    ..good
+                },
+                "Mcp-Name header value 'list_work'",
+            ),
+            (
+                Headers {
+                    name: Some("=?base64?!!?="),
+                    ..good
+                },
+                "not valid Base64",
+            ),
+        ];
+        for (headers, why) in cases {
+            let Outcome::Reply(status, body) = serve(&session, call(), &headers).await else {
+                panic!("expected a reply");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{why}");
+            assert_eq!(body["error"]["code"], -32020, "{why}");
+            let message = body["error"]["message"].as_str().unwrap();
+            assert!(message.contains(why), "{message} should say {why}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_notification_gets_no_reply() {
         let session = Fake::new();
         let notification = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
         assert!(matches!(
-            serve(&session, notification, None).await,
+            serve(&session, notification, &Headers::default()).await,
             Outcome::Accepted
         ));
     }
