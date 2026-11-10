@@ -2176,6 +2176,44 @@ test('switching back keeps the reader’s place', { tag: '@scroll' }, async ({ p
   await expect.poll(async () => Math.abs((await row.boundingBox())!.y - left)).toBeLessThan(2);
 });
 
+test('jumping to the latest in a session the UI has stops it holding the reader up the history', { tag: '@scroll' }, async ({ page }) => {
+  const { long, backoff, open } = await twoSessionsOpen(page);
+  await open(long).click();
+  await expect(page.getByText('The end.')).toBeVisible();
+  // Up the history, away, and back: the view holds the reader where they were while the session catches up (#93).
+  await wheelBy(page, -600);
+  await open(backoff).click();
+  await expect(page.getByText(/Done\. The tests pass/)).toBeVisible();
+  await open(long).click();
+  await expect(page.getByText('The end.')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Scroll to the latest message' })).toBeVisible();
+
+  // Asked for the latest: what arrives after doesn't put them back up the history.
+  await page.getByRole('button', { name: 'Scroll to the latest message' }).click();
+  await page.request.post('/_mock/say?text=At%20the%20bottom%20now.');
+  await expect(page.getByText('At the bottom now.')).toBeInViewport();
+  await expect(page.getByText('The end.')).toBeInViewport();
+});
+
+test('sending a message in a session the UI has stops it holding the reader up the history', { tag: '@scroll' }, async ({ page }) => {
+  const { long, backoff, open } = await twoSessionsOpen(page);
+  await open(long).click();
+  await expect(page.getByText('The end.')).toBeVisible();
+  await wheelBy(page, -600);
+  await open(backoff).click();
+  await expect(page.getByText(/Done\. The tests pass/)).toBeVisible();
+  await open(long).click();
+  await expect(page.getByText('The end.')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Scroll to the latest message' })).toBeVisible();
+
+  // Sending takes the reader to the latest, and there they stay as the turn answers.
+  await page.getByRole('textbox', { name: 'Prompt' }).fill('What about the caching layer?');
+  await page.getByRole('textbox', { name: 'Prompt' }).press('Enter');
+  await expect(userMessages(page).filter({ hasText: 'What about the caching layer?' })).toBeInViewport();
+  await page.request.post('/_mock/say?text=Answered%20at%20the%20bottom.');
+  await expect(page.getByText('Answered at the bottom.')).toBeInViewport();
+});
+
 test('says what the pod is doing while the agent starts, and why a start failed', async ({ page }) => {
   await createSession(page, 'failing start: fix the build in bo0tzz/sloppod');
   const activity = page.getByTestId('activity');

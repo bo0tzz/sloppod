@@ -325,7 +325,9 @@
     let still = 0;
     for (let round = 0; round < 20 && still < 3; round++) {
       await new Promise((resolve) => requestAnimationFrame(resolve));
-      if (pointerHeld || performance.now() - lastUserScroll < 1000) return;
+      // The reader has taken the view where they want it — scrolled, jumped to the latest, sent something — and this
+      // one, still on its way, has nothing left to hold them at (#93).
+      if (!kept || pointerHeld || performance.now() - lastUserScroll < 1000) return;
       const rows = rowElements();
       const row = place.names.length
         ? rows.find((row) => (row.dataset.rowNames ?? '').split(' ').some((name) => place.names.includes(name)))
@@ -467,6 +469,8 @@
   function jumpToLatest() {
     holdBar = false;
     atBottom = true;
+    // Asked for the latest: nothing to hold the reader at the history they were in (#93).
+    kept = null;
     scrollToBottom('smooth');
   }
 
@@ -1027,6 +1031,8 @@
             pointerHeld = false;
             holdBar = false;
             atBottom = true;
+            // Sending takes the reader to the latest, as the jump button does: their history place is done with (#93).
+            kept = null;
             scrollToBottom();
           }}
         />
