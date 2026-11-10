@@ -813,7 +813,7 @@ async fn prepare(
 
     write_launch_files(
         Path::new(&home),
-        &[args.workdir.as_path()],
+        &args.workdir,
         &launch.files,
         launch.workspace_copied,
     )?;
@@ -1079,12 +1079,12 @@ async fn git_output(env: &[(String, String)], cwd: &str, args: &[&str]) -> anyho
 /// of it is there for the files, or the transcript restored after them, to mix with.
 fn write_launch_files(
     home: &Path,
-    keep: &[&Path],
+    workdir: &Path,
     files: &[File],
     copied: bool,
 ) -> anyhow::Result<()> {
     if copied {
-        forget_copied_session(home, keep, files)?;
+        forget_copied_session(home, workdir, files)?;
     }
     for file in files {
         let path = Path::new(&file.path);
@@ -1094,6 +1094,9 @@ fn write_launch_files(
     }
     Ok(())
 }
+
+/// Where the agents sloppod runs keep their state and transcripts, under the workdir.
+const AGENT_STATE_DIRS: &[&str] = &[".claude", ".codex"];
 
 /// Files in the home directory that record what a session did there.
 const HOME_TRACES: &[&str] = &[
@@ -1111,11 +1114,15 @@ const HOME_TRACES: &[&str] = &[
 /// Removes what a copied volume holds of the session it was copied from: each agent's own directory (the parent
 /// directories of the files sloppod writes for it, where it keeps its state and transcripts too) and the traces of
 /// its use in `home`. The directories in `keep` are never removed, whatever a launch asks for.
-fn forget_copied_session(home: &Path, keep: &[&Path], files: &[File]) -> anyhow::Result<()> {
+fn forget_copied_session(home: &Path, workdir: &Path, files: &[File]) -> anyhow::Result<()> {
+    // The state directories of the agents sloppod knows, whichever one this session runs: a child may use another
+    // agent than its parent, and then its launch files name only its own.
+    let known: Vec<PathBuf> = AGENT_STATE_DIRS.iter().map(|d| workdir.join(d)).collect();
     let mut dirs: Vec<&Path> = files
         .iter()
         .filter_map(|f| Path::new(&f.path).parent())
-        .filter(|dir| dir.components().count() > 1 && !keep.contains(dir) && !home.starts_with(dir))
+        .chain(known.iter().map(PathBuf::as_path))
+        .filter(|dir| dir.components().count() > 1 && *dir != workdir && !home.starts_with(dir))
         .collect();
     dirs.sort();
     dirs.dedup();
@@ -1600,13 +1607,9 @@ mod copied_workspace_tests {
         std::fs::write(home.join(".config/gh/config.yml"), "").unwrap();
         std::fs::write(home.join(".cache/tool/blob"), "").unwrap();
 
-        let mut files = launch_files(&config);
-        files.push(File {
-            path: codex.join("config.toml").display().to_string(),
-            content: String::new(),
-            overwrite: true,
-        });
-        forget_copied_session(&home, &[root.as_path()], &files).unwrap();
+        // A Claude child of a Codex parent: its launch files name only `.claude`, and `.codex` goes all the same.
+        let files = launch_files(&config);
+        forget_copied_session(&home, &root, &files).unwrap();
 
         assert!(!config.exists());
         assert!(!codex.exists());
@@ -1614,6 +1617,31 @@ mod copied_workspace_tests {
         assert!(!home.join(".config/gh/hosts.yml").exists());
         assert!(home.join(".config/gh/config.yml").exists());
         assert!(home.join(".cache/tool/blob").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_codex_child_of_a_claude_parent_loses_the_claude_state() {
+        let root = scratch("copied-codex-child");
+        let home = root.join("home");
+        let config = root.join(".claude");
+        let codex = root.join(".codex");
+        std::fs::create_dir_all(config.join("projects/parent")).unwrap();
+        std::fs::write(config.join("projects/parent/log.jsonl"), "old").unwrap();
+        std::fs::create_dir_all(&codex).unwrap();
+        let files = vec![File {
+            path: codex.join("config.toml").display().to_string(),
+            content: "child".into(),
+            overwrite: true,
+        }];
+
+        write_launch_files(&home, &root, &files, true).unwrap();
+
+        assert!(!config.exists());
+        assert_eq!(
+            std::fs::read_to_string(codex.join("config.toml")).unwrap(),
+            "child"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1641,7 +1669,7 @@ mod copied_workspace_tests {
             },
         ];
 
-        forget_copied_session(&home, &[root.as_path()], &files).unwrap();
+        forget_copied_session(&home, &root, &files).unwrap();
 
         assert!(home.join("keep").exists());
         std::fs::remove_dir_all(&root).unwrap();
@@ -1657,7 +1685,7 @@ mod copied_workspace_tests {
         std::fs::write(config.join("CLAUDE.md"), "parent").unwrap();
         let files = launch_files(&config);
 
-        write_launch_files(&home, &[root.as_path()], &files, true).unwrap();
+        write_launch_files(&home, &root, &files, true).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(config.join("CLAUDE.md")).unwrap(),
