@@ -21,7 +21,17 @@ use crate::{AppState, db, proposals, reviews, subsessions, work};
 
 /// Every protocol version the endpoint serves, newest first. The first is the stateless era (2026-07-28: every request
 /// carries its version and client capabilities in `_meta`); the others are the era of `initialize`.
-const SUPPORTED: [&str; 4] = ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"];
+/// The versions sloppod serves, newest first: `[0]` is the stateless one, the rest are served with the handshake.
+/// `2024-11-05` is still offered by clients, and its requests are the same 2025 shape ones. A handshake client asking
+/// for a version that isn't here is answered with `[1]` — the newest of that era — rather than refused, which is what
+/// the 2025 spec's lifecycle says a server does, and the client decides whether it can go on with it.
+const SUPPORTED: [&str; 5] = [
+    "2026-07-28",
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+];
 const STATELESS: &str = "2026-07-28";
 const DEFAULT_LEGACY: &str = "2025-06-18";
 
@@ -1294,13 +1304,16 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body["result"]["protocolVersion"], "2025-11-25");
         }
-        let (_, body) = post(
-            &session,
-            request(3, "initialize", json!({"protocolVersion": "2025-03-26"})),
-            None,
-        )
-        .await;
-        assert_eq!(body["result"]["protocolVersion"], "2025-03-26");
+        // The oldest a client still offers is served as itself, not negotiated away from it.
+        for asked in ["2025-03-26", "2024-11-05"] {
+            let (_, body) = post(
+                &session,
+                request(3, "initialize", json!({"protocolVersion": asked})),
+                None,
+            )
+            .await;
+            assert_eq!(body["result"]["protocolVersion"], asked);
+        }
         // A 2025 client's version isn't a version of the stateless era either.
         let (status, body) = post(
             &session,
