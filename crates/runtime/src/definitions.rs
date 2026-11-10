@@ -6,12 +6,13 @@
 use std::net::SocketAddr;
 
 use anyhow::Context;
+use axum::Json;
 use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use sloppod_contracts::Grant;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -184,7 +185,24 @@ pub async fn proxy(
 }
 
 fn refuse(status: StatusCode, message: String) -> anyhow::Result<Response> {
-    Ok((status, message).into_response())
+    Ok((status, Json(refusal(status, message))).into_response())
+}
+
+/// What a refusal looks like (#480): the request a session's MCP client made is a JSON-RPC call, so what it gets back
+/// is a JSON-RPC error rather than plain text — with a null id, since the body isn't read before refusing (it may be
+/// a stream being forwarded) — and the HTTP status says the same thing for anything that isn't that client. A server
+/// the session doesn't hold is an invalid request (`-32602`); anything else is sloppod's own failure (`-32603`).
+fn refusal(status: StatusCode, message: String) -> Value {
+    let code = if status == StatusCode::BAD_GATEWAY {
+        -32603
+    } else {
+        -32602
+    };
+    json!({
+        "jsonrpc": "2.0",
+        "id": Value::Null,
+        "error": {"code": code, "message": message},
+    })
 }
 
 async fn forward(
@@ -342,6 +360,35 @@ async fn token_header(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a session's MCP client gets when sloppod refuses it: a JSON-RPC error, since the request it made is a
+    /// JSON-RPC call, rather than the plain text anything else gets (#480).
+    #[test]
+    fn a_refusal_is_a_json_rpc_error() {
+        let refused = refusal(
+            StatusCode::FORBIDDEN,
+            "sloppod: this session is parked, so it reaches no servers\n".into(),
+        );
+        assert_eq!(refused["jsonrpc"], "2.0");
+        assert!(refused["id"].is_null(), "{refused}");
+        assert_eq!(refused["error"]["code"].as_i64(), Some(-32602));
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("this session is parked"),
+            "{refused}"
+        );
+        // A server that can't be reached is sloppod's own failure, not something the request got wrong.
+        assert_eq!(
+            refusal(
+                StatusCode::BAD_GATEWAY,
+                "sloppod: the logs server isn't reachable\n".into()
+            )["error"]["code"]
+                .as_i64(),
+            Some(-32603)
+        );
+    }
 
     fn new(name: &str, url: &str) -> NewDefinition {
         NewDefinition {
