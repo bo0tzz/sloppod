@@ -67,6 +67,9 @@ export type ReaderPlace = { names: string[]; seq: number; offset: number; atBott
 /** How many sessions' views are kept for switching back to (#93): the chat then shows at once, without a replay. */
 const RECENT_VIEWS = 4;
 
+/** How many pages of history catching a view up fills in before starting it over instead (#93). */
+const GAP_PAGES = 10;
+
 /** The views of the sessions opened lately, least recently shown first. */
 const recentViews = new Map<string, SessionView>();
 
@@ -149,6 +152,11 @@ export class SessionView {
   #stopped = false;
   /** A `session/load` is on its way over the shared connection. */
   #loading = false;
+  /**
+   * Which showing of this session the view is on: a load started for an earlier one is abandoned where it stands rather
+   * than installing what the view has moved past (#93). Counted by `start`.
+   */
+  #generation = 0;
   /** Lifts the barrier a stop put up for a load that was still on its way. */
   #lifted: (() => void) | undefined;
 
@@ -233,6 +241,7 @@ export class SessionView {
 
   start() {
     this.#stopped = false;
+    this.#generation += 1;
     void this.refresh();
     this.#unregister = app.register(this.#consumer);
   }
@@ -314,9 +323,12 @@ export class SessionView {
   }
 
   async #onReady() {
+    const generation = this.#generation;
     // Back on a session just left: its close has to be through, or it could land after this load and end it.
     await closing.get(this.id);
-    if (this.#stopped) return;
+    // Left and shown again while that was waiting: the load this call was for isn't this view's any more, and starting
+    // one here would run beside the one that is (#93).
+    if (this.#stopped || generation !== this.#generation) return;
     this.#replay = new Transcript();
     this.#replayUpdates = [];
     this.#loading = true;
@@ -331,6 +343,7 @@ export class SessionView {
         await this.#close();
         return;
       }
+      if (generation !== this.#generation) return;
       const before = (response?._meta?.sloppod as { historyBefore?: number | null } | undefined)?.historyBefore ?? null;
       const replay = this.#replayUpdates;
       // A session this view already had is caught up rather than started over (#93): the replay is the latest page, so
@@ -338,29 +351,70 @@ export class SessionView {
       // own) and the part of its last page that has since fallen off the end. Its own boundary is still the one to ask
       // for the page before, since the log only grows.
       const catchingUp = this.#updates.length > 0;
-      const kept = catchingUp
+      const top = this.#updates.reduce((top, u) => Math.max(top, u.seq), 0);
+      // The log can grow past this view by more than a page: then the replay starts beyond what it has, and what lies
+      // between is fetched before the two are joined, or the conversation would show a hole it could never fill. A
+      // session's log only grows, so the run is whole; more than a few pages of it is more than this is worth, and the
+      // view starts over from the replay instead.
+      let between: LoggedUpdate[] = [];
+      let ask = before;
+      for (let page = 0; catchingUp && ask !== null && ask > top + 1 && page < GAP_PAGES; page++) {
+        const fetched = await this.#historyPage(ask);
+        const first = ask - fetched.updates.length;
+        // The page is oldest first, so the part that joins what the view has is its end: everything above its own top.
+        const joins = Math.max(0, Math.min(fetched.updates.length, ask - 1 - top));
+        const piece = fetched.updates.map((update, index) => ({
+          update,
+          seq: first + index,
+          at: fetched.at?.[index] ?? null,
+        }));
+        between = [...piece.slice(Math.max(0, piece.length - joins)), ...between];
+        ask = fetched.before;
+      }
+      // Left while those pages were on their way: the close ends this load, as it does above, and a newer showing's
+      // load is the one to go on (#93).
+      if (this.#stopped) {
+        await this.#close();
+        return;
+      }
+      if (generation !== this.#generation) return;
+      const joined = ask === null || ask <= top + 1;
+      const kept = catchingUp && joined
         ? this.#updates.filter((u) => u.seq === 0 || (before !== null && u.seq < before))
         : [];
-      const updates = [...kept, ...replay];
+      const updates = [...kept, ...(joined ? between : []), ...replay];
       // Nothing kept is the usual case: the replay is the transcript, as it was built.
-      const transcript = kept.length === 0 ? this.#replay! : new Transcript();
-      if (kept.length > 0) for (const { update, seq, at } of updates) transcript.apply(update, seq, at);
+      const transcript = kept.length === 0 && between.length === 0 ? this.#replay! : new Transcript();
+      if (transcript !== this.#replay) for (const { update, seq, at } of updates) transcript.apply(update, seq, at);
       this.transcript = transcript;
       this.#updates = updates;
-      if (!catchingUp) this.historyBefore = before;
+      if (!catchingUp || !joined) this.historyBefore = before;
       this.historyError = null;
       this.configOptions = response?.configOptions ?? [];
     } finally {
-      this.#loading = false;
+      // What this call was going to install isn't the view's any more if it was left and shown again meanwhile: its
+      // barrier still comes down, so whoever waits on that goes on, but the fields are the newer load's (#93).
+      if (generation === this.#generation) {
+        this.#loading = false;
+        this.#replay = null;
+        this.#replayUpdates = null;
+      }
       this.#lifted?.();
       this.#lifted = undefined;
-      this.#replay = null;
-      this.#replayUpdates = null;
     }
+    if (generation !== this.#generation) return;
     this.loaded = true;
     // Fetched again only now that `session/load` has subscribed this socket: a proposal made since the last fetch
     // then comes one way or the other, where fetching alongside the load could miss it (#423).
     await this.refresh();
+  }
+
+  /** A page of the session's history before `before`, as `session/load`'s boundary says to ask for it. */
+  async #historyPage(before: number) {
+    return app.request<{ updates: SessionUpdate[]; at?: string[]; before: number | null }>('_sloppod/history', {
+      sessionId: this.id,
+      before,
+    });
   }
 
   #onNotification(method: string, params: unknown) {
@@ -458,10 +512,7 @@ export class SessionView {
     this.loadingHistory = true;
     this.historyError = null;
     try {
-      const page = await app.request<{ updates: SessionUpdate[]; at?: string[]; before: number | null }>('_sloppod/history', {
-        sessionId: this.id,
-        before,
-      });
+      const page = await this.#historyPage(before);
       // A reload meanwhile has replaced what this page goes in front of.
       if (this.historyBefore !== before || !page) return;
       const transcript = new Transcript();

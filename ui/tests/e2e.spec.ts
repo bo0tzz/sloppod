@@ -2127,6 +2127,30 @@ test('switching back keeps the reader’s place in history they had read into', 
   await page.request.post('/_mock/slow-loads?for=0');
 });
 
+test('switching back to a session that grew by more than a page keeps the whole conversation', { tag: '@scroll' }, async ({ page }) => {
+  const { long, backoff, open } = await twoSessionsOpen(page);
+  await open(long).click();
+  await expect(page.getByText('The end.')).toBeVisible();
+
+  // Away while more than a page of output arrives: the load on the way back covers the latest page only, and what lies
+  // between that and what the view had is a run it has never seen. Left as it is, the conversation would show a hole —
+  // and, since the view believes it has everything, one it could never fetch (#93).
+  await open(backoff).click();
+  await expect(page.getByText(/Done\. The tests pass/)).toBeVisible();
+  // A run of messages in the session that's away, longer than the page a load replays.
+  await page.request.post(`/_mock/say?session=${long}&count=3000&text=Part`);
+
+  await open(long).click();
+  await expect(page.getByText('The end.')).toBeVisible();
+  // The load lands with the latest page: waiting for the newest of what arrived means what's checked next is after it.
+  await expect(agentMessages(page).filter({ hasText: 'Part 2999' })).toBeAttached();
+  // And the run between that page and what the view had is there too: without it the conversation shows a hole, and
+  // one this view could never fetch, since it believes it has everything older (its boundary says so).
+  for (const said of ['Part 0', 'Part 999']) {
+    await expect(agentMessages(page).filter({ hasText: said })).toBeAttached();
+  }
+});
+
 test('switching back keeps the reader’s place', { tag: '@scroll' }, async ({ page }) => {
   const { long, backoff, open } = await twoSessionsOpen(page);
   await open(long).click();
@@ -4351,17 +4375,27 @@ test('a session left and entered again while its load is on its way is loaded on
 
 test('a session left and entered again over and over while its load is slow catches up afterwards', async ({ page }) => {
   await page.setViewportSize({ width: 1400, height: 900 });
+  // Every load the page sends for the session it keeps coming back to.
+  const loads: string[] = [];
+  page.on('websocket', (socket) =>
+    socket.on('framesent', ({ payload }) => {
+      const message = JSON.parse(String(payload));
+      if (message.method === 'session/load') loads.push(message.params?.sessionId);
+    }),
+  );
   const first = 'Say something, left and returned to while loading';
   const other = 'Say something, alongside the slow one';
-  await createSession(page, first);
+  const firstId = await createSession(page, first);
   await finishTurn(page);
   await createSession(page, other);
   await finishTurn(page);
   const nav = page.getByRole('navigation', { name: 'Sessions' });
   const row = (prompt: string) => nav.getByTestId('session-row').filter({ hasText: prompt });
+  const loadsOf = () => loads.filter((id) => id === firstId).length;
 
   // In and out of the first session several times while its load is on its way: each stop is one the load's barrier has
   // to answer, and each entry after the first shows the chat the UI kept (#93).
+  const before = loadsOf();
   await page.request.post('/_mock/slow-loads?for=3000');
   for (let round = 0; round < 3; round++) {
     await row(first).click();
@@ -4369,10 +4403,17 @@ test('a session left and entered again over and over while its load is slow catc
   }
   await page.request.post('/_mock/slow-loads?for=0');
 
-  // Going back in loads it: nothing is left waiting on a barrier that never comes down.
+  // Going back in loads it: nothing is left waiting on a barrier that never comes down. One load, not one per entry:
+  // the entries that the load outlived are no longer the view's, and a load each would run beside each other over the
+  // same fields.
   await row(first).click();
   await expect(agentMessages(page).filter({ hasText: FINAL })).toBeVisible({ timeout: 20_000 });
   await expect(phase(page)).toHaveAttribute('data-phase', 'idle');
+  // Not one load per entry: the entries the load outlived are no longer the view's, and a load each would run beside
+  // each other over the same transcript fields (#93).
+  expect(loadsOf() - before).toBeLessThan(3);
+  // And no replay was applied twice: the message reads once, not once per load.
+  await expect(agentMessages(page).filter({ hasText: FINAL })).toHaveCount(1);
   const box = page.getByRole('textbox', { name: 'Prompt' });
   await box.fill('And once more, back again');
   await box.press('Enter');

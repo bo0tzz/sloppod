@@ -2858,10 +2858,19 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, {});
     }
     if (url.pathname === '/_mock/say' && req.method === 'POST') {
-      // More output in every session, as if its agent carried on.
+      // More output in every session, as if its agent carried on; with `session`, in that one only, and with `count`,
+      // that many messages, each numbered after `text` (`Part 7`), for a run longer than a page of history.
       const text = url.searchParams.get('text') ?? '';
-      for (const session of sessions.values()) {
-        session.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text }, messageId: randomUUID() });
+      const count = Number(url.searchParams.get('count') ?? 1);
+      const only = sessions.get(url.searchParams.get('session') ?? '');
+      for (const session of only ? [only] : sessions.values()) {
+        for (let i = 0; i < count; i++) {
+          session.emit({
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: count > 1 ? `${text} ${i}` : text },
+            messageId: randomUUID(),
+          });
+        }
       }
       return json(res, 200, {});
     }
