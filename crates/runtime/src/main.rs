@@ -346,6 +346,8 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 every.tick().await;
                 lifecycle::sweep_expired_grants(&state).await;
+                // A workspace copied from another session's that never provisioned is placed fresh (#478).
+                lifecycle::sweep_copied_workspaces(&state).await;
                 storage::release_unused(&state).await;
                 reviews::sweep_kept_reviewers(&state).await;
             }
@@ -514,6 +516,11 @@ async fn reconcile(state: &AppState) {
         }
     };
     for session in sessions {
+        // A session whose copied workspace is still being removed is left to the sweep (#478): placing it now would
+        // apply to a Sandbox that's on its way out, which goes with it, and the session would go with it.
+        if session.workspace_copy_stage.as_deref() == Some(lifecycle::COPY_DROPPING) {
+            continue;
+        }
         let interrupted = matches!(session.phase(), Phase::Working | Phase::Waiting);
         state.hub.set_phase(session.id, Phase::Disconnected).await;
         if let Err(e) = lifecycle::place(state, &session).await {
