@@ -5,10 +5,11 @@ use base64::Engine;
 use graphql_parser::query::{
     Definition, OperationDefinition, Selection, SelectionSet, Value as GraphqlValue,
 };
+use sloppod_contracts::github::{Site, clone_instead, repo_path, single_file_read};
 use sloppod_contracts::{
     Decision, Error, HttpRequest, Manifest, RequestPolicy, Result, SessionContext,
 };
-use sloppod_contracts::{operation, repo_from_git_path, same_repo};
+use sloppod_contracts::{operation, same_repo};
 
 use crate::capabilities::{Part, holds};
 use crate::credentials::Credentials;
@@ -295,6 +296,14 @@ impl GitHubPolicy {
                 session,
             )));
         }
+        // Reading one file — the contents API, a README, a blob — or asking for a file's raw bytes: the session
+        // clones the repository instead, and is told to. The trees API, issues, pulls, search and releases stay.
+        if let Some(repo) = single_file_read(Site::Api, path) {
+            return Ok(Decision::deny(clone_refusal(Some(&repo))));
+        }
+        if wants_raw_file(request) {
+            return Ok(Decision::deny(clone_refusal(named_repo(path).as_deref())));
+        }
         // Reads carry a read-only token covering the granted repositories in one installation, which also reads
         // public data: the installation of the repository the request names, if it's granted, or else the first
         // granted repository whose installation still works. A session with no repository it reads as the App gets a
@@ -380,6 +389,11 @@ impl RequestPolicy for GitHubPolicy {
         match request.host.as_str() {
             "api.github.com" => self.api(session, request).await,
             _ => {
+                // A session reads a repository by cloning it: the web views of one file are refused, and what to do
+                // instead is said. The git paths a clone is made of are parsed below, and are unaffected.
+                if let Some(repo) = single_file_read(Site::Web, request.path_only()) {
+                    return Ok(Decision::deny(clone_refusal(Some(&repo))));
+                }
                 if let Some(git) = GitRequest::parse(request) {
                     let span = acting_span(&session.session_id, session.repo_credential(&git.repo));
                     return self.git(session, request, git).instrument(span).await;
@@ -506,9 +520,22 @@ fn user_token_repo<'a>(
 
 /// The repository an API path names, `/repos/<owner>/<name>/…`.
 fn named_repo(path: &str) -> Option<String> {
-    path.strip_prefix("/repos/").and_then(|rest| {
-        let mut parts = rest.splitn(3, '/');
-        Some(format!("{}/{}", parts.next()?, parts.next()?))
+    repo_path(path, "/repos/").map(|(repo, _)| repo)
+}
+
+/// What a session is told when it reads one file from GitHub, or asks for one's raw bytes, instead of cloning the
+/// repository it's in.
+fn clone_refusal(repo: Option<&str>) -> String {
+    format!("sloppod: {}\n", clone_instead(repo))
+}
+
+/// Whether a request asks GitHub for a file's raw bytes rather than JSON, `Accept: application/vnd.github.raw…`
+/// (ADR 11: the authorizer sees the request's headers).
+fn wants_raw_file(request: &HttpRequest) -> bool {
+    request.headers.get("accept").is_some_and(|accept| {
+        accept
+            .to_ascii_lowercase()
+            .contains("application/vnd.github.raw")
     })
 }
 
@@ -570,11 +597,7 @@ struct GitRequest {
 
 impl GitRequest {
     fn parse(request: &HttpRequest) -> Option<Self> {
-        let path = request.path_only().trim_start_matches('/');
-        let mut parts = path.splitn(3, '/');
-        let owner = parts.next()?;
-        let repo = repo_from_git_path(parts.next()?);
-        let rest = parts.next()?;
+        let (repo, rest) = repo_path(request.path_only(), "/")?;
         let (service, advertisement) = match (request.method.as_str(), rest) {
             ("GET", "info/refs") => {
                 let query = request.query().unwrap_or_default();
@@ -591,11 +614,8 @@ impl GitRequest {
             ("POST", "git-receive-pack") => (Service::ReceivePack, false),
             _ => return None,
         };
-        if owner.is_empty() || repo.is_empty() {
-            return None;
-        }
         Some(Self {
-            repo: format!("{owner}/{repo}"),
+            repo,
             service,
             advertisement,
         })
@@ -1295,6 +1315,85 @@ mod tests {
             read_token_order(&["x/y".into(), "p/c".into()], &granted),
             ["p/c", "o/a", "o/b"]
         );
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn reading_one_file_from_github_is_refused_and_the_rest_is_left_alone(db: sqlx::PgPool) {
+        let (policy, _, _) = reads_policy(db, Default::default(), &[(&["o/r"], false)]).await;
+        let session = reading(&[("o/r", None)]);
+        let request = |host: &str, method: &str, path: &str| HttpRequest {
+            method: method.into(),
+            host: host.into(),
+            path: path.into(),
+            headers: Default::default(),
+            body: Vec::new(),
+            body_truncated: false,
+        };
+        let refused = |decision: Decision| {
+            matches!(decision, Decision::Deny { message, .. }
+                if message.contains("clone the repository instead"))
+        };
+        // One file's contents, a listing of them, a README, a blob, and github.com's views of one: a session clones
+        // the repository instead, and is told to.
+        for (host, path) in [
+            ("api.github.com", "/repos/o/r/contents/src/main.rs"),
+            ("api.github.com", "/repos/o/r/contents"),
+            ("api.github.com", "/repos/o/r/readme"),
+            ("api.github.com", "/repos/o/r/git/blobs/8e2a1c"),
+            ("github.com", "/o/r/blob/main/src/main.rs"),
+            ("github.com", "/o/r/raw/main/src/main.rs"),
+        ] {
+            let decision = policy
+                .decide(&session, &request(host, "GET", path))
+                .await
+                .unwrap();
+            assert!(refused(decision), "{host}{path}");
+        }
+        // Asking for a file's raw bytes is refused too, and the hint names the repository the path does.
+        let mut raw = request("api.github.com", "GET", "/repos/o/r/git/trees/main");
+        raw.headers
+            .insert("accept".into(), "application/vnd.github.raw+json".into());
+        let Decision::Deny { message, .. } = policy.decide(&session, &raw).await.unwrap() else {
+            panic!("a read asking for raw bytes should be refused");
+        };
+        assert!(
+            message.contains("https://github.com/o/r /workspace/tmp/r"),
+            "{message}"
+        );
+
+        // Everything else a session reads GitHub with stays: the trees API, issues, pulls, search, releases and the
+        // git paths a clone is made of.
+        for (host, method, path) in [
+            (
+                "api.github.com",
+                "GET",
+                "/repos/o/r/git/trees/main?recursive=1",
+            ),
+            ("api.github.com", "GET", "/repos/o/r/issues"),
+            ("api.github.com", "GET", "/repos/o/r/pulls/1/reviews"),
+            // A repository named `blob` or `raw`: the API reads it like any other.
+            ("api.github.com", "GET", "/repos/o/blob/issues"),
+            ("api.github.com", "GET", "/repos/o/raw/pulls"),
+            ("api.github.com", "GET", "/repos/o/blob/git/trees/main"),
+            ("api.github.com", "GET", "/search/code?q=clone"),
+            ("api.github.com", "GET", "/repos/o/r/releases"),
+            (
+                "github.com",
+                "GET",
+                "/o/r.git/info/refs?service=git-upload-pack",
+            ),
+            ("github.com", "GET", "/o/r"),
+            ("github.com", "GET", "/o/r/tree/main"),
+        ] {
+            let decision = policy
+                .decide(&session, &request(host, method, path))
+                .await
+                .unwrap();
+            assert!(
+                matches!(decision, Decision::Allow { .. }),
+                "{host} {method} {path}: {decision:?}"
+            );
+        }
     }
 
     #[test]

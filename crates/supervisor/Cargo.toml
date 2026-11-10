@@ -12,6 +12,7 @@ name = "sloppod-supervisor"
 path = "src/main.rs"
 
 [dependencies]
+sloppod-contracts.workspace = true
 sloppod-protocol.workspace = true
 anyhow.workspace = true
 axum.workspace = true
