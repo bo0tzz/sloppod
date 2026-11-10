@@ -20,7 +20,7 @@ use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use sloppod_protocol::link::{
-    AgentReady, FromSupervisor, Launch, PATH, RUNTIME_INFO, RunningAgent, ToSupervisor,
+    AgentReady, File, FromSupervisor, Launch, PATH, RUNTIME_INFO, Repo, RunningAgent, ToSupervisor,
     TranscriptRef,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, Lines};
@@ -811,12 +811,12 @@ async fn prepare(
     }
     env.extend(launch.env.iter().cloned());
 
-    for file in &launch.files {
-        let path = Path::new(&file.path);
-        if file.overwrite || !path.exists() {
-            write_file(path, file.content.as_bytes())?;
-        }
-    }
+    write_launch_files(
+        Path::new(&home),
+        &[args.workdir.as_path()],
+        &launch.files,
+        launch.workspace_copied,
+    )?;
 
     std::fs::create_dir_all(&launch.transcript_dir)?;
     // Sessions without a repository work in an empty directory of their own.
@@ -859,58 +859,16 @@ async fn prepare(
             )
             .await;
             run_cmd(&env, &home, "git", &["clone", &repo.clone_url, &repo.path]).await?;
-            let remote_branch = format!("refs/heads/{}", repo.branch);
-            let exists = Command::new("git")
-                .envs(env.iter().cloned())
-                .current_dir(dir)
-                .args([
-                    "ls-remote",
-                    "--exit-code",
-                    "--heads",
-                    "origin",
-                    &remote_branch,
-                ])
-                .stdout(Stdio::null())
-                .status()
-                .await?
-                .success();
-            if exists {
-                run_cmd(
-                    &env,
-                    &repo.path,
-                    "git",
-                    &["fetch", "origin", &remote_branch],
-                )
-                .await?;
-                run_cmd(
-                    &env,
-                    &repo.path,
-                    "git",
-                    &["checkout", "-B", &repo.branch, "FETCH_HEAD"],
-                )
-                .await?;
-            } else {
-                // A new session branch starts from `from` if it's given and there, else from the default branch.
-                let from = match &repo.from {
-                    Some(from) => run_cmd(
-                        &env,
-                        &repo.path,
-                        "git",
-                        &["fetch", "origin", &format!("refs/heads/{from}")],
-                    )
-                    .await
-                    .is_ok(),
-                    None => false,
-                };
-                let start = if from { "FETCH_HEAD" } else { "HEAD" };
-                run_cmd(
-                    &env,
-                    &repo.path,
-                    "git",
-                    &["checkout", "-b", &repo.branch, start],
-                )
-                .await?;
-            }
+            check_out_session_branch(&env, repo, false).await?;
+        } else if launch.workspace_copied {
+            let _ = send(
+                sink,
+                &FromSupervisor::Status {
+                    message: "resetting the copied checkout".into(),
+                },
+            )
+            .await;
+            reset_copied_checkout(&env, repo).await?;
         }
         if let Some(commit) = &repo.commit {
             // The commit itself, which the branch may have moved away from since; the branch if the remote won't
@@ -966,6 +924,218 @@ async fn prepare(
         }
     }
     Ok(env)
+}
+
+/// Puts the checkout on the session's branch: the branch itself if the origin has it, else a new one from `from` if
+/// that's given and there, else from the origin's default branch. `copied` says the directory is a copy of another
+/// session's checkout, whose own branch `HEAD` is, so the default branch is fetched rather than assumed.
+async fn check_out_session_branch(
+    env: &[(String, String)],
+    repo: &Repo,
+    copied: bool,
+) -> anyhow::Result<()> {
+    let remote_branch = format!("refs/heads/{}", repo.branch);
+    let exists = Command::new("git")
+        .envs(env.iter().cloned())
+        .current_dir(&repo.path)
+        .args([
+            "ls-remote",
+            "--exit-code",
+            "--heads",
+            "origin",
+            &remote_branch,
+        ])
+        .stdout(Stdio::null())
+        .status()
+        .await?
+        .success();
+    let start = if exists {
+        run_cmd(env, &repo.path, "git", &["fetch", "origin", &remote_branch]).await?;
+        "FETCH_HEAD"
+    } else {
+        let from = match &repo.from {
+            Some(from) => run_cmd(
+                env,
+                &repo.path,
+                "git",
+                &["fetch", "origin", &format!("refs/heads/{from}")],
+            )
+            .await
+            .is_ok(),
+            None => false,
+        };
+        if from {
+            "FETCH_HEAD"
+        } else if copied {
+            run_cmd(env, &repo.path, "git", &["fetch", "origin", "HEAD"]).await?;
+            "FETCH_HEAD"
+        } else {
+            "HEAD"
+        }
+    };
+    run_cmd(
+        env,
+        &repo.path,
+        "git",
+        &["checkout", "-f", "-B", &repo.branch, start],
+    )
+    .await
+}
+
+/// Git's half-finished operations, which a forced checkout leaves in place.
+const GIT_OPERATION_STATE: &[&str] = &[
+    "rebase-merge",
+    "rebase-apply",
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "BISECT_LOG",
+    "sequencer",
+];
+
+/// Takes a checkout copied from another session's volume over as this session's: its branch, the origin it points
+/// at, and nothing of the other session's work in it. Ignored files stay: they are the build caches the copy is for.
+async fn reset_copied_checkout(env: &[(String, String)], repo: &Repo) -> anyhow::Result<()> {
+    let git_dir = Path::new(&repo.path).join(".git");
+    for name in GIT_OPERATION_STATE {
+        let path = git_dir.join(name);
+        let removed = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if let Err(e) = removed
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(e).with_context(|| format!("removing {}", path.display()));
+        }
+    }
+    // Only the session's repository, at the URL the runtime gave: the other session may have added or changed remotes.
+    let remotes = git_output(env, &repo.path, &["remote"]).await?;
+    for remote in remotes.lines().filter(|r| *r != "origin") {
+        run_cmd(env, &repo.path, "git", &["remote", "remove", remote]).await?;
+    }
+    if remotes.lines().any(|r| r == "origin") {
+        run_cmd(
+            env,
+            &repo.path,
+            "git",
+            &["remote", "set-url", "origin", &repo.clone_url],
+        )
+        .await?;
+    } else {
+        run_cmd(
+            env,
+            &repo.path,
+            "git",
+            &["remote", "add", "origin", &repo.clone_url],
+        )
+        .await?;
+    }
+    check_out_session_branch(env, repo, true).await?;
+    run_cmd(env, &repo.path, "git", &["clean", "-ffd"]).await?;
+    run_cmd(env, &repo.path, "git", &["stash", "clear"]).await?;
+    // The other session's branches, which would otherwise be offered here as if they were this one's.
+    let branches = git_output(
+        env,
+        &repo.path,
+        &["for-each-ref", "--format=%(refname)", "refs/heads"],
+    )
+    .await?;
+    let own = format!("refs/heads/{}", repo.branch);
+    for branch in branches.lines().filter(|b| *b != own) {
+        run_cmd(env, &repo.path, "git", &["update-ref", "-d", branch]).await?;
+    }
+    run_cmd(
+        env,
+        &repo.path,
+        "git",
+        &["reflog", "expire", "--expire=now", "--all"],
+    )
+    .await
+}
+
+/// What `git` prints on stdout, for a command that succeeds.
+async fn git_output(env: &[(String, String)], cwd: &str, args: &[&str]) -> anyhow::Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .envs(env.iter().cloned())
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("running git")?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Writes the files the launch asks for. On a copied volume the other session's agent state goes first, so nothing
+/// of it is there for the files, or the transcript restored after them, to mix with.
+fn write_launch_files(
+    home: &Path,
+    keep: &[&Path],
+    files: &[File],
+    copied: bool,
+) -> anyhow::Result<()> {
+    if copied {
+        forget_copied_session(home, keep, files)?;
+    }
+    for file in files {
+        let path = Path::new(&file.path);
+        if file.overwrite || !path.exists() {
+            write_file(path, file.content.as_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+/// Files in the home directory that record what a session did there.
+const HOME_TRACES: &[&str] = &[
+    ".claude.json",
+    ".config/gh/hosts.yml",
+    ".bash_history",
+    ".zsh_history",
+    ".python_history",
+    ".node_repl_history",
+    ".lesshst",
+    ".viminfo",
+    ".git-credentials",
+];
+
+/// Removes what a copied volume holds of the session it was copied from: each agent's own directory (the parent
+/// directories of the files sloppod writes for it, where it keeps its state and transcripts too) and the traces of
+/// its use in `home`. The directories in `keep` are never removed, whatever a launch asks for.
+fn forget_copied_session(home: &Path, keep: &[&Path], files: &[File]) -> anyhow::Result<()> {
+    let mut dirs: Vec<&Path> = files
+        .iter()
+        .filter_map(|f| Path::new(&f.path).parent())
+        .filter(|dir| dir.components().count() > 1 && !keep.contains(dir) && !home.starts_with(dir))
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    for dir in dirs {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => {
+                tracing::info!(dir = %dir.display(), "removed the copied session's agent state")
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("removing {}", dir.display())),
+        }
+    }
+    for name in HOME_TRACES {
+        match std::fs::remove_file(home.join(name)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("removing ~/{name}")),
+        }
+    }
+    Ok(())
 }
 
 fn has_mise_config(dir: &Path) -> bool {
@@ -1228,5 +1398,273 @@ mod disk_tests {
         let output = "      Used  1B-blocks\n 734003200 21003583488\n";
         assert_eq!(super::parse_df(output), Some((734_003_200, 21_003_583_488)));
         assert_eq!(super::parse_df("Used 1B-blocks\n"), None);
+    }
+}
+
+#[cfg(test)]
+mod copied_workspace_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    async fn git(env: &[(String, String)], cwd: &Path, args: &[&str]) {
+        run_cmd(env, cwd.to_str().unwrap(), "git", args)
+            .await
+            .unwrap();
+    }
+
+    fn git_env() -> Vec<(String, String)> {
+        [
+            ("GIT_AUTHOR_NAME", "t"),
+            ("GIT_AUTHOR_EMAIL", "t@example.com"),
+            ("GIT_COMMITTER_NAME", "t"),
+            ("GIT_COMMITTER_EMAIL", "t@example.com"),
+        ]
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .to_vec()
+    }
+
+    /// An origin with `main` and a `feature` branch, and a clone of it as a parent session leaves it: on its own
+    /// branch with a commit, a stash, an uncommitted change, an untracked file, an ignored cache and another remote.
+    async fn parent_checkout(root: &Path) -> (PathBuf, PathBuf, Vec<(String, String)>) {
+        let env = git_env();
+        let origin = root.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&env, &origin, &["init", "-b", "main"]).await;
+        std::fs::write(origin.join(".gitignore"), "cache/\n").unwrap();
+        std::fs::write(origin.join("tracked"), "origin\n").unwrap();
+        git(&env, &origin, &["add", "."]).await;
+        git(&env, &origin, &["commit", "-m", "first"]).await;
+        git(&env, &origin, &["branch", "feature"]).await;
+
+        let repo = root.join("repo");
+        git(
+            &env,
+            root,
+            &["clone", origin.to_str().unwrap(), repo.to_str().unwrap()],
+        )
+        .await;
+        git(&env, &repo, &["checkout", "-b", "sloppod/parent"]).await;
+        std::fs::write(repo.join("tracked"), "parent commit\n").unwrap();
+        git(&env, &repo, &["commit", "-am", "parent"]).await;
+        std::fs::write(repo.join("tracked"), "stashed\n").unwrap();
+        git(&env, &repo, &["stash"]).await;
+        std::fs::write(repo.join("tracked"), "uncommitted\n").unwrap();
+        std::fs::write(repo.join("untracked"), "x").unwrap();
+        std::fs::create_dir_all(repo.join("cache")).unwrap();
+        std::fs::write(repo.join("cache/object"), "built").unwrap();
+        git(&env, &repo, &["remote", "add", "other", "/nowhere"]).await;
+        (origin, repo, env)
+    }
+
+    fn repo_for(origin: &Path, repo: &Path, branch: &str, from: Option<&str>) -> Repo {
+        Repo {
+            clone_url: origin.to_str().unwrap().to_owned(),
+            branch: branch.to_owned(),
+            path: repo.to_str().unwrap().to_owned(),
+            commit: None,
+            from: from.map(str::to_owned),
+        }
+    }
+
+    async fn out(env: &[(String, String)], repo: &Path, args: &[&str]) -> String {
+        git_output(env, repo.to_str().unwrap(), args).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_copied_checkout_loses_the_parents_work_and_keeps_its_caches() {
+        let root = scratch("copied-checkout");
+        let (origin, repo, env) = parent_checkout(&root).await;
+
+        reset_copied_checkout(&env, &repo_for(&origin, &repo, "sloppod/child", None))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out(&env, &repo, &["branch", "--show-current"]).await.trim(),
+            "sloppod/child"
+        );
+        // From the origin's default branch, not the parent's commit.
+        assert_eq!(
+            std::fs::read_to_string(repo.join("tracked")).unwrap(),
+            "origin\n"
+        );
+        assert!(!repo.join("untracked").exists());
+        assert!(repo.join("cache/object").exists());
+        assert!(out(&env, &repo, &["stash", "list"]).await.is_empty());
+        assert_eq!(out(&env, &repo, &["status", "--porcelain"]).await, "");
+        assert_eq!(
+            out(
+                &env,
+                &repo,
+                &["for-each-ref", "--format=%(refname)", "refs/heads"]
+            )
+            .await
+            .trim(),
+            "refs/heads/sloppod/child"
+        );
+        assert_eq!(out(&env, &repo, &["remote"]).await.trim(), "origin");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_copied_checkout_starts_from_the_parents_branch_when_it_is_given() {
+        let root = scratch("copied-from");
+        let (origin, repo, env) = parent_checkout(&root).await;
+        git(&env, &origin, &["checkout", "feature"]).await;
+        std::fs::write(origin.join("tracked"), "feature\n").unwrap();
+        git(&env, &origin, &["commit", "-am", "feature"]).await;
+
+        reset_copied_checkout(
+            &env,
+            &repo_for(&origin, &repo, "sloppod/child", Some("feature")),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join("tracked")).unwrap(),
+            "feature\n"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_copied_checkout_takes_the_childs_branch_from_the_origin_when_it_is_there() {
+        let root = scratch("copied-existing");
+        let (origin, repo, env) = parent_checkout(&root).await;
+        git(&env, &origin, &["checkout", "feature"]).await;
+        std::fs::write(origin.join("tracked"), "child pushed\n").unwrap();
+        git(&env, &origin, &["commit", "-am", "pushed"]).await;
+        // A detached HEAD and a rebase left half done, as a parent may leave it.
+        git(&env, &repo, &["checkout", "--detach"]).await;
+        std::fs::create_dir_all(repo.join(".git/rebase-merge")).unwrap();
+        std::fs::write(repo.join(".git/MERGE_HEAD"), "0000\n").unwrap();
+
+        reset_copied_checkout(&env, &repo_for(&origin, &repo, "feature", None))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out(&env, &repo, &["branch", "--show-current"]).await.trim(),
+            "feature"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("tracked")).unwrap(),
+            "child pushed\n"
+        );
+        assert!(!repo.join(".git/rebase-merge").exists());
+        assert!(!repo.join(".git/MERGE_HEAD").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn launch_files(config: &Path) -> Vec<File> {
+        vec![
+            File {
+                path: config.join("settings.json").display().to_string(),
+                content: "{}".into(),
+                overwrite: true,
+            },
+            File {
+                path: config.join("CLAUDE.md").display().to_string(),
+                content: "child".into(),
+                overwrite: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn the_parents_agent_state_goes_and_the_caches_stay() {
+        let root = scratch("copied-state");
+        let home = root.join("home");
+        let config = root.join(".claude");
+        let codex = root.join(".codex");
+        for dir in [
+            config.join("projects/parent"),
+            codex.join("sessions"),
+            home.join(".cache/tool"),
+            home.join(".config/gh"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(config.join("projects/parent/log.jsonl"), "secret plans").unwrap();
+        std::fs::write(config.join("CLAUDE.md"), "parent").unwrap();
+        std::fs::write(codex.join("config.toml"), "").unwrap();
+        std::fs::write(home.join(".bash_history"), "ls").unwrap();
+        std::fs::write(home.join(".config/gh/hosts.yml"), "").unwrap();
+        std::fs::write(home.join(".config/gh/config.yml"), "").unwrap();
+        std::fs::write(home.join(".cache/tool/blob"), "").unwrap();
+
+        let mut files = launch_files(&config);
+        files.push(File {
+            path: codex.join("config.toml").display().to_string(),
+            content: String::new(),
+            overwrite: true,
+        });
+        forget_copied_session(&home, &[root.as_path()], &files).unwrap();
+
+        assert!(!config.exists());
+        assert!(!codex.exists());
+        assert!(!home.join(".bash_history").exists());
+        assert!(!home.join(".config/gh/hosts.yml").exists());
+        assert!(home.join(".config/gh/config.yml").exists());
+        assert!(home.join(".cache/tool/blob").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_launch_cannot_make_it_remove_the_home_or_the_workdir() {
+        let root = scratch("copied-protected");
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("keep"), "").unwrap();
+        let files = vec![
+            File {
+                path: home.join("a").display().to_string(),
+                content: String::new(),
+                overwrite: true,
+            },
+            File {
+                path: root.join("b").display().to_string(),
+                content: String::new(),
+                overwrite: true,
+            },
+            File {
+                path: "/c".into(),
+                content: String::new(),
+                overwrite: true,
+            },
+        ];
+
+        forget_copied_session(&home, &[root.as_path()], &files).unwrap();
+
+        assert!(home.join("keep").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_launchs_files_are_written_after_the_parents_are_gone() {
+        let root = scratch("copied-prepare");
+        let home = root.join("home");
+        let config = root.join(".claude");
+        std::fs::create_dir_all(config.join("projects/parent")).unwrap();
+        std::fs::write(config.join("projects/parent/log.jsonl"), "old").unwrap();
+        std::fs::write(config.join("CLAUDE.md"), "parent").unwrap();
+        let files = launch_files(&config);
+
+        write_launch_files(&home, &[root.as_path()], &files, true).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(config.join("CLAUDE.md")).unwrap(),
+            "child"
+        );
+        assert!(config.join("settings.json").exists());
+        assert!(!config.join("projects/parent").exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
